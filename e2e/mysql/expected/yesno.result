@@ -1,0 +1,52 @@
+INSTALL PLUGIN yesno SONAME 'ha_yesno.so';
+CREATE TABLE postings (
+ordinal BIGINT UNSIGNED NOT NULL PRIMARY KEY
+) ENGINE=YESNO CONNECTION='key=42';
+INSERT INTO postings VALUES (9), (1), (65540), (7);
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+1
+7
+9
+65540
+SELECT ordinal FROM postings WHERE ordinal = 7;
+ordinal
+7
+SELECT ordinal FROM postings WHERE ordinal >= 7 AND ordinal < 65540
+ORDER BY ordinal;
+ordinal
+7
+9
+SELECT COUNT(*) FROM postings;
+COUNT(*)
+4
+INSERT INTO postings VALUES (7);
+ERROR 23000: Duplicate entry '7' for key 'postings.PRIMARY'
+DELETE FROM postings WHERE ordinal = 9;
+SELECT ordinal FROM postings ORDER BY ordinal DESC;
+ordinal
+65540
+7
+1
+RENAME TABLE postings TO renamed_postings;
+SELECT COUNT(*) FROM renamed_postings;
+COUNT(*)
+3
+TRUNCATE TABLE renamed_postings;
+SELECT COUNT(*) FROM renamed_postings;
+COUNT(*)
+0
+INSERT INTO renamed_postings VALUES (3);
+DROP TABLE renamed_postings;
+CREATE TABLE reused_key (
+ordinal BIGINT UNSIGNED NOT NULL PRIMARY KEY
+) ENGINE=YESNO CONNECTION='key=42';
+SELECT COUNT(*) FROM reused_key;
+COUNT(*)
+0
+DROP TABLE reused_key;
+SELECT 1;
+1
+1
+UNINSTALL PLUGIN yesno;
+ok

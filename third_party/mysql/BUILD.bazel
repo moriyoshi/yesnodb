@@ -1,0 +1,23 @@
+"""The pinned MySQL server bundle used to build and test `yesno-mysql`."""
+
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "mysql",
+    actual = "@mysql_8_4//:mysql",
+)
+
+filegroup(
+    name = "gen_dir",
+    srcs = [":mysql"],
+    output_group = "gen_dir",
+)
+
+exports_files([
+    "mysql.BUILD",
+    "mysql-openssl-symlink.patch",
+    "ncurses.BUILD",
+    "openssl.BUILD",
+    "patchelf.BUILD",
+    "repository.bzl",
+])

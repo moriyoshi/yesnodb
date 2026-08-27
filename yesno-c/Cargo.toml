@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "yesno-c"
+description = "Stable C ABI for the yesno embedded database"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moriyoshi/yesnodb"
+
+[lib]
+name = "yesno_c"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+yesno-core = { path = "../yesno-core", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = "1.10.0"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

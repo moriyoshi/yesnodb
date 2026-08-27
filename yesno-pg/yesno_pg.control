@@ -1,0 +1,10 @@
+# yesno_pg extension control file.
+#
+# `module_pathname` is rewritten to the installed library path by the packaging
+# step; `$libdir/yesno_pg` is what a normal PGXS install produces and what the
+# regression harness's temporary cluster resolves.
+comment = 'yesno inside PostgreSQL: foreign data wrapper, index AM, table AM'
+default_version = '0.1.0'
+module_pathname = '$libdir/yesno_pg'
+relocatable = false
+superuser = true

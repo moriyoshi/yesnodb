@@ -1,0 +1,316 @@
+"""Bazel module for the ABI-bound PostgreSQL and MySQL integrations.
+
+Scope
+-----
+
+Bazel builds `yesno-pg`, `yesno-mysql`, and the exact database servers that
+load them, plus their first-party Rust dependencies. Everything else in the
+workspace is built and gated by cargo, and `scripts/gate.sh` is untouched. See
+`.bazelrc` for why these ABI-bound exceptions exist.
+
+Dependency versions
+-------------------
+
+`Cargo.toml` and `Cargo.lock` remain the single source of truth for every
+third-party Rust version. `crate_universe` reads them; it does not replace them.
+Never hand-write a crate version into this file. A second dependency list is a
+list that drifts, and the `get-size2 = 0.10.1` pin in `Cargo.lock` exists
+precisely because a silent version move produced a trait error inside a
+dependency. Re-pin with:
+
+    CARGO_BAZEL_REPIN=1 bazel mod deps
+
+Repinning is opt-in on purpose: a stale lockfile must fail the build loudly
+rather than resolve to something nobody chose.
+"""
+
+module(
+    name = "yesno",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+
+# libclang, for bindgen. `pgrx-pg-sys`'s build script generates PostgreSQL's
+# bindings at build time, and bindgen loads libclang at runtime through
+# `clang-sys`. It is a **toolchain** dependency, not an ambient one: this
+# machine has no system clang at all, and a build that silently used one if it
+# were present would be reproducible only by accident.
+bazel_dep(name = "toolchains_llvm", version = "1.8.0")
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "17.0.6",
+)
+use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
+
+# ─── Rust toolchain ──────────────────────────────────────────────────────────
+#
+# This does NOT verify the workspace's MSRVs and must not be mistaken for
+# doing so. `yesno-core` promises 1.89 to its users, `yesno-datafusion` declares
+# 1.94 and `yesno-e2e` 1.95; Bazel builds one configuration with one rustc, so
+# the `msrv` CI job stays on cargo and remains the only thing that checks those
+# promises. The version here is chosen to satisfy pgrx 0.19, whose MSRV is 1.96.
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.97.1"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# ─── Third-party crates, resolved from the existing Cargo files ──────────────
+# **One** extension proxy, several hubs. `use_extension` with the same
+# ( file, name ) pair returns a proxy to the *same* extension instance, so
+# calling it twice does not give two independent configurations — every tag
+# lands on one extension and an `annotation` without `repositories` is applied
+# to whichever hub happens to match, then fails as "unused" on the others.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# The cargo workspace. Only the workspace root manifest is needed; crate_universe
+# reads the members from it.
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+use_repo(crate, "crates")
+
+# `yesno-pg` is outside `[workspace] members` — it has its own empty
+# `[workspace]` table, following the `yesno-core/fuzz` precedent — so it carries
+# its own lockfile and needs its own resolution. Keeping them separate is what
+# stops the pgrx and tonic trees from reaching `cargo tree -p yesno-core`, which
+# the `lean-core` CI job caps at five direct dependencies.
+crate.from_cargo(
+    name = "crates_pg17",
+    cargo_lockfile = "//yesno-pg:Cargo.lock",
+    # Exactly one manifest. `crate_universe` refuses a list spanning two
+    # cargo workspaces, so first-party crates from the main workspace —
+    # `yesno-wire` — are wired as ordinary Bazel deps in `//yesno-pg:BUILD.bazel`
+    # rather than through this hub.
+    manifests = ["//yesno-pg:Cargo.toml"],
+)
+
+# Features are absent from Cargo.lock, so the PostgreSQL 18 hub can share the
+# exact same authoritative resolution. The second manifest differs only in its
+# default `pgN` feature; `scripts/check-pg-manifests.py` enforces that
+# mechanically.
+crate.from_cargo(
+    name = "crates_pg18",
+    cargo_lockfile = "//yesno-pg:Cargo.lock",
+    manifests = ["//yesno-pg:pg18/Cargo.toml"],
+)
+
+# ─── The pgrx integration, which is the whole risk of phase 0 ────────────────
+#
+# `pgrx-pg-sys`'s build script does two things cargo normally arranges and Bazel
+# does not: it locates a PostgreSQL install through `pg_config`, and it runs
+# bindgen over that install's server headers. Both are supplied here explicitly.
+#
+# The `pgN` feature and the `pg_config` must name the **same major version**.
+# They are wired from one flag ( `--//:pg_version` ) for exactly that reason: a
+# build with `pg17` bindings against an 18 server produces a library that links
+# and then corrupts the backend at runtime.
+crate.annotation(
+    # Not optional. Without it the annotation is offered to every hub this
+    # extension defines, fails to match `crates` — which has no pgrx — and the
+    # whole module graph errors with "Unused annotations were provided".
+    repositories = ["crates_pg17"],
+    # `@@//` and not `//`. Labels here are resolved in the **spoke** repo of
+    # the annotated crate, so a bare `//third_party/…` looks for that package
+    # inside `crates_pg17__pgrx-pg-sys-0.19.2` and fails. See
+    # `third_party/llvm/BUILD.bazel` for why libclang is re-exported rather than
+    # referenced across repositories.
+    # `:libclang` appears here *and* is the target of `$(execpath)` below.
+    # `$(execpath X)` requires X itself to be a declared prerequisite — naming
+    # only the enclosing `:libclang_runtime` group fails with "label … in
+    # $(location) expression is not a declared prerequisite of this rule".
+    build_script_data = [
+        "@@//third_party/llvm:libclang",
+        "@@//third_party/llvm:libclang_runtime",
+        "@@//third_party/postgresql:pg17_gen_dir",
+        "@@//third_party/postgresql:pg17_pg_config",
+    ],
+    build_script_env = {
+        # `pgrx-pg-sys` accepts a direct path to a `pg_config`, which is what
+        # lets this skip `cargo pgrx init` and the `~/.pgrx` state entirely.
+        "PGRX_PG_CONFIG_PATH": "$(execpath @@//third_party/postgresql:pg17_pg_config)",
+        # `clang-sys` accepts either a directory or a path to the library
+        # itself. Given a path, it uses it without searching — which is the
+        # point, on a host with no system clang to fall back to.
+        "LIBCLANG_PATH": "$(execpath @@//third_party/llvm:libclang)",
+    },
+    crate = "pgrx-pg-sys",
+)
+
+crate.annotation(
+    repositories = ["crates_pg18"],
+    build_script_data = [
+        "@@//third_party/llvm:libclang",
+        "@@//third_party/llvm:libclang_runtime",
+        "@@//third_party/postgresql:pg18_gen_dir",
+        "@@//third_party/postgresql:pg18_pg_config",
+    ],
+    build_script_env = {
+        "PGRX_PG_CONFIG_PATH": "$(execpath @@//third_party/postgresql:pg18_pg_config)",
+        "LIBCLANG_PATH": "$(execpath @@//third_party/llvm:libclang)",
+    },
+    crate = "pgrx-pg-sys",
+)
+use_repo(crate, "crates_pg17", "crates_pg18")
+
+# ─── PostgreSQL, from source, pinned ─────────────────────────────────────────
+#
+# A `cdylib` that PostgreSQL `dlopen`s must match the server's ABI exactly, so
+# the server the tests run against is built here rather than found on the host.
+#
+# Each archive has a matching pgrx hub above. The root `pg_version` flag selects
+# the hub, this crate's feature, and these server artifacts as one configuration.
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# ─── Apache Arrow C++, from source, pinned ──────────────────────────────────
+#
+# Flight needs seven native dependencies in the minimal configuration. They are
+# separate repositories so CMake receives local file:// URLs and cannot fetch
+# undeclared inputs from inside a build action.
+http_file(
+    name = "arrow_absl_20250127",
+    downloaded_file_path = "20250127.0.tar.gz",
+    sha256 = "16242f394245627e508ec6bb296b433c90f8d914f73b9c026fddb905e27276e8",
+    urls = ["https://github.com/abseil/abseil-cpp/archive/20250127.0.tar.gz"],
+)
+
+http_file(
+    name = "arrow_cares_1_34_6",
+    downloaded_file_path = "c-ares-1.34.6.tar.gz",
+    sha256 = "912dd7cc3b3e8a79c52fd7fb9c0f4ecf0aaa73e45efda880266a2d6e26b84ef5",
+    urls = ["https://github.com/c-ares/c-ares/releases/download/v1.34.6/c-ares-1.34.6.tar.gz"],
+)
+
+http_file(
+    name = "arrow_grpc_1_76_0",
+    downloaded_file_path = "v1.76.0.tar.gz",
+    sha256 = "0af37b800953130b47c075b56683ee60bdc3eda3c37fc6004193f5b569758204",
+    urls = ["https://github.com/grpc/grpc/archive/v1.76.0.tar.gz"],
+)
+
+http_file(
+    name = "arrow_protobuf_31_1",
+    downloaded_file_path = "protobuf-31.1.tar.gz",
+    sha256 = "12bfd76d27b9ac3d65c00966901609e020481b9474ef75c7ff4601ac06fa0b82",
+    urls = ["https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protobuf-31.1.tar.gz"],
+)
+
+http_file(
+    name = "arrow_re2_2023_03_01",
+    downloaded_file_path = "2023-03-01.tar.gz",
+    sha256 = "7a9a4824958586980926a300b4717202485c4b4115ac031822e29aa4ef207e48",
+    urls = ["https://github.com/google/re2/archive/2023-03-01.tar.gz"],
+)
+
+http_file(
+    name = "arrow_xsimd_14_2_0",
+    downloaded_file_path = "14.2.0.tar.gz",
+    sha256 = "21e841ab684b05331e81e7f782431753a029ef7b7d9d6d3ddab837e7782a40ee",
+    urls = ["https://github.com/xtensor-stack/xsimd/archive/14.2.0.tar.gz"],
+)
+
+http_file(
+    name = "arrow_zlib_1_3_1",
+    downloaded_file_path = "zlib-1.3.1.tar.gz",
+    sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+    urls = ["https://zlib.net/fossils/zlib-1.3.1.tar.gz"],
+)
+
+http_archive(
+    name = "apache_arrow_25_0_1",
+    build_file = "//third_party/arrow:arrow.BUILD",
+    patches = ["//third_party/arrow:arrow-ranlib.patch"],
+    patch_strip = 1,
+    sha256 = "43d5de0a581f43cf63a2c06b4dcf13b9ff6fcd800f023324596e5781093bc500",
+    strip_prefix = "apache-arrow-25.0.1",
+    urls = [
+        "https://archive.apache.org/dist/arrow/arrow-25.0.1/apache-arrow-25.0.1.tar.gz",
+        "https://dlcdn.apache.org/arrow/arrow-25.0.1/apache-arrow-25.0.1.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "postgresql_17",
+    build_file = "//third_party/postgresql:postgresql.BUILD",
+    sha256 = "dd27f2b3c59e73ed14aa3324901242bf69a032a6347805f274e6260322d42979",
+    strip_prefix = "postgresql-17.11",
+    urls = ["https://ftp.postgresql.org/pub/source/v17.11/postgresql-17.11.tar.bz2"],
+)
+
+http_archive(
+    name = "postgresql_18",
+    build_file = "//third_party/postgresql:postgresql.BUILD",
+    sha256 = "555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f",
+    strip_prefix = "postgresql-18.6",
+    urls = ["https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2"],
+)
+
+# ─── MySQL 8.4, from source, pinned ─────────────────────────────────────────
+#
+# The official source distribution carries MySQL's bundled Boost, ICU,
+# protobuf, zlib, zstd and other supported dependency snapshots. OpenSSL and ncurses are separate mandatory inputs, so they are pinned and built
+# here too instead of being discovered from the host. MySQL requires patchelf
+# when packaging custom OpenSSL libraries, so that build tool is pinned as well.
+http_archive(
+    name = "ncurses_6_5",
+    build_file = "//third_party/mysql:ncurses.BUILD",
+    sha256 = "136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6",
+    strip_prefix = "ncurses-6.5",
+    urls = ["https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz"],
+)
+
+http_archive(
+    name = "patchelf_0_18_0",
+    build_file = "//third_party/mysql:patchelf.BUILD",
+    sha256 = "1451d01ee3a21100340aed867d0b799f46f0b1749680028d38c3f5d0128fb8a7",
+    strip_prefix = "patchelf-0.18.0",
+    urls = ["https://github.com/NixOS/patchelf/archive/refs/tags/0.18.0.tar.gz"],
+)
+
+http_archive(
+    name = "openssl_3_0_13",
+    build_file = "//third_party/mysql:openssl.BUILD",
+    sha256 = "88525753f79d3bec27d2fa7c66aa0b92b3aa9498dafd93d7cfa4b3780cdae313",
+    strip_prefix = "openssl-3.0.13",
+    urls = ["https://github.com/openssl/openssl/releases/download/openssl-3.0.13/openssl-3.0.13.tar.gz"],
+)
+
+mysql_repository = use_repo_rule(
+    "//third_party/mysql:repository.bzl",
+    "mysql_repository",
+)
+
+mysql_repository(
+    name = "mysql_8_4",
+    backend_header = "//yesno-mysql:backend.h",
+    build_file = "//third_party/mysql:mysql.BUILD",
+    embedded_backend_source = "//yesno-mysql:backend_embedded.cc",
+    flight_backend_source = "//yesno-mysql:backend_flight.cc",
+    flight_cpp_cmake = "//yesno-flight-c++:CMakeLists.txt",
+    flight_cpp_header = "//yesno-flight-c++:include/yesno/flight/client.h",
+    flight_cpp_internal_header = "//yesno-flight-c++:src/protocol_internal.h",
+    flight_cpp_internal_source = "//yesno-flight-c++:src/protocol_internal.cc",
+    flight_cpp_source = "//yesno-flight-c++:src/client.cc",
+    plugin_cmake = "//yesno-mysql:CMakeLists.txt",
+    plugin_header = "//yesno-mysql:ha_yesno.h",
+    mysql_patch = "//third_party/mysql:mysql-openssl-symlink.patch",
+    plugin_source = "//yesno-mysql:ha_yesno.cc",
+    sha256 = "47a5433fcdd639db836b99e1b5459c2b813cbdad23ff2b5dd4ad27f792ba918e",
+    strip_prefix = "mysql-8.4.0",
+    urls = [
+        "https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.0.tar.gz",
+        "https://downloads.mysql.com/archives/get/p/23/file/mysql-8.4.0.tar.gz",
+    ],
+)

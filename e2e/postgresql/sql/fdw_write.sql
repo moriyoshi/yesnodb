@@ -1,0 +1,166 @@
+-- Writing to a yesno foreign table.
+--
+-- The Flight fixture seed data is shared with the other SQL fixtures, so
+-- this one writes to keys **nothing else touches** ( 1000 and 1001 ). A fixture
+-- that mutated `sevens` would make every other fixture's expected output depend
+-- on the order they ran in.
+
+CREATE EXTENSION yesno_pg;
+
+CREATE SERVER yesno FOREIGN DATA WRAPPER yesno_fdw
+    OPTIONS ( endpoint :'endpoint' );
+
+CREATE FOREIGN TABLE w ( ordinal bigint ) SERVER yesno OPTIONS ( key '1000' );
+CREATE FOREIGN TABLE w2 ( ordinal bigint ) SERVER yesno OPTIONS ( key '1001' );
+
+-- ── Insert ──────────────────────────────────────────────────────────────────
+INSERT INTO w VALUES ( 1 ), ( 2 ), ( 3 );
+SELECT ordinal FROM w ORDER BY ordinal;
+SELECT count(*) FROM w;
+
+-- A set holds each ordinal at most once, so re-inserting is idempotent rather
+-- than an error or a duplicate.
+INSERT INTO w VALUES ( 2 );
+SELECT ordinal FROM w ORDER BY ordinal;
+
+-- Bulk insert from a query, to exercise the batching path.
+INSERT INTO w SELECT generate_series( 10, 14 );
+SELECT ordinal FROM w ORDER BY ordinal;
+
+-- ── Delete ──────────────────────────────────────────────────────────────────
+-- The row identity is the ordinal itself; `AddForeignUpdateTargets` supplies
+-- it as a junk column so `DELETE` knows what to remove.
+DELETE FROM w WHERE ordinal = 2;
+SELECT ordinal FROM w ORDER BY ordinal;
+
+-- A qual-driven delete, so the pushdown and the write path compose.
+DELETE FROM w WHERE ordinal >= 12;
+SELECT ordinal FROM w ORDER BY ordinal;
+
+-- Deleting something absent removes nothing and is not an error.
+DELETE FROM w WHERE ordinal = 999;
+SELECT count(*) FROM w;
+
+-- ── ROLLBACK really rolls back ──────────────────────────────────────────────
+-- This is the property the per-transaction buffering exists to provide.
+-- Rows are held until `XACT_EVENT_PRE_COMMIT`, so an abort discards them and
+-- nothing was ever sent to the server.
+BEGIN;
+INSERT INTO w2 VALUES ( 100 ), ( 200 );
+ROLLBACK;
+SELECT count(*) FROM w2;
+
+-- And a committed transaction does write.
+BEGIN;
+INSERT INTO w2 VALUES ( 100 ), ( 200 );
+COMMIT;
+SELECT ordinal FROM w2 ORDER BY ordinal;
+
+-- Delete and re-insert in one transaction: the row survives.
+--
+-- The buffer is keyed by ordinal and the **last write wins**, which is what SQL
+-- means. It used to be an insert list and a remove list with removals applied
+-- first; that got this case right and the mirror case below wrong, because two
+-- lists cannot represent both orders — the ordering was already lost by the time
+-- the buffer flushed. Both are asserted now, and one of them fails under either
+-- fixed order.
+BEGIN;
+DELETE FROM w2 WHERE ordinal = 100;
+INSERT INTO w2 VALUES ( 100 );
+COMMIT;
+SELECT ordinal FROM w2 ORDER BY ordinal;
+
+-- The mirror case: insert then delete in one transaction leaves it **absent**.
+BEGIN;
+INSERT INTO w2 VALUES ( 555 );
+DELETE FROM w2 WHERE ordinal = 555;
+COMMIT;
+SELECT count(*) AS should_be_zero FROM w2 WHERE ordinal = 555;
+
+-- ── Rejected ────────────────────────────────────────────────────────────────
+-- UPDATE changes the row's identity, which is a DELETE plus an INSERT.
+-- Accepting it would hide that from the planner.
+UPDATE w2 SET ordinal = 300 WHERE ordinal = 200;
+
+-- A NULL ordinal is rejected rather than skipped: a posting list is a set of
+-- *present* values, and silently dropping the row would report success for a
+-- row that was never stored.
+INSERT INTO w2 VALUES ( NULL );
+
+-- -1 maps to the reserved ordinal 2^64-1, which is not a member of any set.
+INSERT INTO w2 VALUES ( -1 );
+
+-- `count(*)` is pushed down to the server, which has **not** seen this
+-- transaction's buffered writes. So the fast count is the wrong answer inside
+-- a writing transaction, not merely a stale one, and it has to fall back to
+-- counting the overlaid stream. The `SELECT` beside it is what makes the two
+-- comparable: a count that disagrees with the rows the same transaction can see
+-- is the failure this asserts against.
+BEGIN;
+INSERT INTO w2 VALUES ( 300 ), ( 400 );
+SELECT count(*) AS count_sees_own_writes FROM w2;
+SELECT ordinal FROM w2 ORDER BY ordinal;
+DELETE FROM w2 WHERE ordinal = 300;
+SELECT count(*) AS count_sees_own_delete FROM w2;
+ROLLBACK;
+SELECT count(*) AS unchanged_after_rollback FROM w2;
+
+-- ── An oracle: the same writes against an ordinary table ────────────────────
+-- Every result above is an **accepted** expected value. `mirror` is a plain
+-- heap table, so PostgreSQL applies each statement itself; the foreign table
+-- must end up holding exactly the same set. Compared in both directions —
+-- one direction passes when the wrapper wrote nothing at all.
+--
+-- `ON CONFLICT DO NOTHING` is what makes the heap table a *set*: re-inserting a
+-- member is idempotent for the foreign table, and a bare INSERT would make the
+-- oracle raise where the subject is correct.
+CREATE FOREIGN TABLE w3 ( ordinal bigint ) SERVER yesno OPTIONS ( key '1002' );
+CREATE TEMP TABLE mirror ( ordinal bigint PRIMARY KEY );
+
+INSERT INTO w3 SELECT generate_series( 1, 20 );
+INSERT INTO mirror SELECT generate_series( 1, 20 ) ON CONFLICT DO NOTHING;
+
+DELETE FROM w3     WHERE ordinal % 3 = 0;
+DELETE FROM mirror WHERE ordinal % 3 = 0;
+
+INSERT INTO w3     VALUES ( 3 ), ( 6 ), ( 100 );
+INSERT INTO mirror VALUES ( 3 ), ( 6 ), ( 100 ) ON CONFLICT DO NOTHING;
+
+DELETE FROM w3     WHERE ordinal >= 15;
+DELETE FROM mirror WHERE ordinal >= 15;
+
+-- A transaction that aborts must leave both untouched.
+BEGIN;
+INSERT INTO w3 VALUES ( 777 );
+DELETE FROM w3 WHERE ordinal = 1;
+ROLLBACK;
+
+-- And one that commits, mixing both directions on the same value.
+BEGIN;
+INSERT INTO w3     VALUES ( 900 );
+DELETE FROM w3     WHERE ordinal = 900;
+INSERT INTO w3     VALUES ( 901 );
+COMMIT;
+BEGIN;
+INSERT INTO mirror VALUES ( 900 ) ON CONFLICT DO NOTHING;
+DELETE FROM mirror WHERE ordinal = 900;
+INSERT INTO mirror VALUES ( 901 ) ON CONFLICT DO NOTHING;
+COMMIT;
+
+SELECT count(*) AS write_mismatches FROM (
+            ( SELECT ordinal FROM w3     EXCEPT SELECT ordinal FROM mirror )
+  UNION ALL ( SELECT ordinal FROM mirror EXCEPT SELECT ordinal FROM w3 )
+) d;
+
+-- Shown as well as compared, so the diff carries what the set actually is.
+SELECT ordinal FROM w3 ORDER BY ordinal;
+
+DELETE FROM w3;
+
+-- Clean up so re-running the suite starts from the same state.
+DELETE FROM w;
+DELETE FROM w2;
+SELECT count(*) AS w_left FROM w;
+SELECT count(*) AS w2_left FROM w2;
+
+DROP EXTENSION yesno_pg CASCADE;

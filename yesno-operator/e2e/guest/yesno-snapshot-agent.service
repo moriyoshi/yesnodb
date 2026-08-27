@@ -1,0 +1,16 @@
+[Unit]
+Description=yesno E2E privileged LVM snapshot agent
+After=yesnod.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yesno-snapshot-agent --config /etc/yesno/yesnod.toml
+Restart=on-failure
+RestartSec=1s
+User=root
+Group=root
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=false

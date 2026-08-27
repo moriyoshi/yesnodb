@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: yesno-system
+  labels:
+    app.kubernetes.io/name: yesno-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: yesno-operator
+  namespace: yesno-system
+  labels:
+    app.kubernetes.io/name: yesno-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: yesno-operator
+  labels:
+    app.kubernetes.io/name: yesno-operator
+rules:
+  - apiGroups: ["yesnodb.io"]
+    resources: ["yesnoclusters"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["yesnodb.io"]
+    resources: ["yesnoclusters/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "create", "patch"]
+  # Read-only, and read by name. The EBS snapshot backend needs the volume id
+  # behind each instance's claim, and only the cluster-scoped PersistentVolume
+  # carries it. A controller without this grant reports the condition
+  # `SnapshotBackendReady=False` and keeps reconciling.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: yesno-operator
+  labels:
+    app.kubernetes.io/name: yesno-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: yesno-operator
+subjects:
+  - kind: ServiceAccount
+    name: yesno-operator
+    namespace: yesno-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yesno-operator
+  namespace: yesno-system
+  labels:
+    app.kubernetes.io/name: yesno-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: yesno-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: yesno-operator
+    spec:
+      serviceAccountName: yesno-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          # No image is published yet. Build dist/Dockerfile and replace this.
+          image: yesno-operator:local
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

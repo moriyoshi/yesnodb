@@ -1,0 +1,25 @@
+"""`yesno-core` as a Bazel target.
+
+This exists **only** so `yesno-pg` can depend on it. `yesno-core`'s own
+tests, benches, fuzz targets and MSRV check all stay with cargo — see
+`scripts/gate.sh`, which is unchanged and is still the authority on this crate.
+Do not add `rust_test` targets here on the reasoning that Bazel could also
+run them: that would create a second place where a core regression is either
+caught or missed, and the cargo gate is the one the quality gate documents.
+"""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "yesno_core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_core",
+    edition = "2021",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)

@@ -1,0 +1,33 @@
+diff --git a/cpp/cmake_modules/ThirdpartyToolchain.cmake b/cpp/cmake_modules/ThirdpartyToolchain.cmake
+index 4444444..5555555 100644
+--- a/cpp/cmake_modules/ThirdpartyToolchain.cmake
++++ b/cpp/cmake_modules/ThirdpartyToolchain.cmake
+@@ -909,7 +909,13 @@ if(CMAKE_AR)
+ 
+ # RANLIB isn't used for MSVC
+ if(NOT MSVC)
+-  if(CMAKE_RANLIB)
++  # rules_foreign_cc spells an intentionally unset ranlib as the shell no-op
++  # `:`. That is not a program CMake can resolve for Arrow's bundled external
++  # projects; select the native toolchain's ranlib from PATH in that case.
++  if(CMAKE_RANLIB STREQUAL ":")
++    find_program(EP_CMAKE_RANLIB ranlib REQUIRED)
++    list(APPEND EP_COMMON_TOOLCHAIN -DCMAKE_RANLIB=${EP_CMAKE_RANLIB})
++  elseif(CMAKE_RANLIB)
+     # Ensure using absolute path.
+     find_program(EP_CMAKE_RANLIB ${CMAKE_RANLIB} REQUIRED)
+     list(APPEND EP_COMMON_TOOLCHAIN -DCMAKE_RANLIB=${EP_CMAKE_RANLIB})
+diff --git a/cpp/src/arrow/CMakeLists.txt b/cpp/src/arrow/CMakeLists.txt
+index 2222222..3333333 100644
+--- a/cpp/src/arrow/CMakeLists.txt
++++ b/cpp/src/arrow/CMakeLists.txt
+@@ -394,5 +394,9 @@ cmake_path(GET PROJECT_SOURCE_DIR PARENT_PATH ARROW_PROJECT_SOURCE_DIR)
+ string(REPLACE "${ARROW_PROJECT_SOURCE_DIR}" "<ARROW_PROJECT_SOURCE_DIR>"
+                REDACTED_CXX_FLAGS ${REDACTED_CXX_FLAGS})
++# ESCAPE_QUOTES below escapes the quote in Bazel's reproducible
++# -D__DATE__=\"redacted\" flags. Escape their existing backslashes first so
++# the generated C++ string retains a valid \\\" sequence.
++string(REPLACE "\\" "\\\\" REDACTED_CXX_FLAGS "${REDACTED_CXX_FLAGS}")
+ configure_file("util/config.h.cmake" "util/config.h" ESCAPE_QUOTES)
+ configure_file("util/config_internal.h.cmake" "util/config_internal.h" ESCAPE_QUOTES)
+ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/util/config.h"

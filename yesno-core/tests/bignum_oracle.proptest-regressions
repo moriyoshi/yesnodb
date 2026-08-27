@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9bdb9b3ceebecf5f9e0c1dd759087f7684567e31fb94abfecaa484158e8027ac # shrinks to values = [BigUint(0x80000000000000009f5a919b6218aa9783894956dc59714acc0dfd7fdc2aa30d8f2c2025891ec2f0da1fdf958792c03e76aeebc2105cc4c38e6e107379e17c12578077fbaf531f08ecf290537cd9c7d8aa27741d5145ee8b88ade55aa05a60cd9726bbef11b5c802000000000000001200000000000000000000000000000000000000000000000000000000000000000000000000000000), BigUint(0x0)], stride_pad = 1

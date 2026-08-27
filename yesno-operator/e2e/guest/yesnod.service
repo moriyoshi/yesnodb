@@ -1,0 +1,12 @@
+[Unit]
+Description=yesno E2E database daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yesnod --config /etc/yesno/yesnod.toml --insecure --insecure-replication
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,428 @@
+syntax = "proto3";
+
+package yesno.control.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service ControlPlane {
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeItem);
+  rpc GetSnapshot(GetSnapshotRequest) returns (StateSnapshot);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc Promote(PromoteRequest) returns (CommandAccepted);
+  rpc Demote(DemoteRequest) returns (CommandAccepted);
+  rpc Shutdown(ShutdownRequest) returns (CommandAccepted);
+  rpc BeginBaseSnapshot(BeginBaseSnapshotRequest) returns (BaseSnapshotLease);
+  rpc FetchSnapshotFile(FetchSnapshotFileRequest) returns (stream SnapshotFileChunk);
+  rpc KeepBaseSnapshotAlive(KeepBaseSnapshotAliveRequest) returns (BaseSnapshotLifetime);
+  rpc ReleaseBaseSnapshot(ReleaseBaseSnapshotRequest) returns (ReleaseBaseSnapshotResponse);
+  // Privileged local snapshot agents only. Both RPCs require a Unix connection
+  // carrying an explicit SCM_CREDENTIALS prelude with peer-matched pid and
+  // root uid/gid.
+  rpc ClaimSnapshotAgentWork(ClaimSnapshotAgentWorkRequest) returns (SnapshotAgentWork);
+  rpc CompleteSnapshotAgentWork(CompleteSnapshotAgentWorkRequest) returns (CompleteSnapshotAgentWorkResponse);
+}
+
+message CheckpointRequest {}
+
+message CheckpointResponse {
+  uint64 watermark = 1;
+}
+
+enum BaseSnapshotSource {
+  BASE_SNAPSHOT_SOURCE_UNSPECIFIED = 0;
+  BASE_SNAPSHOT_SOURCE_ZFS = 1;
+  BASE_SNAPSHOT_SOURCE_BTRFS = 2;
+  // Server-staged bounded file copy; always transferred as byte chunks.
+  BASE_SNAPSHOT_SOURCE_PORTABLE = 3;
+  // Amazon EBS point-in-time snapshot, materialized locally or by the archiver.
+  BASE_SNAPSHOT_SOURCE_EBS = 4;
+  // Local LVM copy-on-write snapshot mounted as a file-bearing lease.
+  BASE_SNAPSHOT_SOURCE_LVM = 5;
+}
+
+message BeginBaseSnapshotRequest {}
+
+message SnapshotFile {
+  string name = 1;
+  uint64 size = 2;
+}
+
+message BaseSnapshotLease {
+  bytes lease_id = 1;
+  BaseSnapshotSource source = 2;
+  repeated SnapshotFile files = 3;
+  uint64 lease_ttl_secs = 4;
+  bool direct_path_available = 5;
+  // Present instead of files for an EBS lease whose materialization was
+  // deliberately deferred to the archiver.
+  DeferredEbsSnapshot deferred_ebs = 6;
+}
+
+message DeferredEbsSnapshot {
+  string snapshot_id = 1;
+  string region = 2;
+  string filesystem = 3;
+  // Relative path from the restored volume's filesystem root to the database.
+  string source_subpath = 4;
+  uint64 volume_size_gib = 5;
+}
+
+message FetchSnapshotFileRequest {
+  bytes lease_id = 1;
+  string name = 2;
+  // An optimization request, never an entitlement. The server returns a path
+  // only when its operator explicitly enabled the co-located escape hatch.
+  bool allow_direct_path = 3;
+}
+
+message SnapshotFileChunk {
+  uint64 offset = 1;
+  oneof payload {
+    bytes data = 2;
+    string direct_path = 3;
+  }
+  bool last = 4;
+  uint64 total_size = 5;
+}
+
+message KeepBaseSnapshotAliveRequest {
+  bytes lease_id = 1;
+}
+
+message BaseSnapshotLifetime {
+  uint64 lease_ttl_secs = 1;
+}
+
+message ReleaseBaseSnapshotRequest {
+  bytes lease_id = 1;
+}
+
+message ReleaseBaseSnapshotResponse {}
+
+message ClaimSnapshotAgentWorkRequest {}
+
+enum SnapshotAgentOperation {
+  SNAPSHOT_AGENT_OPERATION_UNSPECIFIED = 0;
+  SNAPSHOT_AGENT_OPERATION_RECONCILE = 1;
+  SNAPSHOT_AGENT_OPERATION_CAPTURE = 2;
+  SNAPSHOT_AGENT_OPERATION_MATERIALIZE = 3;
+  SNAPSHOT_AGENT_OPERATION_CLEANUP = 4;
+}
+
+message SnapshotAgentWork {
+  bytes operation_id = 1;
+  SnapshotAgentOperation operation = 2;
+  // Database-UUID ownership boundary. Present for reconciliation and capture.
+  string namespace = 3;
+  // Server-generated lease/LV name. Present except for reconciliation.
+  string lease_name = 4;
+}
+
+message CompleteSnapshotAgentWorkRequest {
+  bytes operation_id = 1;
+  bool success = 2;
+  string error = 3;
+  // Materialized database root, returned only by MATERIALIZE.
+  string root = 4;
+}
+
+message CompleteSnapshotAgentWorkResponse {}
+
+enum EventSource {
+  EVENT_SOURCE_UNSPECIFIED = 0;
+  EVENT_SOURCE_CORE = 1;
+  EVENT_SOURCE_SERVER = 2;
+  EVENT_SOURCE_RECONCILER = 3;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_DEBUG = 1;
+  SEVERITY_INFO = 2;
+  SEVERITY_WARNING = 3;
+  SEVERITY_ERROR = 4;
+  SEVERITY_CRITICAL = 5;
+}
+
+enum EventPhase {
+  EVENT_PHASE_UNSPECIFIED = 0;
+  EVENT_PHASE_REQUESTED = 1;
+  EVENT_PHASE_STARTED = 2;
+  EVENT_PHASE_COMPLETED = 3;
+  EVENT_PHASE_FAILED = 4;
+  EVENT_PHASE_DEFERRED = 5;
+  EVENT_PHASE_FORCED = 6;
+  EVENT_PHASE_OBSERVED = 7;
+}
+
+enum DatabaseMode {
+  DATABASE_MODE_UNSPECIFIED = 0;
+  DATABASE_MODE_WRITER = 1;
+  DATABASE_MODE_REPLICA = 2;
+  DATABASE_MODE_READER = 3;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_OFFLINE = 1;
+  ROLE_FOLLOWER = 2;
+  ROLE_LEADER = 3;
+}
+
+enum ErrorClass {
+  ERROR_CLASS_UNSPECIFIED = 0;
+  ERROR_CLASS_IO = 1;
+  ERROR_CLASS_CORRUPTION = 2;
+  ERROR_CLASS_CONTENTION = 3;
+  ERROR_CLASS_INVARIANT = 4;
+  ERROR_CLASS_UNSUPPORTED = 5;
+  ERROR_CLASS_OTHER = 6;
+}
+
+message EventError {
+  ErrorClass error_class = 1;
+  optional int32 os_error_code = 2;
+  string detail = 3;
+}
+
+message DatabaseIdentity {
+  bytes uuid = 1;
+  DatabaseMode mode = 2;
+  uint64 open_instance = 3;
+  uint32 shards = 4;
+  uint64 epoch = 5;
+  uint32 term = 6;
+}
+
+message EventEnvelope {
+  uint32 schema_version = 1;
+  uint64 sequence = 2;
+  bytes event_id = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+  google.protobuf.Timestamp recorded_at = 5;
+  EventSource source = 6;
+  Severity severity = 7;
+  bytes node_id = 8;
+  bytes process_instance_id = 9;
+  bytes correlation_id = 10;
+  bytes causation_id = 11;
+  optional DatabaseIdentity database = 12;
+  optional uint32 shard = 13;
+
+  oneof payload {
+    DatabaseLifecycleEvent database_lifecycle = 20;
+    RecoveryEvent recovery = 21;
+    CheckpointEvent checkpoint = 22;
+    WalEvent wal = 23;
+    StorageEvent storage = 24;
+    ProcessLifecycleEvent process_lifecycle = 25;
+    ServerLifecycleEvent server_lifecycle = 26;
+    RoleTransitionEvent role_transition = 27;
+    FollowerEvent follower = 28;
+    ListenerEvent listener = 29;
+    ControlPlaneEvent control_plane = 30;
+    ProjectionCheckpointEvent projection_checkpoint = 31;
+  }
+}
+
+message DatabaseLifecycleEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_OPEN = 1;
+    OPERATION_SHUTDOWN = 2;
+    OPERATION_INTERRUPTION = 3;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  DatabaseMode mode = 3;
+  uint64 visible_version = 4;
+  bool graceful = 5;
+  string reason = 6;
+  optional EventError error = 7;
+}
+
+message RecoveryEvent {
+  EventPhase phase = 1;
+  uint64 checkpoint_version = 2;
+  uint64 recovered_version = 3;
+  uint64 records_replayed = 4;
+  repeated uint64 discarded_versions = 5;
+  optional EventError error = 6;
+}
+
+message CheckpointEvent {
+  EventPhase phase = 1;
+  uint64 watermark = 2;
+  uint64 dirty_bytes = 3;
+  uint64 wal_bytes = 4;
+  optional EventError error = 5;
+}
+
+message WalEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_CUT = 1;
+    OPERATION_TAIL_TRUNCATION = 2;
+    OPERATION_SEGMENT_OPEN = 3;
+    OPERATION_SEGMENT_SEAL = 4;
+    OPERATION_SEGMENT_RECLAIM = 5;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  uint64 old_base_lsn = 3;
+  uint64 new_base_lsn = 4;
+  uint64 old_end_lsn = 5;
+  uint64 new_end_lsn = 6;
+  uint64 bytes_reclaimed = 7;
+  optional uint64 retention_floor_lsn = 8;
+  bool forced_past_retention = 9;
+  optional EventError error = 10;
+  uint64 sealed_through_lsn = 11;
+}
+
+message StorageEvent {
+  EventPhase phase = 1;
+  string operation = 2;
+  optional EventError error = 3;
+}
+
+message ProcessLifecycleEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_START = 1;
+    OPERATION_STOP = 2;
+    OPERATION_INTERRUPTION = 3;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  optional bytes previous_process_instance_id = 3;
+  string detail = 4;
+}
+
+message ServerLifecycleEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_START = 1;
+    OPERATION_SHUTDOWN = 2;
+    OPERATION_INTERRUPTION = 3;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  bool clean = 3;
+  string detail = 4;
+}
+
+message RoleTransitionEvent {
+  EventPhase phase = 1;
+  Role from = 2;
+  Role to = 3;
+  uint32 previous_term = 4;
+  uint32 term = 5;
+  string detail = 6;
+}
+
+message FollowerEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_CONNECT = 1;
+    OPERATION_DISCONNECT = 2;
+    OPERATION_CAUGHT_UP = 3;
+    OPERATION_REBOOTSTRAP = 4;
+    OPERATION_HALT = 5;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  uint64 visible_version = 3;
+  string detail = 4;
+}
+
+message ListenerEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_FLIGHT = 1;
+    KIND_REPLICATION = 2;
+    KIND_METRICS = 3;
+    KIND_CONTROL = 4;
+  }
+  Kind kind = 1;
+  EventPhase phase = 2;
+  string endpoint = 3;
+  string detail = 4;
+}
+
+message ControlPlaneEvent {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    OPERATION_JOURNAL_RECOVERED = 1;
+    OPERATION_SUBSCRIBER_DROPPED = 2;
+  }
+  Operation operation = 1;
+  EventPhase phase = 2;
+  uint64 value = 3;
+  string detail = 4;
+}
+
+message ProjectionCheckpointEvent {
+  StateSnapshot snapshot = 1;
+  optional DatabaseIdentity database = 2;
+}
+
+message SubscribeRequest {
+  uint64 after_sequence = 1;
+}
+
+message SubscriptionStarted {
+  uint64 oldest_sequence = 1;
+  uint64 head_sequence = 2;
+}
+
+message ResyncRequired {
+  uint64 requested_sequence = 1;
+  uint64 oldest_sequence = 2;
+  StateSnapshot snapshot = 3;
+}
+
+message Heartbeat {
+  uint64 head_sequence = 1;
+}
+
+message SubscribeItem {
+  oneof item {
+    SubscriptionStarted started = 1;
+    EventEnvelope event = 2;
+    StateSnapshot snapshot = 3;
+    ResyncRequired resync_required = 4;
+    Heartbeat heartbeat = 5;
+  }
+}
+
+message GetSnapshotRequest {}
+
+message StateSnapshot {
+  uint64 through_sequence = 1;
+  bool process_running = 2;
+  bool database_open = 3;
+  Role role = 4;
+  uint32 term = 5;
+  uint64 visible_version = 6;
+  bool storage_available = 7;
+  bytes process_instance_id = 8;
+}
+
+message PromoteRequest {
+  bytes request_id = 1;
+}
+
+message DemoteRequest {
+  bytes request_id = 1;
+  string leader = 2;
+}
+
+message ShutdownRequest {
+  bytes request_id = 1;
+}
+
+message CommandAccepted {
+  bytes correlation_id = 1;
+  uint64 accepted_sequence = 2;
+}

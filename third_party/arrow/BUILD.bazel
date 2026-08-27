@@ -1,0 +1,8 @@
+"""Build metadata for the pinned Apache Arrow C++ source archive."""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "arrow-ranlib.patch",
+    "arrow.BUILD",
+])

@@ -1,0 +1,134 @@
+-- The index access method: `CREATE INDEX … USING yesno`.
+--
+-- The plans are the assertion. An index that returns the right rows while
+-- PostgreSQL sequentially scans the heap is not being used at all, and only the
+-- plan says so. What proves it is a `Bitmap Index Scan using …`.
+
+CREATE EXTENSION yesno_pg;
+SET yesno_pg.endpoint = :'endpoint';
+
+CREATE TABLE docs ( id serial PRIMARY KEY, tag text );
+INSERT INTO docs ( tag )
+SELECT ( ARRAY['rust','go','zig'] )[ 1 + i % 3 ] FROM generate_series( 1, 300 ) i;
+
+CREATE INDEX docs_tag_yn ON docs USING yesno ( tag );
+
+-- Force the index so the plan is about the AM rather than about costing.
+SET enable_seqscan = off;
+
+-- ── The index is used, and answers correctly ────────────────────────────────
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM docs WHERE tag = 'rust';
+SELECT count(*) FROM docs WHERE tag = 'rust';
+SELECT count(*) FROM docs WHERE tag = 'go';
+SELECT count(*) FROM docs WHERE tag = 'zig';
+
+-- `Recheck Cond` must appear. The key is a *hash*, so the posting list is a
+-- superset and the heap scan re-evaluates the qual per tuple. If this line
+-- ever disappears, a colliding value's rows are being returned as matches.
+EXPLAIN ( COSTS OFF ) SELECT id FROM docs WHERE tag = 'zig' ORDER BY id LIMIT 3;
+SELECT id FROM docs WHERE tag = 'zig' ORDER BY id LIMIT 3;
+
+-- A value that was never indexed returns nothing rather than erroring.
+SELECT count(*) FROM docs WHERE tag = 'nonexistent';
+
+-- ── Inserts reach the index ─────────────────────────────────────────────────
+INSERT INTO docs ( tag ) VALUES ( 'rust' ), ( 'rust' );
+SELECT count(*) FROM docs WHERE tag = 'rust';
+
+-- ROLLBACK must leave the index alone too — the AM shares the foreign data
+-- wrapper's per-transaction buffer precisely so this holds.
+BEGIN;
+INSERT INTO docs ( tag ) VALUES ( 'rust' );
+ROLLBACK;
+SELECT count(*) FROM docs WHERE tag = 'rust';
+
+-- ── VACUUM removes dead TIDs ────────────────────────────────────────────────
+-- This is what `ambulkdelete` is for, and it needs phase 6's key
+-- enumeration: there is no reverse map from an ordinal to the keys holding it.
+-- A key skipped here leaves the index returning TIDs for tuples that no
+-- longer exist.
+DELETE FROM docs WHERE tag = 'rust' AND id % 2 = 0;
+VACUUM docs;
+SELECT count(*) FROM docs WHERE tag = 'rust';
+
+-- The other keys are untouched by the vacuum.
+SELECT count(*) FROM docs WHERE tag = 'go';
+
+-- ── An independent oracle: the heap ─────────────────────────────────────────
+-- Every count above is an **accepted** expected value — produced by the code
+-- under test and frozen by reading a diff. That is not an oracle, and a diff
+-- read is weakest at exactly the failure that matters here: a row that should
+-- be present and is not.
+--
+-- The heap is the one source of truth this index cannot influence. `truth` is
+-- built by a sequential scan, which consults no index at all; comparing the two
+-- in **both** directions turns "the number looked plausible" into an assertion.
+-- One direction is not enough: `docs EXCEPT truth` alone passes when the
+-- index returns nothing.
+RESET enable_seqscan;
+CREATE TEMP TABLE truth AS SELECT id, tag FROM docs;
+SET enable_seqscan = off;
+
+SELECT count(*) AS index_heap_mismatches FROM (
+      ( SELECT id FROM docs  WHERE tag = 'rust' EXCEPT SELECT id FROM truth WHERE tag = 'rust' )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'rust' EXCEPT SELECT id FROM docs  WHERE tag = 'rust' )
+UNION ALL ( SELECT id FROM docs  WHERE tag = 'go'   EXCEPT SELECT id FROM truth WHERE tag = 'go'   )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'go'   EXCEPT SELECT id FROM docs  WHERE tag = 'go'   )
+UNION ALL ( SELECT id FROM docs  WHERE tag = 'zig'  EXCEPT SELECT id FROM truth WHERE tag = 'zig'  )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'zig'  EXCEPT SELECT id FROM docs  WHERE tag = 'zig'  )
+) d;
+
+-- **The oracle above cannot see a skipped key, and neither can any count in
+-- this file.** Verified by sabotage: with `ambulkdelete` made to remove nothing,
+-- every number here is unchanged. `recheck` is unconditionally true, so the
+-- Bitmap Heap Scan re-evaluates the qual against the real tuple and a stale TID
+-- is filtered — as a dead tuple, or as a live one whose tag no longer matches.
+--
+-- So this is the assertion that actually guards `ambulkdelete`. The Bitmap
+-- **Index** Scan's row count is the index's output *before* recheck, so it
+-- counts the stale TIDs that the heap scan then discards. The two numbers
+-- diverging is precisely the bloat a skipped key causes.
+-- PostgreSQL's surrounding EXPLAIN text is not an oracle: 18 added buffer and
+-- index-search counters and prints actual rows with decimals. Normalize the two
+-- facts sabotage proved sensitive — both bitmap nodes exist, and their actual
+-- row counts agree — so a server presentation change cannot hide this check.
+CREATE FUNCTION pg_temp.explain_lines( query text ) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY EXECUTE
+        'EXPLAIN ( ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF ) ' || query;
+END
+$$;
+SELECT regexp_replace(
+           line,
+           '^.*(Bitmap (Heap|Index) Scan).*actual rows=([0-9]+)([.][0-9]+)? loops=.*$',
+           '\1 actual rows=\3'
+       ) AS bitmap_scan
+FROM pg_temp.explain_lines(
+    'SELECT count(*) FROM docs WHERE tag = ''rust'''
+) AS plan( line )
+WHERE line ~ 'Bitmap (Heap|Index) Scan'
+ORDER BY line LIKE '%Index%';
+
+-- Reused line pointers are the case that makes a stale TID dangerous rather
+-- than merely wasteful: VACUUM freed slots above, and these inserts take them
+-- back. A stale posting now points at a **live tuple of a different tag**.
+INSERT INTO docs ( tag ) SELECT 'zig' FROM generate_series( 1, 40 );
+VACUUM docs;
+
+RESET enable_seqscan;
+DROP TABLE truth;
+CREATE TEMP TABLE truth AS SELECT id, tag FROM docs;
+SET enable_seqscan = off;
+
+SELECT count(*) AS mismatches_after_slot_reuse FROM (
+      ( SELECT id FROM docs  WHERE tag = 'rust' EXCEPT SELECT id FROM truth WHERE tag = 'rust' )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'rust' EXCEPT SELECT id FROM docs  WHERE tag = 'rust' )
+UNION ALL ( SELECT id FROM docs  WHERE tag = 'go'   EXCEPT SELECT id FROM truth WHERE tag = 'go'   )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'go'   EXCEPT SELECT id FROM docs  WHERE tag = 'go'   )
+UNION ALL ( SELECT id FROM docs  WHERE tag = 'zig'  EXCEPT SELECT id FROM truth WHERE tag = 'zig'  )
+UNION ALL ( SELECT id FROM truth WHERE tag = 'zig'  EXCEPT SELECT id FROM docs  WHERE tag = 'zig'  )
+) d;
+
+RESET enable_seqscan;
+DROP EXTENSION yesno_pg CASCADE;

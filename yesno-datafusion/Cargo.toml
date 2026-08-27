@@ -1,0 +1,21 @@
+[package]
+name = "yesno-datafusion"
+description = "DataFusion integration for yesno: posting-list pushdown and table functions"
+# Major version tracks DataFusion's, so compatibility is answerable from the
+# version number alone. This is the datafusion-federation convention.
+version = "55.0.0"
+edition.workspace = true
+rust-version = "1.94"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yesno-core.workspace = true
+yesno-arrow.workspace = true
+datafusion.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

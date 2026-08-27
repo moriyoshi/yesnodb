@@ -1,0 +1,34 @@
+"""The set-expression wire format.
+
+No `all_crate_deps()` and no hub. This crate has no third-party dependencies
+by design, which is what lets both `//yesno-flight` ( built against `@crates` )
+and `//yesno-pg` ( built against `@crates_pg` ) depend on it directly without
+either hub's types leaking into the other.
+
+Compiling it twice is harmless because the interface between the two sides is
+**bytes**, not Rust values.
+"""
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "yesno_wire",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_wire",
+    edition = "2021",
+    version = "0.1.0",
+)
+
+# Unlike the other satellite BUILD files, this one *does* carry a test target.
+# The format's never-panic contract and its bare-key disambiguation are the
+# reason the crate exists, and `gate-pg.sh` is the gate that covers the
+# PostgreSQL side — so the property has to be checked from both gates, not only
+# from `cargo test` in the workspace.
+rust_test(
+    name = "unit",
+    crate = ":yesno_wire",
+)

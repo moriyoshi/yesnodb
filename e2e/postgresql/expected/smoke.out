@@ -1,0 +1,29 @@
+-- Phase 0 smoke test: does the library load, and does a call reach Rust?
+--
+-- Deliberately the simplest thing that can fail. Its whole value is that a
+-- failure here points at the build harness — the cdylib, the ABI, the symbol
+-- naming, the control file — rather than at anything yesno does.
+CREATE EXTENSION yesno_pg;
+-- Resolves the symbol lazily, so this is the first line that proves
+-- `yesno_pg_version_wrapper` is actually exported and callable. `CREATE
+-- EXTENSION` alone would not: PostgreSQL binds a C function at first call.
+SELECT yesno_pg_version();
+ yesno_pg_version 
+------------------
+ 0.1.0
+(1 row)
+
+-- The extension is registered, not merely loaded.
+SELECT extname, extversion FROM pg_extension WHERE extname = 'yesno_pg';
+ extname  | extversion 
+----------+------------
+ yesno_pg | 0.1.0
+(1 row)
+
+-- Do not add a `server_version_num` assertion here. It would differ between
+-- `--//:pg_version=17` and `=18` and force a second expected file for no gain:
+-- the ABI is already checked, and checked harder, by `CREATE EXTENSION` above.
+-- pgrx's `pg_module_magic!` emits a magic block that PostgreSQL compares field
+-- by field on load, so a library built against the wrong major fails there
+-- rather than reaching any of this.
+DROP EXTENSION yesno_pg;

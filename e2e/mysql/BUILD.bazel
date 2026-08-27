@@ -1,0 +1,27 @@
+"""Hermetic MySQL fixtures driven by the ordinary yesno-e2e runner."""
+
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_test(
+    name = "regress",
+    size = "large",
+    srcs = ["//yesno-e2e:runner_main"],
+    args = ["--timeout", "300", "$(rootpath :mysql.py)"],
+    crate_name = "yesno_mysql_regress",
+    data = [
+        ":mysql.py",
+        "expected/yesno.result",
+        "sql/yesno.test",
+        "//third_party/mysql:gen_dir",
+    ],
+    edition = "2021",
+    env = {
+        "YESNO_E2E_RESOURCE_EXPECTED": "$(rootpath expected/yesno.result)",
+        "YESNO_E2E_RESOURCE_MYSQL_HOME": "$(rootpath //third_party/mysql:gen_dir)",
+        "YESNO_E2E_RESOURCE_TEST_SQL": "$(rootpath sql/yesno.test)",
+    },
+    use_libtest_harness = False,
+    deps = ["//yesno-e2e:fixture_host"],
+)

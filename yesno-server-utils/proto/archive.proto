@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package yesno.archive.v1;
+
+// Durable sidecar state and object manifests. These messages are the archive
+// format; neither cursors nor manifests are encoded as JSON.
+
+enum SnapshotSource {
+  SNAPSHOT_SOURCE_UNSPECIFIED = 0;
+  SNAPSHOT_SOURCE_NETWORK = 1;
+  SNAPSHOT_SOURCE_ZFS = 2;
+  SNAPSHOT_SOURCE_BTRFS = 3;
+  SNAPSHOT_SOURCE_EBS = 4;
+  SNAPSHOT_SOURCE_LVM = 5;
+}
+
+message WalCursor {
+  uint32 shard = 1;
+  uint64 archived_lsn = 2;
+  // SHA-256 chain tip at archived_lsn. A base snapshot establishes the first
+  // value; every immutable WAL descriptor commits to the previous value and
+  // the exact raw WAL bytes it names.
+  bytes history_fingerprint = 3;
+}
+
+message ArchiveFile {
+  string name = 1;
+  string object_key = 2;
+  uint64 size = 3;
+  uint32 crc32c = 4;
+}
+
+message BaseManifest {
+  uint32 schema_version = 1;
+  bytes database_uuid = 2;
+  uint32 term = 3;
+  uint64 event_sequence = 4;
+  uint64 checkpoint_version = 5;
+  uint64 recovered_version = 6;
+  SnapshotSource source = 7;
+  repeated ArchiveFile files = 8;
+  repeated WalCursor wal_cursors = 9;
+  // Monotonic within this archive, including same-event-sequence rebootstrap.
+  uint64 archive_generation = 10;
+  // SHA-256 over the immutable base identity, file catalogue, and WAL cursor
+  // positions. Per-shard cursor fingerprints are derived from this anchor.
+  bytes history_anchor = 11;
+  // An upper bound, in UNIX epoch microseconds, on the commit time of every
+  // version at or below `checkpoint_version`. Zero means unknown: a base taken
+  // before commit-time stamping existed.
+  //
+  // A bound rather than the watermark's own stamp, because that is what the
+  // image persists -- and it is conservative in the safe direction: a base
+  // selected because this value is at or below the target is guaranteed not to
+  // sit above the target.
+  //
+  // A selection hint only. It narrows which base a wall-clock target starts
+  // from without downloading every candidate; the times a restore actually cuts
+  // on come from the WAL frames, which are hashed and verified. It is therefore
+  // deliberately NOT part of `history_anchor` -- adding a field to that hash
+  // would change the fingerprint of every existing history and break chain
+  // continuity at the sidecar's next reconnect.
+  uint64 checkpoint_time = 12;
+}
+
+message WalObject {
+  uint32 schema_version = 1;
+  bytes database_uuid = 2;
+  uint32 term = 3;
+  uint32 shard = 4;
+  uint64 first_lsn = 5;
+  uint64 last_lsn = 6;
+  string object_key = 7;
+  uint64 size = 8;
+  uint32 crc32c = 9;
+  bytes previous_fingerprint = 10;
+  bytes history_fingerprint = 11;
+  uint64 first_version = 12;
+  uint64 last_version = 13;
+  // Commit times bounding this object's frames, in UNIX epoch microseconds.
+  // Zero means unknown, exactly as for BaseManifest.checkpoint_time, and for
+  // the same reason these are excluded from `history_fingerprint`: they are a
+  // selection hint, and the authority is the frames themselves.
+  uint64 first_time = 14;
+  uint64 last_time = 15;
+}
+
+message ArchiveState {
+  uint32 schema_version = 1;
+  bytes database_uuid = 2;
+  uint64 event_sequence = 3;
+  string latest_base_manifest = 4;
+  repeated WalCursor wal_cursors = 5;
+  // Highest leadership timeline accepted by this archive. A promoted copy has
+  // the same database UUID, so UUID alone cannot fence an obsolete leader.
+  uint32 term = 6;
+  uint64 base_generation = 7;
+  // Owner of the conditional writer lease that last published this state.
+  // Every remote update is compare-and-swap, so a superseded writer cannot
+  // advance a cursor after a replacement has fenced it.
+  bytes writer_id = 8;
+}
+
+message ArchiveWriterLease {
+  uint32 schema_version = 1;
+  bytes owner_id = 2;
+  uint64 expires_unix_millis = 3;
+}

@@ -1,0 +1,22 @@
+# The set-expression wire format, shared by the Flight server and its clients.
+#
+# Values are written literally rather than inherited with
+# `version.workspace = true`, unlike every sibling crate. That is deliberate:
+# `crate_universe` splices this manifest into **two** synthetic workspaces — the
+# cargo workspace's hub and `yesno-pg`'s — and workspace inheritance cannot be
+# resolved outside its own workspace root. Literal values are what let one
+# manifest serve both.
+[package]
+name = "yesno-wire"
+description = "Set-expression wire format shared by the yesno Flight server and its clients"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moriyoshi/yesnodb"
+
+# No dependencies, ever. The entire value of this crate is being cheap enough
+# to link from anywhere — including a PostgreSQL extension that resolves its
+# third-party crates through a different `crate_universe` hub. A dependency here
+# would reintroduce exactly the coupling the crate exists to avoid.
+[dependencies]

@@ -1,0 +1,943 @@
+//! Arrow Flight for yesno **query results**, not for the WAL.
+//!
+//! The split is deliberate and the two services reached it from opposite ends.
+//! WAL shipping is `yesno-server::replication` over plain tonic, because a log is an
+//! opaque self-framed binary stream and wrapping it in Flight buys nothing. Here
+//! the payload genuinely is columnar, so Flight is the right answer: a client
+//! gets `RecordBatch`es over a standard protocol with no bespoke decoder.
+//!
+//! # Two things this server does that most Flight servers do not
+//!
+//! 1. **`FlightInfo.total_records` is exact.** For keys, ordinary Boolean
+//!    expressions, and top-level view selection, the count comes from indexed
+//!    container summaries without building the result. View folds and expansion
+//!    remain eager transform boundaries and are counted after evaluation.
+//! 2. **The ticket carries the snapshot version.** That is what makes a future
+//!    multi-endpoint fetch *consistent* rather than merely parallel. See
+//!    [`ticket`].
+//!
+//! # Flight SQL is cut, not deferred
+//!
+//! yesno is not SQL. Anyone wanting SQL over the wire runs DataFusion's
+//! `FlightSqlService` on top of `yesno-datafusion`'s table provider, which is a
+//! composition rather than a reimplementation. `do_exchange` is cut for the same
+//! reason: there is no bidirectional use case that `do_get` plus `do_put` does
+//! not already cover.
+//!
+//! # Page faults must not run on the reactor
+//!
+//! A yesno read can take a major page fault on the mmap, parking a reactor
+//! thread for 100 us to 10 ms. Every read here goes through `spawn_blocking`
+//! onto a bounded channel, which also supplies backpressure.
+
+use std::sync::Arc;
+
+#[cfg(feature = "server")]
+use arrow_array::{RecordBatch, UInt64Array};
+#[cfg(feature = "server")]
+use arrow_flight::encode::FlightDataEncoderBuilder;
+#[cfg(feature = "server")]
+use arrow_flight::flight_service_server::FlightService;
+#[cfg(feature = "server")]
+use arrow_flight::{
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult,
+    Ticket as FlightTicket,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+#[cfg(feature = "server")]
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+#[cfg(feature = "server")]
+use tonic::{Request, Response, Status, Streaming};
+#[cfg(feature = "server")]
+use yesno_core::{CodecError, Db};
+
+/// Map an engine error to a status a client can act on.
+///
+/// **`internal` is the wrong answer for a refusal.** A client that writes to a
+/// read-only replica by mistake and is told "internal error" will retry, page
+/// somebody, and look for a bug in the server — when what it needs to do is send
+/// the write to the leader. `FailedPrecondition` is gRPC's "the system is not in
+/// a state required for this operation", which is exactly the situation, and it
+/// is the same code the leadership-term fence answers with for the same reason.
+#[cfg(feature = "server")]
+fn engine_status(e: CodecError) -> Status {
+    match e {
+        CodecError::ReadOnlyReplica => Status::failed_precondition(
+            "this node is a read-only replica; send writes to its leader",
+        ),
+        // `failed_precondition`, and the gRPC spec's own gloss is the reason:
+        // "the client should not retry until the system state has been
+        // explicitly fixed". Fixing it here means asking for a new ticket. A
+        // `unavailable` or `internal` would put the client in a retry loop
+        // against a version that only recedes further.
+        e @ CodecError::VersionReclaimed { .. } => Status::failed_precondition(format!(
+            "{e}. This ticket was minted against a version the server has since \
+             collapsed; call GetFlightInfo again."
+        )),
+        // Not the server's fault and not survivable by retrying: a version
+        // this database never assigned. The likeliest cause is a ticket minted
+        // against a *different* server — the case a fan-out coordinator creates
+        // by construction — so name it rather than reporting a bare error.
+        e @ CodecError::VersionNotVisible { .. } => Status::invalid_argument(format!(
+            "{e}. A ticket is only valid against the server that minted it."
+        )),
+        // `aborted`, which gRPC glosses as a concurrency conflict the client
+        // should retry at a higher level — and that is exactly right here: the
+        // read was cut short to bound space amplification, and retrying at a
+        // *newer* snapshot succeeds. The error carries the last key it reached
+        // so the retry can resume rather than restart, so it is repeated in the
+        // message: a status code cannot carry it and the client cannot
+        // reconstruct it.
+        e @ CodecError::SnapshotTooOld { .. } => Status::aborted(format!(
+            "{e}. Retry at a fresh snapshot; a long scan can resume from the key named here."
+        )),
+        other => Status::internal(format!("{other:?}")),
+    }
+}
+
+pub mod client;
+#[cfg(feature = "server")]
+pub mod expr;
+pub mod ticket;
+
+/// What a `FlightDescriptor` resolves to.
+///
+/// Named with a trailing digit to avoid colliding with `tonic::Request`, which
+/// this module already imports.
+#[cfg(feature = "server")]
+enum Request2 {
+    Key(u64),
+    Expr(SetExpr, Option<u64>),
+}
+pub use client::{Ack, QueryInfo, QueryStream, YesnoClient};
+pub use ticket::Ticket;
+pub use yesno_wire::{
+    AnyExpr, BoolExpr, FoldOp, IntExpr, QueryRequest, SetExpr, VecIntExpr, VecSetExpr, ViewLayout,
+    ViewSpec,
+};
+
+/// Space and reader counters returned by the `stats` Flight action.
+///
+/// This is the protobuf message defined by `proto/stats.proto`. Field numbers
+/// are part of the public Flight wire contract and must never be reused.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+#[non_exhaustive]
+pub struct ServerStats {
+    #[prost(uint64, tag = "1")]
+    pub allocated_bytes: u64,
+    #[prost(uint64, tag = "2")]
+    pub deferred_bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub wal_bytes: u64,
+    #[prost(uint64, tag = "4")]
+    pub live_readers: u64,
+    #[prost(uint64, tag = "5")]
+    pub shards: u64,
+}
+
+impl ServerStats {
+    /// Decode a `ServerStats` protobuf action result.
+    pub fn decode_protobuf(bytes: impl AsRef<[u8]>) -> Result<Self, prost::DecodeError> {
+        prost::Message::decode(bytes.as_ref())
+    }
+}
+/// S1: a stream of ordinals for one key.
+pub fn ordinals_schema() -> SchemaRef {
+    // No nulls, structurally: a posting list is a set of *present* values, and
+    // absence is a closed-world fact already encoded by the ordinal's absence.
+    Arc::new(Schema::new(vec![Field::new(
+        "ordinal",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+/// S2: `(key, ordinal)` pairs, the bulk-ingest and export shape.
+pub fn pairs_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("ordinal", DataType::UInt64, false),
+    ]))
+}
+
+/// `do_put` descriptor commands.
+///
+/// An **absent or unrecognised** command means insert, which is what keeps
+/// every existing client working: `yesno put` and the e2e scenarios send no
+/// descriptor at all. Do not make removal the default for any spelling — a
+/// client that meant to ingest and silently deleted instead is unrecoverable.
+pub const PUT_INSERT: &[u8] = b"insert";
+pub const PUT_REMOVE: &[u8] = b"remove";
+
+/// Point and key-level actions used by remote storage adapters.
+///
+/// Payloads are little-endian and fixed width: `clear` carries one key, while
+/// the three point operations carry `(key, ordinal)`. Results are encoded as
+/// one little-endian `u64`: the committed version for `clear`, and zero or one
+/// for the point operations.
+pub const ACTION_CLEAR: &str = "clear";
+pub const ACTION_CONTAINS: &str = "contains";
+pub const ACTION_INSERT_ONE: &str = "insert_one";
+pub const ACTION_REMOVE_ONE: &str = "remove_one";
+
+/// Rows per `RecordBatch`. 64 KiB of `u64`, which fits L2 and matches
+/// DataFusion's default `batch_size`.
+const BATCH_ROWS: usize = 8192;
+
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub struct YesnoFlightService {
+    db: Arc<Db>,
+    /// Snapshots held open between `GetFlightInfo` and `DoGet`, by version.
+    ///
+    /// **A ticket names a version and nothing held it open.** A checkpoint
+    /// between the two calls moved the reclamation floor past it and `DoGet`
+    /// refused — correctly, rather than answering from a different instant, but
+    /// a coordinator fanning one query across endpoints then had to re-mint.
+    ///
+    /// `Snapshot` clones by **refcounting its registry slot**, so a clone
+    /// parked here pins the version for exactly as long as it lives. A lease is
+    /// therefore a registered reader with a deadline, and needs no new
+    /// retention mechanism.
+    leases: Arc<std::sync::Mutex<std::collections::HashMap<u64, TicketLease>>>,
+    lease_ttl: std::time::Duration,
+    /// How long `GetFlightInfo` will wait for a requested version to become
+    /// readable before refusing.
+    ///
+    /// This exists because `commit` returns a version that is not necessarily
+    /// visible yet: the watermark advances over a consecutive prefix, so a
+    /// commit that resolves while an earlier one is still in its fsync holds a
+    /// version the database will not yet show. A client that reads back its own
+    /// write hit that as an intermittent `VersionNotVisible`.
+    ///
+    /// Deliberately short. The window it closes is **one fsync**; a gap
+    /// larger than that is replication lag or a version this database never
+    /// assigned, and neither should be hidden behind a server-side block that
+    /// holds a `spawn_blocking` thread.
+    ///
+    /// **A ticket minted by a different leader now costs this wait before it
+    /// is rejected**, where it used to be refused instantly — that case is
+    /// indistinguishable here from a version about to arrive, which is the whole
+    /// reason the wait is bounded and short. A *reclaimed* version is not
+    /// affected: it sits **below** the watermark, so the wait returns at once and
+    /// `snapshot_at` reports `VersionReclaimed` with no added latency.
+    visibility_wait: std::time::Duration,
+}
+
+#[cfg(feature = "server")]
+struct TicketLease {
+    snap: yesno_core::Snapshot,
+    expires: std::time::Instant,
+}
+
+#[cfg(feature = "server")]
+impl YesnoFlightService {
+    /// A lease long enough to cross a `GetFlightInfo` / `DoGet` round trip and
+    /// short enough that an abandoned one is not a retention leak.
+    pub const DEFAULT_TICKET_LEASE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Long enough to cover one fsync, short enough that a version which will
+    /// never arrive is reported quickly. See [`Self::with_visibility_wait`].
+    pub const DEFAULT_VISIBILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    pub fn new(db: Arc<Db>) -> Self {
+        Self::with_ticket_lease(db, Self::DEFAULT_TICKET_LEASE)
+    }
+
+    /// `Duration::ZERO` restores the pre-wait behaviour: a requested version
+    /// that is not yet visible is refused immediately.
+    pub fn with_visibility_wait(mut self, visibility_wait: std::time::Duration) -> Self {
+        self.visibility_wait = visibility_wait;
+        self
+    }
+
+    /// `Duration::ZERO` disables leasing, restoring the pre-lease behaviour
+    /// where `DoGet` re-opens by version and may be refused.
+    pub fn with_ticket_lease(db: Arc<Db>, lease_ttl: std::time::Duration) -> Self {
+        YesnoFlightService {
+            db,
+            leases: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lease_ttl,
+            visibility_wait: Self::DEFAULT_VISIBILITY_WAIT,
+        }
+    }
+
+    /// Park a clone of `snap` so the version it names survives to `DoGet`.
+    ///
+    /// Sweeps expired leases on the way in, so no background task is needed:
+    /// the only thing that creates leases is the only thing that must retire
+    /// them. An expired lease is *released*, never an error — under the
+    /// observe-only space policy a lease reports through `live_readers` and the
+    /// soft space-amplification threshold, and is not itself an intervention.
+    fn hold(&self, snap: &yesno_core::Snapshot) {
+        if self.lease_ttl.is_zero() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut leases = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        leases.retain(|_, lease| lease.expires > now);
+        // `checked_add`, because `Instant + Duration` **panics** on overflow and
+        // `with_ticket_lease( db, Duration::MAX )` — the obvious spelling of "never
+        // expire" — is a plausible argument to a public constructor. Saturating to
+        // a year is indistinguishable from never for a lease held in process
+        // memory, and it is a value the clock can actually represent.
+        let expires = now
+            .checked_add(self.lease_ttl)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 60 * 60));
+        leases.insert(
+            snap.version(),
+            TicketLease {
+                snap: snap.clone(),
+                expires,
+            },
+        );
+    }
+
+    /// A still-live lease for `version`, if one was taken and has not expired.
+    fn leased(&self, version: u64) -> Option<yesno_core::Snapshot> {
+        let now = std::time::Instant::now();
+        let leases = self.leases.lock().unwrap_or_else(|e| e.into_inner());
+        leases
+            .get(&version)
+            .filter(|lease| lease.expires > now)
+            .map(|lease| lease.snap.clone())
+    }
+
+    /// The key a descriptor names, from `cmd` or a single-element path.
+    fn key_of(d: &FlightDescriptor) -> Result<u64, Status> {
+        if d.cmd.len() == 8 {
+            return Ok(u64::from_le_bytes(d.cmd.as_ref().try_into().unwrap()));
+        }
+        if let [one] = d.path.as_slice() {
+            return one
+                .parse::<u64>()
+                .map_err(|_| Status::invalid_argument("path must be a u64 key"));
+        }
+        Err(Status::invalid_argument(
+            "descriptor must carry an 8-byte LE key in cmd, or one numeric path element",
+        ))
+    }
+
+    /// What a descriptor is asking for.
+    ///
+    /// The expression form is checked **first**, and it is distinguishable
+    /// from a bare key by length as well as magic — a key is exactly 8 bytes and
+    /// its contents are arbitrary, so one can begin with `YSNX` by coincidence.
+    /// See `SetExpr::looks_like_expr`.
+    fn request_of(d: &FlightDescriptor) -> Result<Request2, Status> {
+        if QueryRequest::looks_like_request(&d.cmd) {
+            let q = QueryRequest::decode(&d.cmd)
+                .map_err(|e| Status::invalid_argument(format!("bad query request: {e}")))?;
+            return Ok(Request2::Expr(q.expression, q.version));
+        }
+        if SetExpr::looks_like_expr(&d.cmd) {
+            let e = SetExpr::decode(&d.cmd)
+                .map_err(|e| Status::invalid_argument(format!("bad expression: {e}")))?;
+            return Ok(Request2::Expr(e, None));
+        }
+        Self::key_of(d).map(Request2::Key)
+    }
+}
+
+#[cfg(feature = "server")]
+#[tonic::async_trait]
+impl FlightService for YesnoFlightService {
+    type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
+    type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
+    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
+    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
+    type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
+
+    async fn handshake(
+        &self,
+        _r: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        Err(Status::unimplemented("no authentication handshake in v1"))
+    }
+
+    /// One `FlightInfo` per populated key.
+    ///
+    /// This replaced `Status::unimplemented` with the reason "the key space
+    /// is a u64, not an enumerable catalogue". That sentence was true of the
+    /// *space* and never of the *contents*: `ChunkKey` packs the key in its high
+    /// bits, so the populated subset has always been a walkable B+tree range —
+    /// what was missing was `Snapshot::keys`, which the PostgreSQL index access
+    /// method's `ambulkdelete` finally required.
+    ///
+    /// `total_records` is **not** filled in per key. Doing so would mean one
+    /// `cardinality` call per key, turning a catalogue listing into a scan of
+    /// the whole index; a caller that wants a count asks `get_flight_info` for
+    /// the key it cares about. Do not "improve" this by counting eagerly.
+    #[tracing::instrument(name = "yesno.flight.list_flights", skip_all, err)]
+    async fn list_flights(
+        &self,
+        _r: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        let db = self.db.clone();
+        let span = tracing::Span::current();
+        // `spawn_blocking`: walking the index can fault the mmap, and parking a
+        // reactor thread on a major fault is how an async server stalls
+        // invisibly — the same rule `do_get` follows.
+        let keys = tokio::task::spawn_blocking(move || {
+            span.in_scope(move || -> Result<Vec<(u64, u64)>, Status> {
+                let snap = db
+                    .snapshot()
+                    .map_err(|e| Status::internal(format!("{e:?}")))?;
+                let version = snap.version();
+                let keys = snap.keys().map_err(|e| Status::internal(e.to_string()))?;
+                Ok(keys.into_iter().map(|k| (k, version)).collect())
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+
+        let schema = ordinals_schema();
+        let infos: Vec<Result<FlightInfo, Status>> = keys
+            .into_iter()
+            .map(|(key, version)| {
+                let t = Ticket::whole_key(version, key);
+                FlightInfo::new()
+                    .try_with_schema(&schema)
+                    .map_err(|e| Status::internal(e.to_string()))
+                    .map(|i| {
+                        i.with_descriptor(FlightDescriptor::new_cmd(key.to_le_bytes().to_vec()))
+                            .with_endpoint(
+                                FlightEndpoint::new().with_ticket(FlightTicket::new(t.encode())),
+                            )
+                            .with_ordered(true)
+                    })
+            })
+            .collect();
+
+        Ok(Response::new(futures::stream::iter(infos).boxed()))
+    }
+
+    #[tracing::instrument(
+        name = "yesno.flight.get_flight_info",
+        skip_all,
+        fields(query.kind = tracing::field::Empty, query.version = tracing::field::Empty, result.records = tracing::field::Empty),
+        err
+    )]
+    async fn get_flight_info(
+        &self,
+        r: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let d = r.into_inner();
+        let request = Self::request_of(&d)?;
+        let query_kind = match &request {
+            Request2::Key(_) => "key",
+            Request2::Expr(_, _) => "expression",
+        };
+        tracing::Span::current().record("query.kind", query_kind);
+        let requested_version = match &request {
+            Request2::Key(_) => None,
+            Request2::Expr(_, version) => *version,
+        };
+        let snap = match requested_version {
+            Some(version) => {
+                // `spawn_blocking`, because `wait_visible` sleeps. Running it
+                // inline would park a reactor thread for the duration, which is
+                // the failure this module's header describes for reads.
+                //
+                // Still `snapshot_at` and not "something at least this new".
+                // The version is honoured **exactly**, because that is what a
+                // coordinator fanning one query across endpoints depends on.
+                // The wait only removes a refusal that was purely about timing.
+                let db = self.db.clone();
+                let wait = self.visibility_wait;
+                tokio::task::spawn_blocking(move || {
+                    if !wait.is_zero() {
+                        // A timeout is not itself an error here: `snapshot_at`
+                        // is about to produce the *precise* diagnosis, and it
+                        // distinguishes "never assigned" from "reclaimed",
+                        // which this wait cannot.
+                        let _ = db.wait_visible(version, wait);
+                    }
+                    db.snapshot_at(version)
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            }
+            None => self.db.snapshot(),
+        }
+        .map_err(engine_status)?;
+        tracing::Span::current().record("query.version", snap.version());
+        // Hold the version open for the `DoGet` this info is minted for.
+        self.hold(&snap);
+
+        let (total, t) = match request {
+            // Exact, from the index alone: `card_m1` per chunk, no payload
+            // touched.
+            Request2::Key(key) => {
+                let total = snap
+                    .cardinality(key)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                (total, Ticket::whole_key(snap.version(), key))
+            }
+            // Exact without materializing an ordinary Boolean result. A top-level
+            // view selection likewise uses its dedicated count; folds and expands
+            // are explicit eager transform boundaries in the current core API.
+            Request2::Expr(e, _) => {
+                let total = expr::cardinality(&e, &snap)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                let mut keys = Vec::new();
+                e.keys(&mut keys);
+                // `key` names the primary posting list so a coordinator can
+                // route without decoding the expression; the expression remains
+                // the authority on what to return.
+                let primary = keys.first().copied().unwrap_or(0);
+                (total, Ticket::with_expr(snap.version(), primary, e))
+            }
+        };
+        tracing::Span::current().record("result.records", total);
+
+        let info = FlightInfo::new()
+            .try_with_schema(&ordinals_schema())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .with_descriptor(d)
+            .with_endpoint(FlightEndpoint::new().with_ticket(FlightTicket::new(t.encode())))
+            .with_total_records(total as i64)
+            // Bytes are not known without reading, and a guess would be worse
+            // than the honest -1 the builder defaults to.
+            .with_ordered(true);
+        Ok(Response::new(info))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _r: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("queries here are not long-running"))
+    }
+
+    async fn get_schema(
+        &self,
+        _r: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        let opts = arrow_flight::IpcMessage::try_from(SchemaAsIpc::new(
+            &ordinals_schema(),
+            &arrow_ipc::writer::IpcWriteOptions::default(),
+        ))
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(SchemaResult { schema: opts.0 }))
+    }
+
+    #[tracing::instrument(
+        name = "yesno.flight.do_get",
+        skip_all,
+        fields(query.version = tracing::field::Empty, query.expression = tracing::field::Empty),
+        err
+    )]
+    async fn do_get(
+        &self,
+        r: Request<FlightTicket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        let raw = r.into_inner().ticket;
+        let t = Ticket::decode(&raw).ok_or_else(|| Status::invalid_argument("malformed ticket"))?;
+        let db = self.db.clone();
+        // Resolved here, not inside the worker: the closure is `move` and
+        // owns `db` alone, and the lease map belongs to the service.
+        let leased = self.leased(t.version);
+        tracing::Span::current().record("query.version", t.version);
+        tracing::Span::current().record("query.expression", t.expr.is_some());
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, Status>>(4);
+        let worker_span = tracing::info_span!(
+            "yesno.flight.do_get.read",
+            query.version = t.version,
+            query.expression = t.expr.is_some(),
+        );
+        // `spawn_blocking`: reading may fault the mmap, and parking a reactor
+        // thread on a major fault is how an async server stalls invisibly.
+        tokio::task::spawn_blocking(move || {
+            worker_span.in_scope(move || {
+                // At **the ticket's** version, not at whatever is current.
+                //
+                // This is the field's entire purpose, and until 2026-08-29 nothing
+                // read it: `do_get` opened a fresh snapshot, so a client that called
+                // `get_flight_info` and then `do_get` across a write was handed a
+                // row count and then a different number of rows. Worse for the case
+                // the field exists for — a coordinator fanning one query across N
+                // endpoints — each endpoint answered from its own instant and the
+                // union was a set that never existed.
+                //
+                // Version `0` means "whatever is current" and is not a ticket this
+                // service mints; it is what a hand-built or truncated ticket
+                // carries, and honouring it as a version would refuse every such
+                // caller with `VersionReclaimed` the moment the database checkpoints.
+                let snap = match t.version {
+                    0 => db.snapshot(),
+                    // The lease first: it is the same snapshot `GetFlightInfo`
+                    // answered from, so a checkpoint in between cannot refuse it.
+                    // Falling back to `snapshot_at` is deliberate rather than
+                    // an error — a ticket may outlive its lease, or be minted by
+                    // another process, and refusing those would be a regression.
+                    v => match leased {
+                        Some(snap) => Ok(snap),
+                        None => db.snapshot_at(v),
+                    },
+                };
+                let snap = match snap {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Flight read could not open its snapshot");
+                        let _ = tx.blocking_send(Err(engine_status(e)));
+                        return;
+                    }
+                };
+                // Same shape as the `snapshot()` match above: this closure returns
+                // `()`, so a failed read is reported on the channel rather than
+                // propagated. A snapshot evicted under `AbortOldestReader` lands
+                // here.
+                // When the ticket carries a filter it is the authority, not
+                // `t.key`. Falling back to the bare key here would return a
+                // **superset** — every row the client asked to exclude — and
+                // nothing downstream would notice.
+                let loaded = match &t.expr {
+                    None => snap.load(t.key),
+                    Some(e) => expr::lower(e, &snap).and_then(|lowered| lowered.collect_set()),
+                };
+                let set = match loaded {
+                    Ok(s) => s,
+                    // Through `engine_status`, not `Status::internal(format!(…))`.
+                    // A snapshot evicted under `AbortOldestReader` lands here, and
+                    // it is the one read failure a client can genuinely recover from
+                    // — the error even carries the last key it reached so a long
+                    // scan can resume. Reporting it as an internal fault throws that
+                    // away.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Flight read evaluation failed");
+                        let _ = tx.blocking_send(Err(engine_status(e)));
+                        return;
+                    }
+                };
+                let schema = ordinals_schema();
+                let mut buf: Vec<u64> = Vec::with_capacity(BATCH_ROWS);
+                let mut rows = 0u64;
+                let mut batches = 0u64;
+                for o in set.iter() {
+                    let prefix = o >> 16;
+                    if prefix < t.prefix_lo || prefix >= t.prefix_hi {
+                        continue;
+                    }
+                    buf.push(o);
+                    rows += 1;
+                    if buf.len() == BATCH_ROWS {
+                        let b = std::mem::replace(&mut buf, Vec::with_capacity(BATCH_ROWS));
+                        // `UInt64Array::new(.., None)` and not `from(vec)`: the
+                        // latter builds a validity buffer this schema forbids.
+                        let arr = UInt64Array::new(b.into(), None);
+                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+                        if tx.blocking_send(Ok(rb)).is_err() {
+                            tracing::debug!(rows, batches, "Flight read receiver closed early");
+                            return;
+                        }
+                        batches += 1;
+                    }
+                }
+                if !buf.is_empty() {
+                    let arr = UInt64Array::new(buf.into(), None);
+                    let rb = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+                    if tx.blocking_send(Ok(rb)).is_err() {
+                        tracing::debug!(rows, batches, "Flight read receiver closed early");
+                        return;
+                    }
+                    batches += 1;
+                }
+                tracing::info!(rows, batches, "Flight read produced");
+            })
+        });
+
+        // `FlightError::Tonic` in and back out again, so the status a read
+        // failed with is the status the client sees.
+        //
+        // This used to be `ExternalError(Box::new(e))` in and
+        // `Status::internal(e.to_string())` out, and the pair silently collapsed
+        // **every** read-path failure to `Internal` — the code survived only as
+        // text inside the message, as `External error: code: '…'`. A client
+        // switching on `code()` therefore saw one value for a stale ticket, an
+        // evicted snapshot and a genuine server fault alike, and the first two
+        // are things it can act on: ask for a new ticket, retry at a newer
+        // snapshot. Found while asserting on the codes rather than on the
+        // messages, which is the only way this shows up.
+        let batches = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)));
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(ordinals_schema())
+            .build(batches)
+            .map_err(|e| match e {
+                arrow_flight::error::FlightError::Tonic(s) => *s,
+                // Encoding failed rather than reading — that really is ours.
+                other => Status::internal(other.to_string()),
+            });
+        Ok(Response::new(stream.boxed()))
+    }
+
+    #[tracing::instrument(
+        name = "yesno.flight.do_put",
+        skip_all,
+        fields(operation = tracing::field::Empty, batches = tracing::field::Empty, rows = tracing::field::Empty),
+        err
+    )]
+    async fn do_put(
+        &self,
+        r: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        // The mode rides on the **first message's** descriptor, and reading it
+        // means peeking the stream before handing it to the decoder — a
+        // `FlightRecordBatchStream` consumes the descriptor without exposing it.
+        // The peeked message is chained back so no data is lost.
+        let mut inner = r.into_inner();
+        let first = inner.next().await.transpose().map_err(|e| {
+            Status::invalid_argument(format!("do_put stream failed immediately: {e}"))
+        })?;
+        let remove = first
+            .as_ref()
+            .and_then(|d| d.flight_descriptor.as_ref())
+            .map(|d| d.cmd.as_ref() == PUT_REMOVE)
+            .unwrap_or(false);
+        let operation = if remove { "remove" } else { "insert" };
+        tracing::Span::current().record("operation", operation);
+
+        let head = futures::stream::iter(first.map(Ok));
+        let stream = head
+            .chain(inner)
+            .map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
+        let mut decoded =
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream);
+
+        let mut rows = 0u64;
+        let mut batch_count = 0u64;
+        let mut version = 0u64;
+        while let Some(b) = decoded.next().await {
+            let b = b.map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let db = self.db.clone();
+
+            // `spawn_blocking`, for the same reason `do_get` uses it and a
+            // stronger one. A commit appends to the WAL and **fsyncs**, and it
+            // may synchronously trigger a whole checkpoint — serializing dirty
+            // chunks, rebuilding the index and syncing again, which is seconds
+            // of work under a sustained ingest. Running that inline parked a
+            // reactor thread for the duration, which is the failure this
+            // module's header describes for reads and the write path was doing
+            // anyway.
+            //
+            // Awaited before the next batch is pulled, so "one batch, one
+            // commit" still holds and batches still commit in the order they
+            // arrived: a partially applied ingest batch would be visible to
+            // readers, and the write path is atomic per batch anyway.
+            let batch_rows = b.num_rows() as u64;
+            let commit_span = tracing::debug_span!(
+                "yesno.flight.do_put.commit",
+                batch = batch_count + 1,
+                rows = batch_rows,
+                operation,
+            );
+            let n = tokio::task::spawn_blocking(move || {
+                commit_span.in_scope(move || -> Result<(u64, u64), Status> {
+                    let keys = b
+                        .column_by_name("key")
+                        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                        .ok_or_else(|| {
+                            Status::invalid_argument("expected a UInt64 `key` column")
+                        })?;
+                    let ords = b
+                        .column_by_name("ordinal")
+                        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                        .ok_or_else(|| {
+                            Status::invalid_argument("expected a UInt64 `ordinal` column")
+                        })?;
+
+                    let mut wb = db.batch();
+                    for i in 0..b.num_rows() {
+                        if remove {
+                            wb.remove(keys.value(i), ords.value(i));
+                        } else {
+                            wb.insert(keys.value(i), ords.value(i));
+                        }
+                    }
+                    let committed = wb.commit().map_err(engine_status)?;
+                    tracing::debug!(
+                        version = committed.version,
+                        changed = committed.changed,
+                        "Flight ingest batch committed"
+                    );
+                    Ok((batch_rows, committed.version))
+                })
+            })
+            .await
+            .map_err(|e| Status::internal(e.to_string()))??;
+            rows += n.0;
+            // The **last** batch's version, which is the highest: batches are
+            // awaited in arrival order, so this names a version at or after
+            // which every row in this stream is present.
+            version = version.max(n.1);
+            batch_count += 1;
+        }
+
+        tracing::Span::current().record("batches", batch_count);
+        tracing::Span::current().record("rows", rows);
+        tracing::info!(
+            operation,
+            batches = batch_count,
+            rows,
+            "Flight ingest completed"
+        );
+
+        // **Sixteen bytes, not eight**, and the widening is the whole content
+        // of `no-session-guarantees-on-the-flight-surface`: the engine knew the
+        // commit version, this handler logged it, and then threw it away — so a
+        // remote client could not name the version its write landed at, could
+        // not wait for it, and could not bind a read to it. Rows stay first so
+        // the field is read the same way it always was; the version is appended.
+        //
+        // A `version` of 0 means no batch committed ( an empty stream ), and
+        // is not a version any commit is ever assigned.
+        let mut metadata = Vec::with_capacity(16);
+        metadata.extend_from_slice(&rows.to_le_bytes());
+        metadata.extend_from_slice(&version.to_le_bytes());
+        let out = futures::stream::once(async move {
+            Ok(PutResult {
+                app_metadata: metadata.into(),
+            })
+        });
+        Ok(Response::new(out.boxed()))
+    }
+
+    async fn do_exchange(
+        &self,
+        _r: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented(
+            "do_exchange is cut: do_get and do_put cover every case here",
+        ))
+    }
+
+    #[tracing::instrument(
+        name = "yesno.flight.do_action",
+        skip_all,
+        fields(action = tracing::field::Empty),
+        err
+    )]
+    async fn do_action(
+        &self,
+        r: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        let a = r.into_inner();
+        tracing::Span::current().record("action", a.r#type.as_str());
+        let body: Vec<u8> = match a.r#type.as_str() {
+            "stats" => prost::Message::encode_to_vec(&ServerStats {
+                allocated_bytes: self.db.allocated_bytes(),
+                deferred_bytes: self.db.deferred_bytes(),
+                wal_bytes: self.db.wal_bytes(),
+                live_readers: self.db.live_readers() as u64,
+                shards: self.db.shard_count() as u64,
+            }),
+            ACTION_CLEAR => {
+                let bytes: [u8; 8] = a.body.as_ref().try_into().map_err(|_| {
+                    Status::invalid_argument("clear action body must be one 8-byte LE key")
+                })?;
+                let key = u64::from_le_bytes(bytes);
+                let db = self.db.clone();
+                let span = tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let mut batch = db.batch();
+                        batch.delete_key(key);
+                        batch.commit().map(|result| result.version)
+                    })
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(engine_status)?
+                .to_le_bytes()
+                .to_vec()
+            }
+            ACTION_CONTAINS => {
+                let bytes: [u8; 16] = a.body.as_ref().try_into().map_err(|_| {
+                    Status::invalid_argument(
+                        "contains action body must be an 8-byte LE key followed by an 8-byte LE ordinal",
+                    )
+                })?;
+                let key = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let ordinal = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+                let db = self.db.clone();
+                let span = tracing::Span::current();
+                let present = tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || db.snapshot()?.contains(key, ordinal))
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(engine_status)?;
+                u64::from(present).to_le_bytes().to_vec()
+            }
+            ACTION_INSERT_ONE | ACTION_REMOVE_ONE => {
+                let bytes: [u8; 16] = a.body.as_ref().try_into().map_err(|_| {
+                    Status::invalid_argument(
+                        "point mutation action body must be an 8-byte LE key followed by an 8-byte LE ordinal",
+                    )
+                })?;
+                let key = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let ordinal = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+                let insert = a.r#type == ACTION_INSERT_ONE;
+                let db = self.db.clone();
+                let span = tracing::Span::current();
+                let changed = tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        if insert {
+                            db.insert(key, ordinal)
+                        } else {
+                            db.remove(key, ordinal)
+                        }
+                    })
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(engine_status)?;
+                u64::from(changed).to_le_bytes().to_vec()
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown action `{other}`"
+                )));
+            }
+        };
+        let out =
+            futures::stream::once(async move { Ok(arrow_flight::Result { body: body.into() }) });
+        Ok(Response::new(out.boxed()))
+    }
+
+    async fn list_actions(
+        &self,
+        _r: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        let actions = vec![
+            ActionType {
+                r#type: "stats".into(),
+                description: "space and reader counters, as protobuf".into(),
+            },
+            ActionType {
+                r#type: ACTION_CLEAR.into(),
+                description: "atomically clear one key; returns committed version".into(),
+            },
+            ActionType {
+                r#type: ACTION_CONTAINS.into(),
+                description: "test one (key, ordinal) pair; returns zero or one".into(),
+            },
+            ActionType {
+                r#type: ACTION_INSERT_ONE.into(),
+                description: "atomically insert one pair; returns whether it changed".into(),
+            },
+            ActionType {
+                r#type: ACTION_REMOVE_ONE.into(),
+                description: "atomically remove one pair; returns whether it changed".into(),
+            },
+        ];
+        Ok(Response::new(
+            futures::stream::iter(actions.into_iter().map(Ok)).boxed(),
+        ))
+    }
+}

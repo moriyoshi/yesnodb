@@ -1,0 +1,43 @@
+"""Root package: the PostgreSQL major-version build flag.
+
+The flag selects three things that must move as one ABI configuration:
+
+* a crate-universe hub resolved with pgrx's matching `pgN` feature;
+* this crate's own matching `pgN` feature;
+* the PostgreSQL source build that supplies headers and runs the tests.
+
+Crate features are resolved by `crate_universe` inside a repository rule, which
+runs before analysis and cannot observe this flag. `MODULE.bazel` therefore
+creates one hub per major; analysis-time `select`s choose between their outputs.
+Both hubs share the authoritative `yesno-pg/Cargo.lock`. Their resolver
+manifests are drift-checked by `scripts/check-pg-manifests.py`.
+
+Do not add a `//conditions:default` arm to the selects in
+`//third_party/postgresql`. A silent fallback to the wrong major is exactly the
+ABI mismatch this machinery exists to prevent.
+"""
+
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+package(default_visibility = ["//visibility:public"])
+
+string_flag(
+    name = "pg_version",
+    build_setting_default = "17",
+    values = ["17", "18"],
+)
+
+config_setting(
+    name = "pg17",
+    flag_values = {":pg_version": "17"},
+)
+
+config_setting(
+    name = "pg18",
+    flag_values = {":pg_version": "18"},
+)
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])

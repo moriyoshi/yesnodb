@@ -1,0 +1,196 @@
+-- `count(*)` pushdown: the property the wrapper exists for.
+--
+-- The plans are the assertion. A `count(*)` that returns the right number
+-- while PostgreSQL aggregates the rows itself is *correct and worthless* — it
+-- moved every ordinal across the network to add them up. What proves the
+-- pushdown happened is the **absence of an `Aggregate` node**: the Foreign Scan
+-- is the whole plan, and `yesno: count of …` names what the server counted.
+CREATE EXTENSION yesno_pg;
+CREATE SERVER yesno FOREIGN DATA WRAPPER yesno_fdw
+    OPTIONS ( endpoint :'endpoint' );
+-- Key 42: multiples of 7 below 70 ( 10 ordinals ).
+CREATE FOREIGN TABLE sevens ( ordinal bigint ) SERVER yesno OPTIONS ( key '42' );
+-- Key 99: never written to.
+CREATE FOREIGN TABLE empty_key ( ordinal bigint ) SERVER yesno OPTIONS ( key '99' );
+-- ── Pushed down ─────────────────────────────────────────────────────────────
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM sevens;
+        QUERY PLAN        
+--------------------------
+ Foreign Scan
+   yesno: count of key 42
+(2 rows)
+
+SELECT count(*) FROM sevens;
+ count 
+-------
+    10
+(1 row)
+
+-- `count(ordinal)` too. It differs from `count(*)` by skipping NULLs, which
+-- is safe here only because the column is structurally non-null — a posting
+-- list is a set of *present* values.
+EXPLAIN ( COSTS OFF ) SELECT count(ordinal) FROM sevens;
+        QUERY PLAN        
+--------------------------
+ Foreign Scan
+   yesno: count of key 42
+(2 rows)
+
+SELECT count(ordinal) FROM sevens;
+ count 
+-------
+    10
+(1 row)
+
+-- An empty key counts to zero without reading anything.
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM empty_key;
+        QUERY PLAN        
+--------------------------
+ Foreign Scan
+   yesno: count of key 99
+(2 rows)
+
+SELECT count(*) FROM empty_key;
+ count 
+-------
+     0
+(1 row)
+
+-- The composition that matters: phase 2's qual pushdown feeding phase 3's
+-- count. The server counts a *filtered* set without materializing it, because
+-- `Expr::cardinality` composes the operators' non-materializing walks.
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM sevens WHERE ordinal >= 35;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Foreign Scan
+   yesno: count of (key 42 AND [35, 9223372036854775808))
+(2 rows)
+
+SELECT count(*) FROM sevens WHERE ordinal >= 35;
+ count 
+-------
+     5
+(1 row)
+
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM sevens WHERE ordinal BETWEEN 14 AND 35;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   yesno: count of (key 42 AND [14, 9223372036854775808) AND ([0, 36) OR [9223372036854775808, 18446744073709551615)))
+(2 rows)
+
+SELECT count(*) FROM sevens WHERE ordinal BETWEEN 14 AND 35;
+ count 
+-------
+     4
+(1 row)
+
+-- ── Not pushed down ─────────────────────────────────────────────────────────
+-- Each of these must keep its `Aggregate` node. They are correctness cases,
+-- not missed optimisations: the server returns one number for the whole set and
+-- cannot express any of these variations.
+-- A qual that does not lower exactly. Unlike a row scan — where an inexact
+-- pushdown is corrected by the Filter that stays in the plan — a count has
+-- nothing above it to re-filter, so counting a superset would return a number
+-- larger than the answer with nothing able to notice.
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM sevens WHERE ordinal % 2 = 0;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Aggregate
+   ->  Foreign Scan on sevens
+         Filter: ((ordinal % '2'::bigint) = 0)
+         yesno: key 42
+(4 rows)
+
+SELECT count(*) FROM sevens WHERE ordinal % 2 = 0;
+ count 
+-------
+     5
+(1 row)
+
+-- GROUP BY: the server returns one number and cannot attribute it to groups.
+EXPLAIN ( COSTS OFF ) SELECT ordinal, count(*) FROM sevens GROUP BY ordinal;
+          QUERY PLAN          
+------------------------------
+ HashAggregate
+   Group Key: ordinal
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(4 rows)
+
+-- HAVING filters groups, which do not exist here.
+EXPLAIN ( COSTS OFF ) SELECT count(*) FROM sevens HAVING count(*) > 5;
+          QUERY PLAN          
+------------------------------
+ Aggregate
+   Filter: (count(*) > 5)
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(4 rows)
+
+-- DISTINCT changes what is counted.
+EXPLAIN ( COSTS OFF ) SELECT count(DISTINCT ordinal) FROM sevens;
+             QUERY PLAN             
+------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: ordinal
+         ->  Foreign Scan on sevens
+               yesno: key 42
+(5 rows)
+
+SELECT count(DISTINCT ordinal) FROM sevens;
+ count 
+-------
+    10
+(1 row)
+
+-- FILTER likewise.
+EXPLAIN ( COSTS OFF ) SELECT count(*) FILTER ( WHERE ordinal > 21 ) FROM sevens;
+          QUERY PLAN          
+------------------------------
+ Aggregate
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(3 rows)
+
+SELECT count(*) FILTER ( WHERE ordinal > 21 ) FROM sevens;
+ count 
+-------
+     6
+(1 row)
+
+-- Other aggregates are declined on purpose. `sum` would have to fetch every
+-- ordinal anyway, so pushing it down would move the same data while adding a
+-- path that can be wrong. `min`/`max` are worse: yesno's are `u64` extremes and
+-- PostgreSQL wants `int8` ones, which differ for any set spanning 2^63.
+EXPLAIN ( COSTS OFF ) SELECT sum(ordinal) FROM sevens;
+          QUERY PLAN          
+------------------------------
+ Aggregate
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(3 rows)
+
+EXPLAIN ( COSTS OFF ) SELECT min(ordinal) FROM sevens;
+          QUERY PLAN          
+------------------------------
+ Aggregate
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(3 rows)
+
+-- A count beside a plain column has no single value to report.
+EXPLAIN ( COSTS OFF ) SELECT count(*), max(ordinal) FROM sevens;
+          QUERY PLAN          
+------------------------------
+ Aggregate
+   ->  Foreign Scan on sevens
+         yesno: key 42
+(3 rows)
+
+DROP EXTENSION yesno_pg CASCADE;
+psql:e2e/postgresql/sql/fdw_count.sql:78: NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to server yesno
+drop cascades to foreign table sevens
+drop cascades to foreign table empty_key

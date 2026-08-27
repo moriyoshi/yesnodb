@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package yesno.flight.v1;
+
+// Space and reader counters returned by the Arrow Flight `stats` action.
+message ServerStats {
+  uint64 allocated_bytes = 1;
+  uint64 deferred_bytes = 2;
+  uint64 wal_bytes = 3;
+  uint64 live_readers = 4;
+  uint64 shards = 5;
+}

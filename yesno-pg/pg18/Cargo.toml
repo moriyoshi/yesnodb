@@ -1,0 +1,43 @@
+# Resolver-only mirror of `yesno-pg/Cargo.toml` for the PostgreSQL 18
+# crate-universe hub. `scripts/check-pg-manifests.py` requires the parsed
+# manifests to differ only in `features.default` plus this file's required
+# relative library path. Both hubs deliberately share `yesno-pg/Cargo.lock`
+# so dependency versions have one authority.
+[workspace]
+
+[package]
+name = "yesno-pg"
+description = "PostgreSQL extension for yesno: foreign data wrapper, index access method, table access method"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moriyoshi/yesnodb"
+
+[lib]
+path = "../src/lib.rs"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg17 = ["pgrx/pg17"]
+pg18 = ["pgrx/pg18"]
+
+[dependencies]
+pgrx = { version = "0.19.2", default-features = false }
+arrow-array = { version = "59.2", default-features = false }
+arrow-flight = "59.2"
+arrow-schema = { version = "59.2", default-features = false }
+futures = "0.3"
+prost = "0.14"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

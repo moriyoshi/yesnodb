@@ -1,0 +1,18 @@
+# Local build outputs are enormous and are rebuilt inside the image.
+target
+**/target
+bazel-*
+
+# Agent scratch data and source-control metadata are never build inputs.
+.agents-workspace
+.git
+.bazelrc.user
+
+# Documentation is not an ABI or fixture input; doc-only edits must not rebuild databases.
+.agents
+docs
+**/*.md
+
+# Profiling outputs must not enter an image context.
+perf.data
+**/*.profraw

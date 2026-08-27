@@ -1,0 +1,33 @@
+[package]
+name = "yesno-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Not a member of the parent workspace. `libfuzzer-sys` needs a nightly
+# toolchain and sanitizer flags, so pulling this into the workspace would make
+# the routine `cargo test` depend on nightly for no benefit.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.yesno-core]
+path = ".."
+
+[[bin]]
+name = "decode_container"
+path = "fuzz_targets/decode_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roaring_import"
+path = "fuzz_targets/roaring_import.rs"
+test = false
+doc = false
+bench = false

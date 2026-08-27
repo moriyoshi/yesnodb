@@ -1,0 +1,138 @@
+-- Subtransactions: SAVEPOINT, RELEASE, and the implicit one a PL/pgSQL
+-- EXCEPTION block opens.
+--
+-- This is the regression guard for `fdw-savepoints-are-not-honoured`, and it
+-- was written **red**. Until 2026-09-19 `fdw/modify.rs` registered only
+-- `RegisterXactCallback`; PostgreSQL delivers a subtransaction abort through
+-- `RegisterSubXactCallback` and nowhere else, so nothing discarded the writes a
+-- rolled-back savepoint made and `PRE_COMMIT` sent them. A `DELETE` rolled back
+-- the same way was still applied, losing a row the user had restored.
+--
+-- The expected output is PostgreSQL's semantics, derived from the SQL rather
+-- than from what the wrapper printed. Do not regenerate it from actual output;
+-- that converts a defect into the specification.
+--
+-- Keys 1003 and 1004 are touched by nothing else, so the other fixtures do not
+-- depend on the order the suite runs in.
+
+CREATE EXTENSION yesno_pg;
+
+CREATE SERVER yesno FOREIGN DATA WRAPPER yesno_fdw
+    OPTIONS ( endpoint :'endpoint' );
+
+CREATE FOREIGN TABLE sp ( ordinal bigint ) SERVER yesno OPTIONS ( key '1003' );
+CREATE FOREIGN TABLE sp2 ( ordinal bigint ) SERVER yesno OPTIONS ( key '1004' );
+
+-- ── ROLLBACK TO SAVEPOINT discards what followed it ──────────────────────────
+-- The read inside the transaction matters as much as the one after it: the
+-- pending buffer is also what makes a transaction see its own writes, so a
+-- buffer that keeps rolled-back rows shows them to the rolling-back statement
+-- too.
+BEGIN;
+INSERT INTO sp VALUES ( 1 );
+SAVEPOINT s;
+INSERT INTO sp VALUES ( 2 );
+ROLLBACK TO SAVEPOINT s;
+SELECT ordinal FROM sp ORDER BY ordinal;
+COMMIT;
+SELECT ordinal FROM sp ORDER BY ordinal;
+
+-- ── RELEASE keeps them ───────────────────────────────────────────────────────
+-- The mirror case. A released savepoint's writes belong to the parent and must
+-- survive the commit, so a fix that discarded on every subtransaction end
+-- would pass the case above and fail here.
+BEGIN;
+INSERT INTO sp VALUES ( 3 );
+SAVEPOINT s;
+INSERT INTO sp VALUES ( 4 );
+RELEASE SAVEPOINT s;
+COMMIT;
+SELECT ordinal FROM sp ORDER BY ordinal;
+
+-- ── Rolling back a DELETE restores the outer transaction's INSERT ────────────
+-- This is the case a per-entry subtransaction tag cannot express. Ordinal 10 is
+-- inserted by the outer transaction and deleted inside the savepoint; the
+-- rollback must leave it *inserted*, which means the parent's verdict has to
+-- still exist somewhere when the child's is discarded.
+BEGIN;
+INSERT INTO sp2 VALUES ( 10 ), ( 20 );
+SAVEPOINT s;
+DELETE FROM sp2 WHERE ordinal = 10;
+ROLLBACK TO SAVEPOINT s;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+COMMIT;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+
+-- ── Nested savepoints ────────────────────────────────────────────────────────
+-- Rolling back to the outer one must discard both levels, not just the nearest.
+BEGIN;
+INSERT INTO sp2 VALUES ( 30 );
+SAVEPOINT sp_a;
+INSERT INTO sp2 VALUES ( 40 );
+SAVEPOINT sp_b;
+INSERT INTO sp2 VALUES ( 50 );
+ROLLBACK TO SAVEPOINT sp_a;
+COMMIT;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+
+-- ── A PL/pgSQL EXCEPTION block is an implicit subtransaction ─────────────────
+-- No SAVEPOINT appears in the text, which is what makes this the dangerous
+-- spelling: any trapped error inside a function silently keeps its writes.
+BEGIN;
+INSERT INTO sp2 VALUES ( 60 );
+DO $$
+BEGIN
+    INSERT INTO sp2 VALUES ( 70 );
+    RAISE EXCEPTION 'trapped';
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END;
+$$;
+COMMIT;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+
+-- ── Rolling back to an outer savepoint, then carrying on ────────────────────
+-- `ROLLBACK TO` aborts the named savepoint's own subtransaction and starts a
+-- fresh one under the same name, so the transaction is still nested afterwards
+-- and that level has to be usable again. Rolling back to the same name twice
+-- exercises it repeatedly; the final `RELEASE` then hands the surviving write
+-- to the top level.
+--
+-- 100 is written before any savepoint and survives. 110 and 120 are discarded
+-- by the first rollback -- 110 at the savepoint's own depth, 120 one deeper,
+-- which is the arbitrary-savepoint case. 130 is written into the re-established
+-- level and discarded by the second rollback. 140 survives through `RELEASE`.
+BEGIN;
+INSERT INTO sp2 VALUES ( 100 );
+SAVEPOINT a;
+INSERT INTO sp2 VALUES ( 110 );
+SAVEPOINT b;
+INSERT INTO sp2 VALUES ( 120 );
+ROLLBACK TO SAVEPOINT a;
+INSERT INTO sp2 VALUES ( 130 );
+ROLLBACK TO SAVEPOINT a;
+INSERT INTO sp2 VALUES ( 140 );
+RELEASE SAVEPOINT a;
+COMMIT;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+
+-- ── RELEASE of an outer savepoint carrying a nested one ─────────────────────
+-- Releasing `c` releases `d` with it, so both levels must fold into the top
+-- level rather than only the innermost.
+BEGIN;
+INSERT INTO sp2 VALUES ( 200 );
+SAVEPOINT c;
+INSERT INTO sp2 VALUES ( 210 );
+SAVEPOINT d;
+INSERT INTO sp2 VALUES ( 220 );
+RELEASE SAVEPOINT c;
+COMMIT;
+SELECT ordinal FROM sp2 ORDER BY ordinal;
+
+-- Clean up so re-running the suite starts from the same state.
+DELETE FROM sp;
+DELETE FROM sp2;
+SELECT count(*) AS sp_left FROM sp;
+SELECT count(*) AS sp2_left FROM sp2;
+
+DROP EXTENSION yesno_pg CASCADE;

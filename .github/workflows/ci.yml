@@ -1,0 +1,470 @@
+# Continuous integration.
+#
+# ---------------------------------------------------------------------------
+# Why this exists, and why GitHub Actions
+# ---------------------------------------------------------------------------
+#
+# Every gate in this repo has been manual, and the record is poor: the packed-run
+# accounting leak, an infinite fsync loop in group commit, `fsck` counting every
+# live index node as leaked, a whole unwired follower — each sat in front of a
+# tool that could see it, for milestones, because nothing ran the tool.
+#
+# `TODO.md` recorded the blocker as "needs a CI platform chosen, and guessing
+# would be worse than naming the gap". That was over-cautious: `Cargo.toml`
+# declares `repository = "https://github.com/moriyoshi/yesnodb"`, so the platform
+# is not a guess. If it is wrong, this is one file to delete.
+#
+# ---------------------------------------------------------------------------
+# What is deliberately NOT here
+# ---------------------------------------------------------------------------
+#
+# `cargo semver-checks` ( policy R7, the mechanical enforcement of R1 ). It
+# needs a published baseline to compare against and nothing is published yet.
+#
+# The Bazel PostgreSQL gate is separate. It builds a pinned PostgreSQL server and
+# is not hidden inside the routine Cargo job; a green badge therefore covers the
+# Cargo workspace, not the experimental extension.
+#
+# ---------------------------------------------------------------------------
+# What has and has not been verified
+# ---------------------------------------------------------------------------
+#
+# The commands below have been exercised locally. The *workflow* — syntax,
+# runner behaviour, action versions, cache keys — has not run anywhere yet.
+# Treat the first execution as the test of this file, and do not read a green
+# local gate as evidence that the workflow itself works.
+#
+# Only first-party actions are used, so the toolchain steps are plain `rustup`.
+# That is a few more lines than `dtolnay/rust-toolchain` in exchange for no
+# third-party code in the supply chain of the thing that guards the supply chain.
+
+name: ci
+
+# **No `push` trigger on `main`.** `release.yml` owns that branch: it calls this
+# workflow as its first job and publishes only if it passes, so a push to `main`
+# runs this gate exactly once, inside the release pipeline. Adding `push:
+# branches: [main]` back here would not add coverage, it would run the whole
+# gate twice per merge. The consequence to know: on `main` these checks appear
+# under the `release` workflow, not under `ci`, so a branch-protection rule naming
+# the `ci` job by name has to name the called job instead.
+on:
+  pull_request:
+  schedule:
+    # Sunday 03:00 UTC. The deep tools take over an hour; they belong on a
+    # timer, not on every push.
+    - cron: "0 3 * * 0"
+  workflow_call:
+    inputs:
+      run_deep:
+        description: "Also run the sanitizer and Valgrind job."
+        type: boolean
+        default: false
+        required: false
+  workflow_dispatch:
+    inputs:
+      run_deep:
+        description: "Also run the sanitizer and Valgrind job (takes hours)."
+        type: boolean
+        default: false
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # A literal `ci-` prefix, **not** `${{ github.workflow }}`. In a reusable
+  # workflow that context resolves to the **caller's** workflow name, so this
+  # group became `release-<ref>` the moment `release.yml` called this file — the
+  # same group the caller itself holds. With `cancel-in-progress` the called run
+  # then cancelled the caller that was waiting on it, the `gate` job failed in
+  # seconds, and **no `ci` run was ever created**.
+  #
+  # The consequence was silent and lasted twelve days: every push to `main`
+  # from 2026-09-06 to 2026-09-13 produced a `release` run that failed instantly
+  # and no gate at all, while the Sunday `schedule` trigger kept working and
+  # `workflow_dispatch` kept working — because in both of those
+  # `${{ github.workflow }}` is `ci` and there is no collision. Do not
+  # reintroduce `github.workflow` here; a reusable workflow must not derive its
+  # concurrency group from a context its caller controls.
+  group: ci-${{ github.ref }}
+  # Mirrors `release.yml`: a superseded `main` build is worth cancelling, a tag
+  # publish is not — and when called, this gate is part of that publish.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  gate:
+    name: gate (clippy, tests, layout)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        # `yesno-e2e` declares `rust-version = "1.95"` because `monty` requires
+        # it; the workspace stays at 1.89 for `yesno-core`, whose MSRV is a
+        # promise to its users and is checked by the `msrv` job.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: |
+          cargo fmt --all -- --check
+          (cd yesno-core/fuzz && cargo fmt --all -- --check)
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: tests
+        # Includes `yesno-e2e`'s scenario suite, which runs every `.py` under
+        # `e2e/scenarios/` against a real database.
+        run: cargo test --workspace
+
+      - name: tests behind off-by-default features
+        # The step above is **default features**, so
+        # `yesno-tantivy/tests/flight.rs` -- `#![cfg( feature = "flight" )]`,
+        # off by default -- compiled to nothing here and in `scripts/gate.sh`.
+        # Its one integration test had never executed anywhere until it was run
+        # by hand on 2026-09-17. Clippy's `--all-features` type-checks the file
+        # on every run, which is what made it read as covered: compiled is not
+        # executed, and neither summary distinguishes them.
+        #
+        # Targeted, not `--all-features`. Measured, the entire delta between the
+        # two is this one test ( 1556 -> 1557 passed, same 70 binaries ), and
+        # `--all-features` would additionally compile `yesno-core/tracing` into
+        # the other 69 -- changing the code under test everywhere to gain
+        # nothing, since that feature contributes no tests at all.
+        run: cargo test -p yesno-tantivy --features flight
+
+      - name: ARCHITECTURE.md layout matches the tree
+        run: python3 scripts/check-layout.py
+
+      - name: the unified image's binary set matches the workspace
+        # The binary list lives in the crates' `[[bin]]` targets, in
+        # `dist/Dockerfile`'s copy loop and in `dist/entrypoint.sh`'s dispatch
+        # arm. Only this connects the three. Building the image to find out
+        # costs an hour of cross-compilation; this costs a second.
+        run: python3 scripts/check-image-binaries.py
+
+      - name: the image entrypoint parses as POSIX sh
+        run: sh -n dist/entrypoint.sh
+
+      - name: policy R1 (no Arrow types in yesno-core's public API)
+        # Baselined: fails on new violations and on baseline entries that have
+        # been fixed but not removed, so the list can only shrink.
+        run: python3 scripts/check-r1.py
+
+      - name: docs/ is self-contained
+        run: python3 scripts/check-docs-selfcontained.py
+
+      - name: docs/ converts to TeX
+        # The one failure here with no author-side signal: a bare math symbol in
+        # prose renders fine in every Markdown viewer and fails only under
+        # pandoc/pdflatex, which nobody runs locally. Needs no TeX toolchain in
+        # CI -- the check is on the source, not on a build.
+        run: python3 scripts/check-tex-safe.py
+
+      # The three steps below were in `scripts/gate.sh` and not here. That
+      # divergence matters more than it looks: `ci-has-never-run`, so the first
+      # green CI run would have reported success having never executed any of
+      # them -- and a green CI is exactly what people read instead of running
+      # the local gate. Do not let this file drift from `scripts/gate.sh`
+      # again: the script is the authority, and a check it runs that CI does
+      # not is a check that stops running the day CI is trusted.
+      - name: the AWS gate's runner scripts parse as POSIX sh
+        # Each remote step is a Python string handed to Systems Manager and run
+        # by /bin/sh on the instance. Nothing between here and there parses it,
+        # so a missing `fi` inside a string literal survives compilation,
+        # `terraform apply`, and fifteen minutes of cluster creation.
+        run: python3 scripts/check-runner-scripts.py
+
+      - name: Theorem 7's termination measure
+        run: python3 scripts/check-plan-measure.py
+
+      # And three more that had drifted the same way, found 2026-09-17 by
+      # comparing the two files command by command rather than by step name.
+      # The warning above is eight lines up and this still happened, so state
+      # the mechanism: a check is added to `scripts/gate.sh` by the session
+      # that needs it, and nothing makes that session open this file. Compare
+      # the two by *command* when adding either -- step names differ freely
+      # and make the drift invisible to a name-based sweep.
+      - name: cited backlog slugs are recorded
+        run: python3 scripts/check-todo-refs.py
+
+      - name: unsafe block count matches the recorded inventory
+        run: python3 scripts/check-unsafe-count.py
+
+      - name: doc links resolve
+        # `-D warnings`, not just `broken_intra_doc_links`: the
+        # `private_intra_doc_links` baseline was cleared on 2026-09-17, so this
+        # is a line at zero rather than a baseline. `cargo doc` fails fast per
+        # crate, so a partial count here means earlier crates aborted the run.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      - name: the article's derived figures still follow from the constants
+        # `--self-test` first, exactly as the local gate does: it verifies the
+        # checker can still fail, because a constants audit that has silently
+        # stopped auditing looks identical to one that passes.
+        run: |
+          set -euo pipefail
+          python3 scripts/check-model-constants.py --self-test
+          python3 scripts/check-model-constants.py
+
+  msrv:
+    name: msrv (yesno-core builds at 1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 1.89
+        run: |
+          rustup toolchain install 1.89 --profile minimal
+          rustc +1.89 --version
+      - name: Build the core crate only
+        # Only `yesno-core`. The satellites carry heavier trees and
+        # `yesno-e2e` needs 1.95; the promise being checked is core's.
+        run: cargo +1.89 build -p yesno-core
+
+  lean-core:
+    name: lean core (dependency guard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Direct and transitive dependency counts
+        # The README sells `yesno-core` as five dependencies and no async
+        # runtime; the design asks for a pinned count that PRs may not raise.
+        # Counted with `-e normal`, so a dev-dependency ( roaring, proptest,
+        # criterion ) does not move the number the claim is about.
+        #
+        # Do not raise these to make a PR pass. Dependency creep into the
+        # core is what kills a "lean core" over eighteen months, one justified
+        # crate at a time.
+        run: |
+          set -euo pipefail
+          direct=$(cargo tree -p yesno-core --depth 1 -e normal | tail -n +2 | wc -l)
+          total=$(cargo tree -p yesno-core -e normal | wc -l)
+          echo "direct=$direct total=$total"
+          [ "$direct" -le 5 ]  || { echo "direct dependencies grew past 5"; exit 1; }
+          [ "$total"  -le 36 ] || { echo "transitive tree grew past 36 lines"; exit 1; }
+      - name: No async runtime or gRPC in the core
+        # The two network crates depend on core and never the reverse. This is
+        # what keeps that true.
+        run: |
+          set -euo pipefail
+          if cargo tree -p yesno-core -e normal | grep -E 'tokio|tonic|prost|arrow-flight'; then
+            echo "an async or gRPC crate reached yesno-core"
+            exit 1
+          fi
+          echo "clean"
+
+  python-client:
+    name: python client (lint, types, Flight interoperability)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install uv
+        run: python -m pip install uv==0.12.7
+
+      - name: Python package gate
+        run: ./yesno-flight-python/gate.sh
+
+  java-client:
+    name: java client (compile, tests, docs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            yesno-flight-java/*.gradle.kts
+            yesno-flight-java/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Java package gate
+        run: yesno-flight-java/gradlew -p yesno-flight-java --no-daemon build
+
+  go-client:
+    name: go client (vet, race, Flight interoperability)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: yesno-flight-go/go.mod
+          cache-dependency-path: yesno-flight-go/go.sum
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Go package gate
+        run: ./yesno-flight-go/gate.sh
+
+  # The Python, Go and Java bindings each had a job here and the C ABI did not,
+  # so `yesno-c/gate.sh` -- its clippy, its fmt, and the linked C11 fixture in
+  # `yesno-c/tests/` -- ran only when someone remembered to type it. That
+  # fixture is the only thing that exercises the batch write and the
+  # host-supplied dispatch callback end to end, and nothing else in this file
+  # compiles a C translation unit against the published header at all.
+  #
+  # `yesno-c` is a separate workspace, so `scripts/gate.sh --workspace` does not
+  # reach it either. Added 2026-09-17; needs only a Rust toolchain and the cc
+  # the runner already has.
+  c-abi:
+    name: c abi (clippy, fmt, linked C11 fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: C ABI gate
+        run: ./yesno-c/gate.sh
+
+  deep:
+    name: deep (sanitizers, Valgrind)
+    # Not on every push: the sanitizers rebuild `core` with `-Zbuild-std`.
+    #
+    # A MIRI step ran here until 2026-08-29 and was removed with the rest of
+    # the MIRI gate; `--component miri` went with it. See `scripts/miri.sh`.
+    #
+    # Gated on an explicit input rather than on `workflow_dispatch`, which is
+    # what it used to test. In a `workflow_call` the `github.event_name` seen
+    # here is the *caller's* event, so the old condition made every manual
+    # `release` run start a four-hour sanitizer job as a side effect of
+    # publishing an image. A manual run of this workflow now has to tick the box.
+    if: github.event_name == 'schedule' || inputs.run_deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly with the sanitizer prerequisites
+        # `rust-src` is for ThreadSanitizer's `-Zbuild-std`, not for MIRI.
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src
+          rustup default nightly
+          rustc --version
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: AddressSanitizer
+        # Covers the whole core suite, including `concurrency`, which Valgrind
+        # skips because it serialises threads onto one core.
+        #
+        # `--lib --tests`, i.e. everything except doctests, mirroring
+        # `scripts/gate.sh`. This is a scope fix and not a weakening: the
+        # doctests do not fail, they cannot *link*. rustdoc compiles each
+        # example with these RUSTFLAGS and then links it against dependency
+        # rlibs built without the sanitizer runtime, so the link dies on
+        # `undefined symbol: __asan_report_load8` before any code runs.
+        #
+        # This job failed on exactly that from 2026-08-29 until it was fixed,
+        # while the local gate was green — the fix landed in `scripts/gate.sh`
+        # on 2026-08-30 and was never copied here. A step and its CI twin are
+        # two implementations of one check and both have to be repaired.
+        #
+        # Nothing is lost: the `gate` job's `cargo test --workspace` runs
+        # every doctest unsanitized, and a documentation example is not where a
+        # memory-safety bug lives. Do not "fix" this by deleting the doctests.
+        run: |
+          RUSTFLAGS="-Zsanitizer=address" \
+            cargo test -p yesno-core --lib --tests \
+            --target x86_64-unknown-linux-gnu
+
+      - name: ThreadSanitizer
+        # The only race detector available here: Valgrind serialises the threads
+        # away and ASan does not check races.
+        run: |
+          RUSTFLAGS="-Zsanitizer=thread" \
+            cargo test -p yesno-core -Zbuild-std \
+            --target x86_64-unknown-linux-gnu --test concurrency
+
+      - name: Valgrind
+        run: ./scripts/valgrind.sh
+
+      # These two were in `scripts/gate.sh --deep` and not here, and they are
+      # the pair that has already proved it can break silently: on 2026-09-06
+      # they had been failing for days because `yesno-e2e` gained binaries in
+      # `src/bin/`, which made a bare `cargo run -p yesno-e2e` ambiguous. Had
+      # this job run them, CI would have caught it. What is asserted is that
+      # the measurement **ran** -- a non-zero exit or empty output fails the
+      # step. The numbers are reported for a human to read, not compared, so
+      # this cannot fail on a slow runner.
+      - name: aged-state space measurement (numbers reported, the run asserted)
+        run: |
+          set -euo pipefail
+          run_measurement() {
+            out=$("$@" 2>&1) || { echo "$out"; echo "measurement failed"; exit 1; }
+            [ -n "${out//[[:space:]]/}" ] || { echo "measurement produced no output"; exit 1; }
+            echo "$out" | tail -n 14
+          }
+          run_measurement cargo run --release -p yesno-e2e -- --show-output \
+            --arg keys=200 --arg per_key=2000 --arg rounds=60 \
+            e2e/scenarios/aged_state.py
+          run_measurement cargo run --release -p yesno-e2e -- --show-output \
+            --arg keys=400 --arg per_key=400 --arg rounds=40 --arg spread=100000 \
+            e2e/scenarios/aged_state.py
+
+      - name: WAL bytes per ordinal (numbers reported, the run asserted)
+        # The ceilings themselves are asserted in the durability suite; this
+        # shows the shape curve.
+        run: |
+          set -euo pipefail
+          out=$(cargo run --release -p yesno-e2e -- --show-output \
+            --arg n=100000 e2e/scenarios/wal_size.py 2>&1) \
+            || { echo "$out"; echo "measurement failed"; exit 1; }
+          [ -n "${out//[[:space:]]/}" ] || { echo "measurement produced no output"; exit 1; }
+          echo "$out" | tail -n 5
+
+      - name: two-node failover drill
+        # The only step in this workflow that exercises the **shipped
+        # artifacts** rather than the library: the `yesnod`, `yesno`, and
+        # `yesnoctl` binaries, `yesno-server/dist/`'s example configs, and the
+        # certificate
+        # script, all fitting together. Everything else here tests the code.
+        #
+        # Here rather than in `gate`, and weekly rather than per-push, because
+        # it starts two processes and binds four loopback ports — a failure
+        # surface unrelated to the change under test. `e2e/scenarios/failover.py`
+        # covers the same code in one process on every run.
+        #
+        # Needs `openssl` for the certificates and `curl` for the readiness
+        # probes; both are present on `ubuntu-latest`, and the script says so
+        # itself if either is missing rather than failing obscurely.
+        run: |
+          cargo build --release -p yesno-server
+          ./yesno-server/dist/two-node.sh

@@ -1,0 +1,50 @@
+"""Hermetic PostgreSQL fixtures driven by the ordinary yesno-e2e runner."""
+
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "sql_fixtures",
+    srcs = glob(["sql/*.sql"]),
+)
+
+filegroup(
+    name = "expected_fixtures",
+    srcs = glob(["expected/*.out"]),
+)
+
+filegroup(
+    name = "isolation_fixtures",
+    srcs = glob(["isolation/*.spec"]),
+)
+
+rust_test(
+    name = "regress",
+    size = "large",
+    srcs = ["//yesno-e2e:runner_main"],
+    args = ["--timeout", "300", "$(rootpath :postgres.py)"],
+    crate_name = "yesno_pg_regress",
+    data = [
+        ":expected_fixtures",
+        ":isolation_fixtures",
+        ":postgres.py",
+        ":sql_fixtures",
+        "//third_party/postgresql:gen_dir",
+        "//yesno-pg:extension_sql",
+        "//yesno-pg:yesno_pg",
+        "//yesno-pg:yesno_pg.control",
+    ],
+    edition = "2021",
+    env = {
+        "YESNO_E2E_RESOURCE_EXPECTED_DIR": "e2e/postgresql/expected",
+        "YESNO_E2E_RESOURCE_EXT_CONTROL": "$(rootpath //yesno-pg:yesno_pg.control)",
+        "YESNO_E2E_RESOURCE_EXT_LIB": "$(rootpath //yesno-pg:yesno_pg)",
+        "YESNO_E2E_RESOURCE_EXT_SQL": "$(rootpath //yesno-pg:extension_sql)",
+        "YESNO_E2E_RESOURCE_ISOLATION_DIR": "e2e/postgresql/isolation",
+        "YESNO_E2E_RESOURCE_PG_HOME": "$(rootpath //third_party/postgresql:gen_dir)",
+        "YESNO_E2E_RESOURCE_SQL_DIR": "e2e/postgresql/sql",
+    },
+    use_libtest_harness = False,
+    deps = ["//yesno-e2e:fixture_host"],
+)

@@ -1,0 +1,29 @@
+# Privileged LVM snapshot sidecar for yesnod. Install only on LVM deployments.
+
+[Unit]
+Description=yesno privileged LVM snapshot agent
+Documentation=https://github.com/moriyoshi/yesnodb
+After=yesnod.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yesno-snapshot-agent --config /etc/yesno/yesnod.toml
+Restart=on-failure
+RestartSec=1s
+
+# Root supplies uid/gid 0 and an explicit credential tuple whose real pid is
+# matched against SO_PEERCRED. CAP_SYS_ADMIN is required only by LVM/device
+# mapper and mount. yesnod itself does not receive this capability.
+User=root
+Group=root
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=false
+
+# Harden these paths to the concrete source and snapshot mount roots from the
+# deployment's yesnod.toml before enabling ProtectSystem=strict.
+
+[Install]
+WantedBy=multi-user.target
