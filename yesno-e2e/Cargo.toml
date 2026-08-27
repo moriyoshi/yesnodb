@@ -1,0 +1,81 @@
+[package]
+name = "yesno-e2e"
+version.workspace = true
+edition.workspace = true
+# monty requires 1.95, above the workspace's 1.89. Declared here rather than
+# raised workspace-wide on purpose: `yesno-core`'s MSRV is a promise to its
+# users, and a test harness must not be able to move it. Cargo resolves the
+# member's own `rust-version`, so core keeps 1.89 and this crate gets monty.
+rust-version = "1.95"
+# Load-bearing. `src/bin/` gained `yesno-aws-cleanup` and `yesno-prepare-search`,
+# which made a bare `cargo run -p yesno-e2e` ambiguous and broke the deep gate's
+# three measurement steps — silently, because they are the only gate steps whose
+# command is spelled that way. Do not remove it in favour of adding `--bin` at
+# the call sites: there are 25 of those across scripts, scenario headers, AGENTS.md,
+# TESTING.md and LTM, 7 had already been patched piecemeal and 18 had not, and the
+# next binary added to `src/bin/` would break them all over again.
+default-run = "yesno-e2e"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The scenario language. `monty` is the in-process interpreter; `monty-pool`
+# would add subprocess isolation, which buys nothing here because the code
+# being sandboxed is our own checked-in scenarios rather than anything untrusted.
+monty = "0.0.21"
+monty-types = "0.0.21"
+# Only to move ordinals above `i64::MAX` across the boundary; see `convert`.
+# Version-matched to monty-types so the two share one `BigInt` type.
+num-bigint = "0.4"
+tempfile = "3"
+yesno-core.workspace = true
+# The `repl_*` verbs drive yesno-server's real leader service and follower over
+# a real loopback socket; the scenario scripts the operational sequence and
+# nothing else. `yesno-server` remains a harness dependency, never a core one.
+# The `flight_*` verbs drive the shipped `YesnoFlightService` over a real
+# loopback socket, for the same reason and with the same rule: the scenario
+# scripts the sequence, never a reimplementation of the service.
+#
+yesno-flight = { workspace = true, features = ["server"] }
+# The `srv_*` verbs drive the shipped daemon: open, serve, ingest, restart,
+# shut down. A scenario is the only place that sequence can be *varied*
+# without a recompile, which is exactly TESTING.md's admission test — the
+# daemon's fixed-shape lifecycle assertions stay in its own integration tests.
+yesno-server = { path = "../yesno-server", version = "0.1.0" }
+# The `srv_basebackup` and `srv_archive_*` verbs drive the same library entry
+# points as the two thin binaries. Process, filesystem, and Protobuf inspection
+# stay in the host; scenarios only script the operational sequence.
+yesno-server-utils.workspace = true
+# The `ar_*` verbs drive the shipped Arrow surface — masks, batches and the
+# container wire format — over data read out of a real `Db`. Synchronous, so
+# unlike the network families it costs no runtime and no socket.
+yesno-arrow.workspace = true
+# The `df_*` verbs run SQL against a real database through the shipped
+# `yesno_lookup` UDTF. DataFusion is a large tree, but the gate already builds
+# it via `cargo test --workspace`, so the marginal cost here is linking rather
+# than compiling.
+yesno-datafusion = { path = "../yesno-datafusion", version = "55.0.0" }
+datafusion.workspace = true
+arrow-array.workspace = true
+arrow-flight = "59.2"
+aws-config = { version = "=1.8.3", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+] }
+aws-sdk-ec2 = { version = "=1.154.0", features = ["behavior-version-latest"] }
+futures = "0.3"
+# Decode the sidecar's local Protobuf state copied over the guest serial TTY.
+base64 = "0.22"
+prost = "0.14"
+tonic = "0.14"
+# A host call is synchronous from the VM's side, so the harness owns a runtime
+# and blocks in the verb. See `crate::repl` for why that is enough and monty's
+# async host-call path is not needed.
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+proptest.workspace = true

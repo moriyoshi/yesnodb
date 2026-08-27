@@ -1,0 +1,37 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 78859d5fce0a713a1ac5da13079e04d71245c5d86ab2edce696415cf299ab025 # shrinks to shape = And(Or(Leaf(0), AndNot(Leaf(1), Leaf(1))), Leaf(0))
+cc 4f08e7c66c43dc925528534e429a3102abd85f779f7bad3fd4277fa6da3cea90 # shrinks to shape = Or(Leaf(0), AndNot(Leaf(3), Leaf(3)))
+cc 4a004ee17ac6ff0567f29b118e5aa411700a23c1de13ce0e7229826644af711d # shrinks to shape = And(Leaf(0), And(Xor(Xor(Leaf(2), Leaf(2)), Leaf(0)), Leaf(0)))
+cc 610af8cab7cc9a82aaeeddffa09057cb831d945a7f72aca8cd79b4c9776fa882 # shrinks to shape = AndNot(Leaf(0), Xor(Leaf(2), Leaf(2)))
+cc 5c9427f327f02fb0909280fc46dc50272e4832af5865417b4e2901338e7ba8b1 # shrinks to shape = Not(Leaf(0), 0, 1)
+cc 7423ad085c8ec52be4ae5e7ad438660292ea7d62541d48b67694d5f1cb08fe45 # shrinks to shape = Not(Leaf(0), 0, 1)
+cc eebed9fce3894867a17a98d063e4937cc79e3dcea7dfa03d88b555930fec6bee # shrinks to shape = Or(Leaf(0), Range(0, 1))
+cc b39c0fea25bb5ed130e592058d6769cc05c925c39781254aae4ed47d38372717 # shrinks to shape = AndNot(Or(Leaf(0), Range(0, 1)), Leaf(1))
+cc 4b8f4ee4d7260c0b4141cc36a64b0ec338af4012eba8e325d57b9d5be35ef7c4 # shrinks to shape = AndNot(AndNot(Range(0, 1), Leaf(0)), And(Leaf(0), Leaf(0)))
+cc acdbf21de84d7e5fa19398dc939a5187366e9bfdcb64a1bf2a38bb87a2b299d7 # shrinks to shape = Or(AndNot(Range(1, 34), Leaf(0)), Leaf(0))
+cc 1103206561b794c923e7ccd53860f8f92d6361a1cc6f010137ed0647c6acbaf7 # shrinks to shape = AndNot(Or(Leaf(0), Leaf(2)), Leaf(1))
+cc 6742e9fc5f5266654d6d6f8c902bd23a3b3917ced04ca4274c201075f83989c9 # shrinks to shape = Xor(Leaf(0), Or(Leaf(2), Leaf(0)))
+cc f1e17b1faa8583dd3d00c0d3d7c3a682b5de4435e82d9beeeff724e2798696b0 # shrinks to shape = Xor(Leaf(4), Or(Leaf(0), Leaf(2)))
+cc 056adce25fd2aaa3c828064234e97183c350540bed1b311c982ff7df319016e0 # shrinks to shape = Xor(Or(Leaf(2), Leaf(4)), Leaf(0))
+cc c44968b3b0653519a1e9241ae02d492884ba39cb45e7c466b8a4af51cd0ac115 # shrinks to shape = Xor(Range(18446744073709551614, 18446744073709551615), Leaf(0))
+cc 31a253b06ab8dd87cc9db8234a13de77bfb37df31991663caca513158ffae1c7 # shrinks to shape = Xor(Range(18446744073709551614, 18446744073709551615), Leaf(0))
+cc 7eb0771f6ba5b4261aa0f85b64c60e84a2795c5b349f1d787188e0f93b3c20ae # shrinks to shape = Xor(Leaf(0), Range(18446744073709551614, 18446744073709551615))
+cc 02499b2b258439606ac0f79d4e9d10354f6532bc898c440eb66f231ebdce6d29 # shrinks to shape = Xor(Range(18446744073709551614, 18446744073709551615), And(Leaf(0), Leaf(0)))
+cc 17661d005ab355569edac1074c1cad3ba578bb637aa36a7dd13568ad8b6a18b6 # shrinks to shape = And(Range(0, 1), Xor(Range(65535, 65536), Leaf(0)))
+cc 360d8a7a6a93ffe7bc3f3bdd395b033a6466f229cbe22255f00c6ed8687a7b53 # shrinks to shape = Or(And(Not(Leaf(0), 18446744073709551614, 18446744073709551615), Leaf(4)), Leaf(0))
+cc b15c2ee6e15d6972a74316a0e2cfad60f811e697b2fc1fd640b18431569edca6 # shrinks to shape = Or(Leaf(0), And(Not(Leaf(0), 18446744073709551614, 18446744073709551615), Leaf(4)))
+cc 196fdeeb5f805e0485323eeae5386c0fc6446578230af94250687149e5ee1186 # shrinks to shape = AndNot(Or(Not(Leaf(2), 65535, 65537), Not(Leaf(0), 18446744073709551615, 18446744073709551615)), Leaf(0))
+cc ccfc07238d4f6580933a2ac34c3a76c97577a3aa5dce8730473aa2fddfd7a58a # shrinks to shape = AndNot(AndNot(Range(0, 1), Leaf(0)), Not(Leaf(0), 1, 1))
+cc 73f2cb30610e591b63ba340fb913db08b0cb04787c5c6a6838cb2335fd976f20 # shrinks to shape = Not(And(Leaf(0), Leaf(0)), 0, 1)
+cc 1697b1811a8e2c8072aaa795403791153f503b12e9cd93107603f75deb4e0927 # shrinks to shape = Xor(Not(Leaf(0), 65535, 65536), AndNot(Not(Leaf(0), 65536, 65537), And(Leaf(0), Leaf(0))))
+cc 81406e4a7339d6ad059af30432b3b33a7495541b435493fe0a334315234cd9c5 # shrinks to shape = And(AndNot(Leaf(1), Leaf(0)), Leaf(1))
+cc be598439186769a739f7614205c7c517174bf2cbb8862c2b5a8feb9bf254fba3 # shrinks to shape = AndNot(Or(Leaf(0), Leaf(0)), Leaf(1))
+cc 07dbfb8a8f73d0d13948caca34fdeb4739655c735b66e8225009563052f94724 # shrinks to shape = Or(Or(Leaf(4), Leaf(4)), Range(65536, 65537))
+cc f59b2339f83b67d8c8d3f858598caeabf3d2e6fbb8cbf2784f7af6654137b0cd # shrinks to shape = Xor(And(Leaf(0), Leaf(4)), Or(Range(65536, 65537), Leaf(4)))
+cc b81f832db25f31ff35c6a2c4b29a632881538389940b011ed66923dd46b24b8f # shrinks to shape = Not(Leaf(0), 18446744073709486079, 18446744073709486081)
+cc 3b020695c45ce63daaa254d7d225a846a3d5f2512d04f2c75905337c93c105ad # shrinks to shape = Not(And(Leaf(0), Leaf(0)), 18446744073709551614, 18446744073709551615)

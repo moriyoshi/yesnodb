@@ -1,0 +1,202 @@
+# A leader, annotated.
+#
+# Every value below is the default unless the comment says otherwise, so this
+# file doubles as documentation of what you get by writing nothing. Check what a
+# given file actually resolves to — after the environment and the command line
+# have had their say — with:
+#
+#     yesnod --config /etc/yesno/yesnod.toml --check-config
+#
+# That prints the effective configuration and exits **without opening the
+# database**, which is why it is safe to run from `ExecStartPre=` while the real
+# service is up.
+
+[server]
+role     = "leader"
+data_dir = "/var/lib/yesno"
+
+# How long shutdown waits for in-flight readers before giving up on a clean
+# drain. A `do_get` hands its work to a blocking thread, and a blocking thread
+# cannot be cancelled — this bounds the wait, it does not abort the work.
+shutdown_grace_secs = 30
+
+[server.flight]
+# Client traffic. Binding a non-loopback address with no TLS is refused unless
+# `--insecure` is passed; the refusal is deliberate and not a lint.
+listen = "127.0.0.1:50051"
+
+[server.flight.tls]
+# cert = "/etc/yesno/tls/server.pem"
+# key  = "/etc/yesno/tls/server.key"
+#
+# Set `client_ca` to accept client certificates, and `require_client_auth` to
+# insist on one. With `require_client_auth = false` a client may present a
+# certificate and be recognised by it, or present a bearer token instead.
+#
+# These three files are re-read on SIGHUP — rotation does not need a restart.
+# Replace the file contents in place and signal; the paths themselves are read
+# once, at startup, so changing *them* is still a restart. A reload that does not
+# produce a complete, valid configuration is refused and logged at `error`, and
+# the server keeps serving the previous material.
+# client_ca           = "/etc/yesno/tls/clients-ca.pem"
+require_client_auth = false
+
+[server.control]
+# Lifecycle events and commands plus WAL/image shipping, all as Protobuf gRPC
+# services on one endpoint. Both paths empty disables it.
+#
+# `FetchBaseSnapshot` serves whole database images. Put this on a private
+# interface, configure TLS and principals, and grant replication only with an
+# explicit `[[auth.rule]]`.
+listen = ""
+# listen = "10.0.0.1:50052"
+journal_dir = ""
+# journal_dir = "/var/lib/yesno-control"
+
+[server.control.tls]
+# Also re-read on SIGHUP, independently of the Flight listener above: one signal
+# reloads every configured listener, and one listener refusing its new material
+# does not stop the others taking theirs.
+# cert                = "/etc/yesno/tls/server.pem"
+# key                 = "/etc/yesno/tls/server.key"
+# client_ca           = "/etc/yesno/tls/control-clients-ca.pem"
+require_client_auth = false
+
+[server.snapshot]
+# `disabled` selects the portable staged-copy provider; `zfs`, `btrfs`, `lvm`,
+# and `ebs` replace it with provider-native snapshots. Creation is server-owned
+# so it can briefly exclude checkpoints while writes continue.
+backend = "disabled"
+# zfs_dataset = "tank/yesno"
+# btrfs_snapshot_dir = "/var/lib/yesno-snapshots"
+
+# The normal RPC streams Protobuf byte chunks. Enable this only when a sidecar
+# also opts in and sees exactly the same read-only snapshot paths.
+allow_direct_path = false
+
+# yesnod destroys an unrenewed lease after this many seconds.
+lease_ttl_secs = 300
+
+# Local LVM returns a normal file-bearing lease. The mount directory must be
+# outside the origin mount, and the VG needs the configured free COW space for
+# each concurrent lease.
+# [server.snapshot.lvm]
+# source_mount = "/var/lib/yesno"
+# volume_group = "data-vg"
+# logical_volume = "yesno"
+# mount_dir = "/var/lib/yesno-lvm-snapshots"
+# filesystem = "ext4"
+# snapshot_size_gib = 8
+# operation_timeout_secs = 300
+
+# EBS uses a nested table instead of the ZFS/Btrfs path keys. It requires AWS
+# SDK-resolvable credentials plus Linux mount privileges. Uncomment this table
+# together with `backend = "ebs"`; `source_mount` must be the direct EBS
+# filesystem root.
+# [server.snapshot.ebs]
+# materialization = "local" # use "deferred" for an ECS/EKS archiver
+# region = "ap-northeast-1"
+# volume_id = "vol-0123456789abcdef0"
+# instance_id = "i-0123456789abcdef0" # local only
+# availability_zone = "ap-northeast-1a" # local only
+# source_mount = "/var/lib/yesno"
+# mount_dir = "/var/lib/yesno-ebs-snapshots" # local only
+# filesystem = "ext4"
+# partition = 1
+# device_names = ["/dev/sdf", "/dev/sdg"]
+# operation_timeout_secs = 3600
+# resource_tags = { "backup-policy" = "daily" }
+
+[server.metrics]
+# Prometheus text on `/metrics`, plus `/healthz` and `/readyz`. Plain HTTP, so
+# keep it on loopback and let the node exporter or a sidecar reach it.
+#
+# Every gauge takes the store lock once per shard. Scrape no faster than 15s.
+listen = "127.0.0.1:9750"
+
+[server.telemetry]
+# OTLP/gRPC trace export is opt-in. With no explicit endpoint the exporter uses
+# the standard OTEL_EXPORTER_OTLP_TRACES_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT
+# environment variable, then the OpenTelemetry local-collector default.
+enabled = false
+# endpoint = "http://127.0.0.1:4317"
+service_name = "yesnod"
+
+# One of: always_on, always_off, trace_id_ratio,
+# parent_based_always_on, parent_based_always_off, or
+# parent_based_trace_id_ratio. Parent-based policies preserve an upstream
+# sampling decision and apply their inner policy only to a new root trace.
+sampler = "parent_based_always_on"
+
+# Used only by trace_id_ratio and parent_based_trace_id_ratio. It is the
+# probability of sampling a new root trace and must be between 0 and 1.
+sample_ratio = 1.0
+
+[db]
+# **Creation-only.** After the directory exists the persisted MANIFEST wins,
+# because the shard count is half the routing function and changing it under
+# live data would send keys to shards that do not hold them. `yesnod` warns when
+# this disagrees with what it found rather than adopting either silently.
+shards = 8
+
+# The reader registry's size. A snapshot claims a slot for as long as it lives;
+# running out is an error, not a queue.
+max_readers = 4096
+commit_ring = 4096
+
+# 0 means "no bound" — evacuation moves as many live chunks out of sparse slabs
+# per checkpoint as it finds worth moving.
+evacuate_per_checkpoint = 0
+
+# What to do when deferred bytes reach live bytes, i.e. at 2x space
+# amplification. `abort_oldest_reader` evicts the snapshot holding the floor
+# down; the alternative is to let the disk grow.
+on_space_amp = "abort_oldest_reader"
+rebuild_alloc_on_open = true
+
+[db.checkpoint]
+# Sizes accept a suffixed string — "256MiB" — as well as a plain byte count.
+# "1MB" is refused: an ambiguous unit is not a service.
+dirty_bytes     = "256MiB"
+max_dirty_bytes = "512MiB"
+wal_bytes       = "1GiB"
+max_wal_bytes   = "4GiB"
+
+# The reason the daemon exists. In the library the interval is only consulted
+# from the write path, so a database that stops being written is never
+# checkpointed and replays its whole log on the next start. `yesnod` runs a
+# ticker. `0` is refused rather than read as "off" — it would mean "checkpoint
+# on every tick", which is the opposite.
+interval_secs = 60
+
+[auth]
+# "none" or "read". With no principals configured at all, the server is open —
+# and `validate` then refuses to bind anything but loopback, so an unconfigured
+# server cannot be an unauthenticated public one by accident.
+anonymous = "none"
+
+# **Digests only, never the secret.** A token written into a config file gets
+# copied into tickets, backups and chat.
+#
+# [[auth.principal]]
+# name         = "ingest"
+# role         = "writer"          # reader | writer | admin | replica
+# token_sha256 = "…"
+#
+# [[auth.principal]]
+# name        = "standby-b"
+# role        = "replica"          # grants no Flight read/write/admin permission
+# cert_sha256 = "…"                # SHA-256 of the client certificate's DER
+#
+# Ordered like pg_hba.conf: first matching principal + source + capability wins,
+# and no match denies. `principal = "all"` and `address = "all"` are
+# wildcards.
+#
+# [[auth.rule]]
+# principal  = "standby-b"
+# address    = "10.0.0.0/8"
+# capability = "replication"        # control-read | control-admin | replication
+# action     = "allow"              # allow | deny
+#
+# Put narrow deny rows before broad allows when carving out a subnet or
+# principal.

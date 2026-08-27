@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = ["yesno-core", "yesno-arrow", "yesno-wire", "yesno-datafusion", "yesno-flight", "yesno-tantivy", "yesno-server", "yesno-server-utils", "yesno-operator", "yesno-e2e"]
+
+# DataFusion is a very large dependency tree and this crate is a satellite, not
+# part of the core product. Excluding it from the default set keeps the routine
+# `cargo test` / `cargo clippy` gate fast; `--workspace` still covers it.
+default-members = ["yesno-core", "yesno-arrow"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# 1.89 is where `File::{try_lock, unlock}` stabilized, which `Db::open` uses to
+# take the database's exclusive lock. The alternative was a `libc` / `rustix`
+# dependency for `flock`, in a crate whose whole thesis is four dependencies and
+# whose CI guard pins `cargo tree | wc -l`. It costs nothing here: this project
+# already targets DataFusion 55, whose own MSRV is 1.94.
+rust-version = "1.89"
+# Dual, in the Rust ecosystem's convention, and inherited by every member below
+# with `license.workspace = true`. The MIT arm is the default expectation on
+# crates.io and is GPLv2-compatible, which Apache-2.0 alone is not; the Apache
+# arm carries the express patent grant ( §3 ) that MIT lacks, which is the arm
+# an adopter's legal review will usually want for an on-disk format. Offering
+# both lets the consumer pick and costs us nothing.
+#
+# Two crates cannot inherit this and repeat it literally — `yesno-wire` and
+# `yesno-pg`, both for `crate_universe` reasons stated in their own manifests.
+# Change this and you must change those two as well.
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moriyoshi/yesnodb"
+
+[workspace.dependencies]
+arrow-buffer = { version = "59.2", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2"
+# Hardware-accelerated CRC32C ( SSE4.2 / ARMv8 CRC ) with a software fallback.
+# A hand-rolled table-driven version measured 14.7 us per 8 KiB page, which would
+# dominate the once-per-fault-in verification path.
+crc32c = "0.6"
+memmap2 = "0.9"
+tracing = "0.1"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+# OTLP/gRPC shares yesnod's Tonic/Ring transport. Keeping default features off
+# avoids Reqwest's AWS-LC provider and the CMake toolchain it would add.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "grpc-tonic",
+    "tls-ring",
+    "tls-webpki-roots",
+] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "trace",
+    "gen-tonic",
+] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+arrow-array = { version = "59.2", default-features = false }
+arrow-schema = { version = "59.2", default-features = false }
+yesno-core = { path = "yesno-core", version = "0.1.0" }
+yesno-arrow = { path = "yesno-arrow", version = "0.1.0" }
+yesno-flight = { path = "yesno-flight", version = "0.1.0", default-features = false }
+yesno-server-utils = { path = "yesno-server-utils", version = "0.1.0" }
+yesno-wire = { path = "yesno-wire", version = "0.1.0" }
+# Pinned to the DataFusion release this satellite tracks. DataFusion 55 depends
+# on arrow ^59.2, so the pair aligns with the rest of the workspace exactly.
+datafusion = { version = "55", default-features = false, features = ["sql"] }
+tantivy = { version = "0.26.1", default-features = false }
+
+# dev-only: differential oracle. We reimplement containers because roaring-rs keeps
+# `Store` pub(crate), but it remains the ideal round-trip oracle.
+roaring = "0.11"
+# dev-only: differential oracle for `bignum`, on the same terms as `roaring`
+# above. We cannot use it at runtime for a structurally identical reason: a
+# `BigUint` owns its limbs and exposes them only by copy, so it can neither be
+# handed our gathered buffer nor write into our sink. Pinned to 0.4 to match
+# `yesno-e2e`'s, which is version-matched to `monty-types` — 0.5 is also in the
+# lock and taking it would compile a second copy of a crate the workspace has.
+num-bigint = "0.4"
+proptest = "1"
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }

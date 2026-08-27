@@ -1,0 +1,29 @@
+apiVersion: yesnodb.io/v1alpha1
+kind: YesnoCluster
+metadata:
+  name: search
+spec:
+  # No image is published yet. Build yesno-server/dist/Dockerfile and replace it.
+  image: yesnod:local
+  imagePullPolicy: IfNotPresent
+  instances: 2
+  failoverDelaySecs: 30
+  shards: 4
+  storage:
+    size: 10Gi
+    # This must provision a local filesystem volume suitable for mmap.
+    storageClassName: local-storage
+  config:
+    # Create this Issuer and CA Secret before applying the cluster.
+    certManager:
+      issuerRef:
+        name: yesno-ca
+      caSecretRef:
+        name: yesno-root-ca
+        key: tls.crt
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

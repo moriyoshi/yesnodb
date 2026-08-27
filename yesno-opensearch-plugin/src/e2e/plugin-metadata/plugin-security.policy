@@ -1,0 +1,5 @@
+grant {
+  permission java.net.SocketPermission "127.0.0.1:0-65535", "connect,resolve";
+  permission java.lang.RuntimePermission "modifyThread";
+  permission java.lang.RuntimePermission "modifyThreadGroup";
+};

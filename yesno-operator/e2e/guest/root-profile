@@ -1,0 +1,7 @@
+if [ -t 0 ]; then
+    stty -echo
+    bind 'set enable-bracketed-paste off'
+    export PS1=
+    export PS2=
+    printf '\n__YESNO_E2E_READY__\n'
+fi

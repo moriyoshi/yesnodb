@@ -1,0 +1,87 @@
+# `yesno-pg` — the PostgreSQL extension.
+#
+# Outside `[workspace] members` on purpose, with its own empty `[workspace]`
+# table, following the `yesno-core/fuzz` precedent. Three reasons, all recorded:
+#
+#   * `cargo build --workspace` would try to link a `cdylib` against PostgreSQL
+#     headers and fail on any machine without them;
+#   * `cargo test --workspace`, `scripts/gate.sh` and the `lean-core` CI guard
+#     stay untouched, so `cargo tree -p yesno-core` never sees pgrx;
+#   * it carries its own `Cargo.lock`, which is what keeps the pgrx and tonic
+#     trees out of the workspace lockfile.
+#
+# `cargo build` is not the supported way to build this. Use Bazel — see
+# `.bazelrc`. The manifest is still authoritative for **versions**, because
+# `crate_universe` reads it; it is not authoritative for how the artifact is
+# produced.
+[workspace]
+
+[package]
+name = "yesno-pg"
+description = "PostgreSQL extension for yesno: foreign data wrapper, index access method, table access method"
+version = "0.1.0"
+edition = "2021"
+# pgrx 0.19 declares 1.96. Deliberately *not* the workspace's 1.89: that number
+# is a promise `yesno-core` makes to its users, and an extension crate must not
+# be able to move it. Same reasoning as `yesno-e2e`'s 1.95.
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moriyoshi/yesnodb"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+# Exactly one `pgN` feature may be active: they select mutually exclusive
+# binding sets inside pgrx, and the choice must agree with the `pg_config` that
+# `pgrx-pg-sys`'s build script generates bindings from. Bazel supplies both from
+# `--//:pg_version`, which is what keeps them in step.
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+pg18 = ["pgrx/pg18"]
+
+[dependencies]
+pgrx = { version = "0.19.2", default-features = false }
+
+# `yesno-wire` — the set-expression wire format this crate encodes — is
+# **absent from this file on purpose**, and is supplied by `BUILD.bazel` as
+# `//yesno-wire:yesno_wire` instead.
+#
+# `crate_universe` refuses to splice manifests belonging to two different cargo
+# workspaces ( "manifests are not allowed to from from different workspaces" ),
+# and `yesno-wire` is a member of the workspace this crate deliberately sits
+# outside. First-party dependencies therefore come from Bazel, exactly as they
+# do for `//yesno-flight:yesno_flight_client_pg`; this manifest stays authoritative for
+# **third-party versions**, which is the part `crate_universe` reads.
+#
+# `BUILD.bazel` also supplies `//yesno-flight:yesno_flight_client_pg`. That
+# target compiles the shared convenience client without the `server` feature,
+# so the extension shares protocol handling without linking `yesno-core` or a
+# second storage engine into PostgreSQL.
+
+# A Flight *ticket* remains opaque: received from `get_flight_info`, handed
+# back to `do_get`, never decoded. Only the descriptor is constructed here — a
+# bare 8-byte key, or a `yesno-wire` expression when a filter is pushed down.
+#
+# Versions match the workspace's ( arrow 59.2, tonic 0.14 ) so the two sides
+# speak the same Flight and gRPC.
+arrow-array = { version = "59.2", default-features = false }
+arrow-flight = "59.2"
+arrow-schema = { version = "59.2", default-features = false }
+futures = "0.3"
+prost = "0.14"
+tonic = "0.14"
+# `rt` and not `rt-multi-thread`: this runtime lives inside a PostgreSQL
+# backend, which is a single process serving one session. Spawning a thread pool
+# per backend would multiply threads by connections for no concurrency a scan
+# can use.
+tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

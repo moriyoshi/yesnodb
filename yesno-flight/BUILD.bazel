@@ -1,0 +1,63 @@
+"""`yesno-flight` as a Bazel target. See `//yesno-core:BUILD.bazel` for why these
+satellite BUILD files carry no test targets.
+
+This is the crate `yesno-pg`'s Flight transport talks to, and phases 1-5 extend
+it ( `src/expr.rs`, the ticket's trailing expression, `do_put`'s mode tag ). A
+change here therefore has to satisfy **both** gates: `scripts/gate.sh` for the
+cargo workspace and `scripts/gate-pg.sh` for this build.
+"""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@crates_pg17//:defs.bzl", pg17_crate_deps = "crate_deps")
+load("@crates_pg18//:defs.bzl", pg18_crate_deps = "crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "yesno_flight",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["server"],
+    crate_name = "yesno_flight",
+    edition = "2021",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + [
+        "//yesno-arrow:yesno_arrow",
+        "//yesno-core:yesno_core",
+        "//yesno-wire:yesno_wire",
+    ],
+)
+
+# Client-only build for the PostgreSQL extension. It deliberately resolves
+# Arrow and tonic from the selected PostgreSQL crate hub, so the extension and
+# client use one Rust type identity. Omitting `server` keeps yesno-core out of
+# the PostgreSQL cdylib.
+rust_library(
+    name = "yesno_flight_client_pg",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_flight",
+    edition = "2021",
+    version = "0.1.0",
+    deps = select({
+        "//:pg17": pg17_crate_deps([
+            "arrow-array",
+            "arrow-flight",
+            "arrow-schema",
+            "futures",
+            "prost",
+            "tokio",
+            "tonic",
+        ], package_name = "yesno-pg"),
+        "//:pg18": pg18_crate_deps([
+            "arrow-array",
+            "arrow-flight",
+            "arrow-schema",
+            "futures",
+            "prost",
+            "tokio",
+            "tonic",
+        ], package_name = "yesno-pg"),
+    }) + ["//yesno-wire:yesno_wire"],
+)

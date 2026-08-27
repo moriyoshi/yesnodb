@@ -1,0 +1,49 @@
+"""libclang, re-exported from the LLVM toolchain for bindgen.
+
+This package exists because of a label-resolution rule that is easy to lose
+an hour to: labels in a `crate.annotation()` are resolved in the **spoke**
+repository of the annotated crate, not in the main repository. A bare
+`//third_party/postgresql:pg_config` there resolves against
+`@crates_pg17__pgrx-pg-sys-0.19.2//`, which has no such package. Main-repo labels
+must be written `@@//…`, and external ones are worse — the only spelling that
+works is the canonical repo name ( `toolchains_llvm++llvm+llvm_toolchain_llvm` ),
+which is an implementation detail of module resolution and will break.
+
+Re-exporting here turns that external reference into a main-repo one, so the
+annotation can say `@@//third_party/llvm:libclang` and stay readable.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+# The single file `LIBCLANG_PATH` points at. `clang-sys` accepts either a
+# directory or a path to the library itself; given the path it loads it without
+# searching, which is what we want on a host with no system clang to fall back
+# on.
+filegroup(
+    name = "libclang",
+    srcs = ["@llvm_toolchain_llvm//:lib/libclang.so"],
+)
+
+# Everything libclang needs staged beside it to actually parse a header.
+#
+# Two separate things, and each was a distinct failure:
+#
+#   * the **soname chain** — `libclang.so` is a symlink to `.so.17` to
+#     `.so.17.0.6`, and an action stages only what it declares;
+#   * the **resource directory** — clang finds its own builtin headers
+#     ( `stddef.h`, `stdarg.h` ) at a path relative to the loaded library, so
+#     staging the library without `lib/clang/17/include` produces
+#     `/usr/include/stdio.h: fatal error: 'stddef.h' file not found`, which
+#     reads like a missing *system* header and is not one.
+#
+# `@llvm_toolchain_llvm//:include` already globs `include/**` and
+# `lib/clang/*/include/**`, so it is the resource dir plus the C++ headers.
+filegroup(
+    name = "libclang_runtime",
+    srcs = [
+        "@llvm_toolchain_llvm//:include",
+        "@llvm_toolchain_llvm//:lib/libclang.so",
+        "@llvm_toolchain_llvm//:lib/libclang.so.17",
+        "@llvm_toolchain_llvm//:lib/libclang.so.17.0.6",
+    ],
+)

@@ -1,0 +1,36 @@
+# Bazel configuration for the ABI-bound database integrations.
+#
+# Bazel's scope here is deliberately narrow: `yesno-pg`, `yesno-mysql`,
+# `yesno-c`, `yesno-flight-c++`, and their required dependencies.
+# Everything else — `yesno-datafusion`,
+# `yesno-server`, `yesno-e2e`, the benches, the fuzz targets — is built and
+# gated by cargo exactly as before, and `scripts/gate.sh` is unchanged.
+#
+# The reason for the exception is narrow too. Both database modules are loaded
+# into a specific server process and must match that server's C ABI. Bazel pins
+# the PostgreSQL, MySQL, and native Arrow source archives, their configure
+# inputs, and the local extension compiled into each build.
+
+# Do not let build artifacts into the version-controlled tree. CLAUDE.md
+# forbids it, and Bazel's default `bazel-out` / `bazel-bin` convenience
+# symlinks land in the repository root. `.agents-workspace/` is already
+# gitignored, which is where scratch belongs.
+build --symlink_prefix=.agents-workspace/tmp/bazel-
+
+# rules_foreign_cc shells out to configure/make for PostgreSQL, MySQL, Arrow,
+# and native dependencies and wants a real toolchain rather than Bazel's
+# default sandboxed stub.
+build --incompatible_enable_cc_toolchain_resolution
+
+# A test that cannot say why it failed costs more than the time it saves.
+test --test_output=errors
+test --test_summary=terse
+
+# PostgreSQL and MySQL take several minutes to configure and build from source, and
+# the
+# regression harness runs initdb inside the test. The defaults are tuned for
+# unit tests and time both out.
+build --verbose_failures
+test --test_timeout=120,600,1800,3600
+
+try-import %workspace%/.bazelrc.user

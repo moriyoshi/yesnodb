@@ -1,0 +1,14 @@
+diff --git a/cmake/install_macros.cmake b/cmake/install_macros.cmake
+--- a/cmake/install_macros.cmake
++++ b/cmake/install_macros.cmake
+@@ -727,5 +727,10 @@ FUNCTION(COPY_CUSTOM_SHARED_LIBRARY library_full_filename subdir
+     COMMAND readlink "${library_full_filename}" OUTPUT_VARIABLE library_version
+     OUTPUT_STRIP_TRAILING_WHITESPACE)
++  # A Bazel runfiles symlink has an absolute target. The copy/install logic
++  # below needs the filename inside library_directory, just as it receives from
++  # a conventional relative libcrypto.so -> libcrypto.so.N symlink.
++  GET_FILENAME_COMPONENT(library_version "${library_version}" NAME)
++
+   GET_FILENAME_COMPONENT(library_directory "${library_full_filename}" DIRECTORY)
+   GET_FILENAME_COMPONENT(library_name "${library_full_filename}" NAME)
+   GET_FILENAME_COMPONENT(library_name_we "${library_full_filename}" NAME_WE)

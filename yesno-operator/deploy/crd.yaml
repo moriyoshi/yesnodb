@@ -1,0 +1,373 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: yesnoclusters.yesnodb.io
+spec:
+  group: yesnodb.io
+  names:
+    kind: YesnoCluster
+    plural: yesnoclusters
+    shortNames:
+    - ync
+    singular: yesnocluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.readyInstances
+      name: Ready
+      type: integer
+    - jsonPath: .status.primaryInstance
+      name: Primary
+      type: integer
+    - jsonPath: .status.endpoint
+      name: Endpoint
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for YesnoClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: A yesnodb installation managed by the operator.
+            properties:
+              config:
+                default:
+                  allowInsecure: false
+                description: How yesnod obtains its configuration.
+                properties:
+                  allowInsecure:
+                    default: false
+                    description: |-
+                      Generate plaintext, unauthenticated configuration for a trusted test
+                      namespace. This must be explicitly true when `secretName` is absent.
+                    type: boolean
+                  certManager:
+                    description: |-
+                      Generate per-instance mTLS configuration and have cert-manager issue
+                      the server and client certificates.
+                    nullable: true
+                    properties:
+                      caSecretRef:
+                        description: |-
+                          Independently managed CA bundle trusted by yesnod and the operator.
+                          This must identify the issuer chain, not a leaf Certificate Secret.
+                        properties:
+                          key:
+                            default: ca.crt
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      issuerRef:
+                        description: Issuer or ClusterIssuer used for all leaf certificates.
+                        properties:
+                          group:
+                            default: cert-manager.io
+                            type: string
+                          kind:
+                            default: Issuer
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    required:
+                    - caSecretRef
+                    - issuerRef
+                    type: object
+                  secretName:
+                    description: Secret containing a `yesnod.toml` key and any files it references.
+                    nullable: true
+                    type: string
+                type: object
+              failoverDelaySecs:
+                default: 30
+                description: |-
+                  How long a primary may remain unavailable before automatic failover.
+                  Zero is useful for deterministic tests; production clusters should
+                  leave time for an ordinary Pod restart.
+                format: int64
+                maximum: 600.0
+                minimum: 0.0
+                type: integer
+              image:
+                description: Container image containing `yesnod`.
+                type: string
+              imagePullPolicy:
+                description: Kubernetes image pull policy. Defaults to `IfNotPresent`.
+                nullable: true
+                type: string
+              instances:
+                default: 1
+                description: |-
+                  Number of independently persisted instances. Instance zero is the
+                  initial leader and every additional instance starts as a follower.
+                format: int32
+                maximum: 9.0
+                minimum: 1.0
+                type: integer
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: Node selector copied to the managed Pod template.
+                type: object
+              podLabels:
+                additionalProperties:
+                  type: string
+                description: Labels copied to the managed Pod template.
+                type: object
+              resources:
+                description: Container CPU and memory requests and limits.
+                nullable: true
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                      This field depends on the DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                          type: string
+                        request:
+                          description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  limits:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                  requests:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                type: object
+              serviceAccountName:
+                description: |-
+                  ServiceAccount for the managed Pods, for a cloud provider that grants
+                  credentials through one. The Pods never mount a Kubernetes API token,
+                  so this is useful only where the identity arrives some other way --
+                  on EKS, a webhook projects the IRSA or Pod Identity token into a
+                  volume of its own, which `automountServiceAccountToken` does not gate.
+                nullable: true
+                type: string
+              shards:
+                default: 1
+                description: Creation-time yesnodb shard count for generated configuration.
+                format: int32
+                maximum: 65535.0
+                minimum: 1.0
+                type: integer
+              shutdownGraceSecs:
+                default: 30
+                description: Seconds allowed for graceful reader drain and final checkpoint.
+                format: int64
+                maximum: 3600.0
+                minimum: 1.0
+                type: integer
+              snapshot:
+                default:
+                  backend: disabled
+                  leaseTtlSecs: 300
+                description: |-
+                  Server-owned base-snapshot provider written into generated
+                  configuration. Defaults to the portable copy behind the same lease.
+                properties:
+                  backend:
+                    default: disabled
+                    description: Which provider services a snapshot lease.
+                    enum:
+                    - disabled
+                    - ebs
+                    type: string
+                  ebs:
+                    description: Amazon EBS settings, required for and exclusive to the `ebs` backend.
+                    nullable: true
+                    properties:
+                      filesystem:
+                        default: ext4
+                        description: 'Filesystem on the data volume: `ext4` or `xfs`.'
+                        type: string
+                      operationTimeoutSecs:
+                        default: 3600
+                        description: Maximum wait for each AWS state transition.
+                        format: int64
+                        maximum: 86400.0
+                        minimum: 1.0
+                        type: integer
+                      region:
+                        description: Region holding the instance volumes and the snapshots taken from them.
+                        type: string
+                      resourceTags:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Tags copied to every snapshot the server creates. The provider-owned
+                          `yesno:database` and `yesno:lease` keys are reserved.
+                        type: object
+                    required:
+                    - region
+                    type: object
+                  leaseTtlSecs:
+                    default: 300
+                    description: Seconds a lease survives without renewal before the server destroys it.
+                    format: int64
+                    maximum: 86400.0
+                    minimum: 1.0
+                    type: integer
+                type: object
+              storage:
+                description: Persistent storage mounted at `/var/lib/yesno`.
+                properties:
+                  existingClaim:
+                    description: Mount this existing PVC instead of creating one.
+                    nullable: true
+                    type: string
+                  size:
+                    description: Requested capacity for an operator-created PVC, such as `10Gi`.
+                    nullable: true
+                    type: string
+                  storageClassName:
+                    description: StorageClass for an operator-created PVC.
+                    nullable: true
+                    type: string
+                type: object
+            required:
+            - image
+            - storage
+            type: object
+          status:
+            description: Observed state of a managed cluster.
+            nullable: true
+            properties:
+              clientSecret:
+                description: Administrative mTLS client identity issued for this cluster.
+                nullable: true
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message is a human readable message indicating details about the transition. This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                      format: int64
+                      type: integer
+                    reason:
+                      description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              dataClaim:
+                type: string
+              endpoint:
+                type: string
+              failover:
+                description: Durable progress for an automatic promotion.
+                nullable: true
+                properties:
+                  fromInstance:
+                    format: int32
+                    type: integer
+                  stage:
+                    description: Ordered stages keep failover safe and restartable across operator crashes.
+                    enum:
+                    - Fencing
+                    - Promoting
+                    - AwaitingPromotion
+                    type: string
+                  startedAtMillis:
+                    format: int64
+                    type: integer
+                  toInstance:
+                    format: int32
+                    type: integer
+                required:
+                - fromInstance
+                - stage
+                - startedAtMillis
+                - toInstance
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                description: High-level progress visible through `kubectl get yesnoclusters`.
+                enum:
+                - Pending
+                - Progressing
+                - Degraded
+                - FailingOver
+                - Ready
+                - Invalid
+                type: string
+              primaryInstance:
+                default: 0
+                format: int32
+                type: integer
+              primaryTerm:
+                default: 0
+                format: int64
+                type: integer
+              primaryUnavailableSinceMillis:
+                format: int64
+                nullable: true
+                type: integer
+              promotionCount:
+                default: 0
+                format: int64
+                type: integer
+              readyInstances:
+                format: int32
+                type: integer
+            required:
+            - conditions
+            - dataClaim
+            - endpoint
+            - observedGeneration
+            - phase
+            - readyInstances
+            type: object
+        required:
+        - spec
+        title: YesnoCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

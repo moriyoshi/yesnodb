@@ -1,0 +1,58 @@
+"""The PostgreSQL extension.
+
+Phase 0 builds the library and proves it loads into a hermetic cluster. The
+foreign data wrapper, the index access method and the table access method land
+on top of a toolchain already known to work.
+
+The `pgN` crate feature, crate-universe hub, and PostgreSQL server must
+name the same release. All three select on `--//:pg_version`, without a default
+arm, so adding a major requires wiring every ABI input before analysis passes.
+"""
+
+load("@crates_pg17//:defs.bzl", pg17_all_crate_deps = "all_crate_deps")
+load("@crates_pg18//:defs.bzl", pg18_all_crate_deps = "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+    "pg18/Cargo.toml",
+    "yesno_pg.control",
+])
+
+filegroup(
+    name = "extension_sql",
+    srcs = ["sql/yesno_pg--0.1.0.sql"],
+)
+
+_PG_FEATURE = select({
+    "//:pg17": ["pg17"],
+    "//:pg18": ["pg18"],
+})
+
+_PG_DEPS = select({
+    "//:pg17": pg17_all_crate_deps(normal = True),
+    "//:pg18": pg18_all_crate_deps(normal = True),
+})
+
+rust_shared_library(
+    name = "yesno_pg",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = _PG_FEATURE,
+    crate_name = "yesno_pg",
+    edition = "2021",
+    version = "0.1.0",
+    deps = _PG_DEPS + ["//yesno-flight:yesno_flight_client_pg", "//yesno-wire:yesno_wire"],
+)
+
+rust_test(
+    name = "unit",
+    crate = ":yesno_pg",
+    crate_features = _PG_FEATURE,
+    # These are the crate plain `#[test]`s: pure functions only. Anything
+    # that needs a backend belongs in `//e2e/postgresql:regress`, because
+    # `#[pg_test]` needs the machine-local state this build exists to eliminate.
+    deps = _PG_DEPS + ["//yesno-flight:yesno_flight_client_pg", "//yesno-wire:yesno_wire"],
+)

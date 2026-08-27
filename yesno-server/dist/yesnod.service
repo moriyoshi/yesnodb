@@ -1,0 +1,89 @@
+# systemd unit for yesnod.
+#
+#   install -m0644 yesnod.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now yesnod
+
+[Unit]
+Description=yesno database server
+Documentation=https://github.com/moriyoshi/yesnodb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=simple, not notify. `notify` would need an sd-notify dependency purely to
+# signal readiness, and /readyz on the metrics listener already answers that
+# question — to load balancers as well as to systemd.
+Type=simple
+
+# Resolves defaults, file, environment and flags, validates the result, prints
+# it and exits — **without opening the database**. That last part is what makes
+# it safe to run while the service is up.
+ExecStartPre=/usr/local/bin/yesnod --config /etc/yesno/yesnod.toml --check-config
+ExecStart=/usr/local/bin/yesnod --config /etc/yesno/yesnod.toml
+
+# SIGTERM is the graceful path: stop accepting, drain readers, take a final
+# checkpoint, release the lock.
+KillSignal=SIGTERM
+
+# 180 and not the default 90, and it is not a round number. Shutdown's final
+# checkpoint may write up to `db.checkpoint.max_dirty_bytes` — 512 MiB by
+# default — and fsync once per shard. Killing it is not *corrupting*, because the
+# WAL is the truth and recovery is redo-only, but it discards that work and
+# lengthens the next start's replay.
+TimeoutStopSec=180
+
+Restart=on-failure
+RestartSec=5s
+
+User=yesno
+Group=yesno
+# Creates and chowns /var/lib/yesno, and is what `data_dir` should point at.
+StateDirectory=yesno
+StateDirectoryMode=0700
+# Owns the parent of the optional shared Unix control socket. Add archive
+# sidecars to the yesno group, or tighten access with deployment-specific ACLs.
+RuntimeDirectory=yesno
+RuntimeDirectoryMode=0750
+
+# One process per database directory — `Db` takes an exclusive flock. An
+# overlapping restart fails with "already open", so do not run two units on one
+# directory.
+
+# SIGHUP re-reads the TLS certificates, keys and client CAs named in the
+# configuration and installs them for connections accepted afterwards.
+# Established connections are not disturbed and the database is not touched.
+#
+# **This is the only thing SIGHUP reloads.** Everything else in the
+# configuration file — listen addresses, principals, shard count, checkpoint
+# policy — still needs a restart, and `systemctl reload` will not tell you so.
+#
+# A reload that cannot build a complete, valid configuration from the files on
+# disk is refused: the server logs the reason at `error` and keeps serving the
+# material it already had. So `systemctl reload` succeeding means "the signal was
+# delivered", not "the certificate changed" — check the log, or watch the
+# certificate a client is offered.
+ExecReload=/bin/kill -HUP $MAINPID
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# ReadWritePaths is what makes ProtectSystem=strict workable; add the TLS
+# directory as read-only rather than widening this.
+ReadWritePaths=/var/lib/yesno
+
+# One file descriptor per shard, per WAL, per connection, plus the mmap'd
+# segments. The default 1024 is not enough at any real shard count.
+LimitNOFILE=65536
+
+# Do not set MemoryMax naively. The store is a file-backed mmap, so its pages
+# are page cache rather than anonymous RSS and they count against a cgroup limit
+# very differently from a heap of the same size. A limit sized from RSS
+# intuition will cause reclaim thrash long before it causes an OOM kill.
+
+[Install]
+WantedBy=multi-user.target

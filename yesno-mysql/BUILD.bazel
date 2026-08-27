@@ -1,0 +1,12 @@
+"""The MySQL storage engine; E2E fixtures live under //e2e/mysql."""
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "CMakeLists.txt",
+    "backend.h",
+    "backend_embedded.cc",
+    "backend_flight.cc",
+    "ha_yesno.cc",
+    "ha_yesno.h",
+])

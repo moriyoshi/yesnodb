@@ -1,0 +1,18 @@
+"""`yesno-arrow` as a Bazel target. See `//yesno-core:BUILD.bazel` for why these
+satellite BUILD files carry no test targets."""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "yesno_arrow",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_arrow",
+    edition = "2021",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//yesno-core:yesno_core"],
+)

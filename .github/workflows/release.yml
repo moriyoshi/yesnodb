@@ -1,0 +1,352 @@
+# Release pipeline ( continuous delivery ): gate, build, publish the unified
+# image to GHCR.
+#
+# ---------------------------------------------------------------------------
+# What "delivered" means here, and what it does not
+# ---------------------------------------------------------------------------
+#
+# This publishes an **image**. It does not roll anything out: no cluster is
+# reachable from CI, and `yesnod` takes an exclusive lock on its data directory,
+# so a deployment is a `Recreate` that takes the database down for the swap —
+# which is a decision an operator makes, not something a merge should trigger.
+# Do not add a `kubectl apply` step here without that conversation.
+#
+# ---------------------------------------------------------------------------
+# The gate runs first, and publishing depends on it
+# ---------------------------------------------------------------------------
+#
+# `gate` calls `ci.yml` as a reusable workflow and every other job needs it. A
+# tag that fails clippy or the oracle suite therefore publishes nothing, which
+# is the entire point of putting these in one pipeline instead of two: two
+# workflows racing on the same commit will publish an image and *then* go red.
+#
+# This is also why `ci.yml` no longer triggers on `push` to `main` — the gate
+# runs once, here, rather than once in each workflow.
+#
+# ---------------------------------------------------------------------------
+# Tagging
+# ---------------------------------------------------------------------------
+#
+#   push to main   ->  edge, sha-<short>
+#   tag v1.2.3     ->  1.2.3, 1.2, 1, latest
+#   workflow_dispatch with a tag input -> that tag alone
+#
+# `latest` moves only on a release tag, never on a `main` push. `edge` is the
+# tip of `main` and is the one that moves continuously. A deployment that pins
+# `latest` should get releases; one that wants the tip asks for `edge` and knows
+# what it is asking for.
+#
+# `sha-<short>` is the only tag that is never reused, so it is the one to pin
+# in a manifest when a rollback has to name an exact image.
+#
+# Only first-party actions are used, for the reason `ci.yml` gives: no
+# third-party code in the supply chain of the thing that builds the artifact.
+# `docker/setup-buildx-action`, `docker/login-action` and `docker/metadata-action`
+# are each a few lines of shell below. There is no QEMU step at any point — see
+# `dist/build.Dockerfile` for why nothing here executes a foreign instruction.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    # Build-only proof that the image still assembles. Never publishes; the
+    # `publish` outputs below are what enforce that, not this list.
+    paths:
+      - "dist/**"
+      - "scripts/build-release-image.sh"
+      - "scripts/check-image-binaries.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Publish under this exact tag (e.g. 0.1.0). Empty builds without publishing."
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A superseded `main` build is worth cancelling; a release publish is not.
+  # Cancelling mid-push can leave a tag resolving to a manifest whose blobs were
+  # never all uploaded.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  gate:
+    # The whole `ci.yml` gate: clippy, the workspace test suite, the layout,
+    # R1, docs and image-definition checks. Everything below needs it, so a
+    # commit that fails it publishes nothing.
+    #
+    # Skipped on a pull request, where `ci.yml` already runs on its own
+    # `pull_request` trigger — calling it here as well would run the identical
+    # gate twice on the same commit and report both. What a pull request wants
+    # from this workflow is the *image build*, which the gate cannot give it.
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/ci.yml
+
+  plan:
+    name: plan
+    needs: gate
+    # `needs` treats a **skipped** dependency the same as a failed one and
+    # skips the dependent too, so the gate being deliberately absent on a pull
+    # request would silently disable the whole build. This says what is actually
+    # meant: proceed unless the gate ran and failed. `!cancelled()` rather than
+    # `always()`, so cancelling the run still cancels these.
+    if: ${{ !cancelled() && needs.gate.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      tags: ${{ steps.plan.outputs.tags }}
+      primary: ${{ steps.plan.outputs.primary }}
+    steps:
+      - name: Decide the tags and whether to publish
+        id: plan
+        run: |
+          set -euo pipefail
+          name="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          tags=""
+          publish=0
+
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              version="${GITHUB_REF#refs/tags/v}"
+              publish=1
+              # Expand 1.2.3 into 1.2.3, 1.2, 1, latest so a consumer can pin at
+              # the precision it wants.
+              #
+              # Strictly three numeric components, and nothing else expands.
+              # A prerelease must not move `1.2`, `1` or `latest`; and `v1.2`
+              # or `v2` would produce `1` twice and move `latest` off a version
+              # that is not one. Both were real outputs of the looser
+              # `${version%.*}` form this replaces — duplicates are only untidy,
+              # but `latest` following a malformed tag is a wrong answer.
+              case "$version" in
+                # Four components first, or the pattern below matches it and
+                # `${version%.*}` yields a bogus `1.2.3` alias for `v1.2.3.4`
+                # while `latest` follows a tag that is not a release.
+                *.*.*.*)
+                  tags="${name}:${version}"
+                  ;;
+                [0-9]*.[0-9]*.[0-9]*)
+                  case "$version" in
+                    *[!0-9.]*) tags="${name}:${version}" ;;
+                    *)
+                      tags="${name}:${version}"
+                      tags="$tags ${name}:${version%.*}"
+                      tags="$tags ${name}:${version%%.*}"
+                      tags="$tags ${name}:latest"
+                      ;;
+                  esac
+                  ;;
+                *)
+                  tags="${name}:${version}"
+                  ;;
+              esac
+              tags="$tags ${name}:sha-${short}"
+              ;;
+            refs/heads/main)
+              publish=1
+              tags="${name}:edge ${name}:sha-${short}"
+              ;;
+            *)
+              requested="${{ inputs.tag }}"
+              if [ -n "$requested" ]; then
+                publish=1
+                tags="${name}:${requested} ${name}:sha-${short}"
+              else
+                tags="${name}:pr-${{ github.event.number || 'manual' }}"
+              fi
+              ;;
+          esac
+
+          {
+            echo "publish=${publish}"
+            echo "tags=${tags}"
+            echo "primary=${tags%% *}"
+          } >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}"
+          printf '  %s\n' $tags
+
+  binaries:
+    name: compile (${{ matrix.arch }})
+    needs: gate
+    # See `plan` above: a skipped gate must not skip the build.
+    if: ${{ !cancelled() && needs.gate.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create a buildx builder
+        run: docker buildx create --name yesno-multiarch --driver docker-container --use
+
+      - name: Cross-compile the release binaries
+        env:
+          YESNO_BUILDER: yesno-multiarch
+          # Layer cache, not a compilation cache. BuildKit `type=cache` mounts
+          # — which hold the cargo registry and `target/` — are never exported by
+          # `--cache-to`, so a source change still pays a full compile. What this
+          # buys is the unchanged-context case, and `.dockerignore` excludes
+          # `docs/` and `**/*.md`, so a documentation commit reuses the whole
+          # build rather than recompiling the workspace to produce the same
+          # binaries. Scoped per architecture so the two legs do not evict each
+          # other.
+          YESNO_BUILDX_CACHE: gha
+          YESNO_BUILDX_CACHE_SCOPE: yesno-${{ matrix.arch }}
+        run: ./scripts/build-release-image.sh --binaries-only --platform linux/${{ matrix.arch }}
+
+      - name: Confirm the binaries are for the architecture they claim
+        # The assertion that catches the one failure a cross build makes
+        # silently: producing host binaries under a target-named directory. It
+        # would sail through assembly and fail at `exec` on the first node of
+        # that architecture.
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            amd64) expect="x86-64" ;;
+            arm64) expect="aarch64" ;;
+          esac
+          for binary in target/image-bin/${{ matrix.arch }}/*; do
+            description="$(file -b "$binary")"
+            echo "$binary: $description"
+            case "$description" in
+              *"$expect"*) ;;
+              *) echo "expected $expect, got: $description" >&2; exit 1 ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: target/image-bin/${{ matrix.arch }}
+          retention-days: 1
+          if-no-files-found: error
+
+  image:
+    name: assemble and publish
+    needs: [plan, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: target/image-bin
+
+      - name: Arrange the binaries by architecture
+        # `download-artifact` with a pattern creates one directory per
+        # artifact, named after it, so this yields `binaries-amd64/`. The
+        # assembly context wants a bare architecture name.
+        #
+        # The executable bit does not survive an artifact round trip. Nothing
+        # restores it here on purpose — the assembly COPY sets the mode with
+        # `--chmod=0755` rather than inheriting it, so the image is correct
+        # regardless, and a `chmod` here would hide it if that ever changed.
+        run: |
+          set -euo pipefail
+          cd target/image-bin
+          for dir in binaries-*; do
+            mv "$dir" "${dir#binaries-}"
+          done
+          ls -lR .
+
+      - name: Create a buildx builder
+        # The `docker-container` driver is what can emit a manifest list; the
+        # default `docker` driver cannot.
+        run: |
+          docker buildx create --name yesno-multiarch --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Log in to GHCR
+        if: needs.plan.outputs.publish == '1'
+        # `GITHUB_TOKEN` with `packages: write` is enough; no long-lived secret
+        # needs to exist for this to work.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Assemble (and publish, off a branch or tag)
+        env:
+          YESNO_BUILDER: yesno-multiarch
+        run: |
+          set -euo pipefail
+          args=(--assemble-only)
+          for tag in ${{ needs.plan.outputs.tags }}; do
+            args+=(--tag "$tag")
+          done
+          if [ "${{ needs.plan.outputs.publish }}" = "1" ]; then
+            args+=(--push)
+          fi
+          # A pull request proves the image still assembles for both
+          # architectures. It cannot `--load` a manifest list and must not push,
+          # so the result is built and discarded on purpose.
+          ./scripts/build-release-image.sh "${args[@]}"
+
+      - name: Every published tag is a two-architecture manifest list
+        if: needs.plan.outputs.publish == '1'
+        # The assertion that makes the word "multi-arch" mean something. A
+        # single-platform push succeeds silently and only fails later, on the
+        # first node of the other architecture that tries to pull it. Checked on
+        # every tag, not just the primary one, because an alias that resolved to
+        # the wrong manifest would be just as broken and just as quiet.
+        run: |
+          set -euo pipefail
+          for tag in ${{ needs.plan.outputs.tags }}; do
+            echo "== $tag"
+            docker buildx imagetools inspect "$tag" --raw > manifest.json
+            python3 -c '
+          import json, sys
+          index = json.load(open("manifest.json"))
+          found = {
+              (m.get("platform", {}).get("os"), m.get("platform", {}).get("architecture"))
+              for m in index.get("manifests", [])
+          }
+          missing = [p for p in (("linux", "amd64"), ("linux", "arm64")) if p not in found]
+          if missing:
+              sys.exit(f"manifest list is missing {missing}; it has {sorted(found)}")
+          print("  both architectures present")
+          '
+          done
+
+      - name: Smoke-test the published image
+        if: needs.plan.outputs.publish == '1'
+        # Runs the runner's own architecture only — there is no emulator here, by
+        # design. It proves the dispatcher resolves a binary name, that the
+        # default path reaches `yesnod`, that the image runs as non-root, and
+        # that the unpacked LVM userspace actually links.
+        run: |
+          set -euo pipefail
+          image="${{ needs.plan.outputs.primary }}"
+          docker run --rm "$image" yesnoctl --help > /dev/null
+          docker run --rm "$image" yesno-snapshot-agent --help > /dev/null
+          docker run --rm "$image" --help > /dev/null
+          test "$(docker run --rm --entrypoint id "$image" -u)" = "10001"
+          docker run --rm --entrypoint lvm "$image" version | head -1
+          echo "dispatcher, default path, non-root user and LVM userspace all confirmed"
+
+      - name: Summary
+        if: needs.plan.outputs.publish == '1'
+        run: |
+          {
+            echo "### Published"
+            echo
+            for tag in ${{ needs.plan.outputs.tags }}; do echo "- \`$tag\`"; done
+            echo
+            echo "linux/amd64 + linux/arm64, from \`${GITHUB_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

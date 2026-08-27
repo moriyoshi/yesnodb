@@ -1,0 +1,118 @@
+-- The FDW's read path against a real yesno Flight server.
+--
+-- The harness starts the same `YesnoFlightService` yesnod uses over an
+-- in-memory Db. Its seed data lives in yesno-e2e PostgreSQL harness; the
+-- arithmetic below is checkable by hand, which is the point of keeping the
+-- sets small.
+CREATE EXTENSION yesno_pg;
+CREATE SERVER yesno FOREIGN DATA WRAPPER yesno_fdw
+    OPTIONS ( endpoint :'endpoint' );
+-- Key 42 holds multiples of 7 below 70; key 43 multiples of 3 below 30.
+CREATE FOREIGN TABLE sevens ( ordinal bigint ) SERVER yesno OPTIONS ( key '42' );
+CREATE FOREIGN TABLE threes ( ordinal bigint ) SERVER yesno OPTIONS ( key '43' );
+-- Key 99 was never written to. An empty result here must be reachable and
+-- distinguishable from an error — "no matches" is a fact about the data,
+-- "no answer" is not.
+CREATE FOREIGN TABLE empty_key ( ordinal bigint ) SERVER yesno OPTIONS ( key '99' );
+-- Key 7 spans the sign boundary; see the section at the end.
+CREATE FOREIGN TABLE straddle ( ordinal bigint ) SERVER yesno OPTIONS ( key '7' );
+-- ── Rows actually arrive ────────────────────────────────────────────────────
+SELECT ordinal FROM sevens ORDER BY ordinal;
+ ordinal 
+---------
+       0
+       7
+      14
+      21
+      28
+      35
+      42
+      49
+      56
+      63
+(10 rows)
+
+SELECT count(*) FROM sevens;
+ count 
+-------
+    10
+(1 row)
+
+SELECT ordinal FROM empty_key;
+ ordinal 
+---------
+(0 rows)
+
+SELECT count(*) FROM empty_key;
+ count 
+-------
+     0
+(1 row)
+
+-- ── The row estimate is exact, not a guess ──────────────────────────────────
+-- This is the property that distinguishes a yesno foreign table from most:
+-- `get_flight_info` returns `total_records` computed from container popcounts
+-- in the index, without moving an ordinal. So the planner's estimate is the
+-- truth. `rows=10` below is that exact count, not a default.
+EXPLAIN SELECT ordinal FROM sevens;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Foreign Scan on sevens  (cost=0.00..10.00 rows=10 width=8)
+   yesno: key 42
+(2 rows)
+
+-- ── A join between two keys ─────────────────────────────────────────────────
+-- Multiples of both 7 and 3 below 30: 0 and 21.
+SELECT s.ordinal FROM sevens s JOIN threes t USING ( ordinal ) ORDER BY s.ordinal;
+ ordinal 
+---------
+       0
+      21
+(2 rows)
+
+-- This plan is the record of phase 4 landing. It read `Hash Join` over two
+-- Foreign Scans until join pushdown existed, and is now a single Foreign Scan
+-- evaluating one intersection server-side. The two result rows above are
+-- unchanged — which is the point: only the plan could tell the difference, and
+-- a fixture asserting rows alone would have shown nothing either way.
+EXPLAIN ( COSTS OFF ) SELECT s.ordinal FROM sevens s JOIN threes t USING ( ordinal );
+          QUERY PLAN          
+------------------------------
+ Foreign Scan
+   yesno: (key 42 AND key 43)
+(2 rows)
+
+-- ── The sign boundary ───────────────────────────────────────────────────────
+-- Key 7 holds ordinals 0, 2^63, 2^63 + 1 and ORDINAL_MAX ( 2^64 - 2 ). The
+-- bigint mapping is a bit reinterpretation, so everything at or above 2^63
+-- surfaces negative.
+SELECT ordinal FROM straddle ORDER BY ordinal;
+       ordinal        
+----------------------
+ -9223372036854775808
+ -9223372036854775807
+                   -2
+                    0
+(4 rows)
+
+-- The ordering hazard, made concrete. In u64 order these ordinals ascend
+-- 0 < 2^63 < 2^63+1 < 2^64-2; in int8 order they are -9223372036854775808 <
+-- -9223372036854775807 < -2 < 0. The scan declares no pathkeys precisely so
+-- PostgreSQL sorts rather than trusting yesno's order — the ORDER BY above is
+-- what makes the difference observable.
+SELECT ordinal, ordinal::numeric + 18446744073709551616::numeric AS as_unsigned
+FROM straddle WHERE ordinal < 0 ORDER BY ordinal;
+       ordinal        |     as_unsigned      
+----------------------+----------------------
+ -9223372036854775808 |  9223372036854775808
+ -9223372036854775807 |  9223372036854775809
+                   -2 | 18446744073709551614
+(3 rows)
+
+DROP EXTENSION yesno_pg CASCADE;
+psql:e2e/postgresql/sql/fdw_rows.sql:63: NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to server yesno
+drop cascades to foreign table sevens
+drop cascades to foreign table threes
+drop cascades to foreign table empty_key
+drop cascades to foreign table straddle

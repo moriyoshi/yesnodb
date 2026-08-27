@@ -1,0 +1,57 @@
+[package]
+name = "yesno-core"
+description = "Roaring-style sparse ordinal sets with zero-copy, buffer-backed containers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Keep the default core at its five-dependency budget. Applications that install
+# a tracing subscriber can opt into storage lifecycle and slow-operation spans.
+tracing = ["dep:tracing"]
+
+[dependencies]
+arrow-buffer.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+crc32c.workspace = true
+memmap2.workspace = true
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+roaring.workspace = true
+num-bigint.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "setops"
+harness = false
+
+# Separate from `setops` because the subject is different — packed bit-matrix
+# algebra rather than set algebra — and because it has no external reference to
+# measure against, which its header explains.
+[[bench]]
+name = "bitmatrix"
+harness = false
+
+# Separate again: arbitrary-precision integer arithmetic. It has no external
+# reference *yet* — `num-bigint` would be the equivalent of `roaring` here — so
+# it follows `bitmatrix`'s convention rather than `setops`'s. Its header also
+# records that it did **not** fix `KARATSUBA_MIN`, and why a bench structurally
+# could not.
+[[bench]]
+name = "bignum"
+harness = false
+
+# Separate again: several `OrdSet`s packed into one ordinal space. Its subject
+# is a *layout* cost asymmetry rather than a kernel, so it has no external
+# reference and no scaling curve — both sides of every comparison are the same
+# shipped code selected by a different descriptor, which is what keeps it free of
+# the bench-local reimplementation bias `setops` records.
+[[bench]]
+name = "view"
+harness = false

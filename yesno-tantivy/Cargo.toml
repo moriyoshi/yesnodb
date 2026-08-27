@@ -1,0 +1,40 @@
+[package]
+name = "yesno-tantivy"
+description = "Tantivy Query adapter backed by embedded or remote yesno ordinal sets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+flight = [
+    "dep:arrow-array",
+    "dep:arrow-flight",
+    "dep:futures",
+    "dep:tonic",
+    "dep:yesno-flight",
+]
+
+[dependencies]
+yesno-core.workspace = true
+tantivy.workspace = true
+thiserror.workspace = true
+arrow-array = { workspace = true, optional = true }
+arrow-flight = { version = "59.2", optional = true }
+futures = { version = "0.3", optional = true }
+tonic = { version = "0.14", optional = true }
+yesno-flight = { workspace = true, default-features = false, optional = true }
+
+[dev-dependencies]
+arrow-flight = "59.2"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+yesno-flight = { workspace = true, features = ["server"] }
+
+[[example]]
+name = "remote_filter"
+required-features = ["flight"]

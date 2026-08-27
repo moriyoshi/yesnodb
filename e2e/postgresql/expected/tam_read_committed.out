@@ -1,0 +1,20 @@
+B: CREATE EXTENSION yesno_pg;
+B: CREATE TABLE iso2 ( ordinal bigint ) USING yesno_table;
+B: INSERT INTO iso2 VALUES ( 1 ), ( 2 ), ( 3 );
+A: BEGIN;
+A: SELECT count(*) AS first_read FROM iso2;
+ first_read 
+------------
+          3
+(1 row)
+
+B: INSERT INTO iso2 VALUES ( 4 );
+A: SELECT count(*) AS second_read FROM iso2;
+ second_read 
+-------------
+           4
+(1 row)
+
+A: COMMIT;
+B: DROP TABLE iso2;
+B: DROP EXTENSION yesno_pg CASCADE;

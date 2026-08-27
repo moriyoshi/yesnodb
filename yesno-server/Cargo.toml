@@ -1,0 +1,154 @@
+[package]
+name = "yesno-server"
+description = "The yesnod daemon and its command-line data client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The daemon and its data client share Flight transport code.
+# Backup and archive clients live in `yesno-server-utils`, which depends on this
+# crate without making object-storage support a daemon dependency. The daemon
+# does own filesystem snapshot creation because it coordinates checkpoints.
+[[bin]]
+name = "yesnod"
+path = "src/main.rs"
+
+[[bin]]
+name = "yesno"
+path = "src/bin/yesno.rs"
+
+[[bin]]
+name = "yesno-snapshot-stage"
+path = "src/bin/yesno-snapshot-stage.rs"
+
+[[bin]]
+name = "yesno-snapshot-agent"
+path = "src/bin/yesno-snapshot-agent.rs"
+
+[dependencies]
+yesno-core.workspace = true
+yesno-flight = { workspace = true, features = ["server"] }
+arrow-array.workspace = true
+arrow-flight = "59.2"
+# `default-features = false` is load-bearing, not tidiness. Default axum pulls
+# `serde_urlencoded` and friends, which are **not** in this workspace's lock
+# file; scoped this way it adds nothing at all, because tonic's `router` feature
+# already brings axum in. Verified against `Cargo.lock`.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+futures = "0.3"
+async-trait = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
+# Keep the EC2 control plane in-process and typed. Exact top-level versions and
+# the lockfile's paired Smithy releases preserve this crate's Rust 1.89 promise;
+# newer SDK-family releases raise their MSRV independently.
+aws-config = { version = "=1.8.3", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-ec2 = { version = "=1.154.0", features = ["behavior-version-latest"] }
+# `tls-ring`, not `tls-aws-lc`. Both are real feature names in tonic 0.14; the
+# difference is that `aws-lc-rs` wants CMake and a C toolchain at build time
+# while `ring` is `cc`-only. This crate vendors `protoc` because it must remain
+# buildable on a follower host without system protobuf or CMake packages.
+#
+# Deliberately NOT `tls-native-roots` or `tls-webpki-roots`. A database peer
+# should trust an explicitly configured CA, not `/etc/ssl` and not the public web
+# PKI, and both features add crates to say otherwise.
+tonic = { version = "0.14", features = ["tls-ring"] }
+# The AWS SDK's default HTTPS client also enables rustls' `aws-lc-rs` feature.
+# With both providers compiled in, applications must select one explicitly;
+# `tls::install_crypto_provider` keeps this crate's documented `ring` choice.
+#
+# `std` is named even though `tokio-rustls` already enables it. `tls` builds
+# `ServerConfig` itself and parses PEM through `rustls::pki_types::pem`, and a
+# feature reached through someone else's flag is one a future flag change can
+# remove without warning — the same reasoning as the explicit `ring` below.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Adds **nothing** to `Cargo.lock`: tonic's `tls-ring` already resolves exactly
+# this version, and the features here are the ones tonic asks for, so the graph
+# is unchanged. It is named directly because `tls` now terminates TLS itself
+# rather than handing tonic a `ServerTlsConfig` — which is what makes a
+# certificate swappable without stopping the listener — and the stream it yields
+# must be tonic's own `tokio_rustls::server::TlsStream` for `peer_certs()` to
+# keep working. The `lean-core` dependency budget is scoped to `yesno-core` and
+# is unaffected.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "ring",
+    "tls12",
+] }
+prost = "0.14"
+prost-types = "0.14"
+# tonic 0.14 keeps the generated Prost codec in a separate runtime crate.
+tonic-prost = "0.14"
+# Named explicitly rather than left to arrive with `tls-ring`: `auth` uses
+# `ring::digest` for certificate fingerprints and `ring::constant_time` for token
+# comparison, and a dependency reached through someone else's feature flag is one
+# a future flag change can remove without warning.
+ring = "0.17"
+# For the comparison, not `ring::constant_time::verify_slices_are_equal` —
+# that is deprecated in ring 0.17 with the warning "Internal function not
+# intended for external use with no promises regarding side channels", which is
+# exactly the promise a credential check needs. `subtle` is the purpose-built
+# tool and is already in the lock, arriving with rustls.
+subtle = "2"
+# For one line: restoring the default SIGPIPE disposition in `yesno`.
+# Rust's runtime ignores SIGPIPE, so a write to a closed pipe returns an error
+# and `println!` **panics** — which makes `yesno get … | head` die with a
+# stack trace on a completely ordinary shell idiom. Already in the lock eleven
+# times over via tokio, so this adds nothing.
+libc = "0.2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "fs",
+    "process",
+    "time",
+    "sync",
+    "signal",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+# Deliberately NOT `serde` derives on `yesno_core::DbOptions`. That would put
+# serde into `cargo tree -p yesno-core` and blow the `lean-core` CI job's cap of
+# five direct dependencies. This crate mirrors the struct instead; `config.rs`
+# owns the conversion.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+tracing.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "ansi",
+] }
+crc32c.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+# Keep schema compilation independent of a host-installed protoc.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
+proptest.workspace = true
+# EBS volume and snapshot lifecycle operations are part of EC2's Query API.
+# `winterbaume-ebs` emulates the separate direct snapshot-block API, so it
+# cannot receive the production `aws-sdk-ec2` requests exercised here.
+winterbaume-core = "=0.2.0"
+winterbaume-ec2 = "=1.0.0"
+# Certificates are minted **at test time**, not checked in. A checked-in PEM
+# expires, and then the suite goes red on a calendar date with a failure that
+# reads like a code defect. Dev-only, so it cannot reach `lean-core`.
+rcgen = "0.14"
+opentelemetry-proto.workspace = true

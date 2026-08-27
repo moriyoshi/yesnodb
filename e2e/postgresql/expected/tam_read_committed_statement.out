@@ -1,0 +1,47 @@
+B: CREATE EXTENSION yesno_pg;
+B: CREATE TABLE iso_stmt ( ordinal bigint ) USING yesno_table;
+B: INSERT INTO iso_stmt VALUES ( 1 ), ( 2 ), ( 3 );
+A: SELECT ordinal / ( ordinal - 1 ) FROM iso_stmt ORDER BY ordinal;
+ERROR:  division by zero
+B: INSERT INTO iso_stmt VALUES ( 4 );
+A: SELECT array_agg(ordinal ORDER BY ordinal) AS recovery_after_error FROM iso_stmt;
+ recovery_after_error 
+----------------------
+ {1,2,3,4}
+(1 row)
+
+B: SELECT pg_advisory_lock(170018);
+ pg_advisory_lock 
+------------------
+ 
+(1 row)
+
+A: WITH first_read AS MATERIALIZED ( SELECT array_agg(ordinal ORDER BY ordinal) AS rows FROM iso_stmt ), wait_for_writer AS MATERIALIZED ( SELECT pg_advisory_lock(170018) FROM first_read ), second_read AS MATERIALIZED ( SELECT array_agg(ordinal ORDER BY ordinal) AS rows FROM iso_stmt, wait_for_writer ) SELECT first_read.rows AS first_rows, second_read.rows AS second_rows FROM first_read, second_read;
+B: DO $$ BEGIN WHILE NOT EXISTS ( SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 170018 AND NOT granted ) LOOP PERFORM pg_sleep(0.01); END LOOP; END $$;
+B: INSERT INTO iso_stmt VALUES ( 5 );
+B: SELECT pg_advisory_unlock(170018);
+ pg_advisory_unlock 
+--------------------
+ t
+(1 row)
+
+ first_rows | second_rows 
+------------+-------------
+ {1,2,3,4}  | {1,2,3,4}
+(1 row)
+
+A: SELECT pg_advisory_unlock(170018);
+ pg_advisory_unlock 
+--------------------
+ t
+(1 row)
+
+B: INSERT INTO iso_stmt VALUES ( 6 );
+A: SELECT array_agg(ordinal ORDER BY ordinal) AS next_statement FROM iso_stmt;
+ next_statement 
+----------------
+ {1,2,3,4,5,6}
+(1 row)
+
+B: DROP TABLE iso_stmt;
+B: DROP EXTENSION yesno_pg CASCADE;

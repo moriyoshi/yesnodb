@@ -1,0 +1,45 @@
+"""The common external-fixture host for the ordinary yesno-e2e runner."""
+
+load("@crates//:defs.bzl", "crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "runner_main",
+    srcs = ["src/main.rs"],
+)
+
+# PostgreSQL and MySQL link this exact target. It contains only generic fixture
+# verbs and the same Monty runner source used by the Cargo library; backend
+# identity is scenario data, never a Rust feature or entrypoint.
+rust_library(
+    name = "fixture_host",
+    srcs = [
+        "src/convert.rs",
+        "src/fixture.rs",
+        "src/fixture_lib.rs",
+        "src/fixture_world.rs",
+        "src/runner_common.rs",
+        # `include!`d by src/fixture_world.rs, so it is a source of this target
+        # even though nothing declares it as a module.
+        "src/scenario_prefix.rs",
+    ],
+    crate_name = "yesno_e2e",
+    crate_root = "src/fixture_lib.rs",
+    edition = "2021",
+    deps = crate_deps(
+        [
+            "arrow-flight",
+            "libc",
+            "monty",
+            "monty-types",
+            "num-bigint",
+            "tempfile",
+            "tokio",
+            "tokio-stream",
+            "tonic",
+        ],
+        package_name = "yesno-e2e",
+    ) + ["//yesno-core:yesno_core", "//yesno-flight:yesno_flight"],
+)

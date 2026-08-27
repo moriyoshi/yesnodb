@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package yesno.replication.v1;
+
+// Async single-leader WAL shipping.
+//
+// Deliberately NOT Arrow Flight. Flight moves RecordBatches; a WAL is an opaque
+// self-framed binary log, and wrapping it costs an IPC schema message, per-batch
+// FlatBuffer headers and an extra copy on both ends for no benefit. The decisive
+// argument is that if the leader ships raw on-disk WAL frames, the follower's
+// apply path is byte-identical to crash recovery: one framing, one decoder, one
+// fuzz target.
+service Replication {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // Follower-driven: it supplies the LSN it has already applied per shard.
+  rpc Subscribe(SubscribeRequest) returns (stream WalBatch);
+  rpc Ack(stream AckRequest) returns (AckResponse);
+  rpc FetchBaseSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+  // The database's MANIFEST, verbatim.
+  //
+  // Without this a follower cannot be bootstrapped across a network at all:
+  // FetchBaseSnapshot ships shard images and StatusResponse carries the uuid and
+  // the shard count, but the `vshard -> shard` map is in neither — and a
+  // follower given the identity but not the map routes keys to shards that do
+  // not hold them. Reconstructing it from `uuid + shard_count` works only while
+  // the map is `v % shards`, which is precisely the property `db/manifest.rs`
+  // exists to stop depending on.
+  rpc FetchManifest(ManifestRequest) returns (ManifestResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 visible_version = 1;
+  uint32 shard_count = 2;
+  // Per-shard end LSN, indexed by shard id.
+  repeated uint64 end_lsn = 3;
+  bytes db_uuid = 4;
+  // The leadership term this leader is serving at.
+  //
+  // A follower keeps the highest it has seen and refuses anything below it, so
+  // a revived old leader — which carries the *same* db_uuid as the node that
+  // replaced it, and is therefore indistinguishable by identity alone — is
+  // rejected instead of being followed back onto a dead timeline.
+  uint32 term = 5;
+}
+
+message SubscribeRequest {
+  uint32 shard = 1;
+  // Resume point: the leader sends records at or after this byte offset.
+  uint64 after_lsn = 2;
+  uint32 max_batch_bytes = 3;
+}
+
+// `records` is already-framed on-disk WAL bytes, verbatim.
+message WalBatch {
+  uint32 shard = 1;
+  uint64 first_lsn = 2;
+  uint64 last_lsn = 3;
+  bytes records = 4;
+  uint32 crc32c = 5;
+  bool is_heartbeat = 6;
+}
+
+message AckRequest {
+  uint32 shard = 1;
+  uint64 applied_lsn = 2;
+}
+
+message AckResponse {
+  uint64 lag_versions = 1;
+}
+
+message ManifestRequest {}
+
+message ManifestResponse {
+  // The whole file, both slots. The reader picks the valid one with the higher
+  // seq, exactly as a local open does.
+  bytes manifest = 1;
+}
+
+message SnapshotRequest {
+  uint32 shard = 1;
+}
+
+// One run of a shard image's bytes, or the marker that ends the stream.
+//
+// A shard image is a *sparse* file: the store grows it to a whole 1 GiB mmap
+// segment with set_len, so a database holding kilobytes reports gigabytes and
+// occupies almost nothing. Shipping it byte for byte cost the apparent size
+// three times over -- in the leader's memory, on the wire, and in the
+// follower's disk, which materialized every hole. So the sender skips runs that
+// are entirely zero and `offset` is no longer contiguous.
+message SnapshotChunk {
+  uint32 shard = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // Set on the final chunk: where the follower must begin WAL replay.
+  uint64 wal_replay_off = 4;
+  // The final chunk, which carries no data. It exists so the sender can mark
+  // the end without first scanning to it -- with holes skipped, the last chunk
+  // that carries data may be followed by gigabytes of nothing.
+  bool last = 5;
+  // The image's apparent length, on every chunk. The follower sets its file to
+  // this length before writing anything, which is what turns the runs the
+  // sender skipped back into holes rather than into a truncated file.
+  //
+  // A leader that does not send it cannot be bootstrapped from: the follower
+  // refuses rather than guessing, because guessing means a short image.
+  uint64 total_len = 6;
+  // Set on the final chunk: how many bytes of `data` this stream carried.
+  //
+  // With holes skipped, a *dropped* chunk is indistinguishable from a hole and
+  // would silently become zeros in the middle of the image. This is what
+  // replaces the contiguity the old format could assume.
+  uint64 data_len = 7;
+}

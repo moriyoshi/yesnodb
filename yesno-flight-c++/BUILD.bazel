@@ -1,0 +1,53 @@
+"""The native Arrow Flight C++ client over the pinned Apache Arrow build."""
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "yesno_flight_cpp",
+    copts = ["-std=c++20"],
+    srcs = [
+        "src/client.cc",
+        "src/protocol_internal.cc",
+    ],
+    hdrs = [
+        "include/yesno/flight/client.h",
+        "src/protocol_internal.h",
+    ],
+    includes = ["include"],
+    deps = ["@apache_arrow_25_0_1//:arrow_cpp"],
+)
+
+cc_binary(
+    name = "unit_test_bin",
+    copts = ["-std=c++20"],
+    srcs = ["tests/unit.cc"],
+    includes = ["src"],
+    testonly = True,
+    deps = [":yesno_flight_cpp"],
+)
+
+sh_test(
+    name = "unit_tests",
+    size = "small",
+    srcs = ["tests/run_unit_tests.sh"],
+    data = [":unit_test_bin"],
+)
+
+cc_binary(
+    name = "roundtrip",
+    copts = ["-std=c++20"],
+    testonly = True,
+    srcs = ["tests/roundtrip.cc"],
+    deps = [":yesno_flight_cpp"],
+)
+
+exports_files([
+    "CMakeLists.txt",
+    "include/yesno/flight/client.h",
+    "src/client.cc",
+    "src/protocol_internal.cc",
+    "src/protocol_internal.h",
+    "tests/roundtrip.cc",
+    "tests/run_unit_tests.sh",
+    "tests/unit.cc",
+])

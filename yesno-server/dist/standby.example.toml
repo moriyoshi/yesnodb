@@ -1,0 +1,66 @@
+# A standby.
+#
+# Its own file rather than a `role = "follower"` line in the leader's:
+# follower credentials, upstream endpoint, and read-serving policy are a
+# different deployment identity.
+#
+#     yesnod --config /etc/yesno/standby.toml --check-config
+
+[server]
+role     = "follower"
+data_dir = "/var/lib/yesno"
+
+[server.metrics]
+listen = "127.0.0.1:9750"
+
+# A cold standby needs **no** `[server.flight]` — it opens no database and
+# answers no queries. Give it one only together with `serve_reads` below.
+
+[follower]
+leader = "https://a.internal:50052"
+
+# How long to wait after catching up before asking again.
+poll_interval_secs = 1
+
+# 0 lets the leader choose. Raise it to trade memory for fewer round trips on a
+# fat link; lower it to bound how much one response can allocate.
+max_batch_bytes = 0
+
+# Reconnection backoff is exponential and capped here. A standby retries a
+# transport failure for ever — a leader being restarted is not a reason to give
+# up — but it never retries `WrongLeader` or a divergence.
+max_backoff_secs = 30
+
+# Hold the database open and answer queries while following.
+#
+# Reads are **stale**, by construction and not by tuning: replication is
+# asynchronous, so this is a consistent snapshot of a database that is at least a
+# round trip behind. Good for fan-out, wrong for read-after-write.
+#
+# A standby that falls off the leader's retained log must rebuild, and it
+# cannot do that in place — copying a shard file over a live memory mapping
+# raises SIGBUS, which is not catchable. It therefore closes the database,
+# rebuilds and reopens; the port stays bound throughout and reads answer
+# `unavailable` with the reason. Budget for that window before pointing traffic
+# here.
+serve_reads = false
+
+# [server.flight]
+# listen = "127.0.0.1:50051"       # only meaningful with serve_reads = true
+
+[follower.tls]
+# `ca` is not optional against an `https://` leader — without it there is
+# nothing to verify the certificate against, and `--check-config` says so rather
+# than falling back to the system trust store. That fallback is the one this
+# crate deliberately does not have: a database peer should trust a CA you named,
+# not `/etc/ssl` and not the public web PKI.
+ca   = "/etc/yesno/tls/ca.pem"
+# The leader will demand a client certificate unless it was started with
+# `--insecure-replication`.
+cert = "/etc/yesno/tls/standby-b.pem"
+key  = "/etc/yesno/tls/standby-b.key"
+#
+# Override the name checked against the server certificate's SAN. Needed when
+# you connect by address; not a way to skip verification, and there is no flag
+# for that.
+# domain = "a.internal"

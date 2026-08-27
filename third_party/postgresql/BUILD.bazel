@@ -1,0 +1,103 @@
+"""The PostgreSQL the extension is built and tested against.
+
+Every public alias selects on `--//:pg_version` without a default. The matching
+pgrx hub and extension feature select on the same flag in `//yesno-pg`, so an
+unknown or partially wired major fails analysis instead of silently using the
+wrong ABI.
+
+`pg_config` reports **absolute execroot paths**, baked in at configure time by
+`--prefix`. That is what makes it usable from inside a Bazel action — the paths
+resolve because actions run in the execroot — and it is also what makes these
+outputs non-portable: they cannot be shared through a remote cache or copied to
+another machine. Local correctness was the goal here; remote caching for this
+target was not, and would need a relocatable `pg_config` wrapper to get.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+_PG17 = "//:pg17"
+_PG18 = "//:pg18"
+
+alias(
+    name = "postgresql",
+    actual = select({
+        _PG17: "@postgresql_17//:postgresql",
+        _PG18: "@postgresql_18//:postgresql",
+    }),
+)
+
+# The whole install prefix. `initdb` resolves `share/postgres.bki` relative to
+# its own location, so anything that runs it needs this rather than the bare
+# binary.
+alias(
+    name = "gen_dir",
+    actual = select({
+        _PG17: "@postgresql_17//:gen_dir",
+        _PG18: "@postgresql_18//:gen_dir",
+    }),
+)
+
+alias(
+    name = "pg_config",
+    actual = select({
+        _PG17: "@postgresql_17//:pg_config",
+        _PG18: "@postgresql_18//:pg_config",
+    }),
+)
+
+alias(
+    name = "initdb",
+    actual = select({
+        _PG17: "@postgresql_17//:initdb",
+        _PG18: "@postgresql_18//:initdb",
+    }),
+)
+
+alias(
+    name = "pg_ctl",
+    actual = select({
+        _PG17: "@postgresql_17//:pg_ctl",
+        _PG18: "@postgresql_18//:pg_ctl",
+    }),
+)
+
+alias(
+    name = "postgres_bin",
+    actual = select({
+        _PG17: "@postgresql_17//:postgres_bin",
+        _PG18: "@postgresql_18//:postgres_bin",
+    }),
+)
+
+alias(
+    name = "psql",
+    actual = select({
+        _PG17: "@postgresql_17//:psql",
+        _PG18: "@postgresql_18//:psql",
+    }),
+)
+
+# Fixed-major aliases are inputs to crate-universe build scripts. Repository
+# rules run before analysis and cannot consume the configuration-dependent
+# aliases above.
+alias(
+    name = "pg17_gen_dir",
+    actual = "@postgresql_17//:gen_dir",
+)
+
+alias(
+    name = "pg17_pg_config",
+    actual = "@postgresql_17//:pg_config",
+)
+
+alias(
+    name = "pg18_gen_dir",
+    actual = "@postgresql_18//:gen_dir",
+)
+
+alias(
+    name = "pg18_pg_config",
+    actual = "@postgresql_18//:pg_config",
+)
+
+exports_files(["postgresql.BUILD"])
