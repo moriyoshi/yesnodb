@@ -2,8 +2,8 @@
 //!
 //! # The generic walk is the oracle
 //!
-//! [`OrdSet::view_select`] and [`OrdSet::view_cardinality`] both have a
-//! specialised arm and a generic one. The generic one visits the constituent's
+//! [`OrdSet::view_select`] and [`OrdSet::view_cardinality`] have a specialised
+//! arm and a generic one. The generic one visits the constituent's
 //! physical span and maps every ordinal through [`View::logical_of`]; it is
 //! correct for every descriptor and is never deleted when an arm is faster —
 //! same contract as [`ops::generic`](crate::ops::generic).
@@ -20,7 +20,7 @@
 //! the window covers rather than every word below `hi`.
 //!
 //! What survives is the **shape** of the question, and it is the load-bearing
-//! half. Neither path here asks whether a slot is empty:
+//! half. None of these paths asks whether a slot is empty:
 //! [`OrdSet::view_select`] needs every ordinal of the constituent and
 //! [`OrdSet::view_cardinality`] needs a count, and no emptiness predicate,
 //! however cheap, answers either. Reaching for one would mean *one call per
@@ -28,10 +28,11 @@
 //! — every call re-enters at `partition_point` over the chunk directory, and a
 //! predicate that is `O(window / 64)` still sums to `O(slots × chunk)` when the
 //! windows tile the chunk. That is the same mistake `matrix/read.rs` records as
-//! `O(lines × container size)` — 5.5 ms to move 8 KiB — so both paths here walk
-//! once instead, which records the whole per-slot shape in one pass.
-//!
-//! # The one case that is nearly free
+//! `O(lines × container size)` — 5.5 ms to move 8 KiB. The scalar operations
+//! walk once for one requested slot; [`OrdSet::view_cardinalities`] records the
+//! whole interleaved per-slot shape in one pass when every count is requested.
+//! Blocked views retain per-slot range counts because they can sum whole
+//! containers without reading their payloads.
 //!
 //! Under [`ViewLayout::Blocked`] with a stride that is a multiple of 65 536, a
 //! constituent occupies a whole number of chunks and its logical ordinals differ
@@ -193,6 +194,32 @@ impl OrdSet {
         self.for_each_logical(v, set, |_| n += 1);
         n
     }
+
+    /// Cardinality of every constituent in one batch.
+    ///
+    /// Interleaved constituents share one physical span, so asking the scalar
+    /// operation once per constituent would walk the same packed set `sets`
+    /// times. This method assigns each physical ordinal to its owner in one
+    /// pass. Blocked constituents retain the scalar range-count arm, which can
+    /// sum whole containers without reading their payloads.
+    pub fn view_cardinalities(&self, v: &View) -> Vec<u64> {
+        let mut counts = vec![0; v.sets() as usize];
+        if v.check().is_err() {
+            return counts;
+        }
+        if let ViewLayout::Blocked { .. } = v.layout() {
+            for set in 0..v.sets() {
+                counts[set as usize] = self.view_cardinality(v, set);
+            }
+            return counts;
+        }
+        for ordinal in self.iter() {
+            if let Some((owner, _)) = v.logical_of(ordinal) {
+                counts[owner as usize] += 1;
+            }
+        }
+        counts
+    }
 }
 
 #[cfg(test)]
@@ -261,9 +288,11 @@ mod tests {
             View::blocked(3, 131_072),
         ] {
             let packed = OrdSet::from_iter_unsorted((0..4000u64).map(|i| i * 37));
+            let cardinalities = packed.view_cardinalities(&v);
             for set in 0..3u32 {
                 let sel = packed.view_select(&v, set);
                 assert_eq!(packed.view_cardinality(&v, set), sel.len(), "{v:?} {set}");
+                assert_eq!(cardinalities[set as usize], sel.len(), "{v:?} {set}");
                 for x in [0u64, 1, 5, 99, 100, 1000] {
                     assert_eq!(
                         packed.view_contains(&v, set, x),

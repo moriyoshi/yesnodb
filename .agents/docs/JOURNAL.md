@@ -261,6 +261,106 @@ This pass does not optimize `KeyStream::seek`. Its target search is logarithmic,
 
 ---
 
+## 2026-09-20 — expression-level view maps pay for extraction before they pay for their terminal
+
+Measured step 1 of the view-expression performance plan through the real
+`yesno_flight::expr` evaluator, using a disposable standalone crate under
+`.agents-workspace/tmp/view-expr-baseline-20260920`. No instrument entered
+production source.
+
+The main fixture had 131 072 logical ordinals, 55% density in each constituent,
+and identical logical sets packed as interleaved or chunk-aligned blocked views.
+The database was measured from its resident memtable, then checkpointed, closed,
+reopened, verified, and measured from a new snapshot. The matrix also carried
+10/50/90% filters, a three-level map body, array and run fixtures, all three fold
+operators, a membership map, and `At` over a mapped vector. Release build,
+repository Arrow 59.2.0 lock, rustc 1.97.1, aarch64 Cortex-X925 / Cortex-A725,
+commit `85a41c2bf34f7134df8eaf30a26265ceee6d6eba`. Five timing batches per row,
+the whole process repeated twice, operands black-boxed, result checksums equal
+between resident and reopened snapshots, and the allocation counter calibrated
+with a one-allocation 128 KiB vector.
+
+The headline cardinality map:
+
+```text
+sets    interleaved    blocked aligned    allocations ( interleaved / blocked )
+   4        4.72 ms            1.39 us                         230 / 34
+   8       14.07 ms            2.48 us                         449 / 57
+  16       47.12 ms            4.90 us                        884 / 100
+```
+
+The interleaved heap peaks were 1.25, 1.32, and 1.45 MiB. At eight
+constituents every terminal sat on the same ~14 ms / 1.32 MiB floor:
+unfiltered cardinality, cardinality under a 10/50/90% filter, a three-level
+body, OR/AND/XOR fold of the mapped vector, a membership map, and selecting one
+mapped element. Allocations distinguished their extra work ( 449 through 1 082 )
+while time did not. That is the answer to the causal question: `lower_vec`
+extracts all constituents before the terminal runs, and extraction dominates
+everything above it. The index-of-one case is the clearest witness because it
+builds seven results the caller cannot observe.
+
+Representation changed the magnitude, not the conclusion. Eight-way
+interleaved versus blocked cardinality maps were 39.5 us / 2.53 us for arrays,
+8.32 ms / 2.56 us for runs, and 14.07 ms / 2.48 us for bitmaps. Reopening left
+interleaved bitmap time near 14 ms while the blocked row rose to 5.80 us and 106
+allocations, showing that stored decoding becomes visible only once repeated
+extraction stops dominating. The page cache was warm, so this is not a cold I/O
+number. Exact decoded chunks were deliberately left unreported: the public API
+has no counter, and adding a production observation hook for this one-off study
+would violate the repository's research-code rule.
+
+The backlog's evidence gate is therefore satisfied, but the result points to a
+narrower first implementation than a core lazy `Expr` node: fuse batched
+cardinality and membership, demand-drive `At( Map(..), i )`, and fuse mapped
+sets into their fold. A core node remains open until those paths are measured
+and until statistics, seek behavior, streaming cardinality, planner bounds, and
+termination are specified together.
+
+---
+
+## 2026-09-20 — stage 2 fuses view-map terminals before materialization
+
+Stage 2 replaced the measured extraction floor with terminal-specific paths.
+`OrdSet::view_cardinalities` now counts every interleaved constituent in one
+packed scan, while blocked views retain their range-count path. The Flight
+evaluator demand-drives `At` through sequential maps, batches direct and
+intersection-filtered cardinality maps, evaluates membership maps as scalar
+Boolean expressions, and distributes OR, AND, and XOR folds over supported
+intersection-shaped map bodies. Invariant operands are prepared once as
+reopenable lazy expressions instead of being collected once per constituent.
+Unsupported arbitrary map bodies keep the existing eager fallback.
+
+The same disposable fixture used for the step-1 baseline measured the resident
+interleaved bitmap cardinality map at 0.646, 1.285, and 2.576 ms for 4, 8, and
+16 constituents, down from 4.72, 14.07, and 47.12 ms. Allocations fell from
+230/449/884 to 13/16/19, and peak requested heap fell from 1.25/1.32/1.45 MiB
+to 2.1/3.7/7.0 KiB. At eight constituents, a 50% filtered cardinality map took
+2.491 ms, OR/AND/XOR mapped folds took 2.101/1.691/1.914 ms, membership took
+1.46 us, and `At` over the filtered map took 1.701 ms. Resident and reopened
+checksums remained equal. The construction and wider representation matrix are
+recorded in `LTM/packed-lenses-matrix-bignum-and-views.md`.
+
+Regression coverage includes semantic tests for batched view counts, filtered
+facets, all mapped fold operators, invariant membership, rank, and demand-driven
+indexing. A Flight allocation regression compares 4 and 64 constituents for
+the fused terminal classes; its budgets were introduced with the implementation
+and no existing allocation allowance was raised. No wire format, persisted
+format, codec, container invariant, or unsafe code changed.
+
+### Quality Gate — stage 2 view-expression terminal fusion
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo fmt --check`: pass.
+- `cargo test -p yesno-core`: pass.
+- `cargo test -p yesno-flight`: pass.
+- `./scripts/gate.sh`: pass on the clean rerun, including the full scenario corpus. The first run had one load-sensitive failure in the unrelated `yesno-server` test `an_idle_database_still_checkpoints`; that exact test passed in isolation before the required full rerun passed.
+- `./scripts/gate-pg.sh`: pass for the default PostgreSQL major and PostgreSQL 18, including unit and hermetic regression fixtures.
+- `./scripts/gate-search.sh`: pass; application, OpenSearch, and Elasticsearch scenarios all passed.
+- Invariant audit: the generic expression fallback remains the semantic oracle, `roaring` remains dev-only, Arrow types did not enter `yesno-core`, and the `arrow-buffer` containment boundary is unchanged.
+
+---
+
 ## 2026-09-20 — fail-closed and prefix-bounded key streams
 
 `KeyStream` plan construction now propagates B+tree cursor errors instead of

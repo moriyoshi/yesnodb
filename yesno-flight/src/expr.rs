@@ -9,17 +9,19 @@
 //! without linking a storage engine, and the server must be able to *run* one
 //! without the client's dependencies. Bytes are the only thing that crosses.
 //!
-//! View transforms are eager boundaries in this first network integration:
-//! selection, folding, and expansion use the existing audited `OrdSet` paths,
-//! then re-enter the lazy expression tree as a set leaf. Boolean operators around
-//! them remain lazy. Ordinal literals similarly become one `OrdSet` leaf. This
-//! avoids adding unmeasured `Expr` variants and changing the planner's audited
-//! termination proof merely to expose either feature.
+//! A view's packed input is still an eager boundary: the lens operates on an
+//! audited `OrdSet`, not a core expression node. Its consumers are fused where
+//! their terminal makes that exact. Indexing evaluates only the requested map
+//! element, cardinality and membership maps walk constituents without retaining
+//! them, and intersection-shaped maps commute through folds. Unsupported shapes
+//! keep the eager fallback. This closes the reachable repeated-extraction cost
+//! without adding an unmeasured `Expr` variant or changing the planner's audited
+//! termination proof.
 
 use std::sync::Arc;
 
 use yesno_core::view::{Reduce, View, ViewSink};
-use yesno_core::{Expr, OrdSet, Snapshot};
+use yesno_core::{ChunkStream, Container, Expr, OrdSet, Prefix48, Snapshot};
 pub use yesno_wire::{
     AnyExpr, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort, VecIntExpr, VecSetExpr,
     ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES, MAX_VIEW_SETS, VERSION,
@@ -28,8 +30,8 @@ pub use yesno_wire::{
 /// Exact cardinality for a wire expression.
 ///
 /// A top-level `view( .. )[ i ]` uses the view's dedicated count and does not
-/// build the selected set. Other view transforms are eager boundaries because
-/// the core expression planner has no view operator yet.
+/// build the selected set. Vector consumers use the terminal fusions described
+/// by [`lower`]; unsupported shapes retain the eager fallback.
 pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
     match e {
         // The counting form of the same fusion `lower` performs: counting a
@@ -58,8 +60,10 @@ pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
 /// leaf used to report `Memory`, so the backing-aware branch of the cost model
 /// never fired outside its own unit test.
 ///
-/// View transforms remain explicit eager boundaries: the `view` lens operates on
-/// a materialized `OrdSet` and has no streaming form, so those arms still load.
+/// A view's packed input remains an eager boundary because the core planner has
+/// no view expression node. Exact terminal fusions below avoid materializing
+/// every constituent; unsupported vector shapes still use the explicit eager
+/// fallback.
 pub fn lower(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<Expr> {
     lower_in(e, snap, None)
 }
@@ -87,21 +91,9 @@ fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         SetExpr::And(xs) => fold(xs, snap, hole, Expr::and)?,
         SetExpr::Or(xs) => fold(xs, snap, hole, Expr::or)?,
         SetExpr::AndNot(a, b) => lower_in(a, snap, hole)?.and_not(lower_in(b, snap, hole)?),
-        // The three view-consuming nodes **fuse** with a `view` operand rather
-        // than materializing it. See `lower_vec` for why that is not an
-        // optimization but a correctness-of-cost obligation.
-        SetExpr::At(v, i) => match v.as_ref() {
-            VecSetExpr::View(input, view) => Expr::set(
-                lower_in(input, snap, hole)?
-                    .collect_set()?
-                    .view_select(&core_view(*view), *i),
-            ),
-            _ => {
-                // Nothing to fuse: take the element that was asked for.
-                let mut parts = lower_vec(v, snap, hole)?;
-                Expr::set(parts.swap_remove(*i as usize))
-            }
-        },
+        // Indexing is demand-driven through every map layer. Materializing the
+        // other elements would do work whose result cannot be observed.
+        SetExpr::At(v, i) => lower_vec_at(v, *i, snap, hole)?,
         SetExpr::Fold(v, op) => match v.as_ref() {
             VecSetExpr::View(input, view) => Expr::set(
                 lower_in(input, snap, hole)?
@@ -120,6 +112,9 @@ fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
                 fold(xs, snap, hole, join)?
             }
             VecSetExpr::Map(..) => {
+                if let Some(fused) = fold_mapped_view(v, *op, snap, hole)? {
+                    return Ok(fused);
+                }
                 let parts = lower_vec(v, snap, hole)?;
                 let join: fn(Expr, Expr) -> Expr = match op {
                     FoldOp::Or => Expr::or,
@@ -162,6 +157,11 @@ fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         // `Vec[Bool]` over the constituents **is** a set of constituent
         // indices, which is why this yields a set rather than a vector sort.
         SetExpr::MapBool(v, body) => {
+            if let VecSetExpr::View(input, view) = v.as_ref() {
+                return Ok(Expr::set(eval_view_bool_map(
+                    input, *view, body, snap, hole,
+                )?));
+            }
             let parts = lower_vec(v, snap, hole)?;
             let mut out = Vec::new();
             for (i, part) in parts.into_iter().enumerate() {
@@ -189,6 +189,11 @@ fn eval_vec_int(v: &VecIntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::
             .map(|x| eval_int(x, snap, hole))
             .collect::<yesno_core::Result<Vec<_>>>()?,
         VecIntExpr::Map(vs, body) => {
+            if let VecSetExpr::View(input, view) = vs.as_ref() {
+                if let Some(out) = eval_view_int_map(input, *view, body, snap, hole)? {
+                    return Ok(out);
+                }
+            }
             let parts = lower_vec(vs, snap, hole)?;
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
@@ -206,32 +211,440 @@ fn eval_int(e: &IntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         // `Expr::cardinality` exists, and a facet query is `sets` of these.
         IntExpr::Cardinality(a) => lower_in(a, snap, hole)?.cardinality()?,
         IntExpr::Rank(a, x) => lower_in(a, snap, hole)?.collect_set()?.rank(*x),
-        IntExpr::At(v, i) => {
-            let xs = eval_vec_int(v, snap, hole)?;
-            // Decoding refused an out-of-range index, so this cannot miss for
-            // anything that arrived over the wire.
-            *xs.get(*i as usize)
-                .ok_or(yesno_core::CodecError::Invariant(
-                    "index is at or above the vector's arity",
-                ))?
-        }
+        IntExpr::At(v, i) => eval_vec_int_at(v, *i, snap, hole)?,
     })
 }
 
 fn eval_bool(e: &BoolExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<bool> {
     Ok(match e {
-        BoolExpr::Contains(a, x) => lower_in(a, snap, hole)?.collect_set()?.contains(*x),
+        BoolExpr::Contains(a, x) => expr_contains(lower_in(a, snap, hole)?, *x)?,
     })
+}
+fn index_error() -> yesno_core::CodecError {
+    yesno_core::CodecError::Invariant("index is at or above the vector's arity")
+}
+
+/// Lower only one element, preserving map semantics without evaluating siblings.
+fn lower_vec_at(
+    v: &VecSetExpr,
+    i: u32,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Expr> {
+    if i >= v.arity() {
+        return Err(index_error());
+    }
+    match v {
+        VecSetExpr::List(xs) => lower_in(&xs[i as usize], snap, hole),
+        VecSetExpr::View(input, view) => Ok(Expr::set(
+            lower_in(input, snap, hole)?
+                .collect_set()?
+                .view_select(&core_view(*view), i),
+        )),
+        VecSetExpr::Map(vs, body) => {
+            let part = Arc::new(lower_vec_at(vs, i, snap, hole)?.collect_set()?);
+            lower_in(body, snap, Some(&part))
+        }
+    }
+}
+
+/// Evaluate only one integer element, just as lower_vec_at does for sets.
+fn eval_vec_int_at(
+    v: &VecIntExpr,
+    i: u32,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<u64> {
+    if i >= v.arity() {
+        return Err(index_error());
+    }
+    match v {
+        VecIntExpr::List(xs) => eval_int(&xs[i as usize], snap, hole),
+        VecIntExpr::Map(vs, body) => {
+            let part = Arc::new(lower_vec_at(vs, i, snap, hole)?.collect_set()?);
+            eval_int(body, snap, Some(&part))
+        }
+    }
+}
+
+/// A map body lowered once except where it depends on the current element.
+///
+/// Static expressions are cloneable, reopenable plans. They are deliberately
+/// not collected here: a large invariant filter must remain lazy so the core
+/// planner can order it against each constituent.
+enum PreparedSet<'a> {
+    Static(Expr),
+    Hole,
+    And(Vec<PreparedSet<'a>>),
+    Or(Vec<PreparedSet<'a>>),
+    AndNot(Box<PreparedSet<'a>>, Box<PreparedSet<'a>>),
+    Dynamic(&'a SetExpr),
+}
+
+impl<'a> PreparedSet<'a> {
+    fn new(e: &'a SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Self> {
+        if !set_contains_hole(e) {
+            return Ok(Self::Static(lower_in(e, snap, hole)?));
+        }
+        Ok(match e {
+            SetExpr::Hole => Self::Hole,
+            SetExpr::And(xs) => Self::And(
+                xs.iter()
+                    .map(|x| Self::new(x, snap, hole))
+                    .collect::<yesno_core::Result<_>>()?,
+            ),
+            SetExpr::Or(xs) => Self::Or(
+                xs.iter()
+                    .map(|x| Self::new(x, snap, hole))
+                    .collect::<yesno_core::Result<_>>()?,
+            ),
+            SetExpr::AndNot(a, b) => Self::AndNot(
+                Box::new(Self::new(a, snap, hole)?),
+                Box::new(Self::new(b, snap, hole)?),
+            ),
+            // Select, pack, and other non-Boolean transforms can contain the
+            // hole, but have no exact substitution rule here.
+            other => Self::Dynamic(other),
+        })
+    }
+
+    fn eval(&self, snap: &Snapshot, part: &Arc<OrdSet>) -> yesno_core::Result<Expr> {
+        match self {
+            Self::Static(e) => Ok(e.clone()),
+            Self::Hole => Ok(Expr::set(Arc::clone(part))),
+            Self::And(xs) => eval_prepared(xs, snap, part, Expr::and),
+            Self::Or(xs) => eval_prepared(xs, snap, part, Expr::or),
+            Self::AndNot(a, b) => Ok(a.eval(snap, part)?.and_not(b.eval(snap, part)?)),
+            Self::Dynamic(e) => lower_in(e, snap, Some(part)),
+        }
+    }
+}
+
+fn eval_prepared(
+    xs: &[PreparedSet<'_>],
+    snap: &Snapshot,
+    part: &Arc<OrdSet>,
+    join: fn(Expr, Expr) -> Expr,
+) -> yesno_core::Result<Expr> {
+    let mut it = xs.iter();
+    let Some(first) = it.next() else {
+        return Ok(Expr::Empty);
+    };
+    let mut out = first.eval(snap, part)?;
+    for x in it {
+        out = join(out, x.eval(snap, part)?);
+    }
+    Ok(out)
+}
+
+/// Count an intersection-shaped body without extracting any constituent.
+///
+/// Interleaved physical order is logical-ordinal-major, so one monotone cursor
+/// over the invariant expression answers each logical ordinal once and the
+/// packed walk assigns matching rows to their constituent counters.
+fn eval_intersection_cardinalities(
+    packed: &OrdSet,
+    view: &View,
+    body: &SetExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Option<Vec<u64>>> {
+    if !matches!(view.layout(), yesno_core::view::ViewLayout::Interleaved) {
+        return Ok(None);
+    }
+
+    let mut invariants = Vec::new();
+    let mut holes = 0;
+    collect_intersection_body(body, &mut invariants, &mut holes);
+    if holes != 1 {
+        return Ok(None);
+    }
+    if invariants.is_empty() {
+        return Ok(Some(packed.view_cardinalities(view)));
+    }
+
+    let mut invariants = invariants.into_iter();
+    let mut filter = lower_in(invariants.next().unwrap(), snap, hole)?;
+    for invariant in invariants {
+        filter = filter.and(lower_in(invariant, snap, hole)?);
+    }
+    let mut stream = filter.open();
+    let mut current: Option<(Prefix48, Container)> = None;
+    let mut exhausted = false;
+    let mut last_x = None;
+    let mut selected = false;
+    let mut counts = vec![0; view.sets() as usize];
+
+    for physical in packed.iter() {
+        let Some((owner, x)) = view.logical_of(physical) else {
+            continue;
+        };
+        if last_x != Some(x) {
+            selected = monotone_stream_contains(stream.as_mut(), &mut current, &mut exhausted, x)?;
+            last_x = Some(x);
+        }
+        if selected {
+            counts[owner as usize] += 1;
+        }
+    }
+    Ok(Some(counts))
+}
+
+fn monotone_stream_contains(
+    stream: &mut dyn ChunkStream,
+    current: &mut Option<(Prefix48, Container)>,
+    exhausted: &mut bool,
+    ordinal: u64,
+) -> yesno_core::Result<bool> {
+    let (target, low) = yesno_core::split(ordinal);
+    if !*exhausted && current.as_ref().is_none_or(|(prefix, _)| *prefix < target) {
+        stream.seek(target)?;
+        *current = stream.next_chunk()?;
+        *exhausted = current.is_none();
+    }
+    Ok(current
+        .as_ref()
+        .is_some_and(|(prefix, container)| *prefix == target && container.contains(low)))
+}
+
+fn expr_contains(expr: Expr, ordinal: u64) -> yesno_core::Result<bool> {
+    let mut stream = expr.open();
+    let mut current = None;
+    let mut exhausted = false;
+    monotone_stream_contains(stream.as_mut(), &mut current, &mut exhausted, ordinal)
+}
+
+fn eval_view_int_map(
+    input: &SetExpr,
+    spec: ViewSpec,
+    body: &IntExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Option<Vec<u64>>> {
+    let view = core_view(spec);
+    let packed = lower_in(input, snap, hole)?.collect_set()?;
+
+    match body {
+        IntExpr::Cardinality(a) if matches!(a.as_ref(), SetExpr::Hole) => {
+            Ok(Some(packed.view_cardinalities(&view)))
+        }
+        IntExpr::Cardinality(a) => {
+            if let Some(out) = eval_intersection_cardinalities(&packed, &view, a, snap, hole)? {
+                return Ok(Some(out));
+            }
+            let prepared = PreparedSet::new(a, snap, hole)?;
+            let mut out = Vec::with_capacity(view.sets() as usize);
+            for i in 0..view.sets() {
+                let part = Arc::new(packed.view_select(&view, i));
+                out.push(prepared.eval(snap, &part)?.cardinality()?);
+            }
+            Ok(Some(out))
+        }
+        IntExpr::Rank(a, x) => {
+            let prepared = PreparedSet::new(a, snap, hole)?;
+            let mut out = Vec::with_capacity(view.sets() as usize);
+            for i in 0..view.sets() {
+                let part = Arc::new(packed.view_select(&view, i));
+                out.push(prepared.eval(snap, &part)?.collect_set()?.rank(*x));
+            }
+            Ok(Some(out))
+        }
+        IntExpr::Lit(_) | IntExpr::At(..) => Ok(None),
+    }
+}
+
+/// A membership predicate prepared at its one queried ordinal.
+///
+/// Boolean set operators become Boolean scalar operators. Invariant branches
+/// are answered once, while a hole is a direct packed-view membership probe.
+enum PreparedContains<'a> {
+    Const(bool),
+    Hole,
+    And(Vec<PreparedContains<'a>>),
+    Or(Vec<PreparedContains<'a>>),
+    AndNot(Box<PreparedContains<'a>>, Box<PreparedContains<'a>>),
+    Dynamic(&'a SetExpr),
+}
+
+impl<'a> PreparedContains<'a> {
+    fn new(e: &'a SetExpr, x: u64, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Self> {
+        if !set_contains_hole(e) {
+            return Ok(Self::Const(expr_contains(lower_in(e, snap, hole)?, x)?));
+        }
+        Ok(match e {
+            SetExpr::Hole => Self::Hole,
+            SetExpr::And(xs) => Self::And(
+                xs.iter()
+                    .map(|a| Self::new(a, x, snap, hole))
+                    .collect::<yesno_core::Result<_>>()?,
+            ),
+            SetExpr::Or(xs) => Self::Or(
+                xs.iter()
+                    .map(|a| Self::new(a, x, snap, hole))
+                    .collect::<yesno_core::Result<_>>()?,
+            ),
+            SetExpr::AndNot(a, b) => Self::AndNot(
+                Box::new(Self::new(a, x, snap, hole)?),
+                Box::new(Self::new(b, x, snap, hole)?),
+            ),
+            other => Self::Dynamic(other),
+        })
+    }
+
+    fn eval(
+        &self,
+        packed: &OrdSet,
+        view: &View,
+        i: u32,
+        x: u64,
+        snap: &Snapshot,
+    ) -> yesno_core::Result<bool> {
+        match self {
+            Self::Const(v) => Ok(*v),
+            Self::Hole => Ok(packed.view_contains(view, i, x)),
+            Self::And(xs) => {
+                if xs.is_empty() {
+                    return Ok(false);
+                }
+                for a in xs {
+                    if !a.eval(packed, view, i, x, snap)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Self::Or(xs) => {
+                for a in xs {
+                    if a.eval(packed, view, i, x, snap)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::AndNot(a, b) => {
+                Ok(a.eval(packed, view, i, x, snap)? && !b.eval(packed, view, i, x, snap)?)
+            }
+            Self::Dynamic(e) => {
+                let part = Arc::new(packed.view_select(view, i));
+                expr_contains(lower_in(e, snap, Some(&part))?, x)
+            }
+        }
+    }
+}
+
+fn eval_view_bool_map(
+    input: &SetExpr,
+    spec: ViewSpec,
+    body: &BoolExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Arc<OrdSet>> {
+    let view = core_view(spec);
+    let packed = lower_in(input, snap, hole)?.collect_set()?;
+    let BoolExpr::Contains(a, x) = body;
+    let prepared = PreparedContains::new(a, *x, snap, hole)?;
+    let mut out = Vec::new();
+    for i in 0..view.sets() {
+        if prepared.eval(&packed, &view, i, *x, snap)? {
+            out.push(i as u64);
+        }
+    }
+    Ok(Arc::new(OrdSet::from_iter_unsorted(out)))
+}
+
+/// Fuse fold(map(view, intersect-with-invariants), op).
+///
+/// Intersection distributes over union, intersection, and symmetric difference,
+/// so every mapped invariant can be applied once after the packed fold.
+fn fold_mapped_view(
+    v: &VecSetExpr,
+    op: FoldOp,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Option<Expr>> {
+    let mut invariants = Vec::new();
+    let Some((input, spec)) = mapped_view_intersections(v, &mut invariants) else {
+        return Ok(None);
+    };
+    let packed = lower_in(input, snap, hole)?.collect_set()?;
+    let mut out = Expr::set(packed.view_fold(&core_view(spec), core_reduce(op)));
+    for invariant in invariants {
+        out = out.and(lower_in(invariant, snap, hole)?);
+    }
+    Ok(Some(out))
+}
+
+fn mapped_view_intersections<'a>(
+    v: &'a VecSetExpr,
+    invariants: &mut Vec<&'a SetExpr>,
+) -> Option<(&'a SetExpr, ViewSpec)> {
+    match v {
+        VecSetExpr::View(input, spec) => Some((input, *spec)),
+        VecSetExpr::Map(inner, body) => {
+            let keep = invariants.len();
+            let mut holes = 0;
+            collect_intersection_body(body, invariants, &mut holes);
+            if holes != 1 {
+                invariants.truncate(keep);
+                return None;
+            }
+            mapped_view_intersections(inner, invariants)
+        }
+        VecSetExpr::List(_) => None,
+    }
+}
+
+fn collect_intersection_body<'a>(
+    e: &'a SetExpr,
+    invariants: &mut Vec<&'a SetExpr>,
+    holes: &mut u32,
+) {
+    match e {
+        SetExpr::Hole => *holes += 1,
+        SetExpr::And(xs) => {
+            for x in xs {
+                collect_intersection_body(x, invariants, holes);
+            }
+        }
+        other if !set_contains_hole(other) => invariants.push(other),
+        _ => {
+            // More than one marks this body as unsupported without another flag.
+            *holes += 2;
+        }
+    }
+}
+
+fn set_contains_hole(e: &SetExpr) -> bool {
+    match e {
+        SetExpr::Empty | SetExpr::Key(_) | SetExpr::Range(..) | SetExpr::Literal(_) => false,
+        SetExpr::Hole => true,
+        SetExpr::And(xs) | SetExpr::Or(xs) => xs.iter().any(set_contains_hole),
+        SetExpr::AndNot(a, b) => set_contains_hole(a) || set_contains_hole(b),
+        SetExpr::At(v, _) | SetExpr::Fold(v, _) | SetExpr::Pack(v, _) => vec_set_contains_hole(v),
+        SetExpr::Expand(a, _) | SetExpr::Select(a, _) => set_contains_hole(a),
+        SetExpr::MapBool(v, body) => {
+            vec_set_contains_hole(v)
+                || match body.as_ref() {
+                    BoolExpr::Contains(a, _) => set_contains_hole(a),
+                }
+        }
+    }
+}
+
+fn vec_set_contains_hole(v: &VecSetExpr) -> bool {
+    match v {
+        VecSetExpr::List(xs) => xs.iter().any(set_contains_hole),
+        VecSetExpr::View(a, _) => set_contains_hole(a),
+        VecSetExpr::Map(v, body) => vec_set_contains_hole(v) || set_contains_hole(body),
+    }
 }
 
 /// Materialize a vector's elements.
 ///
-/// **Only called where an operator genuinely needs every constituent** — today
-/// that is `pack`, and indexing into a literal list. The `view` cases of `at`
-/// and `fold` deliberately do **not** come through here: `view( e, s )` under
-/// `Interleaved` has a single-walk arm in `OrdSet::view_fold`, and building the
-/// `sets` constituents first to combine them afterwards would throw it away,
-/// making the composed spelling slower than the single node it replaced.
+/// **Only called where an operator genuinely needs every materialized
+/// constituent or no exact terminal fusion applies.** `at` never comes through
+/// here, and cardinality, membership, and intersection-map folds have direct
+/// view paths. The fallback remains important for arbitrary map bodies.
 fn lower_vec(v: &VecSetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Vec<OrdSet>> {
     Ok(match v {
         VecSetExpr::List(xs) => {
@@ -423,11 +836,68 @@ mod tests {
         assert_eq!(got, want);
         assert!(!want.is_empty(), "the fixture must not be vacuous");
 
-        // Bool body: which constituents hold ordinal 1. That is a set of
-        // *constituent indices* -- the column of the matrix.
+        for (op, want) in [
+            (FoldOp::Or, vec![1, 2, 7]),
+            (FoldOp::And, vec![]),
+            (FoldOp::Xor, vec![2, 7]),
+        ] {
+            let folded = SetExpr::Fold(
+                Box::new(VecSetExpr::Map(
+                    view(),
+                    Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(7)])),
+                )),
+                op,
+            );
+            let got: Vec<u64> = lower(&folded, &snap)
+                .unwrap()
+                .collect_set()
+                .unwrap()
+                .iter()
+                .collect();
+            assert_eq!(got, want, "{op:?}");
+        }
+
+        // Indexing traverses both sequential map layers but no sibling. The
+        // outer union is deliberately not a fold-fusion shape.
+        let indexed = SetExpr::At(
+            Box::new(VecSetExpr::Map(
+                Box::new(VecSetExpr::Map(
+                    view(),
+                    Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(7)])),
+                )),
+                Box::new(SetExpr::Or(vec![SetExpr::Hole, SetExpr::Literal(vec![99])])),
+            )),
+            1,
+        );
+        let got: Vec<u64> = lower(&indexed, &snap)
+            .unwrap()
+            .collect_set()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(got, vec![1, 99]);
+
+        let ranks = VecIntExpr::Map(
+            view(),
+            Box::new(IntExpr::Rank(
+                Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(7)])),
+                7,
+            )),
+        );
+        assert_eq!(vec_int(&ranks, &snap).unwrap(), vec![2, 1, 0]);
+        assert_eq!(
+            eval_int(&IntExpr::At(Box::new(ranks), 1), &snap, None).unwrap(),
+            1
+        );
+        // Bool body: which filtered constituents hold ordinal 1. The invariant
+        // key is prepared once and the hole remains a direct view probe. The
+        // result is a set of constituent indices, the column of the matrix.
         let holds = SetExpr::MapBool(
             view(),
-            Box::new(BoolExpr::Contains(Box::new(SetExpr::Hole), 1)),
+            Box::new(BoolExpr::Contains(
+                Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(7)])),
+                1,
+            )),
         );
         let got: Vec<u64> = lower(&holds, &snap)
             .unwrap()

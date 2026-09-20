@@ -76,6 +76,144 @@ One-sided laws require strict counterexamples in tests. An inclusion-only assert
 
 Flight descriptors carry validated `ViewSpec` values through versioned tickets. The server lowers transforms through audited eager `OrdSet` operations and re-enters the Boolean expression as a set leaf. Top-level view selection retains an exact non-materializing cardinality path. Lazy core expression nodes remain open only under the conditions recorded in `TODO.md`.
 
+#### Expression-level map and fold baseline ( 2026-09-20 )
+
+The typed Flight expression evaluator has a measured bottleneck before any
+Boolean terminal. `lower_vec` materializes every view constituent, then map
+bodies and folds consume those sets. On an interleaved view, each
+`view_select` walks the whole packed set; with fixed logical density the packed
+cardinality itself grows with `sets`, so mapping over all constituents grows
+close to quadratically.
+
+Measured through the public `yesno_flight::expr` entry points at commit
+`85a41c2bf34f7134df8eaf30a26265ceee6d6eba`, in release mode on the 20-core
+Cortex-X925 / Cortex-A725 aarch64 host with rustc 1.97.1 and the repository's
+pinned Arrow 59.2.0 graph. The fixture held 131 072 logical ordinals and 55%
+density per constituent. Each row is the median of five batches; the complete
+process was run twice and the medians below reproduced within 1%.
+
+| constituents | interleaved | blocked aligned | ratio | interleaved allocations | blocked allocations |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 4.72 ms | 1.39 us | 3 390x | 230 | 34 |
+| 8 | 14.07 ms | 2.48 us | 5 675x | 449 | 57 |
+| 16 | 47.12 ms | 4.90 us | 9 620x | 884 | 100 |
+
+This is `map( view( P ), cardinality( _ ) )`. Incremental peak heap was
+1.25, 1.32, and 1.45 MiB on the interleaved rows against 2.1, 3.8, and 7.3 KiB
+on blocked. The 4 -> 8 -> 16 interleaved times scale 1 -> 2.98 -> 9.98 while
+blocked scales 1 -> 1.78 -> 3.51. The shape, allocations, and heap growth agree
+on the mechanism: repeated extraction dominates.
+
+At eight dense interleaved constituents, changing the consumer did not change
+the time or the 1.32 MiB peak:
+
+| terminal | median | allocations |
+|---|---:|---:|
+| unfiltered cardinality map | 14.07 ms | 449 |
+| cardinality map under a 50% filter | 14.06 ms | 561 |
+| OR fold of that map | 14.07 ms | 698 |
+| AND fold of that map | 14.10 ms | 794 |
+| XOR fold of that map | 14.05 ms | 705 |
+| Boolean membership map | 14.06 ms | 485 |
+| one indexed element of the mapped vector | 14.04 ms | 608 |
+| cardinality under a three-level body | 14.08 ms | 945 |
+
+Filter selectivity at 10%, 50%, and 90% measured 14.09, 14.06, and 14.05 ms.
+That flat line is the discriminating observation: neither result density,
+terminal work, nor expression depth controls this frame. Even an index of one
+mapped element first materializes all eight constituents.
+
+The result holds across representations, but cardinality sets the absolute
+cost. For eight constituents, unfiltered interleaved versus blocked cardinality
+maps measured 39.5 us versus 2.53 us for 16 array containers, 8.32 ms versus
+2.56 us for 8/16 run containers, and 14.07 ms versus 2.48 us for 16 bitmap
+containers. After checkpoint, close, reopen, `verify`, and snapshot, dense
+interleaved time stayed near 14 ms. The blocked eight-way row rose from 2.48 us
+to 5.80 us and from 57 to 106 allocations, so stored decoding is visible only
+after extraction stops dominating. The OS page cache remained warm; these are
+reopened mmap results, not cold-storage latency.
+
+Construction: dense membership was `mix64( x xor ( set << 40 ) ) % 100 < 55`;
+the array fixture selected `( x + 37*set ) % 509 == 0`; the run fixture selected
+`[0, 32768)` and `[65536, 98304)` in every constituent so the packed form stayed
+run-encoded. Filters used independent `mix64` seeds. Both layouts held identical
+logical constituents, blocked stride was 131 072, every result was checksumed
+between resident and reopened snapshots, and an allocator positive control
+observed exactly one 128 KiB vector allocation. The disposable harness lived at
+`.agents-workspace/tmp/view-expr-baseline-20260920`; it used adaptive repetitions
+targeting 25 ms per batch and black-boxed operands. Exact decoded-chunk counts
+remain unmeasured because the public engine surface exposes no counter; adding a
+production hook for a one-off question would violate the research-code policy.
+
+This supplies the allocation-motivated workload the lazy-view backlog required,
+but it does not by itself license a new core `Expr` node. The first target is a
+fused evaluator path for batched cardinality, membership, indexed map, and
+map-to-fold consumers. A lazy core node still owes stream statistics,
+cardinality, seek behavior, planner bounds, and termination evidence.
+
+#### Stage 2 terminal fusion ( 2026-09-20 )
+
+The narrow evaluator paths were sufficient to remove repeated extraction from
+all common measured terminals without adding a lazy view node to `Expr`. The
+packed input remains one eager `OrdSet`; the consumer controls what happens
+next:
+
+- `At` descends through sequential maps and selects only the requested element.
+- An unfiltered cardinality map uses `view_cardinalities`. Interleaved layouts
+  assign every physical ordinal to its owner in one walk; blocked layouts retain
+  scalar range counts, which sum whole containers without reading payloads.
+- An intersection-shaped filtered cardinality map lowers invariant operands
+  once as reopenable expressions. A monotone filter stream answers each logical
+  ordinal once while the interleaved packed set assigns matches to row counters.
+  The filter is not eagerly materialized.
+- A membership map scalarizes `And`, `Or`, and `AndNot` at the requested ordinal.
+  The hole is one direct `view_contains` probe per row and invariant branches
+  are answered once.
+- An intersection-shaped mapped fold uses distributivity for all three exact
+  reductions: union, intersection, and symmetric difference. It folds the view
+  once, then applies each invariant once.
+
+Unsupported transforms retain `lower_vec`, and rank still selects one
+constituent at a time while reusing lowered invariant work. That fallback is an
+explicit boundary: the implementation does not claim that arbitrary map bodies
+are vectorized.
+
+The same release harness, fixture, host, repetitions, and resident snapshot as
+the baseline measured:
+
+| constituents | unfiltered before | unfiltered after | speedup | filtered 50% after | allocations unfiltered / filtered | peak heap unfiltered / filtered |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 4.72 ms | 0.646 ms | 7.3x | 1.753 ms | 13 / 20 | 2.1 / 2.1 KiB |
+| 8 | 14.07 ms | 1.285 ms | 11.0x | 2.491 ms | 16 / 23 | 3.7 / 3.7 KiB |
+| 16 | 47.12 ms | 2.576 ms | 18.3x | 3.655 ms | 19 / 26 | 7.0 / 7.0 KiB |
+
+At eight dense interleaved constituents the terminal comparison is:
+
+| terminal | before | after | speedup | allocations after |
+|---|---:|---:|---:|---:|
+| unfiltered cardinality map | 14.07 ms | 1.285 ms | 11.0x | 16 |
+| cardinality under a 50% filter | 14.06 ms | 2.491 ms | 5.6x | 23 |
+| cardinality under a three-level body | 14.08 ms | 2.490 ms | 5.7x | 71 |
+| OR fold of the filtered map | 14.07 ms | 2.101 ms | 6.7x | 105 |
+| AND fold of the filtered map | 14.10 ms | 1.691 ms | 8.3x | 87 |
+| XOR fold of the filtered map | 14.05 ms | 1.914 ms | 7.3x | 89 |
+| Boolean membership map | 14.06 ms | 1.46 us | 9 650x | 28 |
+| one indexed filtered-map element | 14.04 ms | 1.701 ms | 8.3x | 93 |
+
+The 10%, 50%, and 90% filtered cardinality rows are now 2.084, 2.491,
+and 2.218 ms rather than the old flat 14 ms floor. The result still scales with
+the packed input that must be visited, but it no longer multiplies that visit by
+the number of rows. Array and run fixtures improved consistently: the eight-way
+filtered interleaved rows moved from 42.5 us to 7.74 us and from 8.37 ms to
+1.51 ms. Checkpoint, close, reopen, verify, and a fresh snapshot produced the
+same checksums and near-identical interleaved times. Reopened allocation counts
+include the stored key source plan but remain independent of constituent count.
+
+A dedicated allocation regression compares 4 and 64 constituents for direct
+and filtered cardinality maps, mapped folds, membership maps, and indexed maps.
+Every path may grow only by the output collection's 16-allocation allowance;
+the pre-change implementation failed at 192 -> 2 200, 175 -> 2 003, and
+197 -> 2 213 allocations for indexed map, direct cardinality, and membership.
 ### Bit-sliced proposal and the surviving count
 
 A bit-sliced value would read several ordinary sets as integer planes over each ordinal, the transpose of `bignum`'s significance-inner layout. **It was proposed by a consumer and declined in full; see the `view_count` discussion below for why.** The storage doctrine fits because the caller still owns the layout and each plane remains an ordinary equality-encoded key. The arithmetic does not license a lazy API shape: `matrix/`, `bignum/`, `view/`, and `pack/` are eager and contain no `Expr` or `ChunkStream` integration.
