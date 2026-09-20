@@ -16,9 +16,12 @@
 //! them, pointwise Boolean cardinality and rank maps use one packed walk after
 //! decomposing the body at the absent and present values of its hole, and folds
 //! of pointwise maps reduce the same two-value truth table over the packed view.
-//! Non-pointwise shapes keep the eager fallback. This closes the measured
-//! repeated-extraction costs without adding an unmeasured `Expr` variant or
-//! changing the planner's audited termination proof.
+//! A fold of direct selections tracks every constituent's nth ordinal in one
+//! physical walk. An identity cardinality map is normalized through a composed
+//! set map before terminal selection. Other non-pointwise shapes keep the eager
+//! fallback. This closes the measured repeated-extraction costs without adding
+//! an unmeasured `Expr` variant or changing the planner's audited termination
+//! proof.
 
 use std::sync::Arc;
 
@@ -191,6 +194,9 @@ fn eval_vec_int(v: &VecIntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::
             .map(|x| eval_int(x, snap, hole))
             .collect::<yesno_core::Result<Vec<_>>>()?,
         VecIntExpr::Map(vs, body) => {
+            if let Some(normalized) = normalize_cardinality_map(vs, body) {
+                return eval_vec_int(&normalized, snap, hole);
+            }
             if let VecSetExpr::View(input, view) = vs.as_ref() {
                 if let Some(out) = eval_view_int_map(input, *view, body, snap, hole)? {
                     return Ok(out);
@@ -204,6 +210,27 @@ fn eval_vec_int(v: &VecIntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::
             out
         }
     })
+}
+
+/// Move an identity cardinality terminal through one set-map binding.
+///
+/// Only a bare `cardinality( _ )` matches. An arbitrary cardinality operand
+/// would introduce another use of the outer hole, so substituting it into the
+/// inner body here would capture the wrong map binding.
+fn normalize_cardinality_map(input: &VecSetExpr, body: &IntExpr) -> Option<VecIntExpr> {
+    let IntExpr::Cardinality(operand) = body else {
+        return None;
+    };
+    if !matches!(operand.as_ref(), SetExpr::Hole) {
+        return None;
+    }
+    let VecSetExpr::Map(inner, mapped_body) = input else {
+        return None;
+    };
+    Some(VecIntExpr::Map(
+        inner.clone(),
+        Box::new(IntExpr::Cardinality(mapped_body.clone())),
+    ))
 }
 
 fn eval_int(e: &IntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<u64> {
@@ -682,19 +709,27 @@ fn eval_view_bool_map(
     Ok(Arc::new(OrdSet::from_iter_unsorted(out)))
 }
 
-/// Fuse a fold over a pointwise map of a packed view.
+/// Fuse a fold over a mapped packed view.
 ///
-/// The intersection-only arm stays first because it needs one packed fold.
-/// Otherwise let `f0` and `f1` be the map body with its hole absent and present.
-/// At one ordinal the mapped values are therefore copies of only those two bits,
-/// so their OR, AND, or parity is determined by the packed view's any/all/parity
-/// folds and the view arity. Non-pointwise bodies decline to the eager oracle.
+/// Direct selection uses one physical walk to find every constituent's nth
+/// logical ordinal. The intersection-only arm then stays ahead of the general
+/// pointwise arm because it needs only one packed fold. Otherwise let `f0` and
+/// `f1` be the map body with its hole absent and present. At one ordinal the
+/// mapped values are copies of only those two bits, so their OR, AND, or parity
+/// is determined by the packed view's any/all/parity folds and the view arity.
+/// Other non-pointwise bodies decline to the eager oracle.
 fn fold_mapped_view(
     v: &VecSetExpr,
     op: FoldOp,
     snap: &Snapshot,
     hole: Hole<'_>,
 ) -> yesno_core::Result<Option<Expr>> {
+    if let Some((input, spec, n)) = mapped_view_selection(v) {
+        let packed = lower_in(input, snap, hole)?.collect_set()?;
+        let out = fold_view_selections(&packed, &core_view(spec), n, op);
+        return Ok(Some(Expr::set(Arc::new(out))));
+    }
+
     let mut invariants = Vec::new();
     if let Some((input, spec)) = mapped_view_intersections(v, &mut invariants) {
         let packed = lower_in(input, snap, hole)?.collect_set()?;
@@ -747,6 +782,85 @@ fn fold_mapped_view(
         }
     };
     Ok(Some(out))
+}
+
+fn mapped_view_selection(v: &VecSetExpr) -> Option<(&SetExpr, ViewSpec, u64)> {
+    let VecSetExpr::Map(inner, body) = v else {
+        return None;
+    };
+    let VecSetExpr::View(input, spec) = inner.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(selected, n) = body.as_ref() else {
+        return None;
+    };
+    matches!(selected.as_ref(), SetExpr::Hole).then_some((input.as_ref(), *spec, *n))
+}
+
+/// Select one ordinal per constituent and reduce the singleton results.
+///
+/// The state is bounded by the wire's view-arity limit, while the data walk is
+/// bounded by the packed input. Both layouts use `logical_of`, preserving the
+/// generic view mapping as the oracle rather than duplicating its arithmetic.
+fn fold_view_selections(packed: &OrdSet, view: &View, n: u64, op: FoldOp) -> OrdSet {
+    if view.check().is_err() {
+        return OrdSet::new();
+    }
+
+    let mut state = vec![(0u64, None); view.sets() as usize];
+    let mut remaining = view.sets();
+    for physical in packed.iter() {
+        let Some((owner, logical)) = view.logical_of(physical) else {
+            continue;
+        };
+        let (count, selected) = &mut state[owner as usize];
+        if selected.is_some() {
+            continue;
+        }
+        if *count == n {
+            *selected = Some(logical);
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        } else {
+            *count += 1;
+        }
+    }
+
+    match op {
+        FoldOp::Or => {
+            OrdSet::from_iter_unsorted(state.iter().filter_map(|(_, selected)| *selected))
+        }
+        FoldOp::And => {
+            let Some((_, Some(first))) = state.first() else {
+                return OrdSet::new();
+            };
+            if state.iter().all(|(_, selected)| selected == &Some(*first)) {
+                OrdSet::from_iter_unsorted([*first])
+            } else {
+                OrdSet::new()
+            }
+        }
+        FoldOp::Xor => {
+            let mut values: Vec<_> = state.iter().filter_map(|(_, selected)| *selected).collect();
+            values.sort_unstable();
+            let mut odd = Vec::with_capacity(values.len());
+            let mut i = 0;
+            while i < values.len() {
+                let value = values[i];
+                let mut end = i + 1;
+                while end < values.len() && values[end] == value {
+                    end += 1;
+                }
+                if (end - i) % 2 == 1 {
+                    odd.push(value);
+                }
+                i = end;
+            }
+            OrdSet::from_iter_unsorted(odd)
+        }
+    }
 }
 
 fn mapped_view_intersections<'a>(
@@ -819,7 +933,8 @@ fn vec_set_contains_hole(v: &VecSetExpr) -> bool {
 /// **Only called where an operator genuinely needs every materialized
 /// constituent or no exact terminal fusion applies.** `at` never comes through
 /// here, and cardinality, membership, and pointwise-map folds have direct view
-/// paths. The fallback remains important for non-pointwise map bodies.
+/// paths. The fallback remains important for transformed order-sensitive map
+/// bodies.
 fn lower_vec(v: &VecSetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Vec<OrdSet>> {
     Ok(match v {
         VecSetExpr::List(xs) => {

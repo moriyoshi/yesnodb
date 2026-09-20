@@ -394,3 +394,97 @@ fn pointwise_mapped_folds_have_bounded_allocation_growth() {
         }
     }
 }
+
+fn mapped_select_fold(sets: u32, op: FoldOp) -> SetExpr {
+    mapped_fold(sets, SetExpr::Select(Box::new(SetExpr::Hole), 1_000), op)
+}
+
+#[test]
+fn mapped_select_folds_have_bounded_allocation_growth() {
+    let db = Db::new();
+    db.insert_range(9, 0, 262_143).unwrap();
+    let snapshot = db.snapshot().unwrap();
+
+    for op in [FoldOp::Or, FoldOp::And, FoldOp::Xor] {
+        let small = mapped_select_fold(4, op);
+        let large = mapped_select_fold(64, op);
+
+        let _ = expr::lower(&small, &snapshot)
+            .unwrap()
+            .collect_set()
+            .unwrap();
+        let _ = expr::lower(&large, &snapshot)
+            .unwrap()
+            .collect_set()
+            .unwrap();
+
+        let (small_result, small_allocs) = count_allocations(|| {
+            expr::lower(&small, &snapshot)
+                .unwrap()
+                .collect_set()
+                .unwrap()
+        });
+        let (large_result, large_allocs) = count_allocations(|| {
+            expr::lower(&large, &snapshot)
+                .unwrap()
+                .collect_set()
+                .unwrap()
+        });
+
+        assert_eq!(small_result, large_result);
+        const ALLOWANCE: u64 = 16;
+        assert!(
+            large_allocs <= small_allocs + ALLOWANCE,
+            "mapped selection with {op:?} allocated {small_allocs} -> {large_allocs} at 4 -> 64 \
+             constituents; growth may be at most {ALLOWANCE}"
+        );
+    }
+}
+
+fn nested_filtered_cardinalities(sets: u32) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(VecSetExpr::Map(
+            Box::new(view(sets)),
+            Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(7)])),
+        )),
+        Box::new(IntExpr::Cardinality(Box::new(SetExpr::Hole))),
+    )
+}
+
+#[test]
+fn nested_cardinality_maps_share_the_direct_terminal_allocation_shape() {
+    let db = Db::new();
+    db.insert_range(9, 0, 262_143).unwrap();
+    db.insert_range(7, 0, 1_000).unwrap();
+    let snapshot = db.snapshot().unwrap();
+
+    let direct_small = filtered_cardinalities(4);
+    let direct_large = filtered_cardinalities(64);
+    let nested_small = nested_filtered_cardinalities(4);
+    let nested_large = nested_filtered_cardinalities(64);
+    for expression in [&direct_small, &direct_large, &nested_small, &nested_large] {
+        let _ = expr::vec_int(expression, &snapshot).unwrap();
+    }
+
+    let (direct_small_result, direct_small_allocs) =
+        count_allocations(|| expr::vec_int(&direct_small, &snapshot).unwrap());
+    let (direct_large_result, direct_large_allocs) =
+        count_allocations(|| expr::vec_int(&direct_large, &snapshot).unwrap());
+    let (nested_small_result, nested_small_allocs) =
+        count_allocations(|| expr::vec_int(&nested_small, &snapshot).unwrap());
+    let (nested_large_result, nested_large_allocs) =
+        count_allocations(|| expr::vec_int(&nested_large, &snapshot).unwrap());
+
+    assert_eq!(nested_small_result, direct_small_result);
+    assert_eq!(nested_large_result, direct_large_result);
+    const ALLOWANCE: u64 = 16;
+    assert!(
+        nested_small_allocs <= direct_small_allocs + ALLOWANCE
+            && nested_large_allocs <= direct_large_allocs + ALLOWANCE
+            && nested_large_allocs <= nested_small_allocs + ALLOWANCE,
+        "allocations for direct 4/64 and nested 4/64 cardinality maps were \
+         {direct_small_allocs}/{direct_large_allocs} and \
+         {nested_small_allocs}/{nested_large_allocs}; normalization may add at most \
+         {ALLOWANCE} allocations and growth must stay bounded"
+    );
+}

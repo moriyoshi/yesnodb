@@ -580,6 +580,166 @@ retain about 1.2 MiB peak live allocation because they hold both `Any` and
 - Invariant audit: no container-kernel, codec, wire-format, dependency, or unsafe-code changes; non-pointwise expressions retain the existing eager semantics.
 
 ---
+## 2026-09-21 — Test plan: mapped-select folds
+
+The only measured mapped-view fold still taking the eager fallback is
+`fold( map( view, select( _, n ) ), op )`. On the 131,072-ordinal, 55%-dense
+interleaved fixture, a midpoint selection over 4 / 8 / 16 constituents took
+about 4.79 / 14.31 / 47.40 ms for OR, AND, and XOR, with 308-347 /
+611-715 / 1,214-1,374 allocations and 1.25 / 1.32 / 1.45 MiB peak requested
+heap. A disposable one-pass prototype produced identical resident and reopened
+checksums in about 0.30 / 0.61 / 1.21 ms, with 6-25 allocations and 1-4 KiB
+resident peak heap.
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Wrong selected ordinal | The scan treats `n` as one-based, advances the wrong owner's counter, or misses a chunk boundary | Flight expression test against an independent `BTreeSet` oracle |
+| Wrong fold semantics | Duplicate selected ordinals are deduplicated for XOR, retained for AND when one constituent is empty, or lost from OR | Independent oracle covering all three fold operators |
+| Layout divergence | The physical traversal assumes interleaved order and returns wrong values for blocked views | Independent oracle covering interleaved and blocked descriptors |
+| Silent decay | The terminal resumes materializing one set per constituent | Flight allocation regression comparing 4 with 64 constituents |
+
+### Planned tests
+
+- `tests/mapped_select_folds.rs::mapped_select_folds_agree_with_an_independent_set_oracle` — derive each constituent's nth ordinal from independent `BTreeSet` values, then reduce OR, AND, and XOR across common, distinct, and missing selections under both layouts.
+- `tests/expression_allocation.rs::mapped_select_folds_have_bounded_allocation_growth` — compare 4 and 64 interleaved constituents for all three fold operators with a fixed output-size allowance.
+
+### Sabotage plan
+
+- Change the selection comparison from `count == n` to `count + 1 == n` and confirm the independent oracle fails.
+- Bypass the mapped-select fusion and confirm the 4-versus-64 allocation regression fails by arity.
+
+### Deliberately not covered
+
+This stage recognises the direct `select( _, n )` body whose workload was
+measured. Selection over an arbitrary transformed hole retains the eager
+fallback because its ordering can depend on invariant sets and has no measured
+caller. No core lazy-view expression node is introduced.
+
+---
+
+## 2026-09-21 — Test plan: composed cardinality-map normalization
+
+The external expression-math prescription identifies an equivalent spelling
+that misses the existing view terminal:
+`map( map( V, f( _ ) ), cardinality( _ ) )`. On its 4,096-feature sparse
+fixture, normalizing that spelling to
+`map( V, cardinality( f( _ ) ) )` changed the time for two count vectors from
+57.28-59.26 to 8.34-8.53 microseconds at 16 documents, 567.15-573.57 to
+25.60-28.32 microseconds at 64, and 7,535.73-7,553.95 to 75.47-79.04
+microseconds at 256.
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Wrong composition | Direct and nested spellings return different count vectors | Flight expression test against an independent `BTreeSet` oracle |
+| Hole capture | Normalization substitutes through another binding or rewrites a non-identity outer body | Binding-scope case whose outer cardinality operand is not a bare hole |
+| Body loss | Static or repeated-hole inner bodies are simplified incorrectly | Independent oracle covering both shapes and empty constituents |
+| Silent decay | The nested spelling resumes materializing every mapped constituent | Flight allocation regression pairing direct and nested forms at 4 and 64 constituents |
+
+### Planned tests
+
+- `tests/nested_view_maps.rs::nested_cardinality_maps_match_direct_maps_and_an_independent_oracle` — compare direct and nested spellings for union, both difference directions, static, and repeated-hole bodies under both layouts, including an empty constituent.
+- `tests/nested_view_maps.rs::normalization_does_not_capture_a_non_identity_outer_body` — evaluate a nested map whose outer cardinality applies an additional intersection; a rewrite that treats that operand as a bare hole must fail.
+- Extend `tests/expression_allocation.rs` to compare nested and direct intersection-cardinality maps at 4 and 64 constituents with a fixed allocation allowance.
+
+### Sabotage plan
+
+- Disable normalization and confirm the nested allocation regression fails while the semantic oracle stays green.
+- Broaden the match from `cardinality( Hole )` to an arbitrary cardinality operand and confirm the binding-scope oracle fails.
+
+### Deliberately not covered
+
+This stage moves only the identity cardinality terminal across one set-map
+binding and then redispatches. Rank, contains, selection, arbitrary
+substitution, and cross-request source sharing retain their current execution
+and require separate semantic and resource evidence.
+
+---
+
+## 2026-09-21 — stages 5 and 6 close mapped selection and composed cardinality gaps
+
+Stage 5 recognises `fold( map( view, select( _, n ) ), op )` and finds every
+constituent's nth logical ordinal in one physical packed-set walk. OR, AND, and
+XOR then reduce at most one ordinal per constituent without constructing the
+constituent sets. The implementation uses `View::logical_of` for both layouts,
+so Flight does not duplicate the checked view-addressing arithmetic.
+
+On the resident 131,072-ordinal, 55%-dense fixture, 4 / 8 / 16-way midpoint
+selection folds fell from about 4.79 / 14.31 / 47.40 ms to
+0.371 / 0.741 / 1.49 ms. At 16 constituents allocations fell from 1,214-1,374
+to 21-39 and peak requested heap from about 1.45 MiB to 7.1 KiB. Reopened
+checksums matched. The independent oracle spans common, distinct, and missing
+selections, in-range and past-end indices, both layouts, odd and even arities,
+and every fold operator. An off-by-one mutation returned empty instead of
+`{4}`; bypassing fusion made the allocation test fail at 275 -> 3,490.
+
+Stage 6 implements the expression-math prescription's first step: an outer
+identity `cardinality( _ )` map moves through one inner set-map binding and the
+result is redispatched to the existing terminal chooser. The match is
+deliberately limited to a bare hole. It introduces no wire node, arithmetic
+operator, core expression node, or count kernel.
+
+The prescription's 4,096-feature sparse fixture measured the nested spelling at
+57.28-59.26 / 567.15-573.57 / 7,535.73-7,553.95 microseconds for
+16 / 64 / 256 documents and normalize-then-current at
+8.34-8.53 / 25.60-28.32 / 75.47-79.04 microseconds. Locally, the allocation
+test measured direct 4/64 forms at 27/27 allocations and nested forms before
+normalization at 256/3,604. Direct, nested, and independent `BTreeSet` answers
+agree for both layouts and the body shapes already supported by the pointwise
+terminal. Broadening the guard to arbitrary cardinality operands made the
+binding-scope test return `[8, 8, 5]` rather than `[5, 4, 3]`; the exact
+guard is restored.
+
+### Quality gate
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  passed with the default toolchain and with stable.
+- `cargo fmt --check` and the focused semantic and allocation tests passed.
+- `./scripts/gate.sh` passed the complete workspace, property, differential,
+  durability, Flight, server, scenario, documentation, and structural suite.
+- `./scripts/gate-pg.sh` passed the default PostgreSQL major and PostgreSQL 18,
+  including unit tests and hermetic regression fixtures.
+- `./scripts/gate-search.sh` passed the application, OpenSearch, and
+  Elasticsearch scenarios.
+- No core container, codec, persistence, wire, dependency, or unsafe code was
+  changed. No oracle or allocation budget was weakened.
+
+---
+
+## 2026-09-21 — SIMD exploration found a packed-view arm, not a general word-loop arm
+
+A disposable crate under `.agents-workspace/tmp` measured explicit NEON on the
+native Cortex-X925 performance core. Seven alternating repetitions black-boxed
+the operands, checked every candidate against current public operations, and
+kept the production tree untouched.
+
+Plain matrix XOR and OR have no case: release assembly already contains paired
+128-bit loads, vector `eor` / `orr`, and paired stores, and explicit NEON was
+0.99-1.03x from 64 through 16,384 words. Fused AND-plus-popcount does retain a
+wide-row case. A real 64xK by Kx64 `counted_mul` comparison crossed current code
+near K=1,024 bits, then reached 1.38x at 4,096 and 1.44x at 16,384. It regressed
+small shapes as far as 0.43x, so width dispatch is part of the result.
+
+The high-value case is an interleaved view whose physical chunks are bitmaps.
+For four 55%-dense constituents over 262,144 logical ordinals, current
+`view_cardinalities` took 1.361 ms, a byte LUT 59.46 us, and NEON 5.361 us.
+Current-to-NEON is about 254x, while the SIMD-only increment is the 11.1x from
+the LUT to NEON; the rest comes from replacing one iteration per set bit with a
+fixed-width bitmap traversal. Any / All / Parity folds, including output-set
+construction, improved 3.27x / 17-22x / 4.97x. The shared raw fold kernel was
+5.30x faster than the LUT, but dense output construction hid most of that gain
+for Any and Parity.
+
+No implementation landed. A production arm still owes per-container dispatch,
+array/run and generic fallbacks, unaligned-buffer handling, output chunk seams,
+arity-specific 2/4/8 kernels, oracle and sabotage coverage, and a separately
+measured x86 implementation. SVE remains inapplicable: this host's vector length
+is 16 bytes and the intrinsics remain outside the stable MSRV.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

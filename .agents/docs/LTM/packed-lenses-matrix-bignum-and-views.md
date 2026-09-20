@@ -316,6 +316,76 @@ The only known eager mapped-fold remainder is now genuinely non-pointwise, such
 as `select( _, n )`. Its result depends on global order statistics and cannot be
 recovered from the hole's per-ordinal false/true values. Keep that fallback and
 the lazy-core-node planner obligations until a measured caller justifies more.
+
+#### Stage 5 direct mapped-select folds ( 2026-09-21 )
+
+The non-pointwise remainder became measured: a midpoint
+`fold( map( view, select( _, n ) ), op )` on the same 131,072-ordinal,
+55%-dense interleaved fixture shared the old extraction floor. OR, AND, and XOR
+all took about 4.79 / 14.31 / 47.40 ms at 4 / 8 / 16 constituents, with
+308-347 / 611-715 / 1,214-1,374 allocations and 1.25 / 1.32 / 1.45 MiB peak
+requested heap. A disposable implementation established the attainable shape
+before production changed: one physical walk, one counter and selected ordinal
+per constituent, then a reduction of at most one ordinal per constituent.
+
+Flight now recognises the exact direct body `select( _, n )`. It maps every
+physical ordinal through the view's existing `logical_of` oracle, advances only
+that owner's counter, and stops early once every constituent has selected a
+value. OR deduplicates the selected values, AND retains a singleton only when
+every constituent selected the same value, and XOR retains values with odd
+multiplicity. This works for both layouts without copying view-addressing
+arithmetic into Flight.
+
+The resident production medians became about 0.371 / 0.741 / 1.49 ms at
+4 / 8 / 16 constituents across the three reductions, with 15-39 allocations
+and 2.1-7.1 KiB peak requested heap. Reopened medians were comparable and every
+checksum matched the resident result. At 16 constituents this is about 32x
+faster than the eager path and removes roughly 1.44 MiB of transient heap.
+
+An independent `BTreeSet` oracle covers common, distinct, and missing selected
+values, selection indices at and beyond each constituent's length, both
+layouts, odd and even arities, and all three reductions. Changing the
+zero-based comparison made its first OR case return empty instead of `{4}`.
+The 4-versus-64 allocation regression failed at 275 -> 3,490 allocations when
+the fusion was bypassed.
+
+No measured mapped-fold workload now requires constituent extraction. The
+backlog remains partial only for selection over an arbitrary transformed hole,
+whose ordering can depend on invariant sets and has no measured caller. That
+narrow remainder does not justify a core view expression node or any change to
+the planner proof.
+
+#### Stage 6 composed cardinality-map normalization ( 2026-09-21 )
+
+An external expression-math study found that an equivalent expression spelling
+could still force the eager vector fallback:
+`map( map( V, f( _ ) ), cardinality( _ ) )`. The direct spelling
+`map( V, cardinality( f( _ ) ) )` already reaches the stage 2-3 terminal
+fusions. On a 4,096-feature interleaved fixture with exactly 24 features per
+document, evaluating two count vectors through the nested spelling took
+57.28-59.26 microseconds at 16 documents, 567.15-573.57 at 64, and
+7,535.73-7,553.95 at 256. Normalizing first and calling the unchanged evaluator
+took 8.34-8.53, 25.60-28.32, and 75.47-79.04 microseconds respectively.
+
+Flight now moves only an identity `cardinality( _ )` terminal through one
+set-map binding and redispatches the resulting existing expression. It does not
+substitute an arbitrary cardinality operand, extend the wire syntax, or add a
+kernel. Repeated composition removes one map layer per recursive dispatch and
+therefore terminates structurally.
+
+Independent `BTreeSet` coverage compares direct and nested spellings for union,
+both difference directions, static and repeated-hole bodies, both layouts, and
+an empty constituent. A separate binding-scope case keeps an additional outer
+intersection; deliberately broadening the match returned `[8, 8, 5]` instead
+of `[5, 4, 3]`. The allocation regression pairs direct and nested forms at
+4 and 64 constituents. Before normalization the direct forms allocated 27 / 27
+times while the nested forms allocated 256 / 3,604; after normalization the
+fixed allowance passes.
+
+This closes a composition reachability gap, not an execution-kernel gap. The
+prescription's native-container and query-support-driven count traversal remains
+separate future work with much broader core, persistence, dispatch, and
+mixed-container acceptance obligations.
 ### Bit-sliced proposal and the surviving count
 
 A bit-sliced value would read several ordinary sets as integer planes over each ordinal, the transpose of `bignum`'s significance-inner layout. **It was proposed by a consumer and declined in full; see the `view_count` discussion below for why.** The storage doctrine fits because the caller still owns the layout and each plane remains an ordinary equality-encoded key. The arithmetic does not license a lazy API shape: `matrix/`, `bignum/`, `view/`, and `pack/` are eager and contain no `Expr` or `ChunkStream` integration.

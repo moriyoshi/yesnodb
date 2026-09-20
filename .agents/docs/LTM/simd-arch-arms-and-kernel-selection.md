@@ -99,6 +99,59 @@ The literature corroborates both halves. Muła, Kurz and Lemire, *Faster Populat
 
 **What is not ruled out is algorithmic rather than kernel.** These operands are sparse -- 16 535 bits set across 131 072 -- and every arm reads both payloads in full because a dense AND must. A representation letting the intersection skip known-zero regions would beat any amount of kernel tuning, which is a container-format question.
 
+### Packed-view terminals expose a different SIMD problem
+
+A 2026-09-21 disposable probe tested the word loops outside `ops`, on the
+native Cortex-X925 performance core with rustc 1.97.1. Each comparison used
+seven alternating repetitions, black-boxed operands, and independently checked
+answers. The instrument lives under `.agents-workspace/tmp` rather than in
+production.
+
+Plain matrix XOR and OR are already done: LLVM emits paired 128-bit loads,
+`eor` or `orr`, and paired stores for the ordinary iterator loop. Hand-written
+NEON measured 0.99-1.03x from 64 through 16,384 words. This is not room worth an
+unsafe arm.
+
+Fused AND-plus-popcount differs. The shipped bitmap accumulation ladder is
+1.56-1.83x faster than LLVM's ladder from 256 through 4,096 resident words, but
+loses below eight words. In a real `BitMatrix::counted_mul` shape with a fixed
+64x64 output, the cloned NEON path was 0.43x current code at a 64-bit inner
+dimension, 0.88x at 512, 1.05x at 1,024, **1.38x at 4,096**, and **1.44x at
+16,384**. A matrix arm therefore has a case only for wide rows, with a measured
+crossover near 1,024 bits; applying it unconditionally would be a large
+regression on the common narrow shapes.
+
+The larger result is the interleaved packed view. The fixture had 262,144
+logical ordinals, four constituents at 55% density, and 1,048,576 physical bits
+held in 16 bitmap containers. The current public operations were compared with
+a byte-LUT bitmap prototype and a NEON `tbl` / pairwise-pack prototype:
+
+```text
+terminal                 current       byte LUT        NEON       current/NEON
+cardinalities           1.361 ms       59.46 us       5.361 us       254x
+fold Any                2.499 ms      787.06 us      763.58 us       3.27x
+fold All                1.90  ms      115-134 us       85-111 us      17-22x
+fold Parity             2.233 ms      475.21 us      449.37 us       4.97x
+raw fold reduction          --         28.00 us       5.285 us       5.30x LUT/NEON
+```
+
+The fold numbers include rebuilding an `OrdSet`, so output construction hides
+most of the 5.3x kernel win for Any and Parity. Cardinalities have no output set
+and expose the full gain: NEON is 11.1x faster than the LUT and about 254x faster
+than the current set-bit iterator. The large crate-level number is not "SIMD is
+254x". Most of it comes from changing the unit of work from one iteration per
+set bit plus a residue calculation to fixed-width work over bitmap bytes. SIMD
+is the further 11.1x over that representation-aware LUT.
+
+This is a candidate, not a shippable arm yet. The prototype assumes an
+interleaved arity of four, a contiguous byte image, and bitmap containers.
+Production must dispatch per container, preserve array and run fallbacks,
+handle shared unaligned buffers, join output chunks without materializing a
+whole physical image, and keep the generic walk as the oracle. Arity 2 and 8
+have the same byte-aligned structure; other arities do not. An x86 shuffle arm
+needs measurement on real x86 hardware rather than an inferred port. Blocked
+views already use range counts and must not be routed through this arm.
+
 ### ARM SVE: check two preconditions before writing code
 
 `libpopcnt` reports its SVE path beating its NEON one, **"especially on CPUs whose SVE vector width is larger than NEON's 128 bits"**. That qualifier is the whole result. On a Cortex-X925 with SVE and SVE2 both detected, `/proc/sys/abi/sve_default_vector_length` is **16 bytes = 128 bits**, exactly NEON's width -- and since the kernel is load-bound, identical width means identical loads for identical bytes, so there is no mechanism by which SVE moves the binding constraint. Predication would remove the scalar tail, a handful of words out of 1024.
