@@ -59,6 +59,7 @@ mod select;
 mod sink;
 
 pub use fold::Reduce;
+pub use select::{IntersectionCountStrategy, ViewIntersectionCounter};
 pub use sink::ViewSink;
 
 /// How constituents share the ordinal space.

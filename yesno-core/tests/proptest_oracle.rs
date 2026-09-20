@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use proptest::prelude::*;
 use yesno_core::container::codec;
 use yesno_core::roaring_format::{deserialize_u64, serialize_u64};
+use yesno_core::view::View;
 use yesno_core::{ContainerKind, OrdSet, RangeSummary, ORDINAL_MAX};
 
 /// Ordinals clustered into a handful of chunks, so containers actually fill up.
@@ -647,6 +648,115 @@ proptest! {
             // container looked fine until something read `end`.
             prop_assert_eq!(c.iter().count() as u32, c.len());
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Seventeen dense 4,096-bit rows force a bitmap first chunk and a partial
+    /// array tail. Uniform ordinals would produce neither shape and could not
+    /// exercise the blocked word-row arm or its mixed-container fallback.
+    #[test]
+    fn blocked_view_intersection_cardinalities_match_btreeset_oracle(
+        data_divisor in 2u64..8,
+        data_phase in 0u64..32,
+        query_divisor in 2u64..13,
+        query_phase in 0u64..32,
+    ) {
+        const SETS: u32 = 17;
+        const STRIDE: u64 = 4_096;
+        let rows: Vec<BTreeSet<u64>> = (0..SETS as u64)
+            .map(|owner| {
+                (0..STRIDE)
+                    .filter(|x| (x + owner * 11 + data_phase) % data_divisor != 0)
+                    .collect()
+            })
+            .collect();
+        let query: BTreeSet<u64> = (0..STRIDE)
+            .filter(|x| (x * 5 + query_phase) % query_divisor == 0)
+            .collect();
+        let packed = OrdSet::from_iter_unsorted(
+            rows.iter().enumerate().flat_map(|(owner, row)| {
+                row.iter().map(move |x| owner as u64 * STRIDE + x)
+            }),
+        );
+        assert_invariants(&packed);
+        prop_assert!(packed
+            .chunks()
+            .any(|(_, container)| container.kind() == ContainerKind::Bitmap));
+        prop_assert!(packed
+            .chunks()
+            .any(|(_, container)| container.kind() != ContainerKind::Bitmap));
+
+        for query in [query, BTreeSet::new(), (0..STRIDE).collect()] {
+            let filter = OrdSet::from_iter_unsorted(query.iter().copied());
+            assert_invariants(&filter);
+            let want: Vec<u64> = rows
+                .iter()
+                .map(|row| row.intersection(&query).count() as u64)
+                .collect();
+            prop_assert_eq!(
+                packed.view_intersection_cardinalities(&View::blocked(SETS, STRIDE), &filter),
+                want
+            );
+        }
+    }
+
+    /// Seventeen interleaved rows put logical boundaries at non-word and
+    /// non-chunk offsets. The sparse query selects bounded windows while the
+    /// dense sibling makes their batch select the full scan; both must retain
+    /// filter-major ordering and agree with independent row sets.
+    #[test]
+    fn interleaved_view_intersection_batch_matches_btreeset_oracle(
+        data_divisor in 2u64..11,
+        data_phase in 0u64..32,
+        sparse_divisor in 53u64..191,
+        sparse_phase in 0u64..53,
+    ) {
+        const SETS: u32 = 17;
+        const WIDTH: u64 = 8_000;
+        let rows: Vec<BTreeSet<u64>> = (0..SETS as u64)
+            .map(|owner| {
+                (0..WIDTH)
+                    .filter(|x| (x * 7 + owner * 11 + data_phase) % data_divisor != 0)
+                    .collect()
+            })
+            .collect();
+        let sparse: BTreeSet<u64> = (0..WIDTH)
+            .filter(|x| (x + sparse_phase) % sparse_divisor == 0)
+            .collect();
+        let dense: BTreeSet<u64> = (0..WIDTH).filter(|x| x % 3 != 0).collect();
+        let packed = OrdSet::from_iter_unsorted(
+            rows.iter().enumerate().flat_map(|(owner, row)| {
+                row.iter().map(move |x| x * SETS as u64 + owner as u64)
+            }),
+        );
+        let sparse_filter = OrdSet::from_iter_unsorted(sparse.iter().copied());
+        let dense_filter = OrdSet::from_iter_unsorted(dense.iter().copied());
+        let want_sparse: Vec<u64> = rows
+            .iter()
+            .map(|row| row.intersection(&sparse).count() as u64)
+            .collect();
+        let want_dense: Vec<u64> = rows
+            .iter()
+            .map(|row| row.intersection(&dense).count() as u64)
+            .collect();
+
+        prop_assert_eq!(
+            packed.view_intersection_cardinalities(
+                &View::interleaved(SETS),
+                &sparse_filter
+            ),
+            want_sparse.clone()
+        );
+        prop_assert_eq!(
+            packed.view_intersection_cardinalities_batch(
+                &View::interleaved(SETS),
+                &[&sparse_filter, &dense_filter]
+            ),
+            vec![want_sparse, want_dense]
+        );
     }
 }
 

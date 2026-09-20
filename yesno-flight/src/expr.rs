@@ -13,7 +13,9 @@
 //! audited `OrdSet`, not a core expression node. Its consumers are fused where
 //! their terminal makes that exact. Indexing evaluates only the requested map
 //! element, cardinality and membership maps walk constituents without retaining
-//! them, pointwise Boolean cardinality and rank maps use one packed walk after
+//! them. Direct intersection counts over a key use bounded or full persisted
+//! streams and native container traversal, and sibling terminals can share that
+//! traversal through [`vec_int_batch`]. Pointwise Boolean cardinality and rank maps use one packed walk after
 //! decomposing the body at the absent and present values of its hole, and folds
 //! of pointwise maps reduce the same two-value truth table over the packed view.
 //! A fold of direct selections tracks every constituent's nth ordinal in one
@@ -25,7 +27,9 @@
 
 use std::sync::Arc;
 
-use yesno_core::view::{Reduce, View, ViewSink};
+use yesno_core::view::{
+    IntersectionCountStrategy, Reduce, View, ViewIntersectionCounter, ViewSink,
+};
 use yesno_core::{ChunkStream, Container, Expr, OrdSet, Prefix48, Snapshot};
 pub use yesno_wire::{
     AnyExpr, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort, VecIntExpr, VecSetExpr,
@@ -185,6 +189,33 @@ fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
 /// `map( view( k, shape ), cardinality( and( _, q ) ) )` is a facet histogram.
 pub fn vec_int(v: &VecIntExpr, snap: &Snapshot) -> yesno_core::Result<Vec<u64>> {
     eval_vec_int(v, snap, None)
+}
+
+/// Evaluate sibling integer vectors, sharing one packed-key traversal when all
+/// are direct intersection-cardinality maps over the same view.
+///
+/// The wire format deliberately has no multi-result opcode. Callers that own
+/// several facet planes can opt into sharing through this in-process entrypoint;
+/// unrelated shapes retain the exact scalar evaluator.
+pub fn vec_int_batch(vectors: &[VecIntExpr], snap: &Snapshot) -> yesno_core::Result<Vec<Vec<u64>>> {
+    let Some((first_key, first_spec, _)) = vectors.first().and_then(direct_key_intersection) else {
+        return vectors.iter().map(|v| vec_int(v, snap)).collect();
+    };
+    let mut filters = Vec::with_capacity(vectors.len());
+    for vector in vectors {
+        let Some((key, spec, body)) = direct_key_intersection(vector) else {
+            return vectors.iter().map(|v| vec_int(v, snap)).collect();
+        };
+        if key != first_key || spec != first_spec {
+            return vectors.iter().map(|v| vec_int(v, snap)).collect();
+        }
+        let Some(filter) = intersection_filter(body, snap, None)? else {
+            return vectors.iter().map(|v| vec_int(v, snap)).collect();
+        };
+        filters.push(filter);
+    }
+    let filter_refs: Vec<_> = filters.iter().collect();
+    count_key_intersections(first_key, core_view(first_spec), &filter_refs, snap)
 }
 
 fn eval_vec_int(v: &VecIntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Vec<u64>> {
@@ -398,10 +429,6 @@ fn pointwise_fold(
 }
 
 /// Count an intersection-shaped body without extracting any constituent.
-///
-/// Interleaved physical order is logical-ordinal-major, so one monotone cursor
-/// over the invariant expression answers each logical ordinal once and the
-/// packed walk assigns matching rows to their constituent counters.
 fn eval_intersection_cardinalities(
     packed: &OrdSet,
     view: &View,
@@ -409,18 +436,28 @@ fn eval_intersection_cardinalities(
     snap: &Snapshot,
     hole: Hole<'_>,
 ) -> yesno_core::Result<Option<Vec<u64>>> {
-    if !matches!(view.layout(), yesno_core::view::ViewLayout::Interleaved) {
-        return Ok(None);
+    if let Some(filter) = intersection_filter(body, snap, hole)? {
+        return Ok(Some(packed.view_intersection_cardinalities(view, &filter)));
     }
-
     let mut invariants = Vec::new();
     let mut holes = 0;
     collect_intersection_body(body, &mut invariants, &mut holes);
-    if holes != 1 {
-        return Ok(None);
-    }
-    if invariants.is_empty() {
+    if holes == 1 && invariants.is_empty() {
         return Ok(Some(packed.view_cardinalities(view)));
+    }
+    Ok(None)
+}
+
+fn intersection_filter(
+    body: &SetExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Option<OrdSet>> {
+    let mut invariants = Vec::new();
+    let mut holes = 0;
+    collect_intersection_body(body, &mut invariants, &mut holes);
+    if holes != 1 || invariants.is_empty() {
+        return Ok(None);
     }
 
     let mut invariants = invariants.into_iter();
@@ -428,26 +465,79 @@ fn eval_intersection_cardinalities(
     for invariant in invariants {
         filter = filter.and(lower_in(invariant, snap, hole)?);
     }
-    let mut stream = filter.open();
-    let mut current: Option<(Prefix48, Container)> = None;
-    let mut exhausted = false;
-    let mut last_x = None;
-    let mut selected = false;
-    let mut counts = vec![0; view.sets() as usize];
+    Ok(Some(filter.collect_set()?))
+}
 
-    for physical in packed.iter() {
-        let Some((owner, x)) = view.logical_of(physical) else {
-            continue;
-        };
-        if last_x != Some(x) {
-            selected = monotone_stream_contains(stream.as_mut(), &mut current, &mut exhausted, x)?;
-            last_x = Some(x);
+fn direct_key_intersection(v: &VecIntExpr) -> Option<(u64, ViewSpec, &SetExpr)> {
+    let VecIntExpr::Map(vector, terminal) = v else {
+        return None;
+    };
+    let IntExpr::Cardinality(body) = terminal.as_ref() else {
+        return None;
+    };
+    let VecSetExpr::View(input, spec) = vector.as_ref() else {
+        return None;
+    };
+    let SetExpr::Key(key) = input.as_ref() else {
+        return None;
+    };
+    Some((*key, *spec, body))
+}
+
+fn count_key_intersections(
+    key: u64,
+    view: View,
+    filters: &[&OrdSet],
+    snap: &Snapshot,
+) -> yesno_core::Result<Vec<Vec<u64>>> {
+    if filters.iter().all(|filter| filter.is_empty()) {
+        return Ok(vec![vec![0; view.sets() as usize]; filters.len()]);
+    }
+    let (strategy, mut counter) = match view.layout() {
+        yesno_core::view::ViewLayout::Interleaved => {
+            let logical_end = snap
+                .max(key)?
+                .and_then(|physical| view.logical_of(physical))
+                .and_then(|(_, logical)| logical.checked_add(1))
+                .unwrap_or(0);
+            let support_upper = filters
+                .iter()
+                .fold(0u128, |sum, filter| sum + u128::from(filter.len()));
+            let strategy = if support_upper * 2 < u128::from(logical_end) {
+                IntersectionCountStrategy::Selective
+            } else {
+                IntersectionCountStrategy::FullScan
+            };
+            (
+                strategy,
+                ViewIntersectionCounter::new(view, filters.iter().copied(), strategy)?,
+            )
         }
-        if selected {
-            counts[owner as usize] += 1;
+        yesno_core::view::ViewLayout::Blocked { .. } => (
+            IntersectionCountStrategy::FullScan,
+            ViewIntersectionCounter::new(
+                view,
+                filters.iter().copied(),
+                IntersectionCountStrategy::FullScan,
+            )?,
+        ),
+    };
+
+    if strategy == IntersectionCountStrategy::Selective {
+        let windows = counter.prefix_windows().to_vec();
+        for (lo, hi) in windows {
+            let mut stream = snap.key_stream_prefix_range(key, lo, hi)?;
+            while let Some((prefix, container)) = stream.next_chunk()? {
+                counter.push(prefix, &container)?;
+            }
+        }
+    } else {
+        let mut stream = snap.key_stream(key)?;
+        while let Some((prefix, container)) = stream.next_chunk()? {
+            counter.push(prefix, &container)?;
         }
     }
-    Ok(Some(counts))
+    Ok(counter.finish())
 }
 
 fn monotone_stream_contains(
@@ -573,6 +663,12 @@ fn eval_view_int_map(
     hole: Hole<'_>,
 ) -> yesno_core::Result<Option<Vec<u64>>> {
     let view = core_view(spec);
+    if let (SetExpr::Key(key), IntExpr::Cardinality(body)) = (input, body) {
+        if let Some(filter) = intersection_filter(body, snap, hole)? {
+            return count_key_intersections(*key, view, &[&filter], snap)
+                .map(|mut results| results.pop());
+        }
+    }
     let packed = lower_in(input, snap, hole)?.collect_set()?;
 
     match body {

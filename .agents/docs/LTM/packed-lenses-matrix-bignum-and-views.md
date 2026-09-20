@@ -386,6 +386,156 @@ This closes a composition reachability gap, not an execution-kernel gap. The
 prescription's native-container and query-support-driven count traversal remains
 separate future work with much broader core, persistence, dispatch, and
 mixed-container acceptance obligations.
+
+#### Stage 8 candidate: query-driven native intersection counts ( 2026-09-21 )
+
+The direct intersection-count terminal still has two algorithmic gaps after
+normalization. Under `Interleaved` it materializes the packed input and visits
+every stored physical ordinal, asking a monotone filter stream once per logical
+ordinal whether that row is selected. Under `Blocked` the specialised terminal
+declines entirely, so evaluation extracts every constituent and counts its
+intersection separately. Neither cost is inherent to the requested count.
+
+A disposable reference was switched from its pinned evaluator copy to the
+current `epic` `yesno-flight::expr::vec_int`, then run on one Cortex-X925
+performance core. Seven alternating repetitions performed three evaluations
+each and checked complete vectors against independent `BTreeSet` intersections.
+The single-terminal arm used one query plane; its native control deliberately
+retained the reference's second empty output vector and cloned the wanted vector,
+so it slightly penalises the proposed side:
+
+```text
+corpus and layout                         support       current       native snapshot    ratio
+sparse24, 4096-way interleaved                 32      314.36 us          26.66 us       11.8x
+sparse24, 4096-way interleaved               4096      450.12 us         212.23 us        2.1x
+dense50, 512-way blocked bitmap                32       20.61 ms          16.95 us     1215.6x
+runs512, 512-way blocked run                    32        5.02 ms          11.75 us      427.5x
+```
+
+The interleaved construction inverts the current walk. Logical feature `x`
+occupies the contiguous physical row `[x*N, (x+1)*N)`. Sorted query rows become
+coalesced prefix windows; a direct key input can feed those windows through
+`Snapshot::key_stream_prefix_range`, and each array, bitmap, or run payload is
+clipped to the selected row before assigning hits to owner counters. The
+32-feature case therefore avoids both unrelated payloads and unrelated ordinals.
+The full-support row is only 2.1x faster and the earlier 512-document control
+showed a shared full scan beating selective resident traversal, so query support
+and addressed-prefix coverage must choose between selective and full-scan arms.
+
+Blocked data needs a different native traversal. Arrays assign their stored
+positions once, aligned bitmap rows use AND-plus-popcount against the query mask,
+and runs split only at document-row boundaries and count selected query values by
+lower-bound differences. That preserves the representations rather than
+enumerating bitmap bits or run ordinals and explains the three-order-of-magnitude
+results. Unaligned rows and unaligned store-backed bitmap buffers still need an
+exact generic fallback.
+
+This should remain one existing cardinality-map terminal, not a new wire opcode
+or core expression node. The reusable core boundary is a checked chunk-count
+accumulator that resident `OrdSet` chunks and Flight's persisted streams can both
+feed; Flight owns source recognition, bounded stream orchestration, and dispatch.
+Start with the measured direct intersection shape and retain the current walk as
+its oracle. General pointwise positive/negative filters may reuse the helper only
+after separate evidence. Sharing two sibling count terminals is another API
+decision and is not required for the single-terminal gains above.
+
+#### Stage 8a landed: scalar blocked bitmap intersection counts ( 2026-09-21 )
+
+The first blocked arm is deliberately scalar. Flight now recognises the same
+direct intersection-count terminal for a blocked view, materialises its invariant
+filter once, and asks core for the complete count vector. Core builds the query's
+word mask once when the row stride is word-aligned and exactly tiles a 65,536-bit
+chunk. Each bitmap payload is then partitioned into integral rows and counted by
+scalar word-wise AND-popcount. `BitmapContainer::words` keeps store-backed
+unaligned payloads correct by copying only when alignment requires it. Arrays,
+runs, mixed tails, non-tiling rows, and interleaved views retain one exact ordinal
+walk through `View::logical_of`; no constituent `OrdSet` is constructed.
+
+On the same 512-row, 4,096-bit dense blocked fixture, the production Flight
+terminal moved from a 20.61 ms median to 13.47 us, about 1,530x. The checked-in
+core benchmark compares the grouped arm with public `view_select` plus
+`and_cardinality`: 5.329 us against 16.126 ms, about 3,027x. The production path
+slightly beats the disposable 16.95 us control because that control retained an
+unused sibling vector and cloned its result. The generic run fallback also moved
+from about 5.02 ms to 1.27 ms by replacing per-constituent extraction with one
+packed walk, but it is not the proposed interval-rank kernel and must not be
+reported as closing that work.
+
+The core property uses 17 dense rows to force a bitmap first chunk and a partial
+non-bitmap tail, varies data and query phases, and checks ordinary, empty, and
+full filters against independent `BTreeSet` intersections. Flight repeats an
+independent oracle before checkpoint and after reopen. The allocation regression
+holds four physical chunks constant while changing 4 rows to 64; bypassing the
+new path measured 72 -> 2,256 allocations and failed. Shifting the bitmap owner
+by one made both semantic oracles fail, proving they reach the row assignment.
+
+Stage 8 remains partial. Interleaved query-driven bounded streams, native array
+assignment, native run interval ranks, selective/full-scan dispatch, sibling
+sharing, and SIMD are separate measured decisions. A later bitmap SIMD arm can
+replace only the row reduction inside this checked scalar structure and must
+retain the same oracle and fallback boundaries.
+
+#### Stage 8 completed: bounded native counts and sibling sharing ( 2026-09-21 )
+
+`ViewIntersectionCounter` is now the single checked chunk accumulator for
+resident and persisted intersection counts. It requires strictly ascending
+prefixes, exposes coalesced prefix windows for selective interleaved traversal,
+and returns filter-major vectors. Rejecting repeated prefixes prevents two
+overlapping windows from silently counting one payload twice.
+
+For an interleaved view, each requested logical ordinal becomes its checked
+physical row. Sparse query support opens only the prefix windows containing
+those rows and clips array, bitmap, and run containers at both row and chunk
+boundaries. Array visits start and end at binary partitions, run visits seek to
+the first overlapping interval, and bitmap visits mask the boundary words. A
+support upper bound below half the stored logical extent selects this arm.
+Broader support takes one full source scan and caches each filter's membership
+once per logical row, rather than once per present constituent.
+
+Blocked traversal keeps the Stage 8a scalar bitmap arm, assigns array values in
+one pass, and adds the native run arm: a physical run is split only where it
+crosses a constituent boundary, then `len_in_range` counts the filter over the
+corresponding logical interval. Dense blocked filters do not build the
+interleaved-only selected-row metadata.
+
+The resident `OrdSet::view_intersection_cardinalities_batch` method and Flight's
+`vec_int_batch` entrypoint share one source traversal across several filters.
+The latter is deliberately an in-process API rather than a new wire opcode;
+when siblings do not name the same direct key-backed view and intersection
+shape, it falls back to the scalar evaluator for each expression.
+
+On the same oracle-checked fixtures used to prescribe the work, pinned to
+Cortex-X925 CPU 5, final one-terminal production medians were:
+
+```text
+corpus and layout                         support       before       final       ratio
+sparse24, 4096-way interleaved                 32     314.36 us    33.30 us        9.4x
+sparse24, 4096-way interleaved               4096     450.12 us   391.58 us        1.15x
+dense50, 512-way blocked bitmap                32      20.61 ms    13.14 us     1568x
+runs512, 512-way blocked run                    32       5.02 ms    15.66 us      320x
+```
+
+The sparse case retains expression-filter preparation that the native reference
+did not time, explaining the remaining 33.30 versus 26.26 us difference. Full
+support likewise includes rebuilding its literal filter on every evaluation;
+the traversal itself no longer repeats membership per owner.
+
+An explicit NEON AND-popcount row reducer was rejected after measurement. On
+the checked-in 512 by 4,096 blocked bitmap benchmark it took 6.478 us versus
+5.605 us after restoring scalar word popcount, a 15.6% regression. The measured
+row contains only 64 words, so vector setup and byte-horizontal reduction cost
+more than the compiler's scalar popcount sequence. No new unsafe block remains.
+This result does not decide the separate Stage 7 bitmap-native folds, whose
+larger algorithmic gain comes from ceasing to enumerate set bits.
+
+The regression layers are independent: a boundary-biased `BTreeSet` property
+spans odd interleaved arities and sparse/full dispatch; forced core tests cover
+array, bitmap, and run containers and both strategies; Flight checks resident
+and reopened bounded streams; and the allocation suite requires a sibling batch
+to allocate less than two independent evaluations. Shifting selective clipping
+by one ordinal changed owner zero from 100 to 0 in the property and failed on
+its first generated case, after which the correct boundary was restored.
+
 ### Bit-sliced proposal and the surviving count
 
 A bit-sliced value would read several ordinary sets as integer planes over each ordinal, the transpose of `bignum`'s significance-inner layout. **It was proposed by a consumer and declined in full; see the `view_count` discussion below for why.** The storage doctrine fits because the caller still owns the layout and each plane remains an ordinary equality-encoded key. The arithmetic does not license a lazy API shape: `matrix/`, `bignum/`, `view/`, and `pack/` are eager and contain no `Expr` or `ChunkStream` integration.

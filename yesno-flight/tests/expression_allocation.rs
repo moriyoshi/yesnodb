@@ -8,7 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use yesno_core::Db;
+use yesno_core::{Db, OrdSet};
 use yesno_flight::expr;
 use yesno_flight::{BoolExpr, FoldOp, IntExpr, SetExpr, VecIntExpr, VecSetExpr, ViewSpec};
 
@@ -486,5 +486,103 @@ fn nested_cardinality_maps_share_the_direct_terminal_allocation_shape() {
          {direct_small_allocs}/{direct_large_allocs} and \
          {nested_small_allocs}/{nested_large_allocs}; normalization may add at most \
          {ALLOWANCE} allocations and growth must stay bounded"
+    );
+}
+
+fn blocked_filtered_cardinalities(key: u64, sets: u32, stride: u64) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(VecSetExpr::View(
+            Box::new(SetExpr::Key(key)),
+            ViewSpec::blocked(sets, stride),
+        )),
+        Box::new(IntExpr::Cardinality(Box::new(SetExpr::And(vec![
+            SetExpr::Hole,
+            SetExpr::Key(20),
+        ])))),
+    )
+}
+
+fn dense_blocked(sets: u32, stride: u64) -> OrdSet {
+    OrdSet::from_iter_unsorted((0..sets as u64).flat_map(|owner| {
+        (0..stride)
+            .filter(move |x| (x + owner) % 2 == 0)
+            .map(move |x| owner * stride + x)
+    }))
+}
+
+#[test]
+fn blocked_bitmap_intersection_counts_do_not_materialize_constituents() {
+    let db = Db::new();
+    let mut batch = db.batch();
+    batch.store_set(20, &OrdSet::from_iter_unsorted((0..4_096).step_by(3)));
+    // Both frames occupy exactly four physical chunks. Only their row shape
+    // differs, so allocation growth here detects per-constituent intermediates
+    // rather than charging the larger case for more input payloads.
+    batch.store_set(21, &dense_blocked(4, 65_536));
+    batch.store_set(22, &dense_blocked(64, 4_096));
+    batch.commit().unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let small = blocked_filtered_cardinalities(21, 4, 65_536);
+    let large = blocked_filtered_cardinalities(22, 64, 4_096);
+
+    let _ = expr::vec_int(&small, &snapshot).unwrap();
+    let _ = expr::vec_int(&large, &snapshot).unwrap();
+    let (small_result, small_allocs) =
+        count_allocations(|| expr::vec_int(&small, &snapshot).unwrap());
+    let (large_result, large_allocs) =
+        count_allocations(|| expr::vec_int(&large, &snapshot).unwrap());
+
+    assert_eq!(small_result.len(), 4);
+    assert_eq!(large_result.len(), 64);
+    assert!(small_result.iter().all(|count| *count > 0));
+    assert!(large_result.iter().all(|count| *count > 0));
+    const ALLOWANCE: u64 = 16;
+    assert!(
+        large_allocs <= small_allocs + ALLOWANCE,
+        "blocked intersection counts allocated {small_allocs} -> {large_allocs} at 4 -> 64 \
+         constituents over the same four chunks; growth may be at most {ALLOWANCE}"
+    );
+}
+
+fn filtered_cardinalities_for(sets: u32, filter_key: u64) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(view(sets)),
+        Box::new(IntExpr::Cardinality(Box::new(SetExpr::And(vec![
+            SetExpr::Hole,
+            SetExpr::Key(filter_key),
+        ])))),
+    )
+}
+
+#[test]
+fn sibling_intersection_counts_share_source_planning_and_traversal() {
+    let db = Db::new();
+    db.insert_range(9, 0, 262_143).unwrap();
+    db.insert_range(7, 0, 1_000).unwrap();
+    db.insert_range(8, 900, 2_000).unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let expressions = [
+        filtered_cardinalities_for(64, 7),
+        filtered_cardinalities_for(64, 8),
+    ];
+
+    let _ = expr::vec_int_batch(&expressions, &snapshot).unwrap();
+    for expression in &expressions {
+        let _ = expr::vec_int(expression, &snapshot).unwrap();
+    }
+    let (batch_result, batch_allocs) =
+        count_allocations(|| expr::vec_int_batch(&expressions, &snapshot).unwrap());
+    let (independent_result, independent_allocs) = count_allocations(|| {
+        expressions
+            .iter()
+            .map(|expression| expr::vec_int(expression, &snapshot).unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(batch_result, independent_result);
+    assert!(
+        batch_allocs < independent_allocs,
+        "batched siblings allocated {batch_allocs} times versus {independent_allocs} for two \
+         independent traversals; the shared entrypoint must remove source work"
     );
 }

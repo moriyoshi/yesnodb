@@ -740,6 +740,210 @@ measured x86 implementation. SVE remains inapplicable: this host's vector length
 is 16 bytes and the intrinsics remain outside the stable MSRV.
 
 ---
+## 2026-09-21 — native intersection counts dominate the next expression opportunity
+
+The expression-math prescription's native-count reference was rerun against the
+current `epic` Flight evaluator rather than its pinned baseline copy. The full
+24-case matrix passed its independent set oracle across array, bitmap, and run
+containers, both layouts, and query supports 32 / 512 / 4,096. A second
+single-terminal control separated native traversal from the prescription's
+two-plane source sharing. Both runs were pinned to Cortex-X925 CPU 5; the single
+control used seven alternating repetitions of three evaluations.
+
+For one direct intersection-count map over 4,096 sparse interleaved documents,
+32 selected features took a median 314.36 us through current evaluation and
+26.66 us through coalesced bounded streams plus native range visits, an 11.8x
+gain. With all 4,096 features selected the medians were 450.12 and 212.23 us,
+only 2.1x, confirming that a selective arm needs a full-scan dispatch sibling.
+
+Blocked layouts expose the larger omission because their direct-intersection
+recogniser currently declines and the fallback extracts every constituent. One
+count map over 512 dense bitmap rows fell from 20.61 ms to 16.95 us, about
+1,216x; 512 run rows fell from 5.02 ms to 11.75 us, about 428x. The native
+control still allocated an unused second output vector and cloned the first, so
+these numbers do not depend on multi-result sharing and modestly penalise the
+candidate.
+
+The implementation boundary is not another Boolean identity. Interleaved rows
+need query-driven physical windows and `key_stream_prefix_range` for a direct
+persisted key. Blocked chunks need representation-native array assignment,
+bitmap AND-popcount per aligned row, and run/query rank differences. A checked
+core chunk accumulator should own those container details while Flight owns
+source recognition and stream dispatch. The current full walk remains the
+oracle, and unaligned buffers, partial rows, mixed kinds, read failures,
+snapshots, tombstones, address overflow, and selective/full-scan crossover all
+remain required before landing. No production code changed during this study.
+
+---
+
+## 2026-09-21 — Test plan: scalar blocked bitmap intersection counts
+
+Stage 8a improves the existing direct
+`map( view, cardinality( and( _, filter ) ) )` terminal for blocked views before
+adding SIMD. The current blocked path declines the direct recogniser, extracts
+every constituent, and evaluates the same invariant intersection once per row.
+The proposed core helper instead consumes each packed chunk once. Aligned bitmap
+rows use scalar word-wise AND-popcount; every other shape retains an exact
+ordinal fallback.
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Wrong owner | Chunk-prefix or row arithmetic adds a count to the adjacent constituent | `proptest_oracle.rs` against per-row `BTreeSet` intersections |
+| Wrong word mask | A row begins or ends on the wrong word, or the filter's last word leaks bits | The same boundary-biased property with a forced bitmap and a partial final chunk |
+| Mixed-container divergence | A bitmap chunk is correct while the partial array/run tail is skipped or double-counted | Core property requiring at least one bitmap while preserving the generic tail |
+| Persistence divergence | Store-backed bitmap words differ from the resident mutable representation | Flight expression test before checkpoint and after reopen against one independent oracle |
+| Silent decay | Flight resumes constructing one `OrdSet` per constituent | Allocation regression with equal physical span at 4 and 64 constituents |
+
+### Planned tests
+
+- `tests/proptest_oracle.rs::blocked_view_intersection_cardinalities_match_btreeset_oracle` — build 17 dense 4,096-bit rows so the first chunk is necessarily a bitmap and the seventeenth row is a partial tail, then vary data and filter phases and compare every count with independent row sets.
+- `yesno-flight/tests/blocked_intersection_counts.rs::blocked_bitmap_intersection_counts_match_an_independent_oracle_before_and_after_reopen` — exercise the exact wire expression over resident and persisted data, including multiple invariant intersection operands.
+- `yesno-flight/tests/expression_allocation.rs::blocked_bitmap_intersection_counts_do_not_materialize_constituents` — hold the physical span constant while changing 4 rows of width 65,536 to 64 rows of width 4,096, so per-chunk costs stay fixed and only per-constituent materialization can make allocation grow.
+
+### Sabotage plan
+
+- Shift the bitmap row owner by one and confirm the core and Flight oracles fail.
+- Bypass the blocked direct terminal and confirm the 4-versus-64 allocation regression fails.
+
+### Deliberately not covered
+
+This stage does not add interleaved query-driven streams, a specialised array or
+run kernel, sibling terminal sharing, SIMD, or a new wire operation. It also does
+not promise a dispatch crossover: aligned blocked bitmap rows are the measured
+first target, and all other shapes retain the generic exact path.
+
+---
+
+## 2026-09-21 — Stage 8a lands scalar blocked bitmap intersection counts
+
+The direct intersection-cardinality map now accepts blocked views. Flight lowers
+the invariant filter once, while core counts every constituent without extracting
+one set per row. When a blocked stride is word-aligned and exactly tiles a chunk,
+core constructs one query word mask and performs scalar AND-popcount over each
+bitmap row. Other containers, mixed tails, non-tiling rows, and interleaved views
+retain the exact ordinal walk. No explicit SIMD, unsafe code, wire operation, or
+core expression variant was added.
+
+Pinned to Cortex-X925 CPU 5, the same 512-row dense bitmap production terminal
+moved from a 20.61 ms median before the change to 13.47 us after it, about 1,530x.
+The checked-in core benchmark measured 5.329 us for the grouped scalar arm and
+16.126 ms for the public select-plus-`and_cardinality` oracle, about 3,027x. The
+run fixture also moved from about 5.02 ms to 1.27 ms because the fallback now
+walks the packed set once, but that is not a native run kernel.
+
+The boundary-biased core property forces a bitmap chunk plus a partial non-bitmap
+tail and compares ordinary, empty, and full filters with independent `BTreeSet`
+intersections. Flight checks the real expression before checkpoint and after
+reopen. The equal-four-chunk allocation test changes only the row count from 4
+to 64; bypassing the direct terminal produced 72 -> 2,256 allocations and failed
+its fixed allowance. Shifting bitmap ownership by one made both semantic oracles
+fail, then restoring the correct owner made the focused and full local suites
+pass.
+
+Remaining Stage 8 work is deliberately unchanged: interleaved query-driven
+bounded streams, selective/full-scan dispatch, native array and run traversal,
+sibling sharing, and SIMD. The SIMD bitmap candidate now has a smaller insertion
+point: replace the scalar row reduction while preserving this arm's checked
+layout conditions and exact fallback.
+
+---
+
+## 2026-09-21 — Test plan: complete native intersection-count traversal
+
+The remaining Stage 8 work shares several failure modes, so it is tested around
+one checked multi-filter chunk accumulator rather than as unrelated Flight
+shortcuts. Resident sets and persisted bounded streams must feed identical chunk
+semantics. Full-scan and selective interleaved traversal must be separately
+forceable in core tests before production dispatch chooses between them.
+
+### Failure classes
+
+| Class | Concrete failure | Structural catcher |
+|---|---|---|
+| Selective clipping | A logical row crossing a chunk boundary skips or repeats its boundary bits | Core property forces odd arities and row/chunk seams, then compares selective and full arms with independent per-row sets |
+| Window coalescing | Adjacent query rows open overlapping streams and count a payload twice | Counter rejects non-ascending or duplicate prefixes; a direct-key persisted oracle uses coalesced windows before and after reopen |
+| Native kind drift | Array membership, bitmap masks, or run rank differences disagree | Forced array, bitmap, run, and mixed-kind fixtures compare the native batch with public select-and-count |
+| Query-plane aliasing | A value present in two filters updates only one vector | Two-filter oracle includes low-only, high-only, overlap, duplicates at expression construction, empty, and full filters |
+| Dispatch inversion | Broad support remains on selective traversal or sparse support resumes a full ordinal scan | Forced strategies plus a work counter; the 32 / 512 / 4,096 support benchmark records resident and snapshot arms before fixing the coverage rule |
+| Persistence error loss | Tombstones, eviction, or a payload read failure becomes a partial vector | Existing bounded-stream liveness tests remain authoritative; Flight propagates every stream error and adds resident/reopened result checks |
+| Lost sharing | Two sibling terminals resolve and traverse the same source twice | Batch allocation/work regression compares one two-filter batch with two independent calls and checks both complete vectors |
+| SIMD tail/alignment | A vector loop drops a tail word or assumes aligned storage | Scalar and SIMD reducers are directly compared across every tail length and store-backed unaligned bitmap coverage; disabling the vector arm preserves semantics |
+
+### Sabotage
+
+- Remove selected-row boundary masking and require the odd-arity core oracle to fail.
+- Feed one coalesced prefix twice and require the accumulator's ordering check to fail.
+- Replace run interval rank differences with the physical interval length and
+  require the sparse-filter run oracle to fail.
+- Disable batching and require the source-work regression to observe two
+  traversals.
+- Shift one SIMD query pointer by a word and require scalar equivalence to fail.
+
+The existing eager evaluator remains the expression oracle. No test may loosen
+an allocation allowance or substitute current output for the independent set
+construction. Arithmetic scoring, a new wire opcode, cross-RPC sharing, and an
+unbounded view arity remain outside this stage.
+
+---
+
+## 2026-09-21 — Stage 8 completes native view intersection counts
+
+The remaining intersection-cardinality work now uses one checked core
+`ViewIntersectionCounter` for resident chunks and persisted streams. Interleaved
+views choose between a full scan and coalesced selected-prefix windows; blocked
+views keep the Stage 8a bitmap path and add native run splitting. Array, bitmap,
+and run containers each use representation-native counting while retaining the
+generic ordinal walk as the exact oracle. Flight recognises direct key-backed
+expressions, opens bounded streams for selective traversal, and exposes an
+explicit batch API that shares one source traversal across compatible sibling
+maps. It adds no wire opcode, unsafe code, or expression variant.
+
+Pinned to Cortex-X925 CPU 5, the production expression benchmark changed from
+314.36 us to 33.30 us for interleaved support 32 (about 9.4x), from 450.12 us to
+391.58 us for full support 4,096 (about 1.15x), from 20.61 ms to 13.14 us for
+blocked bitmap (about 1,568x), and from 5.02 ms to 15.66 us for blocked run
+(about 320x). A runtime NEON reducer was also measured on the blocked bitmap
+kernel: 6.478 us versus 5.605 us for the restored scalar reducer, 15.6% slower.
+The vector arm and its unsafe code were removed rather than shipped.
+
+The boundary-biased core property exercises odd arities, sparse and dense
+dispatch, multiple filters, and chunk seams against independent `BTreeSet`
+rows. Forced core tests cover both strategies and every native representation;
+Flight covers the direct persisted expression before checkpoint and after
+reopen; and the allocation regression proves one batch is cheaper than two
+independent calls. Sabotaging the selective lower clip by one made the property
+fail on its first generated case, then restoring the boundary made all focused
+and full suites pass.
+
+`scripts/gate.sh`, `scripts/gate-pg.sh`, `scripts/gate-mysql.sh`,
+`scripts/gate-search.sh`, and `yesno-c/gate.sh` all pass. The PostgreSQL gate
+covered its default major and PostgreSQL 18; the database and search gates ran
+their hermetic regression fixtures.
+
+---
+
+## 2026-09-21 — Quality Gate: Stage 8 native view intersection counts
+
+### Result: PASS
+
+The stable workspace Clippy gate with every target and feature, workspace
+format checks, all `yesno-core` tests, the complete cargo gate, both PostgreSQL
+majors, MySQL, OpenSearch, Elasticsearch, and the standalone C ABI gate pass.
+The new behavior is covered at the oracle, persisted-expression, allocation,
+and benchmark layers. Public APIs and their module rationale are documented,
+and no codec, serialized format, container mutation invariant, Arrow buffer
+boundary, or wire protocol changed.
+
+Clippy identified manual saturating arithmetic during implementation; it was
+replaced with `saturating_mul` before the final runs. The measured SIMD attempt
+regressed the target kernel and was removed completely, leaving no new unsafe
+block or architecture-specific production path. No Stage 8 remediation or
+deferred failure remains. The separately identified bitmap-native fold
+candidate remains outside this stage.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

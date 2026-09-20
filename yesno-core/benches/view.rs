@@ -23,6 +23,9 @@
 //! - `view_fold`'s oracle is "select each constituent and combine", which is
 //!   spelled here out of the **public** `view_select` / `or` — the same calls
 //!   `fold_via_select` makes internally, not a copy of them.
+//! - `view_intersection_cardinalities` is compared with selecting every blocked
+//!   row and calling the public count-only intersection on it. The arm and the
+//!   oracle therefore share no bench-local container kernel.
 //! - `view_expand`'s generic path is `ordinal_of` per constituent per ordinal,
 //!   likewise public.
 //!
@@ -143,6 +146,39 @@ fn cardinality(c: &mut Criterion) {
     g.finish();
 }
 
+/// Direct blocked intersection counts against the public select-and-count
+/// oracle that the Flight fallback used before the grouped scalar arm.
+fn intersection_cardinalities(c: &mut Criterion) {
+    const COUNT_SETS: u32 = 512;
+    const COUNT_STRIDE: u64 = 4_096;
+    let view = View::blocked(COUNT_SETS, COUNT_STRIDE);
+    let mut packed = OrdSet::from_iter_unsorted((0..COUNT_SETS as u64).flat_map(|owner| {
+        (0..COUNT_STRIDE)
+            .filter(move |x| (x + owner) % 2 == 0)
+            .map(move |x| owner * COUNT_STRIDE + x)
+    }));
+    packed.optimize();
+    assert_has_bitmaps(&packed, "intersection cardinalities");
+    let filter = OrdSet::from_iter_unsorted(
+        (0..32).map(|i| ((i * 127 + 11) % COUNT_STRIDE as usize) as u64),
+    );
+
+    let mut g = c.benchmark_group("view/intersection_cardinalities");
+    g.bench_function("blocked_bitmap/arm", |b| {
+        b.iter(|| {
+            black_box(&packed).view_intersection_cardinalities(black_box(&view), black_box(&filter))
+        })
+    });
+    g.bench_function("blocked_bitmap/via_select", |b| {
+        b.iter(|| {
+            (0..COUNT_SETS)
+                .map(|row| packed.view_select(&view, row).and_cardinality(&filter))
+                .collect::<Vec<_>>()
+        })
+    });
+    g.finish();
+}
+
 /// The interleaved grouped walk against the select-and-combine oracle.
 ///
 /// Both sides are shipped code: the oracle below is the same sequence of public
@@ -233,5 +269,13 @@ fn build(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, select, cardinality, fold, expand, build);
+criterion_group!(
+    benches,
+    select,
+    cardinality,
+    intersection_cardinalities,
+    fold,
+    expand,
+    build
+);
 criterion_main!(benches);
