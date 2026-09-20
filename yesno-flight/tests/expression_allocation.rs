@@ -228,3 +228,169 @@ fn view_terminals_do_not_allocate_once_per_constituent() {
          may grow by at most {ALLOWANCE}"
     );
 }
+
+fn union_cardinalities(sets: u32) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(view(sets)),
+        Box::new(IntExpr::Cardinality(Box::new(SetExpr::Or(vec![
+            SetExpr::Hole,
+            SetExpr::Key(7),
+        ])))),
+    )
+}
+
+fn repeated_hole_cardinalities(sets: u32) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(view(sets)),
+        Box::new(IntExpr::Cardinality(Box::new(SetExpr::AndNot(
+            Box::new(SetExpr::Or(vec![SetExpr::Hole, SetExpr::Key(7)])),
+            Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(8)])),
+        )))),
+    )
+}
+
+fn union_ranks(sets: u32) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(view(sets)),
+        Box::new(IntExpr::Rank(
+            Box::new(SetExpr::Or(vec![SetExpr::Hole, SetExpr::Key(7)])),
+            750,
+        )),
+    )
+}
+
+#[test]
+fn pointwise_boolean_terminals_have_bounded_allocation_growth() {
+    let db = Db::new();
+    db.insert_range(9, 0, 262_143).unwrap();
+    db.insert_range(7, 0, 1_000).unwrap();
+    db.insert_range(8, 500, 1_500).unwrap();
+    let snapshot = db.snapshot().unwrap();
+
+    let union_small = union_cardinalities(4);
+    let union_large = union_cardinalities(64);
+    let repeated_small = repeated_hole_cardinalities(4);
+    let repeated_large = repeated_hole_cardinalities(64);
+    let rank_small = union_ranks(4);
+    let rank_large = union_ranks(64);
+
+    for expression in [
+        &union_small,
+        &union_large,
+        &repeated_small,
+        &repeated_large,
+        &rank_small,
+        &rank_large,
+    ] {
+        let _ = expr::vec_int(expression, &snapshot).unwrap();
+    }
+
+    let (union_small_result, union_small_allocs) =
+        count_allocations(|| expr::vec_int(&union_small, &snapshot).unwrap());
+    let (union_large_result, union_large_allocs) =
+        count_allocations(|| expr::vec_int(&union_large, &snapshot).unwrap());
+    let (repeated_small_result, repeated_small_allocs) =
+        count_allocations(|| expr::vec_int(&repeated_small, &snapshot).unwrap());
+    let (repeated_large_result, repeated_large_allocs) =
+        count_allocations(|| expr::vec_int(&repeated_large, &snapshot).unwrap());
+    let (rank_small_result, rank_small_allocs) =
+        count_allocations(|| expr::vec_int(&rank_small, &snapshot).unwrap());
+    let (rank_large_result, rank_large_allocs) =
+        count_allocations(|| expr::vec_int(&rank_large, &snapshot).unwrap());
+
+    assert_eq!(union_small_result.len(), 4);
+    assert_eq!(union_large_result.len(), 64);
+    assert_eq!(repeated_small_result.len(), 4);
+    assert_eq!(repeated_large_result.len(), 64);
+    assert_eq!(rank_small_result.len(), 4);
+    assert_eq!(rank_large_result.len(), 64);
+
+    const ALLOWANCE: u64 = 16;
+    let union_bounded = union_large_allocs <= union_small_allocs + ALLOWANCE;
+    let repeated_bounded = repeated_large_allocs <= repeated_small_allocs + ALLOWANCE;
+    let rank_bounded = rank_large_allocs <= rank_small_allocs + ALLOWANCE;
+    assert!(
+        union_bounded && repeated_bounded && rank_bounded,
+        "allocations at 4 -> 64 constituents: union cardinality map \
+         {union_small_allocs} -> {union_large_allocs}, repeated-hole cardinality map \
+         {repeated_small_allocs} -> {repeated_large_allocs}, union rank map \
+         {rank_small_allocs} -> {rank_large_allocs}; each terminal may grow by at most \
+         {ALLOWANCE}"
+    );
+}
+
+fn mapped_fold(sets: u32, body: SetExpr, op: FoldOp) -> SetExpr {
+    SetExpr::Fold(
+        Box::new(VecSetExpr::Map(Box::new(view(sets)), Box::new(body))),
+        op,
+    )
+}
+
+fn union_body() -> SetExpr {
+    SetExpr::Or(vec![SetExpr::Hole, SetExpr::Key(7)])
+}
+
+fn invariant_difference_body() -> SetExpr {
+    SetExpr::AndNot(Box::new(SetExpr::Key(7)), Box::new(SetExpr::Hole))
+}
+
+fn repeated_hole_body() -> SetExpr {
+    SetExpr::AndNot(
+        Box::new(SetExpr::Or(vec![SetExpr::Hole, SetExpr::Key(7)])),
+        Box::new(SetExpr::And(vec![SetExpr::Hole, SetExpr::Key(8)])),
+    )
+}
+
+type BodyFactory = fn() -> SetExpr;
+
+#[test]
+fn pointwise_mapped_folds_have_bounded_allocation_growth() {
+    let db = Db::new();
+    db.insert_range(9, 0, 262_143).unwrap();
+    db.insert_range(7, 0, 1_000).unwrap();
+    db.insert_range(8, 500, 1_500).unwrap();
+    let snapshot = db.snapshot().unwrap();
+
+    let bodies: [(&str, BodyFactory); 3] = [
+        ("union", union_body),
+        ("invariant difference", invariant_difference_body),
+        ("repeated hole", repeated_hole_body),
+    ];
+    let ops = [FoldOp::Or, FoldOp::And, FoldOp::Xor];
+
+    for (name, body) in bodies {
+        for op in ops {
+            let small = mapped_fold(4, body(), op);
+            let large = mapped_fold(64, body(), op);
+
+            let _ = expr::lower(&small, &snapshot)
+                .unwrap()
+                .collect_set()
+                .unwrap();
+            let _ = expr::lower(&large, &snapshot)
+                .unwrap()
+                .collect_set()
+                .unwrap();
+
+            let (_, small_allocs) = count_allocations(|| {
+                expr::lower(&small, &snapshot)
+                    .unwrap()
+                    .collect_set()
+                    .unwrap()
+            });
+            let (_, large_allocs) = count_allocations(|| {
+                expr::lower(&large, &snapshot)
+                    .unwrap()
+                    .collect_set()
+                    .unwrap()
+            });
+
+            const ALLOWANCE: u64 = 16;
+            assert!(
+                large_allocs <= small_allocs + ALLOWANCE,
+                "{name} with {op:?} allocated {small_allocs} -> {large_allocs} at 4 -> 64 \
+                 constituents; growth may be at most {ALLOWANCE}"
+            );
+        }
+    }
+}

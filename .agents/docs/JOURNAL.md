@@ -400,6 +400,186 @@ benchmark justifies changing plan metadata.
 - Invariant audit: no persisted or wire format changed, no unsafe code was added, `roaring` remains dev-only, and the `arrow-buffer` containment boundary is unchanged.
 
 ---
+## 2026-09-20 — Test plan: pointwise Boolean view maps
+
+Stage-3 measurement varied the remaining eager shapes directly. On the same
+resident interleaved bitmap fixture, union, both difference directions, a
+repeated-hole Boolean body, and rank over union took about 4.75 / 14.1 / 46.7 ms
+at 4 / 8 / 16 constituents, with 272-1,409 allocations and about 1.2 MiB peak
+requested heap. The common cause is again constituent extraction.
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Wrong contents | The false/true hole decomposition reverses a difference arm, mishandles a repeated hole, or applies the invariant base count per constituent incorrectly | Flight expression test against an independent `BTreeSet` oracle |
+| Rank boundary | Rank includes `x`, omits zero, or clips only one decomposition arm | Flight expression test comparing every returned rank with the oracle's strict `< x` count |
+| Silent decay | A pointwise Boolean cardinality or rank map falls back to `view_select` once per constituent | Flight allocation regression comparing 4 with 64 constituents |
+| Untested by construction | Only monotone `and( _, q )` bodies run, leaving the false/true branches identical | Deterministic cases spanning union, both difference directions, repeated holes, static bodies, and rank limits |
+
+### Planned tests
+
+- `expr::tests::pointwise_boolean_maps_agree_with_an_independent_set_oracle` — compare cardinality and rank vectors for interleaved and blocked views against `BTreeSet` substitution.
+- `tests/expression_allocation.rs::view_terminals_do_not_allocate_once_per_constituent` — extend the existing 4-versus-64 budget with union cardinality, repeated-hole cardinality, and rank.
+
+### Generators
+
+No new randomized generator is needed. The Boolean truth-table cases are
+deterministic so both values of the hole and both sides of difference are
+guaranteed to occur; the packed fixture contains distinct constituent sets and
+the invariant sets overlap only partially.
+
+### Deliberately not covered
+
+Non-pointwise transforms inside a map body, such as `select( _, n )`, retain the
+eager fallback. Their result cannot be derived from per-ordinal false/true
+substitution. Blocked views retain their near-free selection fallback; the
+allocation contract targets the measured interleaved extraction regression.
+---
+
+## 2026-09-20 — stage 3 fuses pointwise Boolean cardinality and rank maps
+
+The remaining measured map bodies did not justify a core lazy view node. A
+pointwise Boolean body is completely determined at each ordinal by its value
+with the constituent hole absent and present. Calling those expressions `f0`
+and `f1` gives the exact identity:
+
+```text
+|f(H)| = |f0| + |H intersect (f1 minus f0)| - |H intersect (f0 minus f1)|
+```
+
+Flight now prepares the invariant expression tree once, derives those two
+expressions lazily, and uses one interleaved packed walk to count the positive
+and negative filters for every constituent. Rank restricts every term to its
+strict half-open prefix and stops the walk at the bound. The existing direct
+and intersection-specialized paths remain first. Blocked layouts and
+non-pointwise bodies decline to the established eager fallback.
+
+On the extended 131 072-ordinal dense fixture, union cardinality moved from the
+old 4.75 / 14.1 / 46.7 ms extraction floor to 2.128 / 3.027 / 4.470 ms at
+4 / 8 / 16 constituents. Repeated-hole cardinality measured
+2.228 / 3.113 / 4.525 ms, and midpoint rank measured
+1.062 / 1.498 / 2.213 ms. Allocation counts became nearly flat with arity:
+72 / 75 / 78 for union, 160 / 163 / 166 for the repeated-hole body, and
+103 / 106 / 109 for rank. The 16-way peak requested heap was 19.6, 37.5, and
+19.9 KiB respectively instead of about 1.2 MiB. Resident and checkpoint/reopen
+checksums agreed, and the allocator positive control observed one 128 KiB
+allocation.
+
+The new integration oracle checks union, both difference directions, a static
+body, a repeated hole, and strict rank boundaries against independent
+`BTreeSet` substitution under both layouts. The allocation regression compares
+4 with 64 constituents for union cardinality, repeated-hole cardinality, and
+rank. Its distinguishing power was checked deliberately: reversing the
+positive and negative terms made the oracle report union `[4, 5, 4]` against
+`[10, 9, 10]`; bypassing the fused interleaved path made allocation counts
+grow 209 -> 3,225, 302 -> 4,386, and 221 -> 3,161. Both mutations were restored
+and the focused tests passed.
+
+No `yesno-core` source, planner, persisted format, wire format, or unsafe code
+changed. The lazy-view backlog remains partial only for genuinely non-pointwise
+map bodies without a measured caller.
+### Quality Gate — stage 3 pointwise Boolean view maps
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo fmt --check`: pass.
+- `cargo test -p yesno-core`: pass, including 915 unit tests and every integration and doc-test layer.
+- `cargo test -p yesno-flight`: pass, including the new independent oracle and allocation regression.
+- `./scripts/gate.sh`: pass, including workspace tests, off-by-default features, the complete scenario corpus, layout and documentation checks, planner termination audit, derived-figure audit, and formatting.
+- `./scripts/gate-pg.sh`: pass for the default PostgreSQL major and PostgreSQL 18, including unit and hermetic regression fixtures.
+- `./scripts/gate-search.sh`: pass; application, OpenSearch, and Elasticsearch scenarios all passed.
+- Correctness-layer audit: pointwise Flight lowering is checked against an independent `BTreeSet`; blocked views exercise the existing fallback; no oracle was weakened and no proptest seed was removed.
+- Allocation-layer audit: the 4-versus-64 regression has a fixed 16-allocation output allowance and fails by thousands when the fused path is bypassed.
+- Invariant audit: no container kernel, prefix bound, planner rewrite, persisted format, wire format, or `cardinality_dyn` implementation changed. No unsafe block or runtime dependency was added; `roaring` remains dev-only and Arrow types remain outside `yesno-core`.
+
+---
+
+## 2026-09-20 — Test plan: general pointwise mapped folds
+
+The remaining measured `fold( map( view, f( _ ) ), op )` path still extracts
+and materializes every constituent unless `f` is an intersection with invariant
+sets. On the 131,072-ordinal interleaved bitmap fixture, union, right-difference,
+and repeated-hole bodies took 4.78-4.83 ms at four constituents,
+14.33-14.44 ms at eight, and 47.12-47.59 ms at sixteen across OR, AND, and XOR.
+Allocations grew from 354-469 through 698-929 to 1,375-1,852, with
+1.25-1.45 MiB peak requested heap. The construction verified the database after
+checkpoint/reopen and obtained identical resident and reopened checksums.
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Wrong fold truth table | All-absent, all-present, or mixed constituent states use the wrong `f0` / `f1` branch | Flight expression test against an independent `BTreeSet` oracle |
+| Parity error | Even and odd view arities apply the invariant `f0` term with the wrong parity | Flight expression test covering both arities and XOR |
+| Body restriction | Union, either difference direction, a static body, or a repeated hole silently falls back or returns wrong contents | Deterministic independent-oracle cases for all three folds |
+| Silent decay | General pointwise mapped folds resume extracting one set per constituent | Flight allocation regression comparing 4 with 64 constituents |
+
+### Planned tests
+
+- `tests/pointwise_view_folds.rs::pointwise_mapped_folds_agree_with_an_independent_set_oracle` — compare OR, AND, and XOR folds under interleaved and blocked layouts, at odd and even arities, with direct `BTreeSet` substitution and reduction.
+- `tests/expression_allocation.rs::pointwise_mapped_folds_have_bounded_allocation_growth` — compare 4 and 64 constituents for union, invariant-minus-hole, and repeated-hole bodies across the three fold operators.
+
+### Sabotage plan
+
+- Swap the all-present and mixed terms in one truth-table identity and confirm the independent oracle fails on contents.
+- Bypass the general fusion while keeping the old intersection specialization, then confirm the new allocation regression fails by arity.
+
+### Deliberately not covered
+
+Non-pointwise map bodies such as `select( _, n )` retain the materializing
+fallback. A per-ordinal two-value truth table cannot represent an operation that
+depends on the constituent's global order statistics.
+
+---
+
+## 2026-09-20 — stage 4 fuses general pointwise mapped folds
+
+Stage 4 extends mapped-view fold fusion from the intersection-shaped special
+case to every direct pointwise map body. The evaluator prepares the map body
+twice, with the view hole bound to the empty set and to the universe, then
+combines those two invariant sets with one packed fold over the mapped inputs.
+The exact formulas are:
+
+- OR: `( f0 \ All ) ∪ ( f1 ∩ Any )`
+- AND: `( f0 ∩ f1 ) ∪ ( f0 \ Any ) ∪ ( f1 ∩ All )`
+- even XOR: `Parity ∩ ( f0 △ f1 )`
+- odd XOR: `f0 △ ( Parity ∩ ( f0 △ f1 ) )`
+
+The earlier intersection specialization remains first because it needs only
+one packed accumulator. Bodies that use order-sensitive operations such as
+`select` still take the eager fallback; no new expression node or container
+kernel was needed.
+
+An independent `BTreeSet` oracle now covers union, both difference directions,
+static bodies, and repeated-hole bodies for OR, AND, and XOR at odd and even
+arities and with interleaved and blocked layouts. Allocation tests cover
+representative union, difference, and repeated-hole bodies for all three folds.
+Temporarily disabling the general fusion made the allocation regression fail at
+4,195 allocations for 64 inputs versus 268 for four inputs, and temporarily
+substituting an intersection-shaped OR formula made the semantic oracle fail,
+demonstrating that both test layers catch their intended regressions.
+
+On the resident 65,536-key corpus, 16-way general mapped folds fell from about
+47.1-47.6 ms before the change to about 6.08-6.10 ms for OR and AND and 3.04 ms
+for XOR. Sixteen-way allocation counts fell from 1,375-1,852 to 131-253 for OR
+and AND and 114-162 for XOR. Resident and reopened checksums agreed. OR and AND
+retain about 1.2 MiB peak live allocation because they hold both `Any` and
+`All`; XOR is about 0.65 MiB.
+
+### Quality Gate — stage 4 pointwise mapped folds
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass after replacing a verbose test function-pointer type with a local alias.
+- `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo fmt --check`: pass.
+- `cargo test -p yesno-core`: pass, including all 915 unit tests and the integration layers.
+- Focused `yesno-flight` pointwise-fold oracle and allocation tests: pass.
+- `./scripts/gate.sh`: pass, including the complete end-to-end scenario corpus and documentation/layout checks.
+- `./scripts/gate-pg.sh`: pass for the default PostgreSQL target and PostgreSQL 18, including unit and regression suites.
+- `./scripts/gate-search.sh`: pass for the application, OpenSearch, and Elasticsearch scenarios.
+- Invariant audit: no container-kernel, codec, wire-format, dependency, or unsafe-code changes; non-pointwise expressions retain the existing eager semantics.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

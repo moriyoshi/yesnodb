@@ -214,6 +214,108 @@ and filtered cardinality maps, mapped folds, membership maps, and indexed maps.
 Every path may grow only by the output collection's 16-allocation allowance;
 the pre-change implementation failed at 192 -> 2 200, 175 -> 2 003, and
 197 -> 2 213 allocations for indexed map, direct cardinality, and membership.
+#### Stage 3 pointwise Boolean terminal fusion ( 2026-09-20 )
+
+The remaining measured cardinality and rank maps were pointwise Boolean
+functions of one constituent hole. They do not require a lazy view node. For a
+body `f`, evaluate its invariant expression tree twice, with the hole empty
+(`f0`) and with the hole equal to the ordinal universe (`f1`), then use:
+
+```text
+|f(H)| = |f0| + |H intersect (f1 minus f0)| - |H intersect (f0 minus f1)|
+```
+
+Invariant leaves are lowered once. One interleaved packed walk advances
+monotone streams for the positive and negative filters and updates every
+constituent's two counters. Rank applies the same identity below its strict
+upper bound and stops the packed walk when logical order reaches that bound.
+Union, both difference directions, repeated uses of the hole, and static bodies
+therefore share one exact path. Non-pointwise transforms decline the
+substitution and retain the eager fallback; blocked views retain their
+near-free contiguous-selection fallback.
+
+Before this stage, the extended baseline measured union, both differences, a
+repeated-hole body, and rank over union at about 4.75 / 14.1 / 46.7 ms for
+4 / 8 / 16 constituents. They allocated 272-371 / 527-718 / 1,034-1,409 times
+and peaked near 1.2 MiB because every constituent was extracted. After the
+pointwise path, representative resident medians on the same fixture were:
+
+| terminal | 4 constituents | 8 constituents | 16 constituents | allocations at 4 / 8 / 16 | peak heap at 16 |
+|---|---:|---:|---:|---:|---:|
+| union cardinality | 2.128 ms | 3.027 ms | 4.470 ms | 72 / 75 / 78 | 19.6 KiB |
+| repeated-hole cardinality | 2.228 ms | 3.113 ms | 4.525 ms | 160 / 163 / 166 | 37.5 KiB |
+| union rank below the midpoint | 1.062 ms | 1.498 ms | 2.213 ms | 103 / 106 / 109 | 19.9 KiB |
+
+The two difference directions landed in the same 2.13-4.58 ms envelope.
+Checkpoint, close, reopen, verify, and a fresh snapshot produced identical
+checksums and comparable times. The allocator positive control still observed
+one 128 KiB vector allocation. A 4-versus-64 allocation regression now covers
+union cardinality, repeated-hole cardinality, and rank; bypassing the fused
+path made it fail at 209 -> 3,225, 302 -> 4,386, and 221 -> 3,161 allocations.
+An independent `BTreeSet` oracle covers both layouts and strict rank
+boundaries; deliberately reversing the positive and negative terms made its
+first union case fail.
+
+This closes every pointwise Boolean cardinality and rank workload measured so
+far without changing `yesno-core::Expr` or its planner proof. The backlog stays
+partial only for genuinely non-pointwise map bodies. A future core view node
+still needs an allocation-motivated caller plus planner bounds, statistics,
+streaming cardinality, seek behavior, and a termination measure.
+
+#### Stage 4 general pointwise mapped folds ( 2026-09-20 )
+
+A fold of `map( view, f( _ ) )` needs no constituent extraction when `f` is
+pointwise. At one ordinal let `f0` and `f1` be the body's results with its hole
+absent and present, and let `Any`, `All`, and `Parity` be the corresponding
+packed-view folds. The exact set identities are:
+
+```text
+OR  = ( f0 minus All ) union ( f1 intersect Any )
+AND = ( f0 intersect f1 ) union ( f0 minus Any ) union ( f1 intersect All )
+XOR = Parity intersect ( f0 xor f1 )                       when arity is even
+XOR = f0 xor ( Parity intersect ( f0 xor f1 ) )            when arity is odd
+```
+
+The OR and AND forms distinguish the three possible row states: every hole is
+absent, every hole is present, or the holes are mixed. XOR follows by writing
+each mapped bit as `f0 xor ( hole intersect ( f0 xor f1 ) )`; XOR of the `f0`
+copies survives exactly at odd arity. Flight derives `f0` and `f1` from the
+already prepared expression tree, runs the required packed folds, and leaves
+the remaining set algebra lazy. The older intersection-only specialization
+stays first because distributivity answers that case with one packed fold rather
+than the general OR/AND path's two.
+
+The same verified release fixture measured union, invariant-minus-hole, and
+repeated-hole bodies across all three reductions. Before this stage they shared
+the extraction floor: 4.78-4.83 ms at 4 constituents, 14.33-14.44 ms at 8,
+and 47.12-47.59 ms at 16, with 354-1,852 allocations and 1.25-1.45 MiB peak
+requested heap. After fusion, representative resident medians were:
+
+| reduction | 4 constituents | 8 constituents | 16 constituents | allocations at 16 |
+|---|---:|---:|---:|---:|
+| OR, across the three bodies | 2.368-2.379 ms | 3.778-3.785 ms | 6.080-6.099 ms | 131-193 |
+| AND, across the three bodies | 2.371-2.402 ms | 3.776-3.783 ms | 6.081-6.085 ms | 151-253 |
+| XOR, across the three bodies | 1.166-1.179 ms | 1.860-1.870 ms | 3.037-3.040 ms | 114-162 |
+
+Resident and checkpoint/reopen checksums agreed, and the database was verified
+before reopened measurement. OR and AND still peak near 1.2 MiB because their
+general identities retain both `Any` and `All` results; XOR needs only parity
+and peaked near 0.65 MiB at 16 constituents. That residual heap is independent
+of constituent extraction and should not motivate a core node without a caller
+that demonstrates it matters.
+
+An independent `BTreeSet` oracle substitutes each constituent directly and
+reduces it without sharing the truth-table derivation. It covers union, both
+difference directions, a static body, and a repeated hole; OR, AND, and XOR;
+odd and even arities; and both layouts. Deliberately swapping the OR identity's
+mixed-state terms made the first union case fail. The allocation regression
+compares 4 with 64 constituents for nine body/operator combinations; bypassing
+the general fusion made its first case grow from 268 to 4,195 allocations.
+
+The only known eager mapped-fold remainder is now genuinely non-pointwise, such
+as `select( _, n )`. Its result depends on global order statistics and cannot be
+recovered from the hole's per-ordinal false/true values. Keep that fallback and
+the lazy-core-node planner obligations until a measured caller justifies more.
 ### Bit-sliced proposal and the surviving count
 
 A bit-sliced value would read several ordinary sets as integer planes over each ordinal, the transpose of `bignum`'s significance-inner layout. **It was proposed by a consumer and declined in full; see the `view_count` discussion below for why.** The storage doctrine fits because the caller still owns the layout and each plane remains an ordinary equality-encoded key. The arithmetic does not license a lazy API shape: `matrix/`, `bignum/`, `view/`, and `pack/` are eager and contain no `Expr` or `ChunkStream` integration.

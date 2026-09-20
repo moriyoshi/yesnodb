@@ -13,10 +13,12 @@
 //! audited `OrdSet`, not a core expression node. Its consumers are fused where
 //! their terminal makes that exact. Indexing evaluates only the requested map
 //! element, cardinality and membership maps walk constituents without retaining
-//! them, and intersection-shaped maps commute through folds. Unsupported shapes
-//! keep the eager fallback. This closes the reachable repeated-extraction cost
-//! without adding an unmeasured `Expr` variant or changing the planner's audited
-//! termination proof.
+//! them, pointwise Boolean cardinality and rank maps use one packed walk after
+//! decomposing the body at the absent and present values of its hole, and folds
+//! of pointwise maps reduce the same two-value truth table over the packed view.
+//! Non-pointwise shapes keep the eager fallback. This closes the measured
+//! repeated-extraction costs without adding an unmeasured `Expr` variant or
+//! changing the planner's audited termination proof.
 
 use std::sync::Arc;
 
@@ -318,6 +320,21 @@ impl<'a> PreparedSet<'a> {
             Self::Dynamic(e) => lower_in(e, snap, Some(part)),
         }
     }
+
+    /// Substitute one lazy expression for the hole when the body is pointwise.
+    ///
+    /// Non-pointwise transforms decline so their existing materializing
+    /// semantics remain the fallback.
+    fn pointwise(&self, hole: Expr) -> Option<Expr> {
+        match self {
+            Self::Static(e) => Some(e.clone()),
+            Self::Hole => Some(hole),
+            Self::And(xs) => pointwise_fold(xs, hole, Expr::and),
+            Self::Or(xs) => pointwise_fold(xs, hole, Expr::or),
+            Self::AndNot(a, b) => Some(a.pointwise(hole.clone())?.and_not(b.pointwise(hole)?)),
+            Self::Dynamic(_) => None,
+        }
+    }
 }
 
 fn eval_prepared(
@@ -335,6 +352,22 @@ fn eval_prepared(
         out = join(out, x.eval(snap, part)?);
     }
     Ok(out)
+}
+
+fn pointwise_fold(
+    xs: &[PreparedSet<'_>],
+    hole: Expr,
+    join: fn(Expr, Expr) -> Expr,
+) -> Option<Expr> {
+    let mut it = xs.iter();
+    let Some(first) = it.next() else {
+        return Some(Expr::Empty);
+    };
+    let mut out = first.pointwise(hole.clone())?;
+    for x in it {
+        out = join(out, x.pointwise(hole.clone())?);
+    }
+    Some(out)
 }
 
 /// Count an intersection-shaped body without extracting any constituent.
@@ -414,6 +447,97 @@ fn expr_contains(expr: Expr, ordinal: u64) -> yesno_core::Result<bool> {
     monotone_stream_contains(stream.as_mut(), &mut current, &mut exhausted, ordinal)
 }
 
+/// Count a pointwise Boolean map body without extracting its constituents.
+///
+/// For one logical ordinal the body is a Boolean function of the hole. Let
+/// `f0` and `f1` be that function with the hole absent and present. Then
+///
+/// `|f(H)| = |f0| + |H ∩ (f1 ∖ f0)| - |H ∩ (f0 ∖ f1)|`.
+///
+/// The invariant base is counted once and one packed walk counts both
+/// intersections for every constituent. Rank uses the same identity after
+/// restricting all three terms to `[0, upper)`.
+fn eval_pointwise_cardinalities(
+    packed: &OrdSet,
+    view: &View,
+    prepared: &PreparedSet<'_>,
+    upper: Option<u64>,
+) -> yesno_core::Result<Option<Vec<u64>>> {
+    if !matches!(view.layout(), yesno_core::view::ViewLayout::Interleaved) {
+        return Ok(None);
+    }
+    if upper == Some(0) {
+        return Ok(Some(vec![0; view.sets() as usize]));
+    }
+
+    let Some(when_absent) = prepared.pointwise(Expr::Empty) else {
+        return Ok(None);
+    };
+    let Some(when_present) = prepared.pointwise(Expr::Range(0, u64::MAX)) else {
+        return Ok(None);
+    };
+    let restrict = |e: Expr| match upper {
+        Some(hi) => e.and(Expr::Range(0, hi)),
+        None => e,
+    };
+    let base = restrict(when_absent.clone()).cardinality()?;
+    let positive = restrict(when_present.clone().and_not(when_absent.clone()));
+    let negative = restrict(when_absent.and_not(when_present));
+
+    let mut positive_stream = positive.open();
+    let mut positive_current: Option<(Prefix48, Container)> = None;
+    let mut positive_exhausted = false;
+    let mut negative_stream = negative.open();
+    let mut negative_current: Option<(Prefix48, Container)> = None;
+    let mut negative_exhausted = false;
+    let mut positive_counts = vec![0u64; view.sets() as usize];
+    let mut negative_counts = vec![0u64; view.sets() as usize];
+    let mut last_x = None;
+    let mut positive_selected = false;
+    let mut negative_selected = false;
+
+    for physical in packed.iter() {
+        let Some((owner, x)) = view.logical_of(physical) else {
+            continue;
+        };
+        if upper.is_some_and(|hi| x >= hi) {
+            break;
+        }
+        if last_x != Some(x) {
+            positive_selected = monotone_stream_contains(
+                positive_stream.as_mut(),
+                &mut positive_current,
+                &mut positive_exhausted,
+                x,
+            )?;
+            negative_selected = monotone_stream_contains(
+                negative_stream.as_mut(),
+                &mut negative_current,
+                &mut negative_exhausted,
+                x,
+            )?;
+            last_x = Some(x);
+        }
+        if positive_selected {
+            positive_counts[owner as usize] += 1;
+        }
+        if negative_selected {
+            negative_counts[owner as usize] += 1;
+        }
+    }
+
+    let mut out = vec![base; view.sets() as usize];
+    for ((value, add), subtract) in out.iter_mut().zip(positive_counts).zip(negative_counts) {
+        *value = value
+            .checked_add(add)
+            .and_then(|n| n.checked_sub(subtract))
+            .ok_or(yesno_core::CodecError::Invariant(
+                "pointwise cardinality identity overflowed",
+            ))?;
+    }
+    Ok(Some(out))
+}
+
 fn eval_view_int_map(
     input: &SetExpr,
     spec: ViewSpec,
@@ -433,6 +557,9 @@ fn eval_view_int_map(
                 return Ok(Some(out));
             }
             let prepared = PreparedSet::new(a, snap, hole)?;
+            if let Some(out) = eval_pointwise_cardinalities(&packed, &view, &prepared, None)? {
+                return Ok(Some(out));
+            }
             let mut out = Vec::with_capacity(view.sets() as usize);
             for i in 0..view.sets() {
                 let part = Arc::new(packed.view_select(&view, i));
@@ -442,6 +569,9 @@ fn eval_view_int_map(
         }
         IntExpr::Rank(a, x) => {
             let prepared = PreparedSet::new(a, snap, hole)?;
+            if let Some(out) = eval_pointwise_cardinalities(&packed, &view, &prepared, Some(*x))? {
+                return Ok(Some(out));
+            }
             let mut out = Vec::with_capacity(view.sets() as usize);
             for i in 0..view.sets() {
                 let part = Arc::new(packed.view_select(&view, i));
@@ -552,10 +682,13 @@ fn eval_view_bool_map(
     Ok(Arc::new(OrdSet::from_iter_unsorted(out)))
 }
 
-/// Fuse fold(map(view, intersect-with-invariants), op).
+/// Fuse a fold over a pointwise map of a packed view.
 ///
-/// Intersection distributes over union, intersection, and symmetric difference,
-/// so every mapped invariant can be applied once after the packed fold.
+/// The intersection-only arm stays first because it needs one packed fold.
+/// Otherwise let `f0` and `f1` be the map body with its hole absent and present.
+/// At one ordinal the mapped values are therefore copies of only those two bits,
+/// so their OR, AND, or parity is determined by the packed view's any/all/parity
+/// folds and the view arity. Non-pointwise bodies decline to the eager oracle.
 fn fold_mapped_view(
     v: &VecSetExpr,
     op: FoldOp,
@@ -563,14 +696,56 @@ fn fold_mapped_view(
     hole: Hole<'_>,
 ) -> yesno_core::Result<Option<Expr>> {
     let mut invariants = Vec::new();
-    let Some((input, spec)) = mapped_view_intersections(v, &mut invariants) else {
+    if let Some((input, spec)) = mapped_view_intersections(v, &mut invariants) {
+        let packed = lower_in(input, snap, hole)?.collect_set()?;
+        let mut out = Expr::set(packed.view_fold(&core_view(spec), core_reduce(op)));
+        for invariant in invariants {
+            out = out.and(lower_in(invariant, snap, hole)?);
+        }
+        return Ok(Some(out));
+    }
+
+    let VecSetExpr::Map(inner, body) = v else {
         return Ok(None);
     };
+    let VecSetExpr::View(input, spec) = inner.as_ref() else {
+        return Ok(None);
+    };
+    let prepared = PreparedSet::new(body, snap, hole)?;
+    let Some(when_absent) = prepared.pointwise(Expr::Empty) else {
+        return Ok(None);
+    };
+    let Some(when_present) = prepared.pointwise(Expr::Range(0, u64::MAX)) else {
+        return Ok(None);
+    };
+
     let packed = lower_in(input, snap, hole)?.collect_set()?;
-    let mut out = Expr::set(packed.view_fold(&core_view(spec), core_reduce(op)));
-    for invariant in invariants {
-        out = out.and(lower_in(invariant, snap, hole)?);
-    }
+    let view = core_view(*spec);
+    let out = match op {
+        FoldOp::Or => {
+            let any = Expr::set(packed.view_fold(&view, Reduce::Any));
+            let all = Expr::set(packed.view_fold(&view, Reduce::All));
+            when_absent.and_not(all).or(when_present.and(any))
+        }
+        FoldOp::And => {
+            let any = Expr::set(packed.view_fold(&view, Reduce::Any));
+            let all = Expr::set(packed.view_fold(&view, Reduce::All));
+            when_absent
+                .clone()
+                .and(when_present.clone())
+                .or(when_absent.and_not(any))
+                .or(when_present.and(all))
+        }
+        FoldOp::Xor => {
+            let parity = Expr::set(packed.view_fold(&view, Reduce::Parity));
+            let toggled = parity.and(when_absent.clone().xor(when_present));
+            if view.sets().is_multiple_of(2) {
+                toggled
+            } else {
+                when_absent.xor(toggled)
+            }
+        }
+    };
     Ok(Some(out))
 }
 
@@ -643,8 +818,8 @@ fn vec_set_contains_hole(v: &VecSetExpr) -> bool {
 ///
 /// **Only called where an operator genuinely needs every materialized
 /// constituent or no exact terminal fusion applies.** `at` never comes through
-/// here, and cardinality, membership, and intersection-map folds have direct
-/// view paths. The fallback remains important for arbitrary map bodies.
+/// here, and cardinality, membership, and pointwise-map folds have direct view
+/// paths. The fallback remains important for non-pointwise map bodies.
 fn lower_vec(v: &VecSetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Vec<OrdSet>> {
     Ok(match v {
         VecSetExpr::List(xs) => {
