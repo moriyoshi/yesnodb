@@ -28,6 +28,11 @@
 //! it, producing one [`Step`] per visible chunk. A step is a prefix, a
 //! cardinality, and either a memtable container already in hand or a
 //! `( ChunkKey, ChunkRef )` pair — sixteen bytes of reference, not a payload.
+//! [`Snapshot::key_stream_prefix_range`](super::Snapshot::key_stream_prefix_range)
+//! applies its half-open chunk-prefix bounds to both the index cursor and the
+//! memtable iterator before this plan is collected. It therefore pays metadata
+//! planning and plan storage only for the requested prefix interval, while
+//! retaining the same cursor and payload-reading machinery.
 //! Disk payloads are decoded in [`ChunkStream::next_chunk`], one at a time,
 //! and the store lock is taken and released per chunk rather than held across
 //! the walk.
@@ -49,13 +54,14 @@
 //! which is the same property [`Snapshot::cardinality`](super::Snapshot::cardinality)
 //! has and the reason `ChunkRef` carries the field.
 //!
-//! # A deliberate difference from `load`
+//! # Errors surface at the stage that encounters them
 //!
-//! `merged_chunks` **silently drops** a chunk whose payload fails to decode
-//! ( `if let Ok( Some( c ) ) = ...` ), so `load` answers a corrupt key with a
-//! short set. This propagates the error instead, because it can: `next_chunk`
-//! already returns a `Result` and a caller that asked for a stream can be told.
-//! A short answer presented as a complete one is the worse failure.
+//! An index error aborts plan construction. Discarding it would turn an empty
+//! or truncated plan into a successful answer, and a later payload checksum
+//! cannot detect references that never entered the plan. A payload error
+//! surfaces later from [`ChunkStream::next_chunk`], because payloads remain
+//! lazy. Neither failure is converted into an absent chunk: a short answer
+//! presented as a complete one is the worse failure.
 
 use std::sync::Arc;
 
@@ -66,6 +72,11 @@ use crate::mvcc::Version;
 use crate::store::extent::{ChunkKey, ChunkRef};
 use crate::stream::{Backing, BoxedStream, ChunkSource, ChunkStream, StreamStats};
 use crate::Prefix48;
+
+/// The legal exclusive endpoint for a half-open chunk-prefix range.
+///
+/// Unlike an individual [`Prefix48`], the upper endpoint may equal `2^48`.
+const PREFIX_EXCLUSIVE_END: u64 = 1u64 << 48;
 
 /// Where one chunk of the plan comes from.
 enum Source {
@@ -131,6 +142,21 @@ impl KeyStream {
         ))
     }
 
+    /// Construct a stream whose plan is restricted to `[lo, hi)` prefixes.
+    pub(super) fn in_prefix_range(
+        snap: &Snapshot,
+        key: u64,
+        lo: Prefix48,
+        hi: Prefix48,
+    ) -> Result<KeyStream> {
+        let shard = snap.shard_index(key);
+        Ok(KeyStream::over(
+            snap,
+            shard,
+            Arc::new(KeyStream::build_plan_range(snap, key, lo, hi)?),
+        ))
+    }
+
     /// A cursor over an already-resolved plan. No scan, no locks.
     fn over(snap: &Snapshot, shard: usize, plan: Arc<Plan>) -> KeyStream {
         KeyStream {
@@ -146,7 +172,31 @@ impl KeyStream {
 
     /// One index range scan, merged with the memtable. The expensive half.
     fn build_plan(snap: &Snapshot, key: u64) -> Result<Plan> {
+        Self::build_plan_range(snap, key, 0, PREFIX_EXCLUSIVE_END)
+    }
+
+    /// Build only the plan entries in the half-open prefix interval.
+    fn build_plan_range(snap: &Snapshot, key: u64, lo: Prefix48, hi: Prefix48) -> Result<Plan> {
         snap.check_live()?;
+        if lo > hi || hi > PREFIX_EXCLUSIVE_END {
+            return Err(crate::error::CodecError::Invariant(
+                "invalid chunk prefix range",
+            ));
+        }
+        if lo == hi {
+            return Ok(Plan {
+                steps: Vec::new(),
+                disk: 0,
+            });
+        }
+        // Validate before packing: `ChunkKey::new` masks the legal exclusive
+        // endpoint to zero rather than rejecting it.
+        let start = ChunkKey::new(key, lo);
+        let end = if hi == PREFIX_EXCLUSIVE_END {
+            ChunkKey::range_end(key)
+        } else {
+            ChunkKey::new(key, hi)
+        };
         let i = snap.shard_index(key);
         let shard = &snap.db.shards[i];
 
@@ -154,7 +204,7 @@ impl KeyStream {
         // matching comment in `Snapshot::merged_chunks`.
         let overlay: Vec<(Prefix48, Option<Container>)> = {
             let mem = shard.mem.read().unwrap();
-            mem.key_chunks(key, snap.version)
+            mem.chunks_in_key_range(start, end, snap.version)
                 .map(|(p, c)| (p, c.cloned()))
                 .collect()
         };
@@ -184,13 +234,9 @@ impl KeyStream {
                 let store = store.lock().unwrap();
                 let mut overlay = overlay.into_iter().peekable();
 
-                let scan = tree.range(
-                    &*store,
-                    ChunkKey::range_start(key),
-                    ChunkKey::range_end(key),
-                );
+                let scan = tree.range(&*store, start, end);
                 for item in scan {
-                    let Ok((ck, cref)) = item else { continue };
+                    let (ck, cref) = item?;
                     let prefix = ck.prefix();
 
                     // Memtable chunks below this prefix are uncontested.
@@ -1123,5 +1169,58 @@ mod tests {
         db.checkpoint().unwrap();
 
         assert_eq!(drain(s), want, "the stream still reads its own version");
+    }
+
+    /// Prefix bounds do not weaken the reader-slot lifetime or eviction checks.
+    #[test]
+    fn a_prefix_bounded_stream_keeps_and_checks_its_snapshot() {
+        let dir = tmpdir("prefix_lifetime");
+        let _guard = CleanDir(dir.clone());
+
+        {
+            let db = Db::open_with(&dir, opts()).unwrap();
+            let vals: Vec<u64> = (0..12u64).map(|c| (c << 16) | 1).collect();
+            db.insert_many(1, &vals).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let db = Db::open_with(&dir, opts()).unwrap();
+
+        let (stream, want) = {
+            let snap = db.snapshot().unwrap();
+            let want = OrdSet::from_sorted_slice(
+                &snap
+                    .load(1)
+                    .unwrap()
+                    .iter()
+                    .filter(|ordinal| {
+                        let prefix = ordinal >> 16;
+                        (3..7).contains(&prefix)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            (snap.key_stream_prefix_range(1, 3, 7).unwrap(), want)
+        };
+        assert_eq!(
+            db.live_readers(),
+            1,
+            "the bounded stream must retain the dropped snapshot's slot"
+        );
+
+        for c in 0..12u64 {
+            db.insert(1, (c << 16) | 2).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert_eq!(drain(stream), want, "the stream must keep its own version");
+
+        let snap = db.snapshot().unwrap();
+        let mut stream = snap.key_stream_prefix_range(1, 0, 12).unwrap();
+        assert!(stream.next_chunk().unwrap().is_some());
+        assert!(db.evict_oldest_reader(), "the snapshot must be evictable");
+        let err = stream.next_chunk().unwrap_err();
+        assert!(
+            matches!(err, crate::error::CodecError::SnapshotTooOld { .. }),
+            "an evicted bounded stream must refuse, got {err:?}"
+        );
+        assert!(stream.cardinality_dyn().is_err());
     }
 }

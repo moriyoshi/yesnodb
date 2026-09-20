@@ -22,32 +22,34 @@ use yesno_core::{Expr, OrdSet};
 // touch, so there is no recursion into the allocator here.
 thread_local! {
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static BYTES: Cell<u64> = const { Cell::new(0) };
     static COUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Counting;
 
 #[inline]
-fn bump() {
+fn bump(bytes: usize) {
     // `try_with` rather than `with`: during thread teardown the TLS may already
     // be destroyed, and panicking inside the allocator would abort.
     let _ = COUNTING.try_with(|on| {
         if on.get() {
             let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            let _ = BYTES.try_with(|c| c.set(c.get().saturating_add(bytes as u64)));
         }
     });
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        bump();
+        bump(l.size());
         unsafe { System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        bump();
+        bump(new);
         unsafe { System.realloc(p, l, new) }
     }
 }
@@ -62,6 +64,18 @@ fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let out = f();
     COUNTING.with(|c| c.set(false));
     (out, ALLOCS.with(|c| c.get()))
+}
+
+/// Count total requested allocation bytes made by this thread during `f`.
+///
+/// This is cumulative requested memory, not live or peak memory. It sees the
+/// capacity of a metadata plan even when that plan is later filtered or freed.
+fn count_alloc_bytes<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    BYTES.with(|c| c.set(0));
+    COUNTING.with(|c| c.set(true));
+    let out = f();
+    COUNTING.with(|c| c.set(false));
+    (out, BYTES.with(|c| c.get()))
 }
 
 /// Sets spanning many chunks, so "per chunk" and "constant" differ by a lot.
@@ -957,6 +971,72 @@ fn a_key_stream_does_not_decode_the_key_it_streams() {
          it is decoding payloads rather than reading `card_m1`"
     );
 
+    drop(snap);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A prefix-bounded stream must bound metadata planning, not merely payloads.
+///
+/// Correct contents cannot distinguish a range-restricted B+tree cursor from a
+/// full-key plan filtered after construction. Allocation count is weak here too:
+/// a geometrically growing `Vec` uses only logarithmically more allocation
+/// calls. Requested bytes expose the retained plan capacity and all temporary
+/// full-plan growth directly.
+#[test]
+fn a_prefix_bounded_key_stream_does_not_plan_the_whole_key() {
+    use yesno_core::{Db, DbOptions};
+
+    let dir = std::env::temp_dir().join(format!(
+        "yesno-alloc-prefix-keystream-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let chunks = 4_096u64;
+    let width = 8u64;
+    let start = 3_000u64;
+    let options = DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+    {
+        let db = Db::open_with(&dir, options.clone()).unwrap();
+        let values: Vec<u64> = (0..chunks)
+            .flat_map(|prefix| [1u64, 97, 193, 389].map(move |low| (prefix << 16) | low))
+            .collect();
+        db.insert_many(1, &values).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    let db = Db::open_with(&dir, options).unwrap();
+    let snap = db.snapshot().unwrap();
+
+    let (full, full_bytes) = count_alloc_bytes(|| snap.key_stream(1).unwrap());
+    assert_eq!(full.chunks_remaining(), chunks as usize);
+    drop(full);
+
+    let (bounded, bounded_bytes) = count_alloc_bytes(|| {
+        snap.key_stream_prefix_range(1, start, start + width)
+            .unwrap()
+    });
+    assert_eq!(
+        bounded.chunks_remaining(),
+        width as usize,
+        "the fixture has one visible chunk at every requested prefix"
+    );
+
+    // The ratio, not either host-dependent byte total, is the assertion. A
+    // full-key plan followed by `retain` requests essentially the full arm's
+    // memory before returning the right eight chunks. Eightfold headroom is
+    // loose against a 512:1 width ratio while still rejecting that decay.
+    assert!(
+        bounded_bytes.saturating_mul(8) < full_bytes,
+        "bounded planning requested {bounded_bytes} bytes for {width} chunks, against {full_bytes} for {chunks}; it appears to plan the whole key"
+    );
+
+    drop(bounded);
     drop(snap);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);

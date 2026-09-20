@@ -106,10 +106,11 @@ yesno/
       db/
         mod.rs                  # Db / Snapshot / WriteBatch, sharded writers
         apply.rs                # one record -> memtable. Shared by recovery and the live replica
-        keystream.rs            # KeyStream: one key as a lazy ChunkStream. The index scan
-                                #   resolves every chunk to a ( ChunkKey, ChunkRef ); payloads
-                                #   decode one at a time and counts come off card_m1, so
-                                #   nothing is read that the consumer does not ask for.
+        keystream.rs            # KeyStream: one key as a lazy ChunkStream. A full-key or
+                                #   prefix-bounded index scan resolves each requested chunk
+                                #   to a ( ChunkKey, ChunkRef ); the bounded form restricts
+                                #   both index and memtable planning before collection.
+                                #   Payloads decode one at a time and counts come off card_m1.
                                 #   The first and only leaf that reports Backing::Paged.
                                 #   KeySource wraps it as a stream::ChunkSource, which is what
                                 #   Snapshot::key_expr puts in an Expr -- so a query over a key
@@ -716,6 +717,15 @@ A leaf entry is `ksuf_len + 8` bytes: a truncated key suffix plus the 8-byte `Ch
 `card_m1` also carries the **range** questions, which is what the DataFusion pushdown is built on. `Snapshot::{len_in_range, range_summary}` scan the leaf entries for the chunks a range touches and decode a payload only for the at most **two** the range covers *partially* — every chunk it covers wholly answers from the number already in its leaf. So deciding `skip` / `scan` / `scan_selection` for a 1 M-row row group, about sixteen chunks, costs two container reads whatever the range's width. Guarded by `tests/allocation.rs`, not by a correctness test: an implementation that decoded every chunk returns the identical number, and measured 3 201 allocations against 388 chunks when sabotaged.
 
 **Half-open `[lo, hi)`**, unlike `Db::insert_range`'s inclusive `[lo, hi]`. Both conventions exist on purpose and neither is smoothed over; the half-open one is what a row group's `[start, start + count)` already is. `RangeSummary` is `Empty | Full | Partial` and `#[non_exhaustive]` — `Full` is the answer worth having, because it is what lets a row group be scanned with **no** selection vector at all, and a count alone cannot tell it from a large `Partial`.
+
+`Snapshot::key_stream_prefix_range` is the payload-producing counterpart for
+callers that know a chunk window. Its half-open bounds are **chunk prefixes**,
+not ordinals, and `2^48` is legal only as the exclusive endpoint. Both the
+B+tree cursor and the memtable iterator are restricted before plan collection;
+filtering a full plan afterwards would return the same set and lose the property
+the API exists to provide. Index errors abort construction rather than becoming
+missing plan entries, while payload errors remain deferred until the stream
+advances.
 
 ## Arrow edge — `yesno-arrow`
 
@@ -1347,7 +1357,8 @@ Each test file exists to catch a failure class the others structurally cannot. S
 - `proptest_oracle.rs` — properties against `BTreeSet<u64>`. Generators are boundary-biased on purpose ( clustered, runny, mixed, and **ceiling** ordinals ); uniform random `u64`s would put one ordinal per chunk, so arrays would never fill, bitmaps would never appear, and run containers would never be produced. Biased on *three* axes, and the third was missing for four milestones: cardinality and prefix pattern were covered exactly as the comments promised, while the largest ordinal any generator could emit was nowhere near `u64::MAX` — which is how an overflow in the multi-chunk range walk survived. `ceiling_ordinals` and `ceiling_range` close it; the latter bounds a range's *width* without bounding its *position*, which is why no u64-level range property existed before ( a uniform `(lo, hi)` is almost always a span no oracle can enumerate ).
 - `differential.rs` — the M0 gate: semantic agreement with `RoaringBitmap` / `RoaringTreemap`, plus byte-level identity in both directions ( we parse what `roaring` writes, `roaring` parses what we write ).
 - `expr_equivalence.rs` — the M1 gate: random expression shapes evaluated lazily, eagerly, and against a `BTreeSet` oracle; plus `cardinality == collect_set().len()`.
-- `allocation.rs` — a thread-local counting allocator asserts allocation budgets. Counters are thread-local rather than global on purpose, so the tests do not silently require `--test-threads=1`. This is the only layer that can see a *parallel implementation* being chosen wrongly, because both paths return the same answer: it is what caught `Snapshot::cardinality` materializing every container instead of reading `card_m1`, and `Expr::open` folding an n-way OR pairwise instead of using the shared accumulator. Never raise a budget to accommodate a change — the budgets encode "does not scale with chunk count", not a measurement.
+- `stream_conformance.rs` — Proposition 6' shape obligation: both production paths must yield strictly ascending prefixes and no empty fiber. Hand-built malformed streams are the negative controls; database-backed leaves are instantiated here separately from their denotation oracles.
+- `allocation.rs` — a thread-local allocator asserts allocation-count and requested-byte budgets. Counters are thread-local rather than global on purpose, so the tests do not silently require `--test-threads=1`. This is the only layer that can see a *parallel implementation* being chosen wrongly, because both paths return the same answer: it is what caught `Snapshot::cardinality` materializing every container instead of reading `card_m1`, `Expr::open` folding an n-way OR pairwise instead of using the shared accumulator, and a bounded stream planning a whole key before filtering. Never raise a budget to accommodate a change — the budgets encode "does not scale with chunk count", not a measurement.
 - `durability.rs` — every read method against data that is genuinely on disk, oracle-checked. **Always reopens before reading**, because `checkpoint()` does not clear the memtable, so a read on the same `Db` instance is answered from memory and never reaches the store. That blind spot hid three separate bugs; this layer exists so it cannot hide a fourth.
 - `zero_copy_mvcc.rs` — a live reader holding a container that aliases the mmap, across checkpoints, reclamation, reopen, and the death of the `Db` itself. No other layer can reach this: `crash_matrix` restarts the process, `allocation` counts heap bytes these pages never occupy, and the `store::alloc` unit tests drive one allocator by hand. Every set here is deliberately larger than the 3-ordinal inline limit, and every assertion is on **contents** — cardinality comes from the index and stays correct even when the payload is gone.
 - `crash_matrix.rs` — the M3 gate: WAL truncation and corruption at **every byte offset**, superblock tears at every byte, and every multi-shard participation combination. Deterministic, not randomized — the watermark advance and the three-condition reclamation are where the real bugs are, and they need exhaustive rather than sampled coverage.

@@ -1237,6 +1237,10 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
 
   So the structural question stands untouched: can the memtable accept a commit without excluding readers for the whole of it ( shadow overlay and swap, or a versioned memtable )? The hoists took the disk I/O out of the hold and the dispatcher took the shards off each other's critical path; what remains inside `mem.write()` is the mutation itself, which is the part that needs a different structure rather than a shorter section.
 
+- [ ] **keystream-seek-retires-skipped-steps-linearly** ( *2026-09-20, inspected while adding bounded planning* ): `KeyStream::seek` finds its target by galloping and binary search, then calls `advance()` once per skipped plan entry solely to maintain `disk_remaining`. Existing-plan reuse therefore avoids reconstruction but does not make a far seek logarithmic end to end.
+
+  Do not add cumulative disk counts on code inspection alone. The consumer benchmark is consistent with this cost but does not isolate it, and an extra count per step or a suffix table increases plan metadata and construction work for every stream. Build an isolated seek benchmark over a cached `KeySource`, compare the representation cost, and change the plan only if the measured trade is favourable. Prefix-bounded construction is already available when the caller owns a narrow chunk window; this item is for long-lived full plans whose caller does not.
+
 - [ ] **read-concurrency-is-bounded-by-shard-count** ( *2026-09-14, measured* ): `KeyStream::next_chunk` takes `Mutex<ShardStore>` **per chunk** and holds it across the whole of `read_container_for` -- trailer read, checksum verification, `buffer_at` and the decode. Concurrent readers therefore serialize per shard, and read scaling tracks **shard count rather than core count**.
 
   ```text

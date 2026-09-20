@@ -14,6 +14,8 @@ dependency. Network services and integrations live in the satellite crates.
 - `ChunkStream` and `Expr` evaluate set expressions without materializing
   intermediate results.
 - `Db`, `WriteBatch`, and `Snapshot` provide durable, versioned storage.
+  `Snapshot::key_stream_prefix_range` bounds metadata planning to a half-open
+  chunk-prefix interval when a caller will read only part of a posting list.
 - `matrix`, `bignum`, and `view` expose packed-bit representations.
 - `roaring_format` imports and exports portable Roaring data.
 

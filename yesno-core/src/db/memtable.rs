@@ -345,6 +345,20 @@ impl Memtable {
     ) -> impl Iterator<Item = (Prefix48, Option<&Container>)> + '_ {
         let lo = ChunkKey::range_start(key);
         let hi = ChunkKey::range_end(key);
+        self.chunks_in_key_range(lo, hi, at)
+    }
+
+    /// Chunks visible at `at` in a half-open range within one key.
+    ///
+    /// The caller supplies already validated and packed bounds. Keeping the
+    /// range restriction here, rather than filtering [`Self::key_chunks`],
+    /// prevents a narrow read from walking the whole overlay.
+    pub(super) fn chunks_in_key_range(
+        &self,
+        lo: ChunkKey,
+        hi: ChunkKey,
+        at: Version,
+    ) -> impl Iterator<Item = (Prefix48, Option<&Container>)> + '_ {
         self.chunks.range(lo..hi).filter_map(move |(ck, chain)| {
             chain
                 .iter()

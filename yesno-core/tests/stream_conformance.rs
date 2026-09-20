@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use yesno_core::stream::nary::UnionAll;
 use yesno_core::stream::{ChunkStream, ChunkStreamExt, Concat, Restrict};
-use yesno_core::{Container, Expr, OrdSet, Prefix48, Result};
+use yesno_core::{Container, Db, DbOptions, Expr, OrdSet, Prefix48, Result};
 
 /// What a conforming stream may not do.
 #[derive(Debug, PartialEq, Eq)]
@@ -433,4 +433,73 @@ fn the_cancelling_cases_reach_the_operator() {
     // And the same stream must be conforming, which is the property under test.
     let mut s = e.open_planned();
     assert_eq!(violation_of(&mut *s).unwrap(), None);
+}
+
+/// The database-backed bounded leaf has the same conformance obligation as
+/// every in-memory leaf and operator above.
+///
+/// Both disk and memtable entries are present, with an overlay tombstone in the
+/// requested interval. That is the merge where an empty or repeated fiber can
+/// otherwise escape while the denotation remains correct after collection.
+#[test]
+fn a_prefix_bounded_key_stream_conforms() {
+    let dir = std::env::temp_dir().join(format!(
+        "yesno-stream-conformance-prefix-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    struct Clean(std::path::PathBuf);
+    impl Drop for Clean {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _clean = Clean(dir.clone());
+    let options = DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+
+    {
+        let db = Db::open_with(&dir, options.clone()).unwrap();
+        let values: Vec<u64> = (0..24u64)
+            .flat_map(|prefix| [1u64, 7, 11].map(move |low| (prefix << 16) | low))
+            .collect();
+        db.insert_many(9, &values).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    let db = Db::open_with(&dir, options).unwrap();
+    let mut batch = db.batch();
+    batch.remove_range(9, 8 << 16, (9 << 16) - 1);
+    batch.insert(9, (10 << 16) | 13);
+    batch.insert(9, (12 << 16) | 17);
+    batch.commit().unwrap();
+    let snap = db.snapshot().unwrap();
+
+    let mut chunks = snap.key_stream_prefix_range(9, 4, 16).unwrap();
+    assert_eq!(
+        violation_of(&mut chunks).unwrap(),
+        None,
+        "bounded next_chunk path"
+    );
+
+    let mut counts = snap.key_stream_prefix_range(9, 4, 16).unwrap();
+    assert_eq!(
+        violations_of_counts(&mut counts).unwrap(),
+        None,
+        "bounded next_cardinality path"
+    );
+
+    // Neither conformance check may pass because the constructor returned an
+    // empty stream or ignored its bounds.
+    let mut chunks = snap.key_stream_prefix_range(9, 4, 16).unwrap();
+    let mut seen = Vec::new();
+    while let Some((prefix, _)) = chunks.next_chunk().unwrap() {
+        seen.push(prefix);
+    }
+    assert!(
+        !seen.is_empty() && seen.iter().all(|prefix| (4..16).contains(prefix)),
+        "bounded fixture produced the wrong prefix support: {seen:?}"
+    );
 }

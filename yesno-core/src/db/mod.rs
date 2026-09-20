@@ -4717,6 +4717,32 @@ impl Snapshot {
         keystream::KeyStream::new(self, key)
     }
 
+    /// Stream chunks whose prefixes are in the half-open interval
+    /// `[lo_prefix, hi_prefix)`.
+    ///
+    /// A chunk prefix is `ordinal >> 16`; these are not ordinal bounds, and
+    /// the boundary chunks are not clipped. The legal endpoint range is
+    /// `0..=2^48`, with `2^48` accepted only as the exclusive upper
+    /// endpoint ( or as both bounds of an empty range ). Empty ranges produce
+    /// an empty stream.
+    ///
+    /// Both the persisted index cursor and the memtable iterator are restricted
+    /// before the plan is collected. Payloads remain lazy, snapshot visibility
+    /// and tombstone precedence match [`Self::key_stream`], and the returned
+    /// stream holds this snapshot's reader slot.
+    ///
+    /// Returns [`CodecError::Invariant`] when the bounds are reversed or exceed
+    /// the legal endpoint. Bounds are checked before packing because the
+    /// internal chunk-key constructor masks its prefix to 48 bits.
+    pub fn key_stream_prefix_range(
+        &self,
+        key: u64,
+        lo_prefix: Prefix48,
+        hi_prefix: Prefix48,
+    ) -> Result<keystream::KeyStream> {
+        keystream::KeyStream::in_prefix_range(self, key, lo_prefix, hi_prefix)
+    }
+
     /// A key as a **lazy leaf** in an expression.
     ///
     /// The difference from `Expr::set( snap.load( key )? )` is that nothing is

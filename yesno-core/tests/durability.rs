@@ -31,6 +31,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use yesno_core::stream::ChunkStream;
 use yesno_core::{Db, DbOptions};
 
 struct CleanDir(PathBuf);
@@ -3007,6 +3008,183 @@ fn a_range_to_the_top_of_the_universe_sees_the_top_chunk() {
     );
 }
 
+/// A prefix-bounded stream must be the snapshot's set restricted by chunk,
+/// including at both ends of the key and ordinal spaces.
+///
+/// This fixture is reopened before the snapshots are taken, so its base state
+/// comes from the index. The later batch creates every merge position: a
+/// whole-chunk tombstone, a gap insertion, and a partial replacement. The old
+/// snapshot must retain the base while the new one sees the overlay. Container
+/// shapes are deliberately mixed; a uniform sparse fixture would exercise only
+/// arrays.
+#[test]
+fn a_prefix_bounded_key_stream_matches_persisted_mvcc_oracle() {
+    const END: u64 = 1u64 << 48;
+    const TOP_PREFIX: u64 = END - 1;
+
+    fn ord(prefix: u64, low: u64) -> u64 {
+        (prefix << 16) | low
+    }
+
+    fn assert_range(
+        snap: &yesno_core::Snapshot,
+        key: u64,
+        oracle: &BTreeSet<u64>,
+        lo: u64,
+        hi: u64,
+    ) {
+        let expected: Vec<u64> = oracle
+            .iter()
+            .copied()
+            .filter(|ordinal| lo <= ordinal >> 16 && ordinal >> 16 < hi)
+            .collect();
+        let expected_chunks = expected
+            .iter()
+            .map(|ordinal| ordinal >> 16)
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        let mut stream = snap.key_stream_prefix_range(key, lo, hi).unwrap();
+        assert_eq!(
+            stream.chunks_remaining(),
+            expected_chunks,
+            "wrong planned chunk count for {lo}..{hi}"
+        );
+        let mut actual = Vec::new();
+        while let Some((prefix, container)) = stream.next_chunk().unwrap() {
+            assert!(
+                lo <= prefix && prefix < hi,
+                "stream escaped {lo}..{hi} with prefix {prefix}"
+            );
+            actual.extend(container.iter().map(|low| (prefix << 16) | u64::from(low)));
+        }
+        assert_eq!(actual, expected, "wrong contents for {lo}..{hi}");
+
+        let mut counts = snap.key_stream_prefix_range(key, lo, hi).unwrap();
+        let mut cardinality = 0u64;
+        while let Some((prefix, count)) = counts.next_cardinality().unwrap() {
+            assert!(lo <= prefix && prefix < hi);
+            cardinality += count;
+        }
+        assert_eq!(cardinality, expected.len() as u64);
+
+        // Seeking below the constructor's lower bound must not expose an
+        // earlier chunk that was deliberately absent from the plan.
+        let mut seek = snap.key_stream_prefix_range(key, lo, hi).unwrap();
+        seek.seek(lo.saturating_sub(1)).unwrap();
+        let mut after_seek = Vec::new();
+        while let Some((prefix, container)) = seek.next_chunk().unwrap() {
+            after_seek.extend(container.iter().map(|low| (prefix << 16) | u64::from(low)));
+        }
+        assert_eq!(after_seek, expected);
+    }
+
+    let dir = tmpdir("prefix-stream");
+    let _c = CleanDir(dir.clone());
+    let key = u64::MAX;
+    let mut before = BTreeSet::new();
+
+    // Array, run, bitmap, another sparse array, and the persisted final legal
+    // prefix. `ORDINAL_MAX`, not `u64::MAX`, is the final legal ordinal.
+    before.extend((0..40u64).map(|i| ord(0, i * 97)));
+    before.extend((1_000..6_000u64).map(|low| ord(2, low)));
+    before.extend((0..65_536u64).step_by(2).map(|low| ord(4, low)));
+    before.extend((0..24u64).map(|i| ord(9, 17 * i)));
+    before.extend((65_530..=65_534u64).map(|low| ord(TOP_PREFIX, low)));
+
+    {
+        let db = Db::open_with(
+            &dir,
+            DbOptions {
+                shards: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.insert_many(key, &before.iter().copied().collect::<Vec<_>>())
+            .unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let old = db.snapshot().unwrap();
+    let mut after = before.clone();
+    let mut batch = db.batch();
+
+    batch.remove_range(key, ord(2, 0), ord(2, 65_535));
+    after.retain(|ordinal| ordinal >> 16 != 2);
+
+    for value in [ord(3, 7), ord(3, 9), ord(6, 11), ord(6, 13)] {
+        batch.insert(key, value);
+        after.insert(value);
+    }
+
+    batch.remove_range(key, ord(4, 0), ord(4, 10));
+    after.retain(|ordinal| !((ordinal >> 16 == 4) && (ordinal & 0xffff) <= 10));
+    for value in [
+        ord(4, 1),
+        ord(4, 3),
+        ord(4, 5),
+        yesno_core::ORDINAL_MAX - 10,
+    ] {
+        batch.insert(key, value);
+        after.insert(value);
+    }
+    batch.commit().unwrap();
+    let new = db.snapshot().unwrap();
+
+    let fixed = [
+        (0, 0),
+        (0, 1),
+        (1, 3),
+        (2, 4),
+        (3, 7),
+        (4, 10),
+        (TOP_PREFIX, END),
+        (0, END),
+        (END, END),
+    ];
+    for (lo, hi) in fixed {
+        assert_range(&old, key, &before, lo, hi);
+        assert_range(&new, key, &after, lo, hi);
+        assert!(
+            new.key_stream_prefix_range(key - 1, lo, hi)
+                .unwrap()
+                .next_chunk()
+                .unwrap()
+                .is_none(),
+            "an absent maximum-adjacent key must stay absent"
+        );
+    }
+
+    // Repeatable range generation over the overlay-dense low prefixes.
+    let mut state = 0xD1B5_4A32_D192_ED03u64;
+    for _ in 0..64 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let a = state % 12;
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let b = state % 12;
+        let (lo, hi) = (a.min(b), a.max(b));
+        assert_range(&old, key, &before, lo, hi);
+        assert_range(&new, key, &after, lo, hi);
+    }
+
+    assert!(new.key_stream_prefix_range(key, 4, 3).is_err());
+    assert!(new.key_stream_prefix_range(key, 0, END + 1).is_err());
+    assert!(new.key_stream_prefix_range(key, END + 1, END + 1).is_err());
+}
+
 /// `Snapshot::keys` and `key_range` against a `BTreeSet` oracle, after a reopen.
 ///
 /// The oracle is an outside answer, not another yesno path. An enumeration
@@ -3452,6 +3630,27 @@ fn a_corrupt_index_node_payload_fails_the_checksum_scan() {
     // became loud, which is why the error channel and the check had to land
     // together.
     let snap = db.snapshot().unwrap();
+    let stream_err = match snap.key_stream(1) {
+        Ok(_) => panic!("a corrupt index node must fail posting-plan construction"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{stream_err:?}").contains("index node checksum mismatch"),
+        "expected a checksum error from key_stream, got {stream_err:?}"
+    );
+
+    let bounded_err = match snap.key_stream_prefix_range(1, 0, 1u64 << 48) {
+        Ok(_) => panic!("a corrupt index node must fail bounded plan construction"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{bounded_err:?}").contains("index node checksum mismatch"),
+        "expected a checksum error from bounded key_stream, got {bounded_err:?}"
+    );
+
+    // The materializing path must independently refuse the same real reader
+    // failure. This is not a substitute for the stream assertion: the defect
+    // was in the stream's separate planning loop.
     let err = snap
         .load(1)
         .expect_err("a corrupt index node must be refused");
@@ -3598,6 +3797,21 @@ fn a_corrupt_standalone_payload_is_refused_by_the_read_path() {
 
     let db = reopen_one_shard(&dir);
     let snap = db.snapshot().unwrap();
+    for mut stream in [
+        snap.key_stream(1).unwrap(),
+        snap.key_stream_prefix_range(1, 0, 1).unwrap(),
+    ] {
+        let err = stream
+            .next_chunk()
+            .expect_err("a corrupt payload must fail when its stream advances");
+        assert!(
+            format!("{err:?}").contains("fails its stored checksum"),
+            "expected a checksum refusal from KeyStream, got {err:?}"
+        );
+    }
+
+    // The materializing API must independently refuse exactly the same key.
+    // It does not share the stream's deferred payload-read path.
     let mut refused = 0usize;
     for k in 1..40u64 {
         if let Err(e) = snap.load(k) {

@@ -231,6 +231,75 @@ Per-cohort counts under a filter, checked against a `BTreeSet` oracle. That is t
 
 **Two process lessons, both of which cost a run.** A Docker gate snapshots the tree at build time, so editing while one runs produces a result describing a checkout that never existed -- one `gate-pg` run had to be discarded for exactly that. And `cargo test --workspace` exceeds a single 600 s foreground call, so it has to be split by package when background execution is unavailable.
 
+---
+## 2026-09-20 — Test plan: fail-closed and prefix-bounded key streams
+
+### Failure classes
+
+| Class | Concrete failure | Layer |
+|---|---|---|
+| Error becomes omission | A B+tree cursor error is skipped while building a posting plan, so an empty or truncated stream is returned as success | `tests/durability.rs`, corrupting a real persisted index node before opening the stream |
+| Wrong contents or visibility | Prefix bounds are applied after MVCC resolution, mask the `2^48` endpoint, lose a tombstone, or include a chunk outside the requested interval | `tests/durability.rs`, comparing old and new persisted snapshots with mixed container shapes against a `BTreeSet` oracle |
+| Stream-contract divergence | Counting, seeking, reader eviction, or a stream outliving its `Snapshot` behaves differently for the bounded constructor | Existing `KeyStream` conformance assertions instantiated through the new public constructor |
+| Silent planning decay | A narrow constructor builds the whole key's metadata plan and filters it afterwards | `tests/allocation.rs`, comparing requested allocation bytes for a narrow plan with a fresh full-key plan |
+| Deferred payload error is swallowed | A plan opens successfully but a corrupt standalone extent is treated as an absent chunk during iteration | `tests/durability.rs`, corrupting a real persisted payload and reading it through `next_chunk` |
+
+### Planned tests
+
+- `tests/durability.rs::a_prefix_bounded_key_stream_matches_persisted_mvcc_oracle` -- mixed array, bitmap, and run chunks; persisted terminal prefix; whole-chunk deletion, gap insertion, partial replacement, old/new snapshots, maximum key, empty/full/invalid bounds, counting, and seek below the lower bound.
+- `tests/durability.rs::a_corrupt_index_node_payload_fails_the_checksum_scan` -- require both full and bounded plan construction to return the real index-reader error.
+- `tests/durability.rs::a_corrupt_standalone_payload_is_refused_by_the_read_path` -- require payload failure to surface when either stream advances.
+- `tests/allocation.rs::a_prefix_bounded_key_stream_does_not_plan_the_whole_key` -- assert that planning memory follows the requested chunk interval rather than total key width.
+
+### Generators
+
+The persisted oracle fixture deliberately creates all three container kinds and uses a fixed LCG to choose repeatable prefix intervals around disk-only, overlay-only, contested, tombstoned, absent, and terminal chunks. Uniform `u64` ordinals would produce only one-element array chunks and would leave both container diversity and boundary prefixes untested.
+
+### Deliberately not covered
+
+This pass does not optimize `KeyStream::seek`. Its target search is logarithmic, but retiring skipped disk steps is linear because `disk_remaining` is maintained by repeated `advance()`. The prescription's cached-plan timings are consistent with that observation but do not isolate it, and a cumulative-count representation adds plan metadata and construction work. That optimization needs its own measurement before it changes the plan representation.
+
+---
+
+## 2026-09-20 — fail-closed and prefix-bounded key streams
+
+`KeyStream` plan construction now propagates B+tree cursor errors instead of
+turning an unreadable index entry into an omitted chunk. A real persisted index
+corruption reproduced the old false-success path before the one-line `?` fix and
+now fails both full and bounded construction. Standalone payload errors remain
+deferred until the affected chunk is advanced, and tests pin that distinction.
+
+`Snapshot::key_stream_prefix_range` plans only the requested half-open chunk
+prefix interval. Both the persisted B+tree walk and the MVCC memtable walk are
+range-bounded; `2^48` is the exclusive endpoint, invalid bounds are refused, and
+empty ranges preserve snapshot liveness checks. The persisted oracle covers old
+and new snapshots, tombstones, overlays, all container kinds, the terminal
+prefix, maximum keys, counting, seeking, and stream lifetime after the snapshot
+handle is dropped.
+
+The allocation regression compares requested bytes for an eight-chunk plan with
+a 4 096-chunk plan. Deliberately replacing the bounded walk with a full-key walk
+made it fail at 665 312 bounded bytes versus 666 416 full bytes. Deliberately
+removing the disk bound made the persisted oracle return five chunks where one
+was requested. Both sabotages were reverted before the passing gate. Existing
+plan seek retirement remains deliberately deferred under
+`keystream-seek-retires-skipped-steps-linearly` until an isolated cached-source
+benchmark justifies changing plan metadata.
+
+### Quality Gate — fail-closed and prefix-bounded key streams
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+- `cargo fmt --check`: pass.
+- `cargo test -p yesno-core`: pass, including 915 unit tests and all integration and doc-test layers.
+- `./scripts/gate.sh`: pass on the final rerun, including the full scenario corpus. An earlier run reached its final formatting check and found a concurrent untracked Flight test before that separate work was formatted.
+- `./scripts/gate-pg.sh`: pass for the default PostgreSQL major and PostgreSQL 18, including unit and hermetic regression fixtures.
+- `./scripts/gate-mysql.sh`: pass, including the C ABI, native Flight client, pinned server build, and hermetic regression fixture.
+- `./scripts/gate-search.sh`: pass; application, OpenSearch, and Elasticsearch scenarios all passed.
+- `./yesno-c/gate.sh`: pass.
+- Invariant audit: no persisted or wire format changed, no unsafe code was added, `roaring` remains dev-only, and the `arrow-buffer` containment boundary is unchanged.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked
