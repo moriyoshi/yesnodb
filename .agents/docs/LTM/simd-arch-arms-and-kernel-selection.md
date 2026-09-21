@@ -152,6 +152,74 @@ have the same byte-aligned structure; other arities do not. An x86 shuffle arm
 needs measurement on real x86 hardware rather than an inferred port. Blocked
 views already use range counts and must not be routed through this arm.
 
+### Blocked-view SIMD: cross once per container and pair filters
+
+The first blocked-view SIMD attempt put a feature-gated call around each row.
+Its isolated AND-popcount was faster and the endpoint was slower: **6.478 us
+against 5.605 us scalar, a 15.6% regression**. The missing cost was the call
+shape. A blocked 512-row container crossed that boundary 512 times per filter,
+while LLVM had already auto-vectorized the ordinary Rust reducer.
+
+A disposable follow-up under
+`.agents-workspace/tmp/simd-jit-revisit-20260921` moved the architecture
+boundary outside the entire container and evaluated two filters together so a
+data vector was loaded once. The construction was 512 rows, 64 words per row,
+two 4,096-bit query masks, nine alternating repetitions pinned to Cortex-X925
+CPU 5. Query support of 32 and 4,096 produced the same timings, as expected for
+a dense word scan:
+
+```text
+shape                         support 32     support 4096
+auto-vectorized, per row        10.04 us          10.07 us
+ordinary Rust, fused two         9.51 us           9.55 us
+NEON, per row                    7.42 us           7.46 us
+NEON, whole container            6.24 us           6.25 us
+```
+
+That is the dispatch rule now used by the blocked bitmap counter: adjacent
+batch filters are paired, the NEON or AVX2 arm is entered once per bitmap
+container, and each data load feeds both AND-popcounts. An odd final filter
+keeps the scalar row loop. The production Criterion endpoint, 512 rows of
+4,096 bits and two sparse filters, measured **7.130 us for the paired batch
+against 11.297 us for two one-filter calls, 1.58x**. The untouched one-filter
+endpoint was 5.762 us immediately before the change and 5.649 us after it; the
+new arm therefore does not reintroduce the original regression.
+
+The AVX2 path was cross-compiled and its direct SIMD-versus-scalar property ran
+under `qemu-x86_64`; that establishes correctness only. No x86 throughput claim
+is made until it is measured on real hardware. Both architecture arms carry
+bound B8 and the property varies row width across vector boundaries and tails,
+row count, input words, and nonzero initial output accumulators.
+
+### JIT: vector IR still loses to the existing AOT loop
+
+The same disposable crate compiled `(A & B) | (C & !D)` followed by popcount
+through Cranelift 0.135.2. Four equal-length bitmap pointers and a word count
+were the complete runtime interface. Each result was checked against optimized
+Rust before nine alternating pinned repetitions.
+
+Cranelift did not auto-vectorize the scalar loop. Explicit `i64x2` popcount was
+also unsupported by the AArch64 backend, so the vector form used `i8x16`
+popcount, unsigned widening through 16-, 32-, and 64-bit lanes, two vector
+accumulators, and one final horizontal sum. It improved Cranelift's scalar loop
+but did not reach LLVM AOT:
+
+```text
+words       LLVM AOT    scalar JIT    vector JIT    AOT / vector
+64            15.3 ns       35.1 ns       28.0 ns          0.55x
+1,024        217.3 ns      564.6 ns      439.3 ns          0.49x
+16,384     4,018.8 ns    9,100.7 ns    7,055.6 ns          0.57x
+```
+
+Cold compilation of the first function was 1.050 ms; the second, after process
+setup, was 85.8 us. There is **no break-even execution count** because generated
+code remains slower at every measured size. Do not add Cranelift to the runtime
+for the current view terminals. Re-open JIT only for a demonstrated hot Boolean
+DAG where runtime fusion removes enough full bitmap passes to exceed both its
+steady-state deficit and compilation cost; compare first with an ahead-of-time
+specialized fused loop, since that retains LLVM's better vectorization without
+an executable-code cache or new runtime dependency.
+
 ### ARM SVE: check two preconditions before writing code
 
 `libpopcnt` reports its SVE path beating its NEON one, **"especially on CPUs whose SVE vector width is larger than NEON's 128 bits"**. That qualifier is the whole result. On a Cortex-X925 with SVE and SVE2 both detected, `/proc/sys/abi/sve_default_vector_length` is **16 bytes = 128 bits**, exactly NEON's width -- and since the kernel is load-bound, identical width means identical loads for identical bytes, so there is no mechanism by which SVE moves the binding constraint. Predication would remove the scalar tail, a handful of words out of 1024.

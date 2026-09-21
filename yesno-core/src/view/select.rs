@@ -31,8 +31,10 @@
 //! `O(lines × container size)` — 5.5 ms to move 8 KiB. The scalar operations
 //! walk once for one requested slot; [`OrdSet::view_cardinalities`] records the
 //! whole interleaved per-slot shape in one pass when every count is requested.
-//! Blocked views retain per-slot range counts because they can sum whole
-//! containers without reading their payloads.
+//! containers without reading their payloads. Their bitmap arm batches sibling
+//! filters in pairs: one architecture dispatch per container, and each data
+//! vector is reused for both AND-popcounts. A lone filter retains the scalar
+//! word loop because the earlier per-row SIMD dispatch was a measured loss.
 //!
 //! Under [`ViewLayout::Blocked`] with a stride that is a multiple of 65 536, a
 //! constituent occupies a whole number of chunks and its logical ordinals differ
@@ -211,13 +213,34 @@ impl<'a> ViewIntersectionCounter<'a> {
     fn count_blocked(&mut self, container: &Container, base: u64, stride: u64) {
         if let (Container::Bitmap(bitmap), Some(query_words)) = (container, &self.query_words) {
             let row_words = (stride / 64) as usize;
-            for (row, words) in bitmap.words().chunks_exact(row_words).enumerate() {
-                let owner = base / stride + row as u64;
-                if owner >= self.view.sets() as u64 {
-                    break;
-                }
-                for (query, counts) in query_words.iter().zip(&mut self.counts) {
-                    counts[owner as usize] += and_popcount(words, query);
+            let first_owner = base / stride;
+            if first_owner >= self.view.sets() as u64 {
+                return;
+            }
+            let rows = (bitmap.words().len() / row_words)
+                .min((self.view.sets() as u64 - first_owner) as usize);
+            let first_owner = first_owner as usize;
+            let last_owner = first_owner + rows;
+            let data = &bitmap.words()[..rows * row_words];
+
+            let mut filter = 0usize;
+            while filter + 1 < query_words.len() {
+                let (left, right) = self.counts.split_at_mut(filter + 1);
+                crate::ops::bitmap::words_and_cardinality_rows2(
+                    data,
+                    &query_words[filter],
+                    &query_words[filter + 1],
+                    row_words,
+                    &mut left[filter][first_owner..last_owner],
+                    &mut right[0][first_owner..last_owner],
+                );
+                filter += 2;
+            }
+            if filter < query_words.len() {
+                let query = &query_words[filter];
+                let counts = &mut self.counts[filter];
+                for (row, words) in data.chunks_exact(row_words).enumerate() {
+                    counts[first_owner + row] += and_popcount(words, query);
                 }
             }
             return;
@@ -432,9 +455,11 @@ impl OrdSet {
     /// [`OrdSet::and_cardinality`], but it never constructs those constituent
     /// sets. The generic path is the oracle for every descriptor. A blocked
     /// view whose row width divides one chunk and is a whole number of words
-    /// instead counts bitmap rows with scalar word-wise AND-popcount. Array,
-    /// run, mixed, partial, and unaligned payloads remain exact through the
-    /// generic path or the bitmap container's alignment-safe word accessor.
+    /// instead counts bitmap rows with word-wise AND-popcount. Batched filters
+    /// are paired by the whole-container SIMD arm; a lone filter stays on the
+    /// scalar loop. Array, run, mixed, partial, and unaligned payloads remain
+    /// exact through the generic path or the bitmap container's alignment-safe
+    /// word accessor.
     pub fn view_intersection_cardinalities(&self, v: &View, filter: &OrdSet) -> Vec<u64> {
         self.view_intersection_cardinalities_batch(v, &[filter])
             .pop()

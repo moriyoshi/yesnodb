@@ -162,6 +162,9 @@ fn intersection_cardinalities(c: &mut Criterion) {
     let filter = OrdSet::from_iter_unsorted(
         (0..32).map(|i| ((i * 127 + 11) % COUNT_STRIDE as usize) as u64),
     );
+    let sibling = OrdSet::from_iter_unsorted(
+        (0..32).map(|i| ((i * 193 + 17) % COUNT_STRIDE as usize) as u64),
+    );
 
     let mut g = c.benchmark_group("view/intersection_cardinalities");
     g.bench_function("blocked_bitmap/arm", |b| {
@@ -174,6 +177,22 @@ fn intersection_cardinalities(c: &mut Criterion) {
             (0..COUNT_SETS)
                 .map(|row| packed.view_select(&view, row).and_cardinality(&filter))
                 .collect::<Vec<_>>()
+        })
+    });
+    g.bench_function("blocked_bitmap/batch2_arm", |b| {
+        b.iter(|| {
+            black_box(&packed).view_intersection_cardinalities_batch(
+                black_box(&view),
+                black_box(&[&filter, &sibling]),
+            )
+        })
+    });
+    g.bench_function("blocked_bitmap/two_calls", |b| {
+        b.iter(|| {
+            [
+                packed.view_intersection_cardinalities(&view, &filter),
+                packed.view_intersection_cardinalities(&view, &sibling),
+            ]
         })
     });
     g.finish();

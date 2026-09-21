@@ -21,6 +21,8 @@
 //!
 //! * `apply_words` — the four binary ops with a fused popcount.
 //! * `words_and_cardinality` — `|x ∩ y|`, no result.
+//! * `words_and_cardinality_rows2` — two blocked-view filters over many
+//!   fixed-width bitmap rows, with one architecture dispatch per container.
 //! * `words_popcount` — set bits in one payload, for [`super::mixed`], whose
 //!   interval-driven arms cannot fuse their own count.
 //! * `words_disjoint` / `words_contains` — the two predicates.
@@ -233,6 +235,62 @@ fn scalar_and_cardinality(wx: &[u64], wy: &[u64]) -> u32 {
     wx.iter().zip(wy).map(|(p, q)| (p & q).count_ones()).sum()
 }
 
+/// Add two intersection counts for every fixed-width row in `data`.
+///
+/// This is deliberately a two-query kernel. The packed-view batch evaluator
+/// commonly asks for sibling facet planes, and pairing them lets the vector
+/// arm load each data block once. More filters are handled as independent
+/// pairs by the caller; an odd final filter keeps the ordinary scalar path.
+/// Dispatch is outside the row loop, because a feature-gated call per row cost
+/// more than the isolated SIMD win in the first prototype.
+pub(crate) fn words_and_cardinality_rows2(
+    data: &[u64],
+    q0: &[u64],
+    q1: &[u64],
+    row_words: usize,
+    out0: &mut [u64],
+    out1: &mut [u64],
+) {
+    assert!(row_words != 0, "bitmap row width must be non-zero");
+    assert_eq!(out0.len(), out1.len(), "paired row outputs must align");
+    assert!(q0.len() >= row_words && q1.len() >= row_words);
+    let needed = row_words
+        .checked_mul(out0.len())
+        .expect("bitmap row span overflows usize");
+    assert!(data.len() >= needed);
+    let data = &data[..needed];
+
+    #[cfg(target_arch = "aarch64")]
+    if row_words >= 8 && std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: `neon` was just detected. The assertions above establish
+        // bound B8: every output row has `row_words` data and query words.
+        unsafe { simd::and_cardinality_rows2(data, q0, q1, row_words, out0, out1) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if row_words >= 16 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: `avx2` was just detected and bound B8 was checked above.
+        unsafe { simd::and_cardinality_rows2(data, q0, q1, row_words, out0, out1) };
+        return;
+    }
+    scalar_and_cardinality_rows2(data, q0, q1, row_words, out0, out1);
+}
+
+/// Scalar oracle for [`words_and_cardinality_rows2`].
+fn scalar_and_cardinality_rows2(
+    data: &[u64],
+    q0: &[u64],
+    q1: &[u64],
+    row_words: usize,
+    out0: &mut [u64],
+    out1: &mut [u64],
+) {
+    for (row, words) in data.chunks_exact(row_words).take(out0.len()).enumerate() {
+        out0[row] += u64::from(scalar_and_cardinality(words, q0));
+        out1[row] += u64::from(scalar_and_cardinality(words, q1));
+    }
+}
+
 /// Set bits in a payload, as one pass.
 ///
 /// The unary form of [`words_and_cardinality`], with the same accumulator and
@@ -330,6 +388,82 @@ mod simd {
             total = vaddvq_u32(vaddq_u32(vpaddlq_u16(s0), vpaddlq_u16(s1)));
         }
         total + super::scalar_and_cardinality(&wx[i..n], &wy[i..n])
+    }
+
+    /// Two AND-popcounts for every fixed-width row, loading `data` once.
+    ///
+    /// # Safety
+    ///
+    /// Requires `neon` and bound **B8**: `row_words >= 8`, both queries have
+    /// at least `row_words` words, `data` has `row_words * out0.len()` words,
+    /// and both output slices have the same length.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn and_cardinality_rows2(
+        data: &[u64],
+        q0: &[u64],
+        q1: &[u64],
+        row_words: usize,
+        out0: &mut [u64],
+        out1: &mut [u64],
+    ) {
+        debug_assert!(row_words >= WORDS_PER_BLOCK, "B8");
+        debug_assert!(q0.len() >= row_words && q1.len() >= row_words, "B8");
+        debug_assert_eq!(out0.len(), out1.len(), "B8");
+        debug_assert!(data.len() >= row_words * out0.len(), "B8");
+        for row in 0..out0.len() {
+            let words = &data[row * row_words..(row + 1) * row_words];
+            let mut i = 0usize;
+            let (mut x0, mut x1, mut x2, mut x3);
+            let (mut y0, mut y1, mut y2, mut y3);
+            // SAFETY: B8 and `i + 8 <= row_words` keep every four-vector
+            // load within this row and both queries. The data vectors are
+            // shared by the two filters before the loop advances.
+            unsafe {
+                x0 = vdupq_n_u16(0);
+                x1 = vdupq_n_u16(0);
+                x2 = vdupq_n_u16(0);
+                x3 = vdupq_n_u16(0);
+                y0 = vdupq_n_u16(0);
+                y1 = vdupq_n_u16(0);
+                y2 = vdupq_n_u16(0);
+                y3 = vdupq_n_u16(0);
+                while i + WORDS_PER_BLOCK <= row_words {
+                    debug_assert!(i + WORDS_PER_BLOCK <= words.len(), "B8");
+                    let pd = words.as_ptr().add(i).cast::<u8>();
+                    let p0 = q0.as_ptr().add(i).cast::<u8>();
+                    let p1 = q1.as_ptr().add(i).cast::<u8>();
+                    let d0 = vld1q_u8(pd);
+                    let d1 = vld1q_u8(pd.add(16));
+                    let d2 = vld1q_u8(pd.add(32));
+                    let d3 = vld1q_u8(pd.add(48));
+                    x0 = vpadalq_u8(x0, vcntq_u8(vandq_u8(d0, vld1q_u8(p0))));
+                    x1 = vpadalq_u8(x1, vcntq_u8(vandq_u8(d1, vld1q_u8(p0.add(16)))));
+                    x2 = vpadalq_u8(x2, vcntq_u8(vandq_u8(d2, vld1q_u8(p0.add(32)))));
+                    x3 = vpadalq_u8(x3, vcntq_u8(vandq_u8(d3, vld1q_u8(p0.add(48)))));
+                    y0 = vpadalq_u8(y0, vcntq_u8(vandq_u8(d0, vld1q_u8(p1))));
+                    y1 = vpadalq_u8(y1, vcntq_u8(vandq_u8(d1, vld1q_u8(p1.add(16)))));
+                    y2 = vpadalq_u8(y2, vcntq_u8(vandq_u8(d2, vld1q_u8(p1.add(32)))));
+                    y3 = vpadalq_u8(y3, vcntq_u8(vandq_u8(d3, vld1q_u8(p1.add(48)))));
+                    i += WORDS_PER_BLOCK;
+                }
+                out0[row] += u64::from(vaddvq_u32(vaddq_u32(
+                    vpaddlq_u16(vaddq_u16(x0, x1)),
+                    vpaddlq_u16(vaddq_u16(x2, x3)),
+                )));
+                out1[row] += u64::from(vaddvq_u32(vaddq_u32(
+                    vpaddlq_u16(vaddq_u16(y0, y1)),
+                    vpaddlq_u16(vaddq_u16(y2, y3)),
+                )));
+            }
+            out0[row] += u64::from(super::scalar_and_cardinality(
+                &words[i..],
+                &q0[i..row_words],
+            ));
+            out1[row] += u64::from(super::scalar_and_cardinality(
+                &words[i..],
+                &q1[i..row_words],
+            ));
+        }
     }
 
     /// # Safety
@@ -616,6 +750,124 @@ mod simd {
             total = hsum_u64(s) as u32;
         }
         total + super::scalar_and_cardinality(&wx[i..n], &wy[i..n])
+    }
+
+    /// Two AND-popcounts for every fixed-width row, loading `data` once.
+    ///
+    /// # Safety
+    ///
+    /// Requires `avx2` and bound **B8**: `row_words >= 16`, both queries have
+    /// at least `row_words` words, `data` has `row_words * out0.len()` words,
+    /// and both output slices have the same length.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn and_cardinality_rows2(
+        data: &[u64],
+        q0: &[u64],
+        q1: &[u64],
+        row_words: usize,
+        out0: &mut [u64],
+        out1: &mut [u64],
+    ) {
+        debug_assert!(row_words >= WORDS_PER_BLOCK, "B8");
+        debug_assert!(q0.len() >= row_words && q1.len() >= row_words, "B8");
+        debug_assert_eq!(out0.len(), out1.len(), "B8");
+        debug_assert!(data.len() >= row_words * out0.len(), "B8");
+        // SAFETY: B8 and `i + 16 <= row_words` keep the four vector loads
+        // within each row and both queries. AVX2 permits these unaligned loads.
+        unsafe {
+            let (lut, lo_mask) = (nibble_lut(), _mm256_set1_epi8(0x0f));
+            for row in 0..out0.len() {
+                let words = &data[row * row_words..(row + 1) * row_words];
+                let mut i = 0usize;
+                let mut x0 = _mm256_setzero_si256();
+                let mut x1 = _mm256_setzero_si256();
+                let mut x2 = _mm256_setzero_si256();
+                let mut x3 = _mm256_setzero_si256();
+                let mut y0 = _mm256_setzero_si256();
+                let mut y1 = _mm256_setzero_si256();
+                let mut y2 = _mm256_setzero_si256();
+                let mut y3 = _mm256_setzero_si256();
+                while i + WORDS_PER_BLOCK <= row_words {
+                    debug_assert!(i + WORDS_PER_BLOCK <= words.len(), "B8");
+                    let pd = words.as_ptr().add(i).cast::<__m256i>();
+                    let p0 = q0.as_ptr().add(i).cast::<__m256i>();
+                    let p1 = q1.as_ptr().add(i).cast::<__m256i>();
+                    let d0 = _mm256_loadu_si256(pd);
+                    let d1 = _mm256_loadu_si256(pd.add(1));
+                    let d2 = _mm256_loadu_si256(pd.add(2));
+                    let d3 = _mm256_loadu_si256(pd.add(3));
+                    x0 = _mm256_add_epi64(
+                        x0,
+                        popcnt_bytes(_mm256_and_si256(d0, _mm256_loadu_si256(p0)), lut, lo_mask),
+                    );
+                    x1 = _mm256_add_epi64(
+                        x1,
+                        popcnt_bytes(
+                            _mm256_and_si256(d1, _mm256_loadu_si256(p0.add(1))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    x2 = _mm256_add_epi64(
+                        x2,
+                        popcnt_bytes(
+                            _mm256_and_si256(d2, _mm256_loadu_si256(p0.add(2))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    x3 = _mm256_add_epi64(
+                        x3,
+                        popcnt_bytes(
+                            _mm256_and_si256(d3, _mm256_loadu_si256(p0.add(3))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    y0 = _mm256_add_epi64(
+                        y0,
+                        popcnt_bytes(_mm256_and_si256(d0, _mm256_loadu_si256(p1)), lut, lo_mask),
+                    );
+                    y1 = _mm256_add_epi64(
+                        y1,
+                        popcnt_bytes(
+                            _mm256_and_si256(d1, _mm256_loadu_si256(p1.add(1))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    y2 = _mm256_add_epi64(
+                        y2,
+                        popcnt_bytes(
+                            _mm256_and_si256(d2, _mm256_loadu_si256(p1.add(2))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    y3 = _mm256_add_epi64(
+                        y3,
+                        popcnt_bytes(
+                            _mm256_and_si256(d3, _mm256_loadu_si256(p1.add(3))),
+                            lut,
+                            lo_mask,
+                        ),
+                    );
+                    i += WORDS_PER_BLOCK;
+                }
+                let sx = _mm256_add_epi64(_mm256_add_epi64(x0, x1), _mm256_add_epi64(x2, x3));
+                let sy = _mm256_add_epi64(_mm256_add_epi64(y0, y1), _mm256_add_epi64(y2, y3));
+                out0[row] += hsum_u64(sx);
+                out1[row] += hsum_u64(sy);
+                out0[row] += u64::from(super::scalar_and_cardinality(
+                    &words[i..],
+                    &q0[i..row_words],
+                ));
+                out1[row] += u64::from(super::scalar_and_cardinality(
+                    &words[i..],
+                    &q1[i..row_words],
+                ));
+            }
+        }
     }
 
     /// # Safety
@@ -918,6 +1170,27 @@ mod tests {
         unsafe { simd::and_cardinality(wx, wy) }
     }
 
+    /// The paired row kernel, called directly so a disabled dispatcher cannot
+    /// turn its differential property into `scalar == scalar`.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn vec_and_cardinality_rows2(
+        data: &[u64],
+        q0: &[u64],
+        q1: &[u64],
+        row_words: usize,
+        out0: &mut [u64],
+        out1: &mut [u64],
+    ) {
+        assert!(
+            vector_arm_reachable(),
+            "the vector feature must be available"
+        );
+        assert!(row_words >= 16, "satisfies B8 on both supported arches");
+        // SAFETY: the feature was detected, and the property constructs equal
+        // output lengths, full queries, and `rows * row_words` data ( B8 ).
+        unsafe { simd::and_cardinality_rows2(data, q0, q1, row_words, out0, out1) };
+    }
+
     /// The unary popcount kernel, called directly.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn vec_popcount(w: &[u64]) -> u32 {
@@ -1028,6 +1301,64 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// The whole-container pair kernel against its scalar oracle.
+        ///
+        /// Nonzero outputs pin the additive contract used when a counter has
+        /// already consumed earlier chunks. Widths cross both vector block
+        /// boundaries and leave tails on either architecture.
+        #[test]
+        fn paired_row_counts_agree_with_the_scalar_oracle(
+            seed in proptest::prelude::any::<u64>(),
+            row_words in 16usize..129,
+            rows in 1usize..17,
+        ) {
+            let mut state = seed | 1;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                state
+            };
+            let data: Vec<_> = (0..row_words * rows).map(|_| next()).collect();
+            let q0: Vec<_> = (0..row_words).map(|_| next()).collect();
+            let q1: Vec<_> = (0..row_words).map(|_| next()).collect();
+            let mut want0 = vec![7u64; rows];
+            let mut want1 = vec![11u64; rows];
+            scalar_and_cardinality_rows2(
+                &data,
+                &q0,
+                &q1,
+                row_words,
+                &mut want0,
+                &mut want1,
+            );
+
+            let mut got0 = vec![7u64; rows];
+            let mut got1 = vec![11u64; rows];
+            words_and_cardinality_rows2(
+                &data,
+                &q0,
+                &q1,
+                row_words,
+                &mut got0,
+                &mut got1,
+            );
+            proptest::prop_assert_eq!((&got0, &got1), (&want0, &want1));
+
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            {
+                let mut vector0 = vec![7u64; rows];
+                let mut vector1 = vec![11u64; rows];
+                vec_and_cardinality_rows2(
+                    &data,
+                    &q0,
+                    &q1,
+                    row_words,
+                    &mut vector0,
+                    &mut vector1,
+                );
+                proptest::prop_assert_eq!((&vector0, &vector1), (&want0, &want1));
+            }
+        }
+
         /// Every word kernel against the scalar form it replaced.
         ///
         /// The scalar functions are kept reachable precisely so this can exist

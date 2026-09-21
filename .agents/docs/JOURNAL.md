@@ -944,6 +944,52 @@ deferred failure remains. The separately identified bitmap-native fold
 candidate remains outside this stage.
 
 ---
+## 2026-09-21 — Blocked bitmap batches cross the SIMD boundary once
+
+The Stage 8 blocked-bitmap SIMD rejection was a rejection of its call shape,
+not of the instructions. Its feature-gated kernel ran once per row, 512 times
+per filter in the measured fixture, while the scalar Rust reducer was already
+auto-vectorized by LLVM. A disposable follow-up moved the architecture boundary
+around the whole bitmap container and paired two filters so each data vector
+fed both AND-popcounts. Pinned to Cortex-X925 CPU 5, nine alternating
+repetitions measured 10.04 us for the current per-row auto-vectorized shape,
+7.42 us for per-row NEON, and 6.24 us for whole-container paired NEON.
+
+The paired shape now ships in `ops::bitmap` for NEON and AVX2 and is used by
+the blocked view counter for adjacent batch filters. An odd final filter keeps
+the existing scalar row loop, so the one-filter endpoint does not cross the
+feature boundary and does not repeat the prior regression. The production
+Criterion endpoint measured 7.130 us for two filters against 11.297 us for two
+one-filter calls, 1.58x. The one-filter regression guard measured 5.762 us
+before and 5.649 us after.
+
+This adds two `unsafe fn` and five `unsafe` blocks. Bound B8 requires a vector
+block or wider row, complete query rows, equal output lengths, and enough data
+for every output row. The parent dispatcher checks those conditions before the
+feature-gated call. A direct property calls the SIMD functions themselves,
+varies row width across block boundaries and tails, varies row count and word
+contents, starts outputs nonzero, and compares with the retained scalar oracle.
+The public blocked-view property also evaluates a two-filter bitmap batch
+against independent `BTreeSet` intersections. The AVX2 test target compiles and
+that direct property passes under `qemu-x86_64`; no emulated timing is quoted.
+The mechanically checked unsafe total is now 60 blocks and 28 functions.
+
+The same scratch crate tested JIT fusion with Cranelift 0.135.2 on the Boolean
+DAG `(A & B) | (C & !D)` followed by popcount. Scalar JIT was 2.3-2.7x slower
+than LLVM AOT. Explicit vector IR improved it, after replacing unsupported
+`i64x2` popcount with byte popcount and widening reductions, but still ran
+1.75-2.05x slower across 64, 1,024, and 16,384 words. Cold compilation was
+1.050 ms and the warmed second compilation 85.8 us, so there is no break-even
+count: generated code is slower before compilation is charged. Do not add a
+JIT runtime for current view terminals. Re-open only for a measured hot DAG
+where eliminating several full bitmap passes first beats an ahead-of-time
+fused specialization.
+
+The required local gate passes: workspace Clippy with all targets and features,
+workspace format check, and the full `yesno-core` suite. The unsafe-count and
+self-contained-doc checks also pass.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

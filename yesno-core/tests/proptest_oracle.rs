@@ -689,6 +689,31 @@ proptest! {
             .chunks()
             .any(|(_, container)| container.kind() != ContainerKind::Bitmap));
 
+        let sibling_query: BTreeSet<u64> = (0..STRIDE)
+            .filter(|x| (x * 11 + query_phase + 3) % (query_divisor + 2) == 0)
+            .collect();
+        let batch_queries = [query.clone(), sibling_query];
+        let batch_filters: Vec<_> = batch_queries
+            .iter()
+            .map(|query| OrdSet::from_iter_unsorted(query.iter().copied()))
+            .collect();
+        let batch_refs: Vec<_> = batch_filters.iter().collect();
+        let batch_want: Vec<Vec<u64>> = batch_queries
+            .iter()
+            .map(|query| {
+                rows.iter()
+                    .map(|row| row.intersection(query).count() as u64)
+                    .collect()
+            })
+            .collect();
+        prop_assert_eq!(
+            packed.view_intersection_cardinalities_batch(
+                &View::blocked(SETS, STRIDE),
+                &batch_refs,
+            ),
+            batch_want
+        );
+
         for query in [query, BTreeSet::new(), (0..STRIDE).collect()] {
             let filter = OrdSet::from_iter_unsorted(query.iter().copied());
             assert_invariants(&filter);
