@@ -23,6 +23,7 @@ yesno/
     src/
       lib.rs                    # ordinal split/join, the size-class constants, and their rationale
       jit.rs                    # optional Cranelift fused bitmap-DAG cardinality
+      hotspot.rs                # optional query-recurrence capture as tracing events; semver-exempt
       error.rs                  # CodecError + crate Result alias
       events.rs                 # typed storage and database lifecycle facts; no transport or serialization
       dispatch.rs               # Dispatch trait + Dispatcher handle: a host lends its executor; this crate spawns nothing

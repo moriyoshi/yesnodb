@@ -3007,6 +3007,96 @@ field holds one number, rather than in the shared extractor, which cannot tell.
 untouched.
 
 ---
+## 2026-09-23 -- Moving the capture point into yesno-core
+
+The hotspot capture point now lives at `yesno-core/src/hotspot.rs` rather than
+in `yesno-flight`. Moved on an explicit decision, not drift, and the entry
+above describes its previous home.
+
+**The reason it belongs here**: what it measures is a core concern --
+posting-list and container recurrence, and the planned-shape recurrence that
+decides `jit.rs`'s own `AUTO_MIN_CHUNKS`. None of that is about Arrow Flight.
+The capture sat in the wire crate only because that is where the query path
+happened to be hooked.
+
+### The container half needed a redesign to make the move legal
+
+`yesno-core` does not depend on `yesno-wire` and must not: that would invert
+the layering to reach a type the core has no other use for. But container
+identity is the **posting-list key**, and the only place that survives is the
+*wire* expression -- which is exactly the finding that fixed the original
+identity bug, where `lower` allocates a fresh `KeySource` per query and address
+identity reported zero reuse for every workload.
+
+So `record_containers` now takes `&[u64]` -- the keys already extracted --
+instead of a `&SetExpr` to extract them from. The genuinely wire-shaped step,
+`SetExpr::keys`, stays at the call site in `yesno-flight`; everything that is
+not about the wire format moved. The core gains no dependency.
+
+That introduced one hazard and one fix for it. Naively the call site would
+build a `Vec` per query to hand to a function that discards it when no capture
+is running -- reintroducing the exact per-query cost two rounds of measurement
+had just removed. Hence `hotspot::enabled()`, exported so the caller can skip
+building the list at all:
+
+```rust
+if yesno_core::hotspot::enabled() {
+    let mut named = Vec::new();
+    e.keys(&mut named);
+    yesno_core::hotspot::record_containers(&named, snap);
+}
+```
+
+**Measured cost-neutral.** Idle 798.8 ns cheap / 5630.4 ns dense against
+817.2 / 5553.0 before the move; capturing 2118.9 / 7300.5 against 2106.9 /
+7264.5. Every difference is inside the +-30 ns codegen band this session
+already established as the floor, so the cross-crate call is being inlined and
+nothing regressed.
+
+### Semver, and the rule this sits against
+
+The module is now **public API** -- it has cross-crate callers -- so it is
+marked semver-exempt on the [`unstable_arrow`] precedent, which is this
+crate's existing convention for a public module that is not promised.
+
+CLAUDE.md says research does not ship and names `stats.rs` as the precedent: a
+1 600-line instrument in this crate with **zero callers**, deleted once the
+decision it gated was made. This is a deliberate exception and it differs from
+that precedent in the way that matters -- *it has callers*, and the entire
+point of it is to run inside a deployed server. It is inert unless a subscriber
+asks for `yesno::hotspot`, and a capture is bounded, so even switched on it
+stops by itself. What it must not become is permanent: when the distribution is
+known, delete the module, its line in ARCHITECTURE's diagram, and the two call
+sites.
+
+### Two things the move improved, neither of them planned
+
+**The `postfix` wildcard was dead and is now gone.** `Expr` is
+`#[non_exhaustive]`, which binds downstream crates but not the defining one --
+so inside `yesno-core` the compiler flagged `_ => out.push( u64::MAX )` as
+unreachable. Removing it makes adding an `Expr` variant a **compile error**
+here until someone assigns it a shape marker, which is strictly better than
+the runtime fallback the module needed in `yesno-flight`, where a new variant
+would silently have joined an existing class and merged two shapes the JIT
+compiles apart.
+
+**No new dev-dependency.** The tests used `tempfile`, which `yesno-core` does
+not carry. Rather than add it -- `crate_universe` reads these manifests, so it
+would cost a Bazel re-pin -- they now use the house `tmpdir` plus `CleanDir`
+convention already used by `db/mod.rs` and `db/keystream.rs`.
+
+`scripts/check-layout.py` required ARCHITECTURE's module diagram to gain the
+file, which it has; the check verifies that in both directions.
+
+### Validation
+
+Thirteen unit tests moved with the module and pass under
+`--features tracing`; the live-server integration test stays in `yesno-flight`,
+where the path it exercises is. `clippy --workspace --all-targets
+--all-features -- -D warnings` clean, `cargo fmt --check` clean, seven
+invariant scripts pass.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

@@ -99,11 +99,6 @@ fn engine_status(e: CodecError) -> Status {
 pub mod client;
 #[cfg(feature = "server")]
 pub mod expr;
-// Private on purpose: a research capture point must make no API promise. The
-// `server` gate is a dependency requirement, not a switch -- the module needs
-// `yesno-core`, which the client-only build does not have.
-#[cfg(feature = "server")]
-mod hotspot;
 pub mod ticket;
 
 /// What a `FlightDescriptor` resolves to.

@@ -51,10 +51,9 @@ pub use yesno_wire::{
 /// build the selected set. Vector consumers use the terminal fusions described
 /// by [`lower`]; unsupported shapes retain the eager fallback.
 fn expr_cardinality(expr: Expr) -> yesno_core::Result<u64> {
-    // Research capture. One relaxed load and a predictable branch unless
-    // YESNO_HOTSPOT_TRACE is set; see `crate::hotspot` for the measurement
-    // that justifies it being unconditional.
-    crate::hotspot::record_shape(&expr);
+    // Research capture, on target `yesno::hotspot`. A level check against a
+    // global atomic unless a capture is running; see `yesno_core::hotspot`.
+    yesno_core::hotspot::record_shape(&expr);
     #[cfg(feature = "jit")]
     {
         yesno_core::jit::cardinality(&expr)
@@ -68,8 +67,14 @@ fn expr_cardinality(expr: Expr) -> yesno_core::Result<u64> {
 pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
     // Container identity lives on the wire expression, not the lowered one:
     // lowering replaces every key with a freshly allocated source. See
-    // `crate::hotspot`, "Identity, which the first version got wrong".
-    crate::hotspot::record_containers(e, snap);
+    // `yesno_core::hotspot`, "Identity, which the first version got wrong".
+    // This is the whole of the wire-specific half -- naming the posting lists
+    // -- and it is guarded so an idle server never builds the list.
+    if yesno_core::hotspot::enabled() {
+        let mut named = Vec::new();
+        e.keys(&mut named);
+        yesno_core::hotspot::record_containers(&named, snap);
+    }
     match e {
         // The counting form of the same fusion `lower` performs: counting a
         // constituent never needs the constituent.

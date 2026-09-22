@@ -237,7 +237,7 @@ Do not land the encoder without the wiring. Eight pieces of machinery in this co
   `--trace` already replays a captured stream through the same counters. See
   JOURNAL, *2026-09-23 -- The hotspot observer*.
 
-  **The capture point now exists** ( 2026-09-23 ): `yesno-flight`, private
+  **The capture point now exists** ( 2026-09-23 ): `yesno-core`, semver-exempt
   module, publishing `tracing` events on target `yesno::hotspot` at TRACE, each
   shape event tagged with its **OS thread** -- the per-worker distinction this
   item asks for, made structural. **No build flag**: the feature gate came off

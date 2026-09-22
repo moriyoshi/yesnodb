@@ -10,11 +10,36 @@
 //! *policy* half; only a real query stream can answer the workload half, and
 //! capturing one means being on the path a real query takes.
 //!
-//! CLAUDE.md forbids adding instruments to `yesno-core/src/`, and that is
-//! respected: nothing in the core changes, this module reaches it only through
-//! published API, and it is **private** -- `mod hotspot`, never `pub mod` --
-//! so R1, R6 and R7 make no semver promise. It should be deleted once the
-//! distribution is known.
+//! # Stability, and the rule this sits against
+//!
+//! **Semver-exempt**, on the [`crate::unstable_arrow`] precedent: this is a
+//! research capture, its shape will change as the questions above are
+//! answered, and it should be deleted once they are. Do not build on it.
+//!
+//! CLAUDE.md says research does not ship, and names `stats.rs` -- a 1 600-line
+//! instrument in this crate with no callers -- as the precedent for why. This
+//! module is a deliberate exception, placed here by an explicit decision
+//! rather than by drift, and it differs from that precedent in the way that
+//! matters: **it has callers.** `yesno-flight` invokes it on the live query
+//! path, and the whole point of it is to run in a deployed server.
+//!
+//! Two things keep the exception honest. It is inert unless a subscriber asks
+//! for target [`TARGET`], which costs a level check against a global atomic;
+//! and a capture is bounded, so even switched on it stops by itself. What it
+//! must not become is permanent: when the recurrence distribution is known,
+//! delete the module, the `hotspot` line in ARCHITECTURE's diagram, and the
+//! two call sites in `yesno-flight`.
+//!
+//! # Why it lives here and not in `yesno-flight`
+//!
+//! It started in `yesno-flight`, next to the query path it hooks. It belongs
+//! in the core because *what it measures* is a core concern -- posting-list
+//! and container recurrence, and the planned-shape recurrence that decides
+//! `jit.rs`'s own admission threshold -- and none of that is about Arrow
+//! Flight. The one genuinely wire-shaped part, turning a `SetExpr` into the
+//! posting-list keys it names, stays at the call site: [`record_containers`]
+//! takes the keys already extracted, which is why this crate needs no
+//! dependency on `yesno-wire` and gets none.
 //!
 //! # Why `tracing` and not a file of its own
 //!
@@ -92,6 +117,11 @@
 //!   measurement worth taking.
 //! * `hotspot.done` -- once, when a budget is spent.
 //!
+//! Consumed by the offline observer under `.agents-workspace/tmp/`, which
+//! parses whatever the operator's subscriber formatted. That tool is research
+//! and deliberately outside the tree; this module is the half that has to be
+//! where the queries are.
+//!
 //! # Fidelity, stated rather than assumed
 //!
 //! A leaf contributes `chunk_count` containers rather than its actual
@@ -114,12 +144,11 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use yesno_core::{Expr, Snapshot};
-use yesno_wire::SetExpr;
+use crate::{Expr, Snapshot};
 
 /// Event target. Capture with a filter directive such as
 /// `RUST_LOG=yesno::hotspot=trace`.
-pub(crate) const TARGET: &str = "yesno::hotspot";
+pub const TARGET: &str = "yesno::hotspot";
 
 /// Queries one capture records before disarming itself.
 ///
@@ -128,14 +157,14 @@ pub(crate) const TARGET: &str = "yesno::hotspot";
 /// measures every reuse distance below its own length exactly, and then stops.
 /// Re-arming means restarting the process -- deliberately, so that "I left it
 /// on" cannot be the state of a production server.
-pub(crate) const CAPTURE_QUERIES: u64 = 250_000;
+pub const CAPTURE_QUERIES: u64 = 250_000;
 
 /// Containers attributed to one leaf before truncating.
 ///
 /// 4096 containers is 32 MiB of payload, past the largest budget the residency
 /// projection sweeps. The cap now bounds the *observer's* expansion rather than
 /// a line length, but it bounds it in the same place and for the same reason.
-pub(crate) const MAX_CONTAINERS_PER_LEAF: u64 = 4096;
+pub const MAX_CONTAINERS_PER_LEAF: u64 = 4096;
 
 /// Deterministic mix for the shape fingerprint.
 ///
@@ -214,11 +243,13 @@ fn postfix(e: &Expr, out: &mut Vec<u64>) {
         Expr::Not(a, _, _) => {
             postfix(a, out);
             out.push(7);
-        }
-        // `Expr` is `#[non_exhaustive]`. A variant added later gets its own
-        // marker rather than joining an existing class, which would merge two
-        // shapes the JIT would compile separately.
-        _ => out.push(u64::MAX),
+        } // **Deliberately no wildcard.** `Expr` is `#[non_exhaustive]`, which
+          // binds downstream crates but not this one -- so inside `yesno-core`
+          // the compiler enforces the match, and adding an `Expr` variant breaks
+          // the build here until someone assigns it a marker. That is strictly
+          // better than the runtime fallback this needed while it lived in
+          // `yesno-flight`, where a new variant would silently have joined an
+          // existing shape class and merged two shapes the JIT compiles apart.
     }
 }
 
@@ -290,11 +321,30 @@ fn describe(keys: &[u64], snap: &Snapshot) {
     }
 }
 
-/// Record the posting lists a wire query names.
+/// Whether a capture is running and would record.
+///
+/// Exported so a caller can skip building the key list at all. Without it the
+/// wire layer would allocate a `Vec` per query to hand to a function that
+/// immediately discards it, which is precisely the per-query cost this module
+/// spent two rounds of measurement removing. See the module header for what
+/// this check actually compiles to.
 #[inline]
-pub(crate) fn record_containers(e: &SetExpr, snap: &Snapshot) {
+pub fn enabled() -> bool {
+    tracing::enabled!(target: TARGET, tracing::Level::TRACE)
+}
+
+/// Record the posting lists one query names.
+///
+/// Takes the keys already extracted rather than an expression to extract them
+/// from. That is what lets this live in the core at all: the identity that
+/// matters is the posting-list key, and the only place it survives is the
+/// *wire* expression, whose type this crate cannot see and should not. The
+/// caller does `SetExpr::keys` and hands over the result; everything that is
+/// not about the wire format is here.
+#[inline]
+pub fn record_containers(keys: &[u64], snap: &Snapshot) {
     static BUDGET: AtomicU64 = AtomicU64::new(CAPTURE_QUERIES);
-    record_containers_in(e, snap, &BUDGET);
+    record_containers_in(keys, snap, &BUDGET);
 }
 
 /// The body, with its budget supplied.
@@ -302,7 +352,7 @@ pub(crate) fn record_containers(e: &SetExpr, snap: &Snapshot) {
 /// Split so tests can drive it with a counter of their own: the budget is
 /// process-wide state, and a test that spent the real one would silently
 /// disarm every test that ran after it.
-fn record_containers_in(e: &SetExpr, snap: &Snapshot, budget: &AtomicU64) {
+fn record_containers_in(keys: &[u64], snap: &Snapshot, budget: &AtomicU64) {
     // Explicit, though `event!` would check the same thing: the work below is
     // shared by the dimension pass and the query event, and the point of the
     // guard is that neither runs when the target is off. See the module header
@@ -310,15 +360,13 @@ fn record_containers_in(e: &SetExpr, snap: &Snapshot, budget: &AtomicU64) {
     if !tracing::enabled!(target: TARGET, tracing::Level::TRACE) {
         return;
     }
-    if !spend(budget, "containers") {
-        return;
-    }
-    let mut keys = Vec::new();
-    e.keys(&mut keys);
     if keys.is_empty() {
         return;
     }
-    describe(&keys, snap);
+    if !spend(budget, "containers") {
+        return;
+    }
+    describe(keys, snap);
 
     let mut list = String::with_capacity(keys.len() * 8);
     for (i, k) in keys.iter().enumerate() {
@@ -337,7 +385,7 @@ fn record_containers_in(e: &SetExpr, snap: &Snapshot, budget: &AtomicU64) {
 
 /// Record a planned shape, tagged with the thread that would compile it.
 #[inline]
-pub(crate) fn record_shape(expr: &Expr) {
+pub fn record_shape(expr: &Expr) {
     // Its own budget rather than a shared one: the two hooks sit on different
     // functions and not every query reaches both, so one counter would let the
     // busier stream starve the other.
@@ -364,10 +412,10 @@ fn record_shape_in(expr: &Expr, budget: &AtomicU64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Db, DbOptions, OrdSet};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tracing::field::{Field, Visit};
-    use yesno_core::{Db, DbOptions, OrdSet};
 
     /// Minimal collecting subscriber.
     ///
@@ -438,6 +486,24 @@ mod tests {
         events.iter().filter(|e| e.contains_key(kind)).collect()
     }
 
+    /// The house convention for a scratch database directory. `yesno-core`
+    /// carries no `tempfile` dev-dependency and should not gain one: these
+    /// manifests are what `crate_universe` reads, so a new dependency costs a
+    /// Bazel re-pin.
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("yesno-hotspot-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    struct CleanDir(std::path::PathBuf);
+    impl Drop for CleanDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn open(dir: &std::path::Path) -> Db {
         Db::open_with(
             dir,
@@ -472,8 +538,9 @@ mod tests {
 
     #[test]
     fn a_dense_posting_list_reports_its_chunk_count() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_dense_posting_list_reports");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 101, 3);
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
@@ -482,8 +549,9 @@ mod tests {
 
     #[test]
     fn a_posting_list_that_is_not_all_bitmap_is_not_offload_material() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_posting_list_that_is_not_a");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         db.insert_many(102, &[1u64, 5, 11, 70000, 140000])
             .expect("insert");
         db.checkpoint().expect("checkpoint");
@@ -499,8 +567,9 @@ mod tests {
         // disjoint keys and the trace reported zero reuse however hot the
         // workload was. A flat histogram is exactly the outcome that retires
         // the question, so the failure would have looked like an answer.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("the_same_key_reports_the_sam");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 103, 2);
         db.checkpoint().expect("checkpoint");
         let first = db.snapshot().expect("snapshot");
@@ -517,13 +586,14 @@ mod tests {
         //
         // Key ids are unique per test because the described-set is
         // process-wide, which is what makes "once" observable at all.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_posting_list_is_described_");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 110, 4);
         dense(&db, 111, 2);
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
-        let e = SetExpr::And(vec![SetExpr::Key(110), SetExpr::Key(111)]);
+        let e = [110u64, 111];
         let budget = AtomicU64::new(100);
 
         let events = capture(true, || {
@@ -549,13 +619,14 @@ mod tests {
 
     #[test]
     fn a_query_event_names_the_posting_lists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_query_event_names_the_post");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 120, 4);
         dense(&db, 121, 3);
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
-        let e = SetExpr::And(vec![SetExpr::Key(120), SetExpr::Key(121)]);
+        let e = [120u64, 121];
         let budget = AtomicU64::new(10);
 
         let events = capture(true, || record_containers_in(&e, &snap, &budget));
@@ -566,12 +637,13 @@ mod tests {
 
     #[test]
     fn a_capture_spends_its_budget_and_stops() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_capture_spends_its_budget_");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 130, 1);
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
-        let e = SetExpr::Key(130);
+        let e = [130u64];
         let budget = AtomicU64::new(3);
 
         let events = capture(true, || {
@@ -649,8 +721,9 @@ mod tests {
 
     #[test]
     fn a_filtered_out_target_emits_nothing_and_spends_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_filtered_out_target_emits_");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         dense(&db, 140, 2);
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
@@ -658,7 +731,7 @@ mod tests {
 
         let events = capture(false, || {
             for _ in 0..20 {
-                record_containers_in(&SetExpr::Key(140), &snap, &budget);
+                record_containers_in(&[140u64], &snap, &budget);
                 record_shape_in(&Expr::Empty, &budget);
             }
         });
@@ -672,15 +745,16 @@ mod tests {
 
     #[test]
     fn a_query_naming_no_posting_list_emits_no_query_event() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(dir.path());
+        let dir = tmpdir("a_query_naming_no_posting_li");
+        let _clean = CleanDir(dir.clone());
+        let db = open(&dir);
         db.insert(150, 1).expect("insert");
         db.checkpoint().expect("checkpoint");
         let snap = db.snapshot().expect("snapshot");
         let budget = AtomicU64::new(5);
 
         let events = capture(true, || {
-            record_containers_in(&SetExpr::Range(0, 10), &snap, &budget);
+            record_containers_in(&[], &snap, &budget);
         });
         assert!(of(&events, "keys").is_empty());
     }

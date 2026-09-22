@@ -22,6 +22,9 @@ pub(crate) mod db;
 pub mod dispatch;
 pub(crate) mod error;
 pub mod events;
+/// Research capture for the hotspot observer. Semver-exempt; see the module.
+#[cfg(feature = "tracing")]
+pub mod hotspot;
 pub(crate) mod index;
 #[cfg(feature = "jit")]
 pub mod jit;
