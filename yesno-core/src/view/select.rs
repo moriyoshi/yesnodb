@@ -92,6 +92,13 @@ pub struct ViewIntersectionCounter<'a> {
     last_prefix: Option<Prefix48>,
     last_logical: Option<u64>,
     last_selected: Vec<bool>,
+    /// A device to offer blocked batches to, and the identity prefix its
+    /// residency table keys on. See [`ViewIntersectionCounter::with_accelerator`].
+    accel: crate::accel::Accel,
+    source: u64,
+    /// Reused across chunks so the offload path does not allocate the larger
+    /// of its two buffers per chunk.
+    offload_out: Vec<u32>,
 }
 
 impl<'a> ViewIntersectionCounter<'a> {
@@ -134,7 +141,35 @@ impl<'a> ViewIntersectionCounter<'a> {
             last_prefix: None,
             last_logical: None,
             last_selected,
+            accel: crate::accel::Accel::none(),
+            source: 0,
+            offload_out: Vec::new(),
         })
+    }
+
+    /// Offer blocked batches to `accel`, keyed under `source`.
+    ///
+    /// # What `source` has to be
+    ///
+    /// `ChunkId` is `source` mixed with the chunk prefix, so `source` carries
+    /// the whole of the identity contract that
+    /// [`crate::accel::ChunkId`] states and this type cannot check: equal
+    /// payloads must produce equal ids, and **different payloads must produce
+    /// different ones**. A posting-list key alone satisfies the first and
+    /// fails the second, because a commit rewrites a chunk without changing
+    /// its key or its prefix -- so fold in something that moves when the bytes
+    /// move, such as the snapshot version.
+    ///
+    /// Getting this wrong does not produce an error. It produces a stale
+    /// device copy answering for new contents.
+    ///
+    /// Only the blocked layout is offered today; interleaved traversal keeps
+    /// its own path. An accelerator is free to decline, and the CPU path
+    /// below is both the fallback and the oracle.
+    pub fn with_accelerator(mut self, accel: crate::accel::Accel, source: u64) -> Self {
+        self.accel = accel;
+        self.source = source;
+        self
     }
 
     /// Coalesced half-open chunk-prefix windows for selective traversal.
@@ -233,6 +268,20 @@ impl<'a> ViewIntersectionCounter<'a> {
             let first_owner = first_owner as usize;
             let last_owner = first_owner + rows;
             let data = &bitmap.words()[..rows * row_words];
+
+            if try_offload_blocked(
+                &self.accel,
+                chunk_identity(self.source, base),
+                data,
+                row_words,
+                query_words,
+                &mut self.counts,
+                first_owner,
+                rows,
+                &mut self.offload_out,
+            ) {
+                return;
+            }
 
             let mut filter = 0usize;
             while filter + 1 < query_words.len() {
@@ -511,6 +560,64 @@ fn add_view_cardinalities(
 /// Unlike an `OrdSet`, an arbitrary stream is fallible and untrusted, so empty
 /// chunks, repeated prefixes, prefixes outside 48 bits, and the reserved
 /// `u64::MAX` ordinal are reported as errors.
+/// Mix a caller-supplied source with a chunk base into a device identity.
+///
+/// Not a hash of the payload: hashing 8 KiB to identify a chunk costs more
+/// than the intersection being accelerated. See [`crate::accel::ChunkId`] for
+/// what the caller must guarantee instead.
+fn chunk_identity(source: u64, base: u64) -> crate::accel::ChunkId {
+    let mut x = source ^ base.wrapping_mul(0xd1b5_4a32_d192_ed03);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    crate::accel::ChunkId(x ^ (x >> 31))
+}
+
+/// Offer one blocked chunk to an accelerator, accumulating on success.
+///
+/// Returns `false` for every reason -- no device, a batch too small to pay,
+/// a chunk not resident and not yet worth filling, a device that simply said
+/// no -- and the caller then runs its ordinary loop. Declining is the normal
+/// case and costs a comparison.
+///
+/// A free function rather than a method so the three fields it needs can be
+/// borrowed disjointly: `counts` mutably while `query_words` stays shared.
+#[allow(clippy::too_many_arguments)]
+fn try_offload_blocked(
+    accel: &crate::accel::Accel,
+    chunk: crate::accel::ChunkId,
+    data: &[u64],
+    row_words: usize,
+    query_words: &[Vec<u64>],
+    counts: &mut [Vec<u64>],
+    first_owner: usize,
+    rows: usize,
+    scratch: &mut Vec<u32>,
+) -> bool {
+    if rows == 0 || !accel.worth_offering(query_words.len()) {
+        return false;
+    }
+    // Only the pointer vector is built per chunk; the wider count buffer is
+    // the caller's scratch and is reused.
+    let filters: Vec<&[u64]> = query_words.iter().map(|q| q.as_slice()).collect();
+    if filters.iter().any(|f| f.len() != row_words) {
+        return false;
+    }
+    scratch.clear();
+    scratch.resize(filters.len() * rows, 0);
+    if !accel.and_cardinalities(chunk, data, row_words, &filters, scratch) {
+        return false;
+    }
+    // The accelerator returns absolute counts; accumulation across chunks is
+    // the caller's, which is what keeps the device free of scan state.
+    for (f, owner_counts) in counts.iter_mut().enumerate().take(filters.len()) {
+        let row_counts = &scratch[f * rows..(f + 1) * rows];
+        for (r, got) in row_counts.iter().enumerate() {
+            owner_counts[first_owner + r] += u64::from(*got);
+        }
+    }
+    true
+}
+
 pub fn stream_view_cardinalities(stream: &mut dyn ChunkStream, view: &View) -> Result<Vec<u64>> {
     view.check()?;
     let mut counts = vec![0; view.sets() as usize];

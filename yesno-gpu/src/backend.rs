@@ -17,18 +17,27 @@ pub trait Backend: Send + Sync {
     /// Slots this device can hold. Fixed for the backend's lifetime, because
     /// the residency table sizes itself from it once.
     fn capacity(&self) -> usize;
-    /// Payload words per slot. A caller offering a different length is a bug,
-    /// not a decline.
+    /// Largest payload a slot can hold. A shorter one is fine and common:
+    /// `count_blocked` presents the prefix of a container that belongs to the
+    /// view, which is usually narrower than the container.
     fn slot_words(&self) -> usize;
+
+    /// Words currently valid in `slot`, or zero if it holds nothing.
+    ///
+    /// Exists so a caller can notice that a chunk it believes resident is
+    /// there at a different width, which is the cheap half of detecting that
+    /// an identity was reused for a payload that changed.
+    fn slot_len(&self, slot: Slot) -> usize;
 
     /// Copy `words` into `slot`, replacing whatever was there.
     ///
-    /// `false` means the payload did not land, and the caller must treat the
-    /// slot as holding nothing.
+    /// `words` may be shorter than [`Backend::slot_words`] and the slot then
+    /// holds exactly that many. `false` means the payload did not land, and
+    /// the caller must treat the slot as holding nothing.
     fn upload(&self, slot: Slot, words: &[u64]) -> bool;
 
     /// Set `out[ f * rows + r ]` to `| row r of slot AND filters[ f ] |`,
-    /// where `rows` is `slot_words() / row_words`.
+    /// where `rows` is `slot_len( slot ) / row_words`.
     ///
     /// `false` means nothing was computed and `out` is untouched.
     fn and_cardinalities(
@@ -54,7 +63,7 @@ pub trait Backend: Send + Sync {
 /// it as a real accelerator. [`crate::Offload::host`] exists for tests and for
 /// answering "is the plumbing right" on a laptop.
 pub struct HostBackend {
-    slots: std::sync::Mutex<Vec<u64>>,
+    slots: std::sync::Mutex<(Vec<u64>, Vec<usize>)>,
     capacity: usize,
     slot_words: usize,
 }
@@ -63,7 +72,7 @@ impl HostBackend {
     pub fn new(capacity: usize, slot_words: usize) -> HostBackend {
         assert!(capacity > 0 && slot_words > 0);
         HostBackend {
-            slots: std::sync::Mutex::new(vec![0; capacity * slot_words]),
+            slots: std::sync::Mutex::new((vec![0; capacity * slot_words], vec![0; capacity])),
             capacity,
             slot_words,
         }
@@ -79,15 +88,24 @@ impl Backend for HostBackend {
         self.slot_words
     }
 
+    fn slot_len(&self, slot: Slot) -> usize {
+        if slot.0 >= self.capacity {
+            return 0;
+        }
+        self.slots.lock().map(|m| m.1[slot.0]).unwrap_or(0)
+    }
+
     fn upload(&self, slot: Slot, words: &[u64]) -> bool {
-        if slot.0 >= self.capacity || words.len() != self.slot_words {
+        if slot.0 >= self.capacity || words.is_empty() || words.len() > self.slot_words {
             return false;
         }
         let Ok(mut mem) = self.slots.lock() else {
             return false;
         };
         let base = slot.0 * self.slot_words;
-        mem[base..base + self.slot_words].copy_from_slice(words);
+        let (data, lens) = &mut *mem;
+        data[base..base + words.len()].copy_from_slice(words);
+        lens[slot.0] = words.len();
         true
     }
 
@@ -98,18 +116,23 @@ impl Backend for HostBackend {
         filters: &[&[u64]],
         out: &mut [u32],
     ) -> bool {
-        if slot.0 >= self.capacity || row_words == 0 || !self.slot_words.is_multiple_of(row_words) {
-            return false;
-        }
-        let rows = self.slot_words / row_words;
-        if out.len() != filters.len() * rows || filters.iter().any(|f| f.len() != row_words) {
+        if slot.0 >= self.capacity || row_words == 0 {
             return false;
         }
         let Ok(mem) = self.slots.lock() else {
             return false;
         };
+        let (data, lens) = &*mem;
+        let len = lens[slot.0];
+        if len == 0 || !len.is_multiple_of(row_words) {
+            return false;
+        }
+        let rows = len / row_words;
+        if out.len() != filters.len() * rows || filters.iter().any(|f| f.len() != row_words) {
+            return false;
+        }
         let base = slot.0 * self.slot_words;
-        let chunk = &mem[base..base + self.slot_words];
+        let chunk = &data[base..base + len];
         for (f, filter) in filters.iter().enumerate() {
             for r in 0..rows {
                 let row = &chunk[r * row_words..(r + 1) * row_words];
@@ -183,10 +206,11 @@ mod tests {
         assert!(b.and_cardinalities(Slot(0), 2, &filters, &mut a));
         assert!(b.and_cardinalities(Slot(2), 2, &filters, &mut c));
         assert_eq!((a[0], c[0]), (64, 64));
-        // Slot 1, never written, is still empty.
+        // Slot 1 was never written, so it has no payload to answer with. A
+        // zero here would be a plausible wrong answer rather than a refusal.
         let mut empty = [7u32; 1];
-        assert!(b.and_cardinalities(Slot(1), 2, &filters, &mut empty));
-        assert_eq!(empty[0], 0);
+        assert!(!b.and_cardinalities(Slot(1), 2, &filters, &mut empty));
+        assert_eq!(empty[0], 7);
     }
 
     #[test]
@@ -199,10 +223,38 @@ mod tests {
     }
 
     #[test]
-    fn a_wrongly_sized_payload_is_refused() {
+    fn a_payload_wider_than_the_slot_is_refused_and_an_empty_one_too() {
         let b = HostBackend::new(2, 4);
-        assert!(!b.upload(Slot(0), &[0; 3]), "short payload");
-        assert!(!b.upload(Slot(0), &[0; 5]), "long payload");
+        assert!(!b.upload(Slot(0), &[0; 5]), "wider than the slot");
+        assert!(!b.upload(Slot(0), &[]), "nothing to hold");
+        assert_eq!(b.slot_len(Slot(0)), 0);
+    }
+
+    #[test]
+    fn a_partial_payload_is_held_at_its_own_width() {
+        // `count_blocked` presents the prefix of a container that belongs to
+        // the view, which is usually narrower than the container. Refusing
+        // those would decline most of the real traffic.
+        let b = HostBackend::new(1, 8);
+        assert!(b.upload(Slot(0), &[u64::MAX; 4]));
+        assert_eq!(b.slot_len(Slot(0)), 4);
+        let f = [u64::MAX; 2];
+        let filters: Vec<&[u64]> = vec![&f];
+        let mut out = [0u32; 2];
+        assert!(b.and_cardinalities(Slot(0), 2, &filters, &mut out));
+        assert_eq!(out, [128, 128], "two rows of two words, not four");
+        // And the untouched tail of the slot is not counted.
+        let mut wrong = [0u32; 4];
+        assert!(!b.and_cardinalities(Slot(0), 2, &filters, &mut wrong));
+    }
+
+    #[test]
+    fn re_uploading_at_a_different_width_replaces_the_width_too() {
+        let b = HostBackend::new(1, 8);
+        assert!(b.upload(Slot(0), &[u64::MAX; 8]));
+        assert_eq!(b.slot_len(Slot(0)), 8);
+        assert!(b.upload(Slot(0), &[u64::MAX; 2]));
+        assert_eq!(b.slot_len(Slot(0)), 2, "the old width must not survive");
     }
 
     #[test]

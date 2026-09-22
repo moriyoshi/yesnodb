@@ -59,13 +59,26 @@
 //! learn that from the payload without hashing 8 KiB -- which costs more than
 //! the intersection it is trying to accelerate.
 //!
-//! The identity must be **stable across calls and across snapshots** for a
-//! cache to work at all. A pointer is not: the `Arc<OrdSet>` behind a query
-//! leaf is rebuilt per query, so pointer identity makes every chunk look new
-//! and a cache built on it reports a zero hit rate for every workload. That
-//! mistake is recorded in `crate::hotspot`, which measures the recurrence this
-//! cache would exploit. Callers should derive `ChunkId` from something
-//! durable, such as the posting-list key and the chunk prefix.
+//! The contract has two halves and **both are the caller's responsibility**:
+//!
+//! * **Equal payloads, equal id.** Otherwise there is no reuse to find. A
+//!   pointer fails this: the `Arc<OrdSet>` behind a query leaf is rebuilt per
+//!   query, so pointer identity makes every chunk look new and a cache built
+//!   on it reports a zero hit rate for every workload. That mistake is
+//!   recorded in `crate::hotspot`, which measures the very recurrence this
+//!   cache would exploit. Derive it from something durable instead, such as
+//!   the posting-list key and the chunk prefix.
+//! * **Different payloads, different id.** This half is the dangerous one. A
+//!   posting list rewritten by a commit keeps its key and its prefix, so an id
+//!   built from those alone would let a *stale* device copy answer for the new
+//!   contents -- wrong counts, with nothing anywhere reporting an error. Fold
+//!   in something that moves when the bytes move: a snapshot version is the
+//!   blunt instrument, a per-chunk generation the precise one.
+//!
+//! An implementation may check the cheap half of the second condition, by
+//! noticing that a chunk it believes resident has arrived at a different
+//! width. That catches a resize and not a rewrite, so it is a safety net and
+//! not a substitute for the contract.
 
 use std::sync::Arc;
 

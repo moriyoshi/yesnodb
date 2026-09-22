@@ -3371,3 +3371,72 @@ may hold fewer words than its full width, since `count_blocked` often presents
 a partial chunk.
 
 ---
+
+## 2026-09-23 -- Wiring the accelerator into `count_blocked`
+
+The hook now has a caller. `ViewIntersectionCounter::with_accelerator( accel,
+source )` offers each blocked chunk to a device; declining is the normal case
+and the CPU loop below is both the fallback and the oracle. Still no device
+backend -- this is the call site, verified against a host-memory stand-in.
+
+### Two decisions the previous increment deferred
+
+**Partial chunks are offloaded, not declined.** `count_blocked` presents the
+prefix of a container that belongs to the view, which is usually narrower than
+the container, so a backend that only accepted full-width payloads would have
+sat idle on most real traffic. Slots now record the width they hold.
+
+**`ChunkId` has a second obligation, and it is the dangerous one.** The
+contract was written as "equal payloads, equal id", which is what makes reuse
+findable. The other half was missing: **different payloads, different id.** A
+commit rewrites a posting list without changing its key or its chunk prefix,
+so an identity built from those alone lets a *stale device copy answer for the
+new contents* -- wrong counts, with nothing anywhere reporting an error. The
+caller must fold in something that moves when the bytes move; a snapshot
+version is the blunt instrument, a per-chunk generation the precise one. Both
+`accel.rs` and `with_accelerator` now say so, because this crate cannot check
+it.
+
+There is a cheap partial net: a chunk believed resident that arrives at a
+different *width* cannot be the same bytes, and is re-uploaded. That catches a
+resize and not a rewrite, so it is a safety net and not a substitute for the
+contract.
+
+### A test that passed while asserting nothing
+
+The first differential built a view of 64 constituents at a 1024-bit stride --
+65 536 bits, which is **exactly one chunk** -- and pushed six. `count_blocked`
+returns early for any chunk whose first owner is past `sets`, so five of the
+six were outside the view entirely and contributed nothing on *either* path.
+The differential compared two identical, mostly-empty answers and passed.
+
+It was caught by asserting the device had actually been reached:
+`admissions == chunks.len()`. That assertion failed at 1 of 6, which is how
+the corpus bug surfaced. **The same test also ran under `Policy::measured`
+at first, whose `admit_after` is 5 -- so a single pass declined every chunk and
+the device never ran at all.** Two independent ways for the same test to be
+green and vacuous, in one test. It now pins `admit_after: 1` with a comment
+saying why, and asserts the admission count.
+
+This is the third time this session a test has been green without executing
+the thing it names. The pattern is always the same: an environmental
+precondition -- a CPU feature, a hook that is not called, a view that does not
+reach the data -- silently turns the body into a no-op. The remedy that keeps
+working is to assert that the work *happened*, not only that the answer is
+right.
+
+### Mutation
+
+Adding one to a single count in the host backend fails both differentials and
+neither of the two tests that should not notice ( a declining device, a batch
+below the floor ). Restored afterwards.
+
+### Shape of the call site
+
+`try_offload_blocked` is a free function rather than a method so `counts` can
+be borrowed mutably while `query_words` stays shared. It builds one small
+pointer vector per chunk; the wider count buffer is a scratch field reused
+across chunks. The accelerator returns **absolute** counts and the caller
+accumulates, which is what keeps the device free of any scan state.
+
+---

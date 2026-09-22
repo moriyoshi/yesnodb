@@ -146,14 +146,14 @@ impl<B: Backend> Accelerator for Offload<B> {
         filters: &[&[u64]],
         out: &mut [u32],
     ) -> bool {
-        if row_words == 0 || data.len() != self.backend.slot_words() {
+        if row_words == 0 || data.is_empty() || data.len() > self.backend.slot_words() {
+            return false;
+        }
+        if !data.len().is_multiple_of(row_words) {
             return false;
         }
         let rows = data.len() / row_words;
-        if filters.len() < self.min_filters
-            || !data.len().is_multiple_of(row_words)
-            || out.len() != filters.len() * rows
-        {
+        if filters.len() < self.min_filters || out.len() != filters.len() * rows {
             return false;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -164,7 +164,19 @@ impl<B: Backend> Accelerator for Offload<B> {
         };
         let slot = match state.touch(chunk) {
             Decision::Decline => return false,
-            Decision::Resident(slot) => slot,
+            Decision::Resident(slot) => {
+                // The cheap half of "different payload, different id": a chunk
+                // that was resident at another width cannot be the same bytes.
+                // This catches a resize, not a rewrite -- see the contract in
+                // `yesno_core::accel` -- but a stale copy answering for new
+                // contents is the one failure that produces wrong counts with
+                // nothing reporting an error, so the net is worth its cost.
+                if self.backend.slot_len(slot) != data.len() && !self.backend.upload(slot, data) {
+                    state.abandon(chunk);
+                    return false;
+                }
+                slot
+            }
             Decision::Admit(slot) => {
                 if !self.backend.upload(slot, data) {
                     // The slot does not hold what the table thinks it holds.
@@ -334,13 +346,63 @@ mod tests {
     }
 
     #[test]
+    fn a_resident_chunk_presented_at_a_new_width_is_re_uploaded() {
+        // The cheap half of "different payload, different id". A caller that
+        // reuses an identity across a resize would otherwise be served the old
+        // bytes -- wrong counts, with nothing reporting an error.
+        let a = Offload::host(2, W).with_min_filters(1);
+        let wide = payload(31, W);
+        let filters = filter_set(2, 32);
+        let refs = borrow(&filters);
+        let mut out = vec![0u32; 2 * ROWS];
+        offer_until_accepted(&a, 9, &wide, &refs, &mut out);
+        assert_eq!(out, expected(&wide, &filters));
+
+        // Same identity, half the rows. The stale payload must not answer.
+        let narrow = &wide[..ROW * 2];
+        let mut half = vec![0u32; 2 * 2];
+        assert!(a.and_cardinalities(ChunkId(9), narrow, ROW, &refs, &mut half));
+        let mut want = Vec::new();
+        for filter in &filters {
+            for r in 0..2 {
+                want.push(reference(&narrow[r * ROW..(r + 1) * ROW], filter));
+            }
+        }
+        assert_eq!(half, want);
+    }
+
+    #[test]
+    fn a_partial_chunk_is_offloaded_rather_than_declined() {
+        // `count_blocked` usually presents fewer rows than the container
+        // holds. Declining those would leave the accelerator idle on most of
+        // the real traffic.
+        let a = Offload::host(2, W).with_min_filters(1);
+        let chunk = payload(41, ROW * 3);
+        let filters = filter_set(3, 42);
+        let refs = borrow(&filters);
+        let mut out = vec![0u32; 3 * 3];
+        offer_until_accepted(&a, 11, &chunk, &refs, &mut out);
+        let mut want = Vec::new();
+        for filter in &filters {
+            for r in 0..3 {
+                want.push(reference(&chunk[r * ROW..(r + 1) * ROW], filter));
+            }
+        }
+        assert_eq!(out, want);
+    }
+
+    #[test]
     fn a_wrongly_sized_chunk_is_declined_rather_than_truncated() {
         let a = Offload::host(4, W).with_min_filters(1);
         let filters = filter_set(4, 13);
         let refs = borrow(&filters);
         let mut out = vec![0u32; 4 * ROWS];
-        let short = payload(1, W - 1);
-        assert!(!a.and_cardinalities(ChunkId(1), &short, ROW, &refs, &mut out));
+        // Wider than any slot: nowhere to put it.
+        let over = payload(1, W + 1);
+        assert!(!a.and_cardinalities(ChunkId(1), &over, ROW, &refs, &mut out));
+        // Not a whole number of rows.
+        let ragged = payload(2, W - 1);
+        assert!(!a.and_cardinalities(ChunkId(1), &ragged, ROW, &refs, &mut out));
         assert_eq!(a.stats().touches, 0);
     }
 
