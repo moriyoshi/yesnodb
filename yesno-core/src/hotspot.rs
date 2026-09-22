@@ -264,6 +264,95 @@ fn thread_ordinal() -> u64 {
     ORDINAL.with(|v| *v)
 }
 
+/// Emission, which is the only part of this module that needs `tracing`.
+///
+/// # Why the module is unconditional and only the behaviour is gated
+///
+/// It was the other way round -- `#[cfg( feature = "tracing" )] pub mod
+/// hotspot;` -- and that **broke the Bazel build**, which compiles
+/// `yesno-core` without the feature while `yesno-flight` calls into this
+/// module. Cargo hid it: `yesno-flight`'s `server` feature declares
+/// `yesno-core/tracing`, so the implication holds there and nowhere else.
+///
+/// Requiring every build system to reproduce a dependency-feature implication
+/// is the fragile arrangement. Exporting the functions unconditionally and
+/// letting them do nothing is not: any caller compiles anywhere, and without
+/// the feature [`enabled`] is a `const false` that the optimizer deletes the
+/// rest of.
+mod emit {
+    #[cfg(feature = "tracing")]
+    use super::TARGET;
+
+    #[cfg(feature = "tracing")]
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        tracing::enabled!(target: TARGET, tracing::Level::TRACE)
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        false
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(super) fn key(key: u64, chunks: u64) {
+        tracing::event!(target: TARGET, tracing::Level::TRACE, key, chunks, "hotspot.key");
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(super) fn query(keys: &str) {
+        tracing::event!(target: TARGET, tracing::Level::TRACE, keys, "hotspot.query");
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(super) fn shape(shape: u64, thread: u64) {
+        tracing::event!(target: TARGET, tracing::Level::TRACE, shape, thread, "hotspot.shape");
+    }
+
+    #[cfg(feature = "tracing")]
+    pub(super) fn done(stream: &'static str) {
+        tracing::event!(
+            target: TARGET,
+            tracing::Level::TRACE,
+            stream,
+            recorded = super::CAPTURE_QUERIES,
+            "hotspot.done"
+        );
+    }
+
+    // Without the feature `enabled` is always false, so none of these can be
+    // reached; they exist so every call site type-checks in both builds.
+    #[cfg(not(feature = "tracing"))]
+    pub(super) fn key(_: u64, _: u64) {}
+    #[cfg(not(feature = "tracing"))]
+    pub(super) fn query(_: &str) {}
+    #[cfg(not(feature = "tracing"))]
+    pub(super) fn shape(_: u64, _: u64) {}
+    #[cfg(not(feature = "tracing"))]
+    pub(super) fn done(_: &'static str) {}
+}
+
+#[inline]
+fn emit_key(k: u64, chunks: u64) {
+    emit::key(k, chunks);
+}
+
+#[inline]
+fn emit_query(list: &str) {
+    emit::query(list);
+}
+
+#[inline]
+fn emit_shape(shape: u64, thread: u64) {
+    emit::shape(shape, thread);
+}
+
+#[inline]
+fn emit_done(stream: &'static str) {
+    emit::done(stream);
+}
+
 /// Spend one unit of a budget, reporting whether it was still solvent.
 ///
 /// Also reports the transition, so `hotspot.done` is emitted exactly once by
@@ -277,13 +366,7 @@ fn spend(budget: &AtomicU64, what: &'static str) -> bool {
         match budget.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => {
                 if cur == 1 {
-                    tracing::event!(
-                        target: TARGET,
-                        tracing::Level::TRACE,
-                        stream = what,
-                        recorded = CAPTURE_QUERIES,
-                        "hotspot.done"
-                    );
+                    emit_done(what);
                 }
                 return true;
             }
@@ -311,13 +394,7 @@ fn describe(keys: &[u64], snap: &Snapshot) {
         // `None` is recorded as zero rather than skipped, so the key is not
         // re-examined on every subsequent query that names it.
         let chunks = leaf_chunks(k, snap).unwrap_or(0);
-        tracing::event!(
-            target: TARGET,
-            tracing::Level::TRACE,
-            key = k,
-            chunks = chunks,
-            "hotspot.key"
-        );
+        emit_key(k, chunks);
     }
 }
 
@@ -330,7 +407,7 @@ fn describe(keys: &[u64], snap: &Snapshot) {
 /// this check actually compiles to.
 #[inline]
 pub fn enabled() -> bool {
-    tracing::enabled!(target: TARGET, tracing::Level::TRACE)
+    emit::enabled()
 }
 
 /// Record the posting lists one query names.
@@ -357,7 +434,7 @@ fn record_containers_in(keys: &[u64], snap: &Snapshot, budget: &AtomicU64) {
     // shared by the dimension pass and the query event, and the point of the
     // guard is that neither runs when the target is off. See the module header
     // for why this is a level check against a global atomic and not a lookup.
-    if !tracing::enabled!(target: TARGET, tracing::Level::TRACE) {
+    if !enabled() {
         return;
     }
     if keys.is_empty() {
@@ -375,12 +452,7 @@ fn record_containers_in(keys: &[u64], snap: &Snapshot, budget: &AtomicU64) {
         }
         let _ = write!(list, "{k}");
     }
-    tracing::event!(
-        target: TARGET,
-        tracing::Level::TRACE,
-        keys = %list,
-        "hotspot.query"
-    );
+    emit_query(&list);
 }
 
 /// Record a planned shape, tagged with the thread that would compile it.
@@ -394,22 +466,16 @@ pub fn record_shape(expr: &Expr) {
 }
 
 fn record_shape_in(expr: &Expr, budget: &AtomicU64) {
-    if !tracing::enabled!(target: TARGET, tracing::Level::TRACE) {
+    if !enabled() {
         return;
     }
     if !spend(budget, "shapes") {
         return;
     }
-    tracing::event!(
-        target: TARGET,
-        tracing::Level::TRACE,
-        shape = shape_key(expr),
-        thread = thread_ordinal(),
-        "hotspot.shape"
-    );
+    emit_shape(shape_key(expr), thread_ordinal());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tracing"))]
 mod tests {
     use super::*;
     use crate::{Db, DbOptions, OrdSet};

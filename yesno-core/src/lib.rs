@@ -23,7 +23,10 @@ pub mod dispatch;
 pub(crate) mod error;
 pub mod events;
 /// Research capture for the hotspot observer. Semver-exempt; see the module.
-#[cfg(feature = "tracing")]
+///
+/// Unconditional on purpose: gating the module on `tracing` broke the Bazel
+/// build, which compiles this crate without the feature while `yesno-flight`
+/// calls into it. Only the emission inside is gated.
 pub mod hotspot;
 pub(crate) mod index;
 #[cfg(feature = "jit")]

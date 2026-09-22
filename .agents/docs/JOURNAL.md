@@ -3097,6 +3097,57 @@ where the path it exercises is. `clippy --workspace --all-targets
 invariant scripts pass.
 
 ---
+## 2026-09-23 -- `hotspot` must not be gated on a dependency's feature
+
+`310d422` moved the hotspot capture point into `yesno-core` behind
+`#[cfg( feature = "tracing" )] pub mod hotspot;`. That **broke the Bazel
+build**, and the cargo gate structurally could not see it:
+
+```text
+  yesno-flight/src/expr.rs:76:21
+  yesno_core::hotspot::record_containers( &named, snap );
+              ^^^^^^^ could not find `hotspot` in `yesno_core`
+  note: found an item that was configured out
+        the item is gated behind the `tracing` feature
+```
+
+`yesno-flight`'s `server` feature declares `"yesno-core/tracing"`, so under
+cargo's feature unification the implication always holds and the module always
+exists. Bazel builds `yesno-core` with `crate_features = select({
+"//:jit_enabled": ["jit"], ... => [] })` and `yesno-flight` with `["server"]`;
+it does not propagate a dependency's feature from a dependent's manifest. Under
+Bazel the module was configured out while a caller referenced it.
+
+**I reported `310d422` as gated having run only `scripts/gate.sh`.** CLAUDE.md
+says in as many words that a change to `yesno-core` must run both gates and
+that neither subsumes the other. This is what that rule is for.
+
+### The fix removes the dependency rather than documenting it
+
+`pub mod hotspot;` is now unconditional and only the emission inside is
+`#[cfg( feature = "tracing" )]`. Without the feature, `enabled()` is a `const
+false` and the four `emit::*` helpers are empty, so every caller compiles in
+every build system and the behaviour stays opt-in.
+
+The first arrangement asked every build system to reproduce a cross-crate
+feature implication. The second asks nothing of them, which matters more than
+convenience: the first one silently produced a module that some builds have and
+others do not.
+
+### Reproduced without Bazel, in seconds
+
+The class is worth being able to test cheaply, because a 6-minute containerized
+gate is not where anyone wants to discover it. A scratch crate depending on
+`yesno-core` with `default-features = false` and calling
+`hotspot::record_shape` reproduces it exactly -- that is the configuration
+Bazel builds and the one cargo's unification hides. It fails with `E0433`
+before the fix and compiles after.
+
+Any future `pub mod` in this crate that a satellite calls should be checked the
+same way: a dependent that does not enable the optional feature is a
+configuration cargo will never assemble on its own.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked
