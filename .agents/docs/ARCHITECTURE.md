@@ -27,6 +27,7 @@ yesno/
       error.rs                  # CodecError + crate Result alias
       events.rs                 # typed storage and database lifecycle facts; no transport or serialization
       dispatch.rs               # Dispatch trait + Dispatcher handle: a host lends its executor; this crate spawns nothing
+      accel.rs                  # Accelerator trait + Accel handle: a host lends a device; this crate opens nothing
       buffer.rs                 # U16Store / BitStore — the containment types for arrow_buffer
       container/
         mod.rs                  # Container enum, kind selection, promotion/demotion, optimize
@@ -158,6 +159,10 @@ yesno/
         decode_container.rs     # decode must Err or validate, never panic
         roaring_import.rs       # the whole-file import boundary
   yesno-arrow/                  # masks, RecordBatch streams, the S4 container dump
+  yesno-gpu/                    # batched bitmap intersection counts on an accelerator,
+                                #   admitted by residency. Implements yesno-core's
+                                #   Accelerator; yesno-core knows nothing of it and names
+                                #   no device. The device backend is not built yet.
   yesno-datafusion/             # yesno_lookup UDTF, filter lowering. Outside default-members.
   yesno-wire/                   # the set-expression wire format. Zero dependencies by
                                 #   design: it is compiled into both yesno-flight ( which

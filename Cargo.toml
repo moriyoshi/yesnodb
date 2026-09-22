@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["yesno-core", "yesno-arrow", "yesno-wire", "yesno-datafusion", "yesno-flight", "yesno-tantivy", "yesno-server", "yesno-server-utils", "yesno-operator", "yesno-e2e"]
+members = ["yesno-core", "yesno-arrow", "yesno-gpu", "yesno-wire", "yesno-datafusion", "yesno-flight", "yesno-tantivy", "yesno-server", "yesno-server-utils", "yesno-operator", "yesno-e2e"]
 
 # DataFusion is a very large dependency tree and this crate is a satellite, not
 # part of the core product. Excluding it from the default set keeps the routine

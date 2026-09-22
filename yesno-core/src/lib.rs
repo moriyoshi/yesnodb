@@ -15,10 +15,12 @@ pub mod bignum;
 // public API, so an arrow-buffer major bump stays a patch release ( policy R1 ).
 // The deliberate handoff points live in `unstable_arrow`, which is documented as
 // semver-exempt.
+pub mod accel;
 pub(crate) mod buffer;
 pub mod checkpoint;
 pub mod container;
 pub(crate) mod db;
+
 pub mod dispatch;
 pub(crate) mod error;
 pub mod events;

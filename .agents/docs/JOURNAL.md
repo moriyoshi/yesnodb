@@ -3275,3 +3275,99 @@ evidence about the claim, not about the file. Searching for the claim across
 the tree cost one command and found seven more.
 
 ---
+## 2026-09-23 -- Starting the GPU offload satellite, on branch `gpu-offload`
+
+Branched off `epic` at `310d422`. What exists is the policy and the plumbing,
+both fully tested; **there is no device backend yet and no call site wired**.
+
+### The hook: `yesno-core/src/accel.rs`
+
+An `Accelerator` trait, an `Accel` handle and a `Declines` default, mirroring
+`dispatch.rs` clause for clause -- including its argument for why the handle is
+a concrete type rather than `Option<Arc<dyn _>>`. The core **opens nothing**,
+names no device, and depends on nothing in the satellite. A host that wants
+offload constructs an `Offload` and hands it over, exactly as it hands over an
+executor.
+
+`yesno-gpu` is the satellite: `residency` ( what to keep ), `backend` ( where
+payloads live ), and `Offload` ( the join ). 35 tests, none needing a GPU.
+
+### The interface is narrow because only one shape has a measurement
+
+`| row AND filter |` over the rows of one chunk against a set of filters, and
+nothing else. The GB10 probe measured the naive arrangement -- one block per
+`( chunk, filter )` pair -- at **1.06x-1.23x**, because blocks touching the
+same chunk were scattered across the grid and each re-read it. Restructured to
+one block per chunk with the chunk in registers, the same work measured
+**6.71x-11.08x**. The win is entirely in reuse across filters, so the batch
+*is* the unit; an interface offering one intersection at a time cannot express
+the thing that pays.
+
+**And the first version of that interface was the wrong shape, which the only
+call site revealed.** It took one chunk and a slice of filters. But
+`view::select::count_blocked` splits a container into rows of `stride` bits and
+counts *every row against every filter* -- so the batch is `rows x filters`,
+and reuse runs both ways. A one-dimensional hook would have had to be called in
+a loop by the single call site it exists for, which is a reliable sign the
+interface is wrong. Reworked before it calcified; the degenerate `rows = 1`
+case still works and has a test.
+
+### An off-by-one that a threshold field name was hiding
+
+`Policy::admit_after` is compared against a *decayed* count, and five
+consecutive touches under a 15 000-access half-life accumulate **4.9997**, not
+5 -- each earlier observation decays by a tick before the next arrives. So the
+naive comparison silently means "admit after six", for every threshold and
+every half-life.
+
+The fix compares against `admit_after - 0.5`: admit once the decayed count
+*rounds* to the threshold. It cannot resurrect a slow drip, which is decay's
+actual job -- a chunk touched every 100 accesses under a half-life of 10 sits
+at weight 1 forever, and 1 does not round to 3. There is a regression test
+sweeping thresholds 1 through 8 and asserting that exactly `admit_after`
+touches admit.
+
+### What the residency table carries forward from the simulator sweep
+
+Three findings, now encoded rather than recorded: evidence must decay; the
+threshold and the half-life are **one parameter** ( at half-life 20 000,
+`admit_after` 10 scored 64.2% against 5's 78.2% -- *below* admitting on first
+sight ); and the win is in bandwidth, not hit rate, so `futile_admissions` is
+the number to watch. `Policy::measured` sets threshold and window together for
+that reason.
+
+The sweep's one **wrong** conclusion is corrected in the module header: it
+called admission control free, which is true of admission and false of the
+threshold. Where capacity binds, raising `admit_after` from 1 to 10 halved the
+hit rate.
+
+### Two safety properties, both with tests that would catch their absence
+
+**A failed upload must not leave a slot marked as holding it.** A later
+`Resident` decision for that chunk would launch against uninitialized device
+memory and return wrong counts with nothing reporting an error, which is the
+one failure this design cannot absorb -- every other failure degrades to the
+CPU. Hence `Residency::abandon`, and a test that a recycled slot never serves
+another chunk's payload under eviction pressure.
+
+**Evidence dies with the entry.** Otherwise a chunk evicted for being cold
+walks straight back in on its next touch, which is the classic
+admission-control thrash.
+
+### Deliberately serialized, and said so rather than discovered later
+
+`Offload` holds one lock across touch, upload and launch. Releasing it between
+would let another thread evict the slot in between, and the loser would launch
+against a payload that is no longer the chunk it asked for. That is a
+throughput ceiling and the first thing to fix once there is a device to measure
+it against; the fix is a per-slot pin, not a finer lock.
+
+### Next
+
+The device backend, and the `count_blocked` call site. The call site needs two
+decisions this increment did not make: how a `ChunkId` is derived there
+( posting-list key plus prefix, as `hotspot` does ), and whether a backend slot
+may hold fewer words than its full width, since `count_blocked` often presents
+a partial chunk.
+
+---

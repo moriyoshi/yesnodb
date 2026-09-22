@@ -7600,6 +7600,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yesno-gpu"
+version = "0.1.0"
+dependencies = [
+ "yesno-core",
+]
+
+[[package]]
 name = "yesno-operator"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,19 @@
+[package]
+name = "yesno-gpu"
+description = "Batched bitmap intersection counts offloaded to a GPU, with residency-based admission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The device backend. Deliberately not a *build* requirement: the CUDA path is
+# discovered at run time, so enabling this feature on a machine with no GPU
+# still builds and still passes its tests -- it simply declines. `--all-features`
+# in the gate must never need a toolchain the gate's machine lacks.
+cuda = []
+
+[dependencies]
+yesno-core.workspace = true
