@@ -9,11 +9,24 @@ repository.workspace = true
 
 [features]
 default = []
-# The device backend. Deliberately not a *build* requirement: the CUDA path is
-# discovered at run time, so enabling this feature on a machine with no GPU
-# still builds and still passes its tests -- it simply declines. `--all-features`
-# in the gate must never need a toolchain the gate's machine lacks.
-cuda = []
+# The device backend. OpenCL rather than CUDA because the two measured
+# identical on this project's GB10 ( 0.99x-1.03x across every size and batch
+# width; see LTM/gpu-offload-on-unified-memory.md ), so the API choice is
+# decided by reach, and OpenCL also runs on AMD and Intel.
+#
+# `opencl3`'s default `dynamic` feature loads the ICD at run time via dlopen2,
+# so enabling this on a machine with no device still builds and still passes
+# its tests -- it declines. `--all-features` in the gate must never need a
+# toolchain the gate's machine lacks.
+opencl = ["dep:opencl3"]
+
+# Only compiled when there is a backend for it to drive. Without this the
+# default `cargo test -p yesno-gpu` fails to build rather than skipping, which
+# would make the feature effectively mandatory.
+[[test]]
+name = "opencl_device"
+required-features = ["opencl"]
 
 [dependencies]
+opencl3 = { version = "0.12.3", optional = true }
 yesno-core.workspace = true

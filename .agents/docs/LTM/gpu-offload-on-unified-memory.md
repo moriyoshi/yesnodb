@@ -501,6 +501,62 @@ conditional on a synthetic stream whose skew is a dial, and the program prints
 that caveat itself. `--trace` replays a captured key stream through the same
 counters. The remaining work is a capture point on the ordinary query path.
 
+### CUDA and OpenCL are the same speed on this device
+
+*Measured 2026-09-23.* The batched AND-popcount kernel, written the same way
+in both APIs -- one work group per row, the row staged in local/shared memory,
+one thread per filter -- run in one process against identical data, pinned,
+interleaved, nine rounds, with a CPU reference checking both:
+
+```text
+  chunks  filters      cuda     opencl   opencl/cuda
+     256       16    0.077ms    0.079ms        1.03x
+     256       64    0.249ms    0.249ms        1.00x
+     256      128    0.477ms    0.477ms        1.00x
+    1024       64    0.944ms    0.938ms        0.99x
+    1024      128    1.848ms    1.849ms        1.00x
+    4096       16    0.960ms    0.971ms        1.01x
+    4096       64    3.730ms    3.739ms        1.00x
+    4096      128    7.393ms    7.502ms        1.01x
+```
+
+**Parity at every size and batch width**, and both agree with the CPU
+reference on every one of the counts. The explanation is in the device string:
+`NVIDIA GB10 / OpenCL 3.0 CUDA`. NVIDIA's OpenCL is layered on the same driver
+and lowers to the same SASS, so there is no native-path advantage to spend.
+
+**This is a stronger result than it looks, because neither arm is bandwidth
+capped.** Effective throughput is 22-52 GB/s, far below what this device can
+do -- the kernel runs 64 threads per block, which is two warps and poor
+occupancy. If both arms were pinned at the memory ceiling, parity would be
+trivial and would say nothing about the generated code. They are not, so it
+does.
+
+It also means **the kernel as written has headroom**, and whichever backend
+ships should sweep block size before anyone quotes a speedup from it.
+
+**Setup cost is not the differentiator either.** Steady state is CUDA 262 ms
+against OpenCL 220 ms for context, allocation, upload and first build. The
+very first run of the day measured **4899 ms for CUDA**, which is cold driver
+load and not a property of the API -- a single measurement would have reported
+an eight-fold gap that does not exist.
+
+**What this changes.** The case for choosing CUDA first rested partly on it
+being the native path on the only machine with a measurement. That reasoning
+is now retired: on NVIDIA the API choice is performance-neutral, so it should
+be decided on reach and ecosystem instead -- and an OpenCL backend that costs
+nothing here also runs on AMD and Intel, where a CUDA one does not. The
+remaining arguments for CUDA are ecosystem ones ( `cudarc` is a well
+maintained crate with runtime loading and no build-time toolchain ), not
+speed ones.
+
+**An operational note that cost time.** Back-to-back runs of the harness hit
+`cudaMalloc` out-of-memory on a machine with 111 GiB free, until the harness
+released its device allocations and contexts explicitly instead of leaving
+them to process exit. The failures were intermittent and skipped whole
+configurations, which in a benchmark is worse than being slow: the skipped
+rows look like the ones that did not fit.
+
 ### Reproduction
 
 The GB10 probes are at `.agents-workspace/tmp/gpu-probe/` ( `ats.cu` for the
@@ -509,7 +565,14 @@ latency, `scattered.cu` for the container layout, `batch.cu` for reuse ), built
 with `nvcc -O3 -arch=sm_121 -Xcompiler "-O3 -fopenmp -march=native"`. They are
 research and do not ship; this document is what survives their deletion. The
 fixture is the LCG seeded `0x2545_f491_4f6c_dd1d` that Stage 7 uses, so the
-densities match the rest of the project's bitmap measurements. The Mac probe is
+densities match the rest of the project's bitmap measurements. The CUDA-versus-OpenCL harness is
+`.agents-workspace/tmp/cuda-vs-opencl/vs.cu`, one binary running both paths so
+the data and the timing method cannot differ between them, built with
+`nvcc -O3 -arch=sm_121 -o vs vs.cu -l:libOpenCL.so.1`. It vendors a minimal
+`clmin.h` because the machine has `libOpenCL.so.1` and NVIDIA's ICD but no CL
+headers; that is safe only because both arms are checked against a CPU
+reference, so an ABI mistake would surface as wrong answers rather than as a
+wrong timing. The Mac probe is
 `.agents-workspace/tmp/gpu-probe-mac/mac.c`, built with
 `clang -O3 -march=native -Wno-deprecated-declarations mac.c -framework OpenCL`;
 OpenCL is deprecated on macOS and still functional, and was chosen because this

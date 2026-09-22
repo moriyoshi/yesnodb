@@ -3440,3 +3440,167 @@ across chunks. The accelerator returns **absolute** counts and the caller
 accumulates, which is what keeps the device free of any scan state.
 
 ---
+
+## 2026-09-23 -- CUDA versus OpenCL on GB10: no difference, and what that retires
+
+Ran a throw-away harness comparing the two APIs on the batched AND-popcount
+this project would offload. Full numbers and reproduction in
+`LTM/gpu-offload-on-unified-memory.md`; the short version is **parity, 0.99x to
+1.03x, at every size and batch width measured**, with both arms agreeing with a
+CPU reference on every count.
+
+The device string explains it: `NVIDIA GB10 / OpenCL 3.0 CUDA`. NVIDIA's
+OpenCL rides the same driver and lowers to the same SASS.
+
+**This retires an argument I made earlier in the same session.** When asked
+about OpenCL, Vulkan and Metal, I recommended CUDA first partly on the grounds
+that it is "the native path" on the only machine with a measurement. That was
+reasoning from plausibility, and it is now measured to be false: there is no
+native-path advantage. The choice should be made on reach and ecosystem, and
+an OpenCL backend that costs nothing on NVIDIA also runs on AMD and Intel.
+
+### Harness design, because the result depends on it
+
+One binary running both paths, so the data, the timing method and the process
+state cannot differ between arms. Both kernels written identically -- one work
+group per row, row staged in local/shared memory, one thread per filter -- so
+the comparison is between runtimes and not between two people's algorithms.
+Pinned, interleaved, nine rounds, medians reported with min and max.
+
+**A CPU reference checks both.** A kernel that is fast because it computed
+nothing is the failure mode this had to be designed against, and it is the
+third time in this session that mattered.
+
+It also makes the vendored `clmin.h` safe. The machine has `libOpenCL.so.1`
+and NVIDIA's ICD but no CL headers, so the harness declares the dozen entry
+points it needs itself -- which would be reckless if a mistake could produce a
+plausible wrong *timing*, and is fine when it can only produce wrong *answers*.
+
+### Two findings that are not about the comparison
+
+**Neither arm is bandwidth capped**, at 22-52 GB/s effective against a device
+that does far more. The kernel runs 64 threads per block, two warps, poor
+occupancy. That makes parity a *stronger* claim -- if both were pinned at the
+memory ceiling it would say nothing about the generated code -- and it means
+the kernel has headroom. Whichever backend ships should sweep block size
+before anyone quotes a speedup from it.
+
+**Setup cost is not a differentiator, and one measurement said it was.** The
+first run of the day reported CUDA setup at 4899 ms against OpenCL's 631 ms,
+an eight-fold gap. Re-measured three times: **262 ms against 220 ms**. The
+first figure was cold driver load. I had already written the 8x into a draft
+reply before re-running it.
+
+### An operational trap worth recording
+
+Back-to-back runs hit `cudaMalloc` out-of-memory on a machine with **111 GiB
+free**, because the harness left its device allocations and contexts to
+process exit and the driver had not reclaimed them. It failed *intermittently*
+and skipped whole configurations -- and a benchmark that silently skips rows is
+worse than a slow one, because the gaps look like the configurations that did
+not fit. Fixed by releasing explicitly.
+
+---
+
+## 2026-09-23 -- An OpenCL device backend for `yesno-gpu`
+
+`yesno-gpu` now has a real device backend, behind a non-default `opencl`
+feature, and the wired `count_blocked` call site produces device-computed
+counts that match the CPU on an NVIDIA GB10.
+
+**OpenCL rather than CUDA on measurement, not preference.** The two ran at
+0.99x-1.03x on the same kernel on this machine ( previous entry ), so there was
+no performance to trade and the choice fell to reach: this backend also runs on
+AMD and Intel.
+
+### `opencl3` with runtime loading, and why that was the deciding property
+
+Every OpenCL crate links `libOpenCL` at build time by default, which needs the
+`libOpenCL.so` development symlink -- and this machine did not have one even
+after its Khronos headers were installed, because the symlink ships in a
+separate package. A CI runner has neither. Build-time linking would therefore
+make `cargo clippy --workspace --all-features` fail wherever there is no
+OpenCL SDK, which is the build-depends-on-machine-state problem this project
+rejects elsewhere.
+
+`opencl3`'s default `dynamic` feature loads the ICD through `dlopen2`.
+**Verified rather than assumed**: `readelf -d` on the test binary lists
+`libgcc_s`, `libm` and `libc` and nothing else. No `libOpenCL` entry, so the
+crate compiles and its tests run on a machine with no OpenCL at all, where
+`OpenClBackend::open` returns `None` and every caller falls back.
+
+`opencl-sys` ships pre-generated bindings rather than running `bindgen`, so no
+headers are needed at build time either.
+
+### The bug, and the test that was green while it was there
+
+The device returned **all zeros**. `opencl3`'s `enqueue_write_buffer` passes
+`offset` straight to `clEnqueueWriteBuffer`, which takes a **byte** offset,
+while deriving the length from `size_of_val( data )`. Computing the slot offset
+in *elements* wrote slot 2 a quarter of the way to where the kernel reads it.
+
+The kernel's own `slot_base` argument stays in *elements*, because it does
+pointer arithmetic on `ulong *`. Both units are right and they are different,
+which is exactly the sort of thing that does not announce itself.
+
+**Three of five tests caught it; the fourth passed.**
+`a_resident_chunk_is_served_from_the_device_without_re_uploading` compared the
+device's answer to *its own earlier answer* -- zeros equal zeros, ten times
+over -- and reported success. It now compares against the host backend and
+asserts the counts are not all zero.
+
+That is the fourth time in this session a test has been green without testing
+anything, and the fourth time the same remedy worked: compare against an
+independent oracle, and assert the work happened.
+
+### Shape
+
+One work group per row, the row staged in local memory once and every filter
+applied to it by a separate work item. That arrangement *is* the measurement --
+the naive one, a work item per `( row, filter )` pair re-reading the row from
+global memory, measured 1.06x-1.23x of the CPU while this one measured
+6.71x-11.08x.
+
+**The kernel is not tuned.** 64 work items per group is two warps on an NVIDIA
+device, and the harness measured 22-52 GB/s effective against a device that
+does far more. Sweeping the group size is the first thing to do before anyone
+quotes a speedup from this backend.
+
+### Two smaller things
+
+The device test needs `required-features = ["opencl"]`, or the default
+`cargo test -p yesno-gpu` fails to build rather than skipping, which would make
+the feature effectively mandatory.
+
+Skipping is allowed, skipping silently is not: with no ICD, no GPU, or a
+program that will not build, the device tests print the reason to stderr and
+return. A test that passes in 0.00s having executed nothing is
+indistinguishable from one that passes.
+
+---
+
+## 2026-09-23 -- A gate piped into `tail` reports its own success
+
+Running `scripts/gate-pg.sh` while adding the OpenCL backend failed on
+something the OpenCL work did not touch -- `yesno-core::hotspot` gated on a
+feature Bazel does not enable. The fix and its reasoning are on `epic` as
+*Stop gating yesno-core::hotspot on a dependency's feature*; what belongs here
+is how nearly it was missed twice.
+
+**The invocation hid it.** I ran `./scripts/gate-pg.sh 2>&1 | tail -40`, so the
+pipeline's exit status was `tail`'s. The background task reported **exit code
+0** over a log whose last lines read `ERROR: Build did NOT complete
+successfully`. It was caught only because the output was read rather than the
+status trusted, which is not a process anyone should rely on.
+
+Redirect a gate to a file and check `$?`; never pipe one. The second run was
+`./scripts/gate-pg.sh > log 2>&1; echo "GATE EXIT CODE: $?"`.
+
+**And the break was in a commit already reported as gated.** `310d422` changed
+`yesno-core`, and CLAUDE.md says a change to `yesno-core` must run both gates
+because neither subsumes the other. I ran one. The rule was written for exactly
+this class -- a cross-crate feature implication that cargo's unification makes
+true in every cargo build and Bazel does not reproduce -- and no amount of care
+inside the cargo gate would have found it.
+
+---
