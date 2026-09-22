@@ -2707,6 +2707,306 @@ checkpoint/reopen evaluation; the allocation layer rejects reconstruction of
 the packed input.
 
 ---
+## 2026-09-23 -- The capture point, and the identity bug that would have faked an answer
+
+Built the capture point the previous entry named as the remaining work, on top
+of the Codex session's committed tree ( `760f6e7` ). The hotspot observer can
+now be fed a real query stream: live Flight server -> trace files -> hit-rate
+curve, demonstrated end to end.
+
+### Where it went, and the rule it is judged against
+
+`yesno-flight`, behind a non-default `hotspot-trace` feature, in a **private**
+module -- `mod hotspot`, never `pub mod`, so R1, R6 and R7 make no semver
+promise. Nothing in `yesno-core` changed; the module reaches it only through
+published API. `check-r1.py` and the other six invariant scripts pass.
+
+CLAUDE.md says research does not ship, and this is still an instrument in a
+shipped crate's source. That is a deliberate judgment: a capture point has to
+be where the traffic is, and the alternatives were worse -- `CoreEvent` was
+checked first and is storage-lifecycle only, with a synchronous sink that a
+per-container event would be the wrong cardinality for. What keeps it honest is
+that it is doubly inert ( compiled out without the feature; a single `OnceLock`
+returning `None` without `YESNO_HOTSPOT_TRACE` ) and deletable in one commit.
+
+### The bug worth recording: pointer identity is a silent false negative
+
+The obvious container key is the leaf `OrdSet`'s address plus the chunk prefix,
+which is what the offline observer uses over resident sets. **On the Flight
+path it measures nothing.** `lower` turns every `SetExpr::Key( k )` into
+`Snapshot::key_expr`, which allocates a *fresh* `Arc<KeySource>` per query. So
+pointer identity makes every leaf unique on every query, and the trace reports
+zero reuse regardless of how hot the workload is.
+
+**The reason this is worse than an ordinary bug**: a flat recurrence
+distribution is exactly the outcome that *retires* both open questions. The
+instrument would not have crashed or looked broken -- it would have confidently
+reported "do not build the GPU satellite, do not lower the JIT floor", which is
+the cheap answer everyone was hoping for. It was caught only by running the
+real server and noticing the container trace contained nothing but its own
+header. There is now a named regression test,
+`the_same_key_yields_the_same_containers_across_snapshots`.
+
+The fix is that identity is the **posting-list key**, taken from the wire
+expression before lowering, where `SetExpr::Key` still says which list it is.
+`dyn ChunkSource` cannot be asked -- it exposes statistics but not the key and
+there is no downcast -- so the container hook sits on `expr::cardinality` with
+the wire expression while the shape hook sits on `expr_cardinality` with the
+planned expression the JIT keys on. **Two hooks, each where its data is.** The
+key is also the identity that is stable across *snapshots*, which the address
+never was: a new snapshot would have made every container look cold.
+
+### Two more things only the real path showed
+
+**Shape files are per thread.** `DagJit`'s cache is thread-local and
+`MAX_CACHED_SHAPES` is a per-thread bound, so a workload repeating one query
+across 64 workers amortizes nothing and a merged file would report the exact
+opposite. The TODO names this distinction as the sharpening that makes the
+measurement worth taking, and it is now structural rather than a note.
+
+**Filenames carry the pid.** Several processes share a trace prefix -- the test
+suite does exactly that -- and `File::create` truncates, so the first capture
+run silently lost most of its own output to the next test binary.
+
+### Fidelity, stated rather than assumed
+
+Three approximations, all documented in the module and all erring toward
+*overstating* reuse, so any hit rate derived from a capture is an upper bound:
+a leaf contributes `chunk_count` containers indexed `0..n` rather than its real
+prefixes ( enumerating them needs a stream walk, which is I/O per query and
+would change the behaviour being measured ); only leaves whose chunks are all
+bitmap count, via `ChunkSource::all_bitmap_chunks`; and a leaf is capped at
+4096 containers.
+
+### Validation
+
+Ten unit tests plus an integration test that drives a live server. Both hooks
+were mutated to confirm the tests are load-bearing: removing the container hook
+fails `a_live_flight_query_is_captured_to_a_replayable_trace` and nothing else;
+reverting the per-thread file assignment fails `each_thread_gets_its_own_shape_
+file` and nothing else. The integration test exists specifically because the
+unit tests supply their own expression and therefore cannot see the hook being
+deleted -- which is the failure that actually happened.
+
+Clippy caught a genuinely vacuous assertion in the first draft: a
+`.map( parse ).count()` that discarded the parse, so "every token is a decimal
+`u64`" was checked by nothing. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean, `cargo fmt --check` clean, the default
+`yesno-flight` build unaffected, `yesno-core/src/jit.rs` byte-identical to what
+the Codex session committed.
+
+### What is still missing
+
+A workload. The pipe is proven and the numbers it currently produces come from
+the test suite, which is not traffic. Capturing a real stream is an operational
+step, not a coding one.
+
+---
+
+## 2026-09-23 -- Ungating the capture point, and what the idle path actually costs
+
+The hotspot capture point shipped behind a non-default `hotspot-trace` feature.
+That gate is now **removed**: the module compiles into every server build and
+`YESNO_HOTSPOT_TRACE` is the only switch.
+
+**The reason is the point of the tool.** A capture that needs a custom build
+will never meet production traffic, and production traffic is the only traffic
+whose distribution anyone wants. Ungated, an operator sets one environment
+variable on a binary that is already deployed. Gated, someone must first
+convince a release process to ship a research build -- which is how instruments
+end up never being run.
+
+### The measurement that permits it
+
+Two arms of one probe at `.agents-workspace/tmp/hotspot-cost/`: the hook
+compiled out ( today's production build ) against the hook compiled in with the
+environment variable unset. Pinned to one core, ten interleaved rotations, and
+the control binary stayed **byte-identical** across every rebuild, so any
+difference is the hook and nothing else.
+
+```text
+                      idle          capturing
+  Key( 1 )           779 ns           2402 ns     3.08x
+  K7 AND K8         5562 ns           9785 ns     1.76x
+```
+
+**Idle is below the measurement floor.** The instrumented build measured 31 ns
+*faster* on the cheap query, in 100% of pairings -- which cannot be a causal
+effect of adding work. Incidental codegen and layout differences are worth
+about +-30 ns on an 800 ns call, and the hook's own work, one relaxed load and
+a predictable branch, is far under that. `Key( 1 )` is also the cheapest query
+the path can serve, with no gRPC or network in it, so a real Flight request
+pays a smaller fraction still.
+
+The "capturing" column is the control that proves the arms differ at all: the
+same binary, same core, with the variable set. A 1.8x-3.1x regression is
+unmistakable, so the ON binary demonstrably contains a live hook, and the idle
+column is a real null rather than a hook that was optimized away.
+
+### A defect the measurement caught, which is why it was worth taking
+
+The first fast path used a two-state `AtomicBool` initialized to `false`. That
+cannot distinguish "capture is off" from "not resolved yet", so **every idle
+call fell through to the `#[cold]` resolver** -- an out-of-line call on what was
+supposed to be the fast path. It measured **+18 ns per query, consistently, at
+7% pairwise overlap**: precisely the overhead the flag had been added to
+remove, and it would have been reported as the cost of the feature. The
+tri-state `UNRESOLVED / OFF / ON` that replaced it measures at nothing. An
+unmeasured fast path is not a fast path.
+
+This also explains an earlier confusion in the same session. Before the flag
+existed, two four-rotation runs disagreed about whether a ~15 ns delta was real
+-- one showed overlap, one did not. Both were contaminated: the delta was real
+( the `OnceLock` call was not being folded into the caller ), and four
+rotations could not resolve it against machine drift. Ten interleaved
+rotations, with min *and* median *and* a pairwise-win count, separated the two.
+
+### What ungating costs elsewhere
+
+Nothing in the gate, and it gains coverage: the ten unit tests and the live
+server integration test now run in the **default** `cargo test -p yesno-flight`
+( 61 tests ) instead of only under a feature nobody passes. The client-only
+build is unaffected -- the module keeps a `#[cfg(feature = "server")]` gate,
+which is a dependency requirement ( it needs `yesno-core` ) and not a switch.
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean,
+`cargo fmt --check` clean, the seven invariant scripts pass, `check-r1` included
+-- the module is private, so nothing became public API.
+
+**The tension with CLAUDE.md is sharper now, and stated rather than buried.**
+"Research does not ship" and this now ships unconditionally. It remains private,
+inert, and deletable in one commit, and it should be deleted once the
+distribution is known. Ungating was a direct instruction, taken after the cost
+was measured rather than assumed.
+
+**The operator warning belongs with the switch, not in a footnote**: capture
+writes unbounded, unbuffered output and costs up to 3.1x. It is a sampled,
+time-boxed diagnostic, not telemetry to leave on.
+
+---
+
+## 2026-09-23 -- Publishing through tracing, and bounding what a capture commits to
+
+Two pieces of review feedback landed on the capture point, and both were right.
+**The two entries above describe a design that no longer exists**: the bespoke
+trace files, the `YESNO_HOTSPOT_TRACE` variable, the pid-stamped names, the
+per-thread file table and the hand-rolled enabled-flag are all gone.
+
+### One: it should publish through `tracing`, not invent a channel
+
+This crate already spans every request, already emits structured events, and
+the server already wires an `EnvFilter` plus an OTLP layer. Writing files next
+to that was a second output channel where a configured one existed. It now
+emits on target `yesno::hotspot` at TRACE, and filtering, routing and retention
+belong to whoever runs the deployment.
+
+Three things fell out of the change rather than being argued for:
+
+* **The payload shrank by about three orders of magnitude.** Container keys are
+  `hash( key, i )` for `i` in `0..chunk_count`, which is *entirely determined*
+  by `( key, chunk_count )`. The old capture expanded up to 4096 hashes per
+  leaf into the trace. It now emits the two integers and the observer expands
+  them. **That flaw had nothing to do with transport** and would have survived
+  indefinitely in a file nobody questioned.
+* **The cross-process hash contract disappeared.** Container identity is the
+  posting-list key, so no two programs have to agree about hashing any more.
+* **The hand-rolled fast-path flag disappeared**, replaced by the mechanism it
+  was imitating.
+
+### Two: emitting once per query is an open-ended commitment
+
+An enabled target that emits for as long as it is on promises unbounded volume
+on a server that may serve thousands of queries a second, for a measurement
+that stops improving long before anyone remembers to turn it off. Two fixes:
+
+**A capture spends a budget and disarms itself** -- 250 000 queries, then one
+`hotspot.done` event and silence. Demonstrated rather than asserted: 200 000-
+iteration rounds against that budget measure min 794 ns and max 2094 ns, a
+164% spread, because the first round captures and every later one runs
+disarmed. **794 ns is the idle number**, so a spent capture costs exactly what
+never enabling it costs.
+
+**Bounding by stopping, not by sampling, is forced by the metric.** Stack
+distance is defined by the accesses falling *between* two touches of a key, so
+dropping one query in ten does not add ten percent of error -- it deletes the
+quantity being measured and reports distances far shorter than the truth. A
+contiguous window measures every distance below its own length exactly. This is
+also why these events must not ride the OTLP span sampler.
+
+**And the per-key work came off the per-query path.** Chunk count is a property
+of the posting list, not of the query, and obtaining it costs a `key_expr` plan
+build -- which was most of the cost of having the target on. It is now emitted
+once per key per capture as `hotspot.key`, and `hotspot.query` carries only the
+key list, which is a tree walk and a format. In a 2000-query capture that is
+**6 dimension events instead of 2000**.
+
+```text
+                   idle      capturing ( before )   capturing ( after )
+  Key( 1 )        817 ns        2402 ns  3.08x        2107 ns  2.58x
+  K7 AND K8      5553 ns        9785 ns  1.76x        7265 ns  1.31x
+```
+
+The residual is the event construction and formatting itself, which is what
+emitting per query costs and cannot be optimized away without sampling.
+
+### The `Interest` question, answered from the source rather than memory
+
+Asked whether configuring `Interest` correctly would reduce the overhead. The
+generated guard in `tracing` 0.1 is:
+
+```rust
+let enabled = level_enabled!($lvl) && {
+    let interest = __CALLSITE.interest();
+    !interest.is_never() && __is_enabled(__CALLSITE.metadata(), interest)
+};
+// level_enabled! = $lvl <= STATIC_MAX_LEVEL && $lvl <= LevelFilter::current()
+```
+
+**For the idle path, yes, and it is already doing it** -- which is why the idle
+cost measures at nothing. With the target filtered out, the subscriber's
+`max_level_hint` puts `LevelFilter::current()` above TRACE, and the event dies
+at an integer compare against a global atomic: it never reaches `interest()`,
+never touches the callsite cache, never calls the subscriber. `Interest::never`
+is the next rung down, for a callsite whose level is globally on.
+
+**For the enabled path, no.** `Interest` is tri-state and cached *per
+callsite*, not per event; it cannot express "one in N". A subscriber *can*
+sample inside `enabled()` by returning `Interest::sometimes()`, and because the
+expensive work here sits behind a `tracing::enabled!` guard that would
+genuinely cut the cost -- but it is the wrong lever for this metric, for the
+stack-distance reason above. Recorded because the mechanism is real and the
+objection to using it is statistical, not technical.
+
+Also worth recording: **do not reach for `release_max_level_*`**. It would
+compile these callsites out of release builds, which is precisely the ungating
+benefit thrown away.
+
+### Validation
+
+Thirteen unit tests and the live-server integration test, all in the default
+build ( `cargo test -p yesno-flight`, 64 tests ). The budget is injected rather
+than read from the process-wide static, because a test that spent the real one
+would silently disarm every test after it; `spending_is_exact_under_concurrency`
+drives eight threads through one counter. `a_posting_list_is_described_once_
+however_often_it_is_queried` is the regression test for the overcommit fix.
+
+The observer gained a parser for `tracing` output and lost its two bespoke
+formats -- 41 tests, including one that feeds it real
+`tracing_subscriber::fmt` output produced by a live query path, with
+`with_target( false )` as the server configures it. Parsing is deliberately
+loose about formatter, quoting and span context, and strict about one thing:
+`key` is a prefix of `keys`, so a sloppy match would read every query event as
+a dimension event. There is a test for exactly that.
+
+One bug found by the JSON case: the field extractor treated `,` as a value
+terminator, which is right for `{"key":7,"chunks":2}` and wrong for
+`keys=7,8`. The cut now lives in the single-valued accessor, which knows its
+field holds one number, rather than in the shared extractor, which cannot tell.
+
+`clippy --workspace --all-targets --all-features -- -D warnings` clean,
+`cargo fmt --check` clean, seven invariant scripts pass, `yesno-core`
+untouched.
+
+---
 ## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
 
 Answered the CDC handoff and its haiiie addendum, then built what they asked

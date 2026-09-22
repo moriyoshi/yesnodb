@@ -237,6 +237,18 @@ Do not land the encoder without the wiring. Eight pieces of machinery in this co
   `--trace` already replays a captured stream through the same counters. See
   JOURNAL, *2026-09-23 -- The hotspot observer*.
 
+  **The capture point now exists** ( 2026-09-23 ): `yesno-flight`, private
+  module, publishing `tracing` events on target `yesno::hotspot` at TRACE, each
+  shape event tagged with its **OS thread** -- the per-worker distinction this
+  item asks for, made structural. **No build flag**: the feature gate came off
+  after the idle cost measured below the noise floor, so any deployed server
+  can capture with a filter directive. A capture spends a bounded budget of
+  250 000 queries and disarms itself; while it runs it costs 1.3x-2.6x, and
+  once spent it costs what it cost idle. Replay the log with the observer's
+  `--trace`. What remains is running it against real traffic. See JOURNAL,
+  *2026-09-23 -- The capture point*, *-- Ungating the capture point*, and
+  *-- Publishing through tracing*.
+
 - [ ] **jit-vpopcntb-tier-unexercised** ( *opened 2026-09-22* ): Cranelift 0.135.2 lowers `popcnt` over `i8x16` three ways, and only two are reachable on any machine this project has. QEMU's TCG implements no AVX512 ( `-cpu Icelake-Server` prints "TCG doesn't support requested feature" for every AVX512 bit ) and the i9-9880H is Coffee Lake, so the `vpopcntb` tier under AVX512VL + AVX512BITALG has never executed. It needs an Ice Lake, Sapphire Rapids or Zen 4 host; the check is one run of `cargo test -p yesno-core --features jit` there. Low risk and cheap, but it is a generated-code path with no coverage, which is not a thing to leave unrecorded.
 
 - [ ] **kernel-specialization-simd**: all nine kind-pairs are specialized in both `ops::apply` and `ops::card`, and as of 2026-08-25 the last per-value probes are merges too. Measured against the `roaring` crate, worst first: `array x run` OR **5.0x**, `array x run` cardinality **2.15x**, `array x run` AND **2.07x**, `array x bitmap` cardinality **1.44x**; `run x run` cardinality is **35x faster** than the reference and `bitmap x run` **2.3x faster**. Nothing pathological remains. The `array x run` OR/XOR arms expand the run into words on purpose — emitting intervals would need result split/merge, which the design excludes from v1 by name. Changing that is a **design decision**, not a tuning step. True SIMD ( shuffle-based array intersect ) is still a separate later question, benchmark-gated. When specializing a kernel, check whether `ops::card` has the same arm — it is a second implementation of the same dispatch and does not inherit the fix. **RE-MEASURED 2026-09-07 and the recorded figures are current, not stale** — `array x run` OR **5.07x** ( recorded 5.0 ), `array x run` cardinality **2.14x** ( 2.15 ), `array x run` AND **1.99x** ( 2.07 ), `array x bitmap` cardinality **1.40x** ( 1.44 ). Worth knowing given the neighbouring `array-intersect-simd-x86` entry was found over-claiming on the same day: this one is trustworthy. The wins are unchanged too — `run x run` cardinality **0.03x** of the reference, `run x run` AND/OR **0.16x**, `bitmap x run` cardinality **0.40x**.

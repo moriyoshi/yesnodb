@@ -39,6 +39,10 @@ name = "client"
 required-features = ["server"]
 
 [[test]]
+name = "hotspot_capture"
+required-features = ["server"]
+
+[[test]]
 name = "reactor"
 required-features = ["server"]
 
