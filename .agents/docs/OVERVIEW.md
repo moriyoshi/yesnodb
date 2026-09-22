@@ -3,16 +3,17 @@
 `yesno` is a Rust library for Roaring-style sparse ordinal sets. An ordinal is a `u64`. The low 16 bits select a slot within a *chunk*; the high 48 bits are the chunk's `Prefix48`. A set is a sorted sequence of `(Prefix48, Container)` pairs, where a container is one of three representations — array, bitmap, or run — chosen by size class.
 
 `yesno-core` is the engine and holds the whole data model. Satellite crates and
-language clients surround it. The core boundary is enforced rather than
-intended: CI's `lean-core` job fails if
+language clients surround it. The default core boundary is enforced rather
+than intended: CI's `lean-core` job fails if
 `cargo tree -p yesno-core -e normal` so much as mentions
-`tokio`, `tonic`, `prost` or `arrow-flight`, and caps the direct dependencies at
-five. Every "just add serde derives to `DbOptions`" shortcut breaks that cap,
+`tokio`, `tonic`, `prost` or `arrow-flight`, and caps default direct dependencies
+at five. The optional `jit` feature adds Cranelift without changing that
+budget. Every "just add serde derives to `DbOptions`" shortcut breaks the cap,
 which is why the server mirrors the struct instead of deriving on it.
 
 | | |
 |---|---|
-| `yesno-core` | containers, kernels, page store, WAL, MVCC, the sharded `Db` |
+| `yesno-core` | containers, kernels, page store, WAL, MVCC, the sharded `Db`, and opt-in Cranelift bitmap-DAG cardinality |
 | `yesno-wire` | the on-wire encoding shared by `yesno-flight` and `yesno-pg` |
 | `yesno-arrow` | zero-copy Arrow surface |
 | `yesno-datafusion` | predicate lowering |
@@ -22,7 +23,7 @@ which is why the server mirrors the struct instead of deriving on it.
 | `yesno-server` | `yesnod` + `yesno`: daemon, data CLI, TLS, auth, lifecycle, failover, and gRPC WAL replication |
 | `yesno-server-utils` | `yesnoctl` + `yesno-archive`: checkpoint, hot backup, restore, and continuous object archive |
 | `yesno-e2e` | the scenario harness; Python driven by `monty` |
-| `yesno-c` | the host-independent C ABI. A separate cargo workspace at the core Rust 1.89 floor |
+| `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.95 floor |
 | `yesno-mysql` | the embedded or remote MySQL 8.4 storage engine. Built and tested with pinned MySQL and Arrow source by Bazel |
 | `yesno-pg` | the PostgreSQL extension. Outside the cargo workspace, built by Bazel |
 | `yesno-flight-python/` | the pure-Python `yesnodb` Arrow Flight client |

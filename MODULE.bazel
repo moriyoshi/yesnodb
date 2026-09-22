@@ -51,10 +51,10 @@ use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
 # ─── Rust toolchain ──────────────────────────────────────────────────────────
 #
 # This does NOT verify the workspace's MSRVs and must not be mistaken for
-# doing so. `yesno-core` promises 1.89 to its users, `yesno-datafusion` declares
-# 1.94 and `yesno-e2e` 1.95; Bazel builds one configuration with one rustc, so
-# the `msrv` CI job stays on cargo and remains the only thing that checks those
-# promises. The version here is chosen to satisfy pgrx 0.19, whose MSRV is 1.96.
+# doing so. Workspace members promise at least 1.95 and the PostgreSQL
+# extension requires 1.96. Bazel builds one configuration with one rustc, so
+# the `msrv` CI job stays on cargo and checks the core package's floor.
+# This toolchain is chosen to satisfy pgrx 0.19, whose MSRV is 1.96.
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2021",

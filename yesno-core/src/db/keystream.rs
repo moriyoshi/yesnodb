@@ -1,5 +1,9 @@
 //! A key's posting list as a lazy [`ChunkStream`], without materializing it.
 //!
+//! Automatic bitmap-JIT admission also reads each step's representation tag
+//! from the plan. Disk `ChunkRef` tags and resident container variants reveal
+//! it without decoding a payload.
+//!
 //! # What was missing
 //!
 //! [`Snapshot::load`](super::Snapshot::load) builds **every** container of a
@@ -489,16 +493,17 @@ pub struct KeySource {
     stats: std::sync::OnceLock<Option<SourceStats>>,
 }
 
-/// The three things [`crate::stream::plan`] reads off a leaf.
+/// Planner statistics and the no-payload bitmap-JIT admission hint.
 ///
-/// Named rather than a tuple because all three are integers or spans and a
-/// positional `( u64, _, u64 )` invites exactly the mix-up that would make the
-/// planner confidently wrong.
+/// The three planner fields are named rather than a tuple because they are
+/// integers or spans; a positional `( u64, _, u64 )` invites a mix-up that makes
+/// the planner confidently wrong.
 #[derive(Clone, Copy, Debug)]
 struct SourceStats {
     chunks: u64,
     span: Option<(Prefix48, Prefix48)>,
     cardinality: u64,
+    all_bitmap: bool,
 }
 
 impl KeySource {
@@ -540,6 +545,10 @@ impl KeySource {
                 chunks: n as u64,
                 span: (n > 0).then(|| (plan.steps[0].prefix, plan.steps[n - 1].prefix)),
                 cardinality: plan.steps.iter().map(|st| st.card as u64).sum(),
+                all_bitmap: plan.steps.iter().all(|step| match &step.src {
+                    Source::Mem(container) => matches!(container, Container::Bitmap(_)),
+                    Source::Disk(_, chunk_ref) => chunk_ref.kind() == crate::ContainerKind::Bitmap,
+                }),
             })
         })
     }
@@ -595,6 +604,10 @@ impl ChunkSource for KeySource {
 
     fn prefix_span(&self) -> Option<(Prefix48, Prefix48)> {
         self.stats().and_then(|s| s.span)
+    }
+
+    fn all_bitmap_chunks(&self) -> Option<bool> {
+        self.stats().map(|s| s.all_bitmap)
     }
 
     fn cardinality(&self) -> Option<u64> {
@@ -1072,6 +1085,40 @@ mod tests {
             yield_chunks(&snap.key_expr(1)),
             yield_chunks(&crate::Expr::set(resident.clone()))
         );
+    }
+
+    #[test]
+    fn key_source_bitmap_hint_matches_disk_and_memtable_encodings() {
+        let dir = tmpdir("bitmap_hint");
+        let _guard = CleanDir(dir.clone());
+        {
+            let db = Db::open_with(&dir, opts()).unwrap();
+            let scattered: Vec<u64> = (0..5_000u64).map(|i| (i * 37) & 0xffff).collect();
+            db.insert_many(1, &scattered).unwrap();
+            db.insert(2, 7).unwrap();
+            db.checkpoint().unwrap();
+        }
+
+        let db = Db::open_with(&dir, opts()).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert!(snap
+            .load(1)
+            .unwrap()
+            .chunks()
+            .all(|(_, chunk)| matches!(chunk, Container::Bitmap(_))));
+        assert_eq!(
+            KeySource::new(snap.clone(), 1).all_bitmap_chunks(),
+            Some(true)
+        );
+        assert_eq!(
+            KeySource::new(snap.clone(), 2).all_bitmap_chunks(),
+            Some(false)
+        );
+        drop(snap);
+
+        db.insert(1, (1 << 16) | 9).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert_eq!(KeySource::new(snap, 1).all_bitmap_chunks(), Some(false));
     }
 
     /// An evicted snapshot must not turn into an empty answer.

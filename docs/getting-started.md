@@ -18,7 +18,8 @@ filesystem. There are no published crates or binary releases yet.
 | Query posting lists from DataFusion | `yesno-datafusion` |
 | Experiment with PostgreSQL integration | `yesno-pg` |
 
-The full workspace needs Rust 1.95 or newer. The core crate supports Rust 1.89.
+The Cargo workspace, including the core crate, needs Rust 1.95 or newer. The
+separate PostgreSQL extension needs Rust 1.96.
 The supported platforms are 64-bit Linux and macOS on local filesystems.
 Windows and network filesystems such as NFS are not supported.
 

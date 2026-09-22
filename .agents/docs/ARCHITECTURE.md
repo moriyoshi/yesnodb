@@ -22,6 +22,7 @@ yesno/
   yesno-core/
     src/
       lib.rs                    # ordinal split/join, the size-class constants, and their rationale
+      jit.rs                    # optional Cranelift fused bitmap-DAG cardinality
       error.rs                  # CodecError + crate Result alias
       events.rs                 # typed storage and database lifecycle facts; no transport or serialization
       dispatch.rs               # Dispatch trait + Dispatcher handle: a host lends its executor; this crate spawns nothing
@@ -132,6 +133,7 @@ yesno/
       proptest_oracle.rs        # randomized properties vs BTreeSet<u64>
       differential.rs           # M0 gate: semantic + byte-level vs the `roaring` crate
       expr_equivalence.rs       # M1 gate: lazy == eager, cardinality == collect().len()
+      opaque_source_equivalence.rs # unknown source bounds must not erase lazy leaves
       allocation.rs             # allocation budgets asserted as tests
       events.rs                 # lifecycle ordering, correlation, panic isolation, unexpected drop
       bignum_oracle.rs          # arbitrary-precision arithmetic vs num-bigint; the OrdSet boundary
@@ -144,6 +146,8 @@ yesno/
       setops.rs                 # baselines against the `roaring` crate
       bitmatrix.rs              # bit-matrix algebra; no external reference exists — see its header
       bignum.rs                 # arbitrary-precision scaling; did not fix the crossover, see its header
+      view.rs                   # packed-view layout benchmarks
+      dag.rs                    # paired nested-expression core/JIT cardinality timing
     examples/
       readme.rs                 # the README's opening snippet, compiled so it cannot rot
                                 # — the only example left; the measurement fixtures that
@@ -378,6 +382,56 @@ Four contract points matter when touching this module:
 
 `ChunkStreamExt` holds the combinators so that `ChunkStream` itself stays object-safe. `Expr` ( in `dynamic.rs` ) is the runtime-constructed tree a query planner builds when it does not know the shape ahead of time; `Expr::open()` lowers it to a `Box<dyn ChunkStream>`.
 
+### Fused bitmap-DAG cardinality -- `yesno-core::jit`
+
+`yesno-core` shares the workspace's Rust 1.95 floor with Cranelift 0.135.
+Its opt-in `jit` feature owns the generator; the default feature set retains
+core's five-runtime-dependency contract. Flight's separate `jit` feature enables
+it for expression-cardinality terminals; the default `server` feature uses the
+scalar core evaluator. Bazel defaults to JIT off and enables both crate features
+with `--//:jit=on`. Core also hosts the whole-path benchmark. The explicit `DagJit` caches
+postfix Boolean shapes by leaf position and can lower arbitrary combinations
+of `And`, `Or`, `Xor` and `AndNot` over resident `Set` and lazy `Source` leaves.
+Explicit `DagJit` buffers at most one chunk per leaf. Its seek-driven
+whole-DAG candidate walk uses payload-free lower-bound peeks to skip
+non-contributing prefixes and loads only active leaves. Automatic admission
+retains the previously measured dense union walk. Bitmap words ( or a static
+zero page for absent prefixes ) feed one compiled 128-bit vector loop. Code
+generation is allow-listed to AArch64 and x86_64 --
+an allow-list rather than a probe, because a backend lacking a lowering rule
+panics inside Cranelift rather than returning an error. Arrays, runs and
+unaligned mmap bitmaps use `ops::apply` for that prefix. `Range`, `Not`, oversized DAGs, JIT failures, and unsupported
+hosts use the ordinary planned core evaluator. Source read errors propagate.
+
+The JIT owns executable code for its cache's lifetime, explicitly releases it
+on drop ( including compilation failures ), and caps the cache at 64 shapes
+per thread. The automatic Flight entry now requires every leaf to report the
+same contiguous span of at least 256 bitmap chunks and at least four leaves
+in the expression; `KeySource` answers the encoding hint from its plan
+without decoding payloads, while an unknown hint declines. This protects
+the automatic dense-union walk from selective ANDs
+and array fallbacks, which regressed there; explicit `DagJit` now seeks those
+shapes without changing automatic admission. The leaf-count check runs before
+container or source-hint scans, preserving core's tuned simple binary path:
+a measured aligned two-leaf bitmap AND was 22-24% slower through automatic
+JIT, while a
+four-leaf mixed DAG retained a measured win. Automatic admission is enabled
+on **both** allow-listed hosts as of 2026-09-22. It was briefly AArch64-only,
+on the argument that core reaches AVX2 bitmap kernels on x86_64 while Cranelift
+IR caps vectors at 128 bits; measured on an Intel i9-9880H over three complete
+runs, x86_64 tracks AArch64 to within about 15% on every benchmark shape and
+wins on all of them, because the gain is fusion rather than generated bitmap
+instructions. The four-leaf and contiguous-span floors were measured on
+AArch64 and are applied on both hosts -- they only narrow admission, and they
+exclude exactly the shapes the x86 run did not cover. An explicit `DagJit` may
+be used for smaller hot shapes on either host.
+`yesno-core/benches/dag.rs` compares the same unplanned expression through
+core cardinality and the cached JIT path, so both pay for planning per call.
+It measures whole-query work, not merely generated instructions. The scalar core path
+remains the correctness oracle, and the independent opaque-source test guards
+the planner's `None == proven empty` rule: an unreported source span must use
+the full-universe conservative bound, not `None`.
+
 ### Unary NOT
 
 `OrdSet::not_in_range( lo, hi )`, `ChunkStreamExt::not_in_range( lo, hi )` and `Expr::not_in( lo, hi )` complement within a half-open range; `not()` on each complements over the whole universe.
@@ -430,6 +484,13 @@ They differ for exactly two nodes, and those two are why the planner pays: a `Ra
 **The cost is read from the operands, not from the shape.** `Set` reports its real `chunk_count`, `Range` its real width, so the same rewrite is accepted for one dataset and declined for another — `de_morgan_is_declined_when_the_data_says_it_is_worse` pins a case where narrowing the range and enlarging the inputs reverses the decision. A structurally-decided rule would be wrong in one direction or the other.
 
 **Rules.** Unconditional: empty-identity folding; `AndNot( Range, x ) -> Not( x )` ( the definition of a complement ). Conditional on containment, decided by `bounds()`: `And( x, R ) -> x`, `Or( x, R ) -> R`, `Xor( x, R ) -> Not( x )`, `AndNot( x, R ) -> Empty`. Conditional on provable disjointness: `And -> Empty`, `AndNot( a, b ) -> a`, `Xor -> Or`. Range algebra: intersection and union **fuse**, and difference **splits** into up to two range leaves — the one rewrite that grows the tree, and still cheaper because both pieces count arithmetically. Cost-guided: both De Morgan directions, applied only when `cardinality_cost` strictly drops.
+
+**An unreported source span is unknown, not empty.** `bounds()` uses the full
+universe as its conservative bound because its `None` denotes proven emptiness
+to identity rewrites. Returning `None` for an opaque `ChunkSource` discarded
+that source from `Or` or rewrote its `And` to `Empty`; the independent
+`opaque_source_equivalence` test catches this without trusting either planned
+terminal's answer.
 
 **Planning must stay cheap relative to execution, and once did not.** The fixpoint check was `format!( "{next:?}" ) == format!( "{cur:?}" )`, and `Debug` on `Expr::Set` renders the entire set — so every operand was serialized twice per pass. On a realistic query ( a 1 000-chunk dense operand ) that made `plan()` take **192 ms for something that executes in 37 µs**: the planner costing five thousand times the work it was saving, while the doc claimed it was memoized. `same_shape` compares set leaves by `Arc::ptr_eq`; planning is now ~2 µs against 24 µs of execution. Anything added to the planner needs measuring against the query it plans, not just against correctness.
 
@@ -593,6 +654,8 @@ Several `OrdSet`s packed into **one** ordinal space. A `View { sets, layout }` m
 
 **Measured, not derived** — `benches/view.rs`, 4 constituents over 200 000 logical ordinals, on a heavily loaded machine so read the *ratios* rather than the absolutes. The asymmetry is far larger than the original prose guessed: extraction is ~18 000x and cardinality ~59 000x, because the aligned blocked arm is a prefix relabel with payloads shared by refcount and `len_in_range` probes at most two chunks, while interleaved must walk every ordinal. A **non-aligned** blocked stride loses the arm entirely and measures 729 µs — 4 000x the aligned case — so `Blocked`'s advantage is a property of the stride, not of the layout.
 
+**Batched interleaved counts have a different arm from one-constituent counts.** For arities 2, 4 and 8, `view_cardinalities` borrows aligned bitmap words and counts fixed per-owner masks, avoiding one iterator step per set bit. The chunk and word widths are divisible by those arities, so the same masks apply at every prefix. Little-endian AArch64 counts those masks with NEON, and little-endian x86_64 with AVX2 after runtime feature detection; other hosts use scalar word counts. The x86 arm synthesizes byte population count with a `pshufb` nibble table and accumulates with `psadbw`, whose 64-bit lanes cannot overflow from an 8 KiB input, so its bound is trivial where NEON's needs an argument about 16-bit lanes. Array, run and unaligned shared bitmap payloads keep the generic ordinal walk; other arities and blocked views are unchanged. The generic path remains the oracle.
+
 **This is deliberately not `matrix/`.** That module reads a *dense value* out of a set — bounded, materialised, in memory. A view over 8 constituents of `2^40` ordinals is `2^43` bits, a terabyte dense, so every operation here works on the sparse representation. `matrix/` is used as a **differential oracle** at sizes that do fit, and `a_small_view_is_a_bit_matrix_whose_rows_are_the_constituents` is that test.
 
 **Elementwise algebra across two views is free, and it is a theorem rather than an optimization.** `docs/formal-model.md` §15.2 proves the map from a set to its object stack is a bijection under a dense layout, so for two sets packed under the same view `OrdSet::and` / `or` / `xor` **are** the `n`-wise elementwise operations at once, through no new code. There is deliberately no `view_and`; `View::compatible_with` exists instead, because a mismatched pair produces a well-formed *wrong* answer rather than an error and nothing in the type system can catch it.
@@ -617,9 +680,11 @@ Several `OrdSet`s packed into **one** ordinal space. A `View { sets, layout }` m
 
 **Arms, and one of them has to decline.** Selecting each constituent and combining with ordinary set algebra is the oracle — correct everywhere, and it reuses the tuned pairwise kernels rather than reimplementing them. Under `Interleaved` that is `O( n · nnz )` because each select is itself a strided filter, so a single grouped walk replaces it at `O( nnz )`; it is correct there because the physical order *is* the logical order, which is exactly what fails under `Blocked` where `x` restarts per constituent. The interleaved fold arm measures **5.1x** the oracle ( 3.42 ms against 17.5 ms ).
 
+**Bitmap-native materializing folds.** At interleaved arities 2/4/8, if every physical chunk can lend aligned bitmap words, byte reducers pack each group of constituent bits into one logical bit. A physical chunk contributes one n-th of a logical output chunk, so n source words fill one output word and n adjacent source prefixes fill one output prefix. Little-endian AArch64 selects NEON and little-endian x86_64 selects SSSE3 after feature detection; other hosts use compile-time scalar byte tables. The two vector arms are not ports of one another at arity 8: x86 gathers one output bit per input byte with `pmovmskb` in a single instruction, which NEON has no equivalent for, making arity 8 the cheapest x86 fold and the most expensive NEON one. The fold arms stay 128-bit while the count arm takes AVX2, because every fold ends by packing bytes from across the vector and AVX2 would need a cross-lane permute per iteration to repair the order. The result is built directly as bitmap containers with exact cached cardinality, then optimized. Missing prefixes stay absent. The preflight declines mixed kinds and unaligned shared payloads to the grouped walk; select-and-combine remains the independent correctness oracle. Shared on-disk words are borrowed only on little-endian hosts; big-endian hosts decode through the fallback.
+
 **`view_expand`'s interval arm is not uniformly better, and shipping it unconditionally was a regression.** A logical ordinal's `n` slots are contiguous under `Interleaved`, so adjacent inputs coalesce and a 20 000-ordinal range becomes two chunks of run containers rather than 80 000 values — 2x the generic path. But a *scattered* input coalesces into nothing, so the builder makes one `insert_range` per input ordinal where the generic path makes one bulk sorted build, and it measured **9.1x slower**. That is the crate's oldest measured asymmetry in disguise ( bulk build against per-ordinal insert, 133 µs against 3.70 ms ). The arm now runs an `O(nnz)` allocation-free counting pre-pass and declines when the expansion will not coalesce; sparse input went 5.92 ms -> 500 µs, within 8% of the generic path. `EXPAND_INTERVAL_COST` is the measured cost ratio behind that test and is not a tuning knob.
 
-**Still no core `Expr` variant and no descriptor catalog.** Flight carries `ViewSpec` in `ViewSelect`, `ViewFold`, and `ViewExpand` wire nodes and evaluates each transform eagerly before re-entering the Boolean tree as a set leaf. The packed bits persist under an ordinary database key; the caller must supply the same descriptor on every request. A lazy planner node and a server-side `view_id -> descriptor` catalog remain separate, measured design choices.
+**Still no core `Expr` variant and no descriptor catalog.** Flight carries `ViewSpec` in `ViewSelect`, `ViewFold`, and `ViewExpand` wire nodes and normally evaluates each transform eagerly before re-entering the Boolean tree as a set leaf. A terminal-only exception streams direct-key interleaved identity counts and folds when exact source statistics prove at least 64 occupied chunks with exactly one value per chunk; the declined arm materializes the already-open stream, and dense bitmap inputs retain the SIMD kernels above. Direct-key interleaved identity ranks use a separate bounded plan: Flight opens only the physical prefixes below the strict logical rank endpoint, core reuses whole-chunk cardinality reducers, and the one possible final chunk is clipped by logical ordinal. This bound is valid for every container encoding and needs no singleton admission threshold. The packed bits persist under an ordinary database key; the caller must supply the same descriptor on every request. A lazy planner node and a server-side `view_id -> descriptor` catalog remain separate, measured design choices.
 
 ## Serialization — `roaring_format.rs`
 

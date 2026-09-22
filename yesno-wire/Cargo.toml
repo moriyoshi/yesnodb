@@ -11,7 +11,7 @@ name = "yesno-wire"
 description = "Set-expression wire format shared by the yesno Flight server and its clients"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moriyoshi/yesnodb"
 

@@ -30,6 +30,8 @@ guides to [data modeling](docs/data-modeling.md), the
 Implemented and covered by tests:
 
 - Roaring-style containers, codecs, and eager and lazy set algebra;
+- opt-in Cranelift fused bitmap-DAG cardinality in `yesno-core`, enabled for
+  Flight server queries on supported AArch64 hosts;
 - copy-on-write page storage, WAL recovery, MVCC, checkpointing, and sharding;
 - Arrow and DataFusion integration;
 - Arrow Flight ingest and queries;
@@ -160,8 +162,8 @@ differential oracle; it is not a runtime dependency.
 
 ## Quick start
 
-The full workspace currently requires Rust 1.95 or newer. `yesno-core` supports
-Rust 1.89.
+The Cargo workspace, including `yesno-core`, requires Rust 1.95 or newer.
+The separate PostgreSQL extension requires Rust 1.96.
 
 ```console
 git clone https://github.com/moriyoshi/yesnodb.git
@@ -506,8 +508,8 @@ network and query-engine dependency trees remain in satellite crates.
 library is compiled and tested against pinned PostgreSQL 17 and 18 server ABIs. Run
 `./scripts/gate-pg.sh` rather than `cargo pgrx test`.
 
-`yesno-c` is a separate Cargo workspace so it can keep the core Rust 1.89
-floor and emit static and shared libraries independently. Bazel also builds its
+`yesno-c` is a separate Cargo workspace at the Rust 1.95 floor. It emits
+static and shared libraries independently. Bazel also builds its
 static library as the embedded Rust input to `yesno-mysql`; the MySQL gate also
 builds `yesno-flight-c++` against pinned Arrow C++ and compiles the plugin and
 pinned MySQL 8.4.0 together. See the

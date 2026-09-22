@@ -642,6 +642,10 @@ pub(crate) fn use_nary_union(streams: &[BoxedStream]) -> bool {
 /// **All three must be answerable without decoding a payload.** A source that
 /// opened a stream to count its chunks would make planning cost what evaluation
 /// costs, which is exactly what a lazy leaf exists to avoid.
+///
+/// The optional JIT admission hint below is separate from those planner
+/// statistics. It is exact only when the source can inspect container
+/// encodings without opening or decoding a payload.
 pub trait ChunkSource: std::fmt::Debug + Send + Sync {
     /// A fresh stream over this source's contents.
     ///
@@ -657,6 +661,15 @@ pub trait ChunkSource: std::fmt::Debug + Send + Sync {
 
     /// Inclusive prefix span, if known without opening one.
     fn prefix_span(&self) -> Option<(Prefix48, Prefix48)> {
+        None
+    }
+
+    /// Whether every yielded chunk is a bitmap, when known without decoding.
+    ///
+    /// `None` declines automatic bitmap-JIT admission. An incorrect `true`
+    /// remains semantically safe because the executor falls back per prefix,
+    /// but can cause severe performance regressions.
+    fn all_bitmap_chunks(&self) -> Option<bool> {
         None
     }
 

@@ -60,7 +60,7 @@
 * `yesno-core/fuzz` is **outside `[workspace] members`**, so `cargo fmt --all` does not reach it. Format it separately ( `cd yesno-core/fuzz && cargo fmt --all` ) if you edit it; the gate checks it separately for the same reason.
 * **Do not use bare `rustfmt <file>`.** rustfmt follows every `mod x;` declaration, so `rustfmt yesno-core/src/lib.rs` rewrites **seven** files. That no longer produces a diff on a clean tree, but it is still the wrong tool — use `cargo fmt`.
 * **Do not run a bare `cargo update`.** `get-size2` is pinned to 0.10.1 in `Cargo.lock`. 0.10.2 moved to `compact_str` 0.10 while `ruff_python_ast` — which `monty` parses with — still uses 0.9, so the `GetSize` impl for `CompactString` stops applying and `yesno-e2e` fails to build with a confusing trait error inside a dependency. If you must update, re-pin with `cargo update -p get-size2 --precise 0.10.1`.
-* `yesno-e2e` declares its own `rust-version = "1.95"` because `monty` requires it. That is deliberate and must stay per-package: `yesno-core`'s MSRV of 1.89 is a promise to its users, and a test harness must not be able to move it. Do not "fix" the mismatch by raising `[workspace.package] rust-version`.
+* The workspace now promises Rust 1.95, including `yesno-core` and the `yesno-e2e` harness that depends on `monty`. Keep the package manifests, CI MSRV check, and release-image toolchains aligned with that floor. `yesno-pg` declares Rust 1.96 separately because pgrx requires it.
 
 ## Testing
 

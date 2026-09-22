@@ -101,9 +101,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
-        # `yesno-e2e` declares `rust-version = "1.95"` because `monty` requires
-        # it; the workspace stays at 1.89 for `yesno-core`, whose MSRV is a
-        # promise to its users and is checked by the `msrv` job.
+        # All workspace members now promise at least Rust 1.95, matching
+        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
@@ -146,7 +145,15 @@ jobs:
         # `--all-features` would additionally compile `yesno-core/tracing` into
         # the other 69 -- changing the code under test everywhere to gain
         # nothing, since that feature contributes no tests at all.
-        run: cargo test -p yesno-tantivy --features flight
+        run: |
+          cargo test -p yesno-tantivy --features flight
+          # Same class, found again on 2026-09-22 while enabling the fused
+          # bitmap-DAG generator on x86_64: `yesno-core/src/jit.rs` is
+          # `#[cfg( feature = "jit" )]` and `jit` is off by default, so its five
+          # tests -- including the property test that is the only check on two
+          # `unsafe` boundaries -- had never executed here either. This runner
+          # is also the only x86_64 machine the generator is ever built for.
+          cargo test -p yesno-core --features jit
 
       - name: ARCHITECTURE.md layout matches the tree
         run: python3 scripts/check-layout.py
@@ -223,19 +230,19 @@ jobs:
           python3 scripts/check-model-constants.py
 
   msrv:
-    name: msrv (yesno-core builds at 1.89)
+    name: msrv (workspace builds at 1.95)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install 1.89
+      - name: Install 1.95
         run: |
-          rustup toolchain install 1.89 --profile minimal
-          rustc +1.89 --version
-      - name: Build the core crate only
-        # Only `yesno-core`. The satellites carry heavier trees and
-        # `yesno-e2e` needs 1.95; the promise being checked is core's.
-        run: cargo +1.89 build -p yesno-core
+          rustup toolchain install 1.95 --profile minimal
+          rustc +1.95 --version
+      - name: Check the Cargo workspace at its minimum
+        run: cargo +1.95 check --workspace --all-targets --all-features
+      - name: Check the standalone C ABI at its minimum
+        run: cargo +1.95 check --manifest-path yesno-c/Cargo.toml --all-targets
 
   lean-core:
     name: lean core (dependency guard)

@@ -219,11 +219,20 @@ step "tests behind off-by-default features"
 #     cargo test --workspace                  1556 passed, 70 binaries
 #     cargo test --workspace --all-features   1557 passed, 70 binaries
 #
-# The whole delta is this one test. `--all-features` would additionally compile
+# The whole delta is this one test ( measured 2026-09-17, before the `jit`
+# feature existed; the line after it covers what that one added ).
+# `--all-features` would additionally compile
 # `yesno-core/tracing` into the other 69 binaries -- changing the code under
 # test everywhere to gain nothing, since that feature gates instrumentation and
 # contributes no tests at all.
 check cargo test -p yesno-tantivy --features flight
+# The same class, found again on 2026-09-22 while enabling the fused bitmap-DAG
+# generator on x86_64: `yesno-core/src/jit.rs` is `#[cfg( feature = "jit" )]`
+# and `jit` is off by default, so its five tests -- including the property test
+# that is the only check on two `unsafe` boundaries -- had never executed in
+# this gate or in CI. Clippy's `--all-features` type-checks them, which is
+# exactly what made the gap invisible the first time.
+check cargo test -p yesno-core --features jit
 
 step "ARCHITECTURE.md layout matches the tree"
 # Cheap, and it catches a class review cannot: a diagram that is 90% right reads

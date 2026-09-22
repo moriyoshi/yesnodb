@@ -1,6 +1,6 @@
 """The host-independent C ABI as a Bazel static library.
 
-Cargo remains the authority for the C-facing tests and the Rust 1.89 MSRV.
+Cargo remains the authority for the C-facing tests and the Rust 1.95 MSRV.
 This target exists so ABI-bound host builds can consume the exact same Rust
 sources without invoking Cargo from inside a foreign build action.
 """

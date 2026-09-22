@@ -7,6 +7,9 @@
 //!
 //! These are asserted as **tests, not benchmarks**, because a benchmark
 //! regression gets triaged next quarter and a failing test gets fixed today.
+//! A counted-source work budget below also checks payload reads: an allocation
+//! counter cannot reliably see a zero-copy source consuming chunks it should
+//! have sought past.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -1259,4 +1262,133 @@ fn a_checkpoint_does_not_decode_every_leaf() {
          the untouched-leaf reuse path is no longer being taken \
          ( 2095 expected with it, 3375 without )"
     );
+}
+
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod jit_admission_work {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use yesno_core::stream::{BoxedStream, ChunkSource, ChunkStream, SetStream};
+    use yesno_core::{jit, Container, Expr, OrdSet, Prefix48, Result};
+
+    #[derive(Debug)]
+    struct CountedSource {
+        set: Arc<OrdSet>,
+        payloads: Arc<AtomicUsize>,
+    }
+
+    struct CountedStream {
+        inner: SetStream,
+        payloads: Arc<AtomicUsize>,
+    }
+
+    impl ChunkStream for CountedStream {
+        fn next_chunk(&mut self) -> Result<Option<(Prefix48, Container)>> {
+            let next = self.inner.next_chunk()?;
+            if next.is_some() {
+                self.payloads.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(next)
+        }
+
+        fn seek(&mut self, prefix: Prefix48) -> Result<()> {
+            self.inner.seek(prefix)
+        }
+
+        fn peek_prefix(&mut self) -> Result<Option<Prefix48>> {
+            self.inner.peek_prefix()
+        }
+    }
+
+    impl ChunkSource for CountedSource {
+        fn open(&self) -> BoxedStream {
+            Box::new(CountedStream {
+                inner: SetStream::new(self.set.clone()),
+                payloads: self.payloads.clone(),
+            })
+        }
+
+        fn chunk_count(&self) -> Option<u64> {
+            Some(self.set.chunk_count() as u64)
+        }
+
+        fn prefix_span(&self) -> Option<(Prefix48, Prefix48)> {
+            let lo = self.set.chunk_at(0)?.0;
+            let hi = self.set.chunk_at(self.set.chunk_count() - 1)?.0;
+            Some((lo, hi))
+        }
+
+        fn all_bitmap_chunks(&self) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    fn bitmap_source(prefixes: impl Iterator<Item = u64>) -> (Expr, Arc<AtomicUsize>) {
+        let values = prefixes.flat_map(|prefix| {
+            (0..5_000u64).map(move |low| (prefix << 16) | ((low * 37) & 0xffff))
+        });
+        let set = Arc::new(OrdSet::from_iter_unsorted(values));
+        assert!(set
+            .chunks()
+            .all(|(_, chunk)| matches!(chunk, Container::Bitmap(_))));
+        let payloads = Arc::new(AtomicUsize::new(0));
+        let source = CountedSource {
+            set,
+            payloads: payloads.clone(),
+        };
+        (Expr::Source(Arc::new(source)), payloads)
+    }
+
+    /// A selective AND should use the seek-driven core path, whose payload
+    /// work is bounded by the matching prefixes, not the wide leaf's size.
+    #[test]
+    fn automatic_jit_does_not_decode_the_wide_side_of_a_selective_and() {
+        let (wide, wide_reads) = bitmap_source(0..256);
+        let (narrow, narrow_reads) = bitmap_source(std::iter::once(128));
+        let expr = wide.and(narrow);
+        let expected = expr.cardinality().unwrap();
+        assert!(expected > 0);
+        assert_eq!(wide_reads.swap(0, Ordering::Relaxed), 1);
+        assert_eq!(narrow_reads.swap(0, Ordering::Relaxed), 1);
+
+        assert_eq!(jit::cardinality(&expr).unwrap(), expected);
+        assert_eq!(wide_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(narrow_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_jit_seeks_past_wide_side_of_selective_and() {
+        let (wide, wide_reads) = bitmap_source(0..256);
+        let (narrow, narrow_reads) = bitmap_source(std::iter::once(128));
+        let expr = wide.and(narrow);
+        let expected = expr.cardinality().unwrap();
+        assert!(expected > 0);
+        assert_eq!(wide_reads.swap(0, Ordering::Relaxed), 1);
+        assert_eq!(narrow_reads.swap(0, Ordering::Relaxed), 1);
+
+        let mut jit = jit::DagJit::new();
+        assert_eq!(jit.try_cardinality(&expr).unwrap().unwrap(), expected);
+        assert_eq!(wide_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(narrow_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_jit_skips_an_inactive_and_branch_beneath_or() {
+        let (wide, wide_reads) = bitmap_source(0..256);
+        let (narrow, narrow_reads) = bitmap_source(std::iter::once(128));
+        let (other, other_reads) = bitmap_source(std::iter::once(0));
+        let expr = wide.and(narrow).or(other);
+        let expected = expr.cardinality().unwrap();
+        assert!(expected > 0);
+        wide_reads.store(0, Ordering::Relaxed);
+        narrow_reads.store(0, Ordering::Relaxed);
+        other_reads.store(0, Ordering::Relaxed);
+
+        let mut jit = jit::DagJit::new();
+        assert_eq!(jit.try_cardinality(&expr).unwrap().unwrap(), expected);
+        assert_eq!(wide_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(narrow_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(other_reads.load(Ordering::Relaxed), 1);
+    }
 }

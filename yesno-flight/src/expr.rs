@@ -9,28 +9,37 @@
 //! without linking a storage engine, and the server must be able to *run* one
 //! without the client's dependencies. Bytes are the only thing that crosses.
 //!
-//! A view's packed input is still an eager boundary: the lens operates on an
-//! audited `OrdSet`, not a core expression node. Its consumers are fused where
-//! their terminal makes that exact. Indexing evaluates only the requested map
-//! element, cardinality and membership maps walk constituents without retaining
-//! them. Direct intersection counts over a key use bounded or full persisted
-//! streams and native container traversal, and sibling terminals can share that
-//! traversal through [`vec_int_batch`]. Pointwise Boolean cardinality and rank maps use one packed walk after
-//! decomposing the body at the absent and present values of its hole, and folds
-//! of pointwise maps reduce the same two-value truth table over the packed view.
-//! A fold of direct selections tracks every constituent's nth ordinal in one
-//! physical walk. An identity cardinality map is normalized through a composed
-//! set map before terminal selection. Other non-pointwise shapes keep the eager
-//! fallback. This closes the measured repeated-extraction costs without adding
-//! an unmeasured `Expr` variant or changing the planner's audited termination
-//! proof.
+//! A view has no core expression node, so unsupported shapes retain an eager
+//! packed `OrdSet` boundary. Exact terminal fusions avoid unnecessary
+//! constituent materialization. Indexing evaluates only the requested map
+//! element, while cardinality and membership maps walk constituents without
+//! retaining them. Direct intersection counts over a key use bounded or full
+//! persisted streams and native container traversal, and sibling terminals can
+//! share that traversal through [`vec_int_batch`]. When exact key statistics
+//! show one value in each of at least 64 occupied chunks, direct interleaved
+//! identity counts and folds also consume the persisted stream and construct
+//! only their terminal result; denser inputs retain materialization and its
+//! bitmap SIMD kernels. A direct interleaved identity-rank map instead opens
+//! only the physical prefix that can contribute below its strict logical
+//! bound, then counts rows without constructing the packed set. Pointwise
+//! Boolean cardinality and rank maps use one
+//! packed walk after decomposing the body at the absent and present values of
+//! its hole, and folds of pointwise maps reduce the same two-value truth table
+//! over the packed view. A fold of direct selections tracks every
+//! constituent's nth ordinal in one physical walk. An identity cardinality map
+//! is normalized through a composed set map before terminal selection. This
+//! closes the measured repeated-extraction costs without adding an unmeasured
+//! `Expr` variant or changing the planner's audited termination proof.
 
 use std::sync::Arc;
 
 use yesno_core::view::{
+    stream_interleaved_view_fold, stream_view_cardinalities, stream_view_ranks,
     IntersectionCountStrategy, Reduce, View, ViewIntersectionCounter, ViewSink,
 };
-use yesno_core::{ChunkStream, Container, Expr, OrdSet, Prefix48, Snapshot};
+use yesno_core::{
+    ChunkStream, ChunkStreamExt, Container, Expr, KeyStream, OrdSet, Prefix48, Snapshot,
+};
 pub use yesno_wire::{
     AnyExpr, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort, VecIntExpr, VecSetExpr,
     ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES, MAX_VIEW_SETS, VERSION,
@@ -41,6 +50,17 @@ pub use yesno_wire::{
 /// A top-level `view( .. )[ i ]` uses the view's dedicated count and does not
 /// build the selected set. Vector consumers use the terminal fusions described
 /// by [`lower`]; unsupported shapes retain the eager fallback.
+fn expr_cardinality(expr: Expr) -> yesno_core::Result<u64> {
+    #[cfg(feature = "jit")]
+    {
+        yesno_core::jit::cardinality(&expr)
+    }
+    #[cfg(not(feature = "jit"))]
+    {
+        expr.cardinality()
+    }
+}
+
 pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
     match e {
         // The counting form of the same fusion `lower` performs: counting a
@@ -49,9 +69,9 @@ pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
             VecSetExpr::View(input, view) => Ok(lower(input, snap)?
                 .collect_set()?
                 .view_cardinality(&core_view(*view), *i)),
-            _ => lower(e, snap)?.cardinality(),
+            _ => expr_cardinality(lower(e, snap)?),
         },
-        _ => lower(e, snap)?.cardinality(),
+        _ => expr_cardinality(lower(e, snap)?),
     }
 }
 
@@ -69,10 +89,10 @@ pub fn cardinality(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<u64> {
 /// leaf used to report `Memory`, so the backing-aware branch of the cost model
 /// never fired outside its own unit test.
 ///
-/// A view's packed input remains an eager boundary because the core planner has
-/// no view expression node. Exact terminal fusions below avoid materializing
-/// every constituent; unsupported vector shapes still use the explicit eager
-/// fallback.
+/// A view still has no core planner node. Exact terminal fusions below avoid
+/// materializing every constituent, and the conservative singleton-chunk arm
+/// consumes direct persisted identity counts and folds as streams. Unsupported
+/// vector shapes and denser sources still use the explicit eager fallback.
 pub fn lower(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<Expr> {
     lower_in(e, snap, None)
 }
@@ -83,6 +103,53 @@ pub fn lower(e: &SetExpr, snap: &Snapshot) -> yesno_core::Result<Expr> {
 /// here means a locally built expression rather than one off the wire, and it is
 /// reported rather than silently treated as empty.
 type Hole<'a> = Option<&'a Arc<OrdSet>>;
+
+/// Below 64 singleton chunks the measured saving is only a few microseconds.
+///
+/// This is deliberately the conservative edge of the Stage 7f measurement:
+/// exactly one ordinal per occupied chunk gained 24-42%, while eight ordinals
+/// per chunk gained only 5-8%. Dense bitmap inputs can never satisfy the
+/// singleton condition and therefore retain their materialized SIMD terminal.
+const SPARSE_VIEW_MIN_CHUNKS: u64 = 64;
+
+fn extremely_sparse_view_admitted(
+    spec: ViewSpec,
+    chunks: Option<u64>,
+    cardinality: (u64, Option<u64>),
+) -> bool {
+    let Some(chunks) = chunks else {
+        return false;
+    };
+    spec.check().is_ok()
+        && matches!(spec.layout, ViewLayout::Interleaved)
+        && chunks >= SPARSE_VIEW_MIN_CHUNKS
+        && cardinality == (chunks, Some(chunks))
+}
+
+fn key_view_stream(
+    key: u64,
+    spec: ViewSpec,
+    snap: &Snapshot,
+) -> yesno_core::Result<(KeyStream, bool)> {
+    let stream = snap.key_stream(key)?;
+    let admitted =
+        extremely_sparse_view_admitted(spec, stream.stats().chunks, stream.cardinality_hint());
+    Ok((stream, admitted))
+}
+
+const PREFIX_EXCLUSIVE_END: u64 = 1u64 << 48;
+
+fn interleaved_rank_prefix_end(spec: ViewSpec, upper: u64) -> Option<u64> {
+    spec.check().ok()?;
+    if !matches!(spec.layout, ViewLayout::Interleaved) {
+        return None;
+    }
+    let physical_end = u128::from(upper) * u128::from(spec.sets);
+    let prefixes = physical_end
+        .div_ceil(1u128 << 16)
+        .min(u128::from(PREFIX_EXCLUSIVE_END));
+    Some(prefixes as u64)
+}
 
 fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Expr> {
     Ok(match e {
@@ -104,11 +171,24 @@ fn lower_in(e: &SetExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         // other elements would do work whose result cannot be observed.
         SetExpr::At(v, i) => lower_vec_at(v, *i, snap, hole)?,
         SetExpr::Fold(v, op) => match v.as_ref() {
-            VecSetExpr::View(input, view) => Expr::set(
-                lower_in(input, snap, hole)?
-                    .collect_set()?
-                    .view_fold(&core_view(*view), core_reduce(*op)),
-            ),
+            VecSetExpr::View(input, spec) => {
+                let view = core_view(*spec);
+                if let SetExpr::Key(key) = input.as_ref() {
+                    let (mut stream, admitted) = key_view_stream(*key, *spec, snap)?;
+                    let out = if admitted {
+                        stream_interleaved_view_fold(&mut stream, &view, core_reduce(*op))?
+                    } else {
+                        stream.collect_set()?.view_fold(&view, core_reduce(*op))
+                    };
+                    Expr::set(out)
+                } else {
+                    Expr::set(
+                        lower_in(input, snap, hole)?
+                            .collect_set()?
+                            .view_fold(&view, core_reduce(*op)),
+                    )
+                }
+            }
             // A literal vector has no packed form to walk, so the fold is the
             // ordinary pairwise one over its elements -- which is exactly what
             // `fold_via_select` would do anyway.
@@ -269,7 +349,7 @@ fn eval_int(e: &IntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         IntExpr::Lit(v) => *v,
         // Counting never materializes the operand: this is the whole reason
         // `Expr::cardinality` exists, and a facet query is `sets` of these.
-        IntExpr::Cardinality(a) => lower_in(a, snap, hole)?.cardinality()?,
+        IntExpr::Cardinality(a) => expr_cardinality(lower_in(a, snap, hole)?)?,
         IntExpr::Rank(a, x) => lower_in(a, snap, hole)?.collect_set()?.rank(*x),
         IntExpr::At(v, i) => eval_vec_int_at(v, *i, snap, hole)?,
     })
@@ -597,7 +677,7 @@ fn eval_pointwise_cardinalities(
         Some(hi) => e.and(Expr::Range(0, hi)),
         None => e,
     };
-    let base = restrict(when_absent.clone()).cardinality()?;
+    let base = expr_cardinality(restrict(when_absent.clone()))?;
     let positive = restrict(when_present.clone().and_not(when_absent.clone()));
     let negative = restrict(when_absent.and_not(when_present));
 
@@ -663,8 +743,25 @@ fn eval_view_int_map(
     hole: Hole<'_>,
 ) -> yesno_core::Result<Option<Vec<u64>>> {
     let view = core_view(spec);
-    if let (SetExpr::Key(key), IntExpr::Cardinality(body)) = (input, body) {
-        if let Some(filter) = intersection_filter(body, snap, hole)? {
+    if let (SetExpr::Key(key), IntExpr::Rank(operand, upper)) = (input, body) {
+        if matches!(operand.as_ref(), SetExpr::Hole) {
+            if let Some(prefix_end) = interleaved_rank_prefix_end(spec, *upper) {
+                let mut stream = snap.key_stream_prefix_range(*key, 0, prefix_end)?;
+                return stream_view_ranks(&mut stream, &view, *upper).map(Some);
+            }
+        }
+    }
+    if let (SetExpr::Key(key), IntExpr::Cardinality(operand)) = (input, body) {
+        if matches!(operand.as_ref(), SetExpr::Hole) {
+            let (mut stream, admitted) = key_view_stream(*key, spec, snap)?;
+            let out = if admitted {
+                stream_view_cardinalities(&mut stream, &view)?
+            } else {
+                stream.collect_set()?.view_cardinalities(&view)
+            };
+            return Ok(Some(out));
+        }
+        if let Some(filter) = intersection_filter(operand, snap, hole)? {
             return count_key_intersections(*key, view, &[&filter], snap)
                 .map(|mut results| results.pop());
         }
@@ -686,7 +783,7 @@ fn eval_view_int_map(
             let mut out = Vec::with_capacity(view.sets() as usize);
             for i in 0..view.sets() {
                 let part = Arc::new(packed.view_select(&view, i));
-                out.push(prepared.eval(snap, &part)?.cardinality()?);
+                out.push(expr_cardinality(prepared.eval(snap, &part)?)?);
             }
             Ok(Some(out))
         }
@@ -1112,6 +1209,75 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use yesno_core::Db;
+
+    #[test]
+    fn extremely_sparse_view_admission_is_narrow_and_boundary_exact() {
+        let interleaved = ViewSpec::interleaved(4);
+        assert!(!extremely_sparse_view_admitted(
+            interleaved,
+            Some(SPARSE_VIEW_MIN_CHUNKS - 1),
+            (SPARSE_VIEW_MIN_CHUNKS - 1, Some(SPARSE_VIEW_MIN_CHUNKS - 1)),
+        ));
+        assert!(extremely_sparse_view_admitted(
+            interleaved,
+            Some(SPARSE_VIEW_MIN_CHUNKS),
+            (SPARSE_VIEW_MIN_CHUNKS, Some(SPARSE_VIEW_MIN_CHUNKS)),
+        ));
+        assert!(!extremely_sparse_view_admitted(
+            interleaved,
+            Some(SPARSE_VIEW_MIN_CHUNKS),
+            (SPARSE_VIEW_MIN_CHUNKS, Some(SPARSE_VIEW_MIN_CHUNKS + 1)),
+        ));
+        assert!(!extremely_sparse_view_admitted(
+            ViewSpec::blocked(4, 65_536),
+            Some(SPARSE_VIEW_MIN_CHUNKS),
+            (SPARSE_VIEW_MIN_CHUNKS, Some(SPARSE_VIEW_MIN_CHUNKS)),
+        ));
+        assert!(!extremely_sparse_view_admitted(
+            interleaved,
+            None,
+            (SPARSE_VIEW_MIN_CHUNKS, Some(SPARSE_VIEW_MIN_CHUNKS)),
+        ));
+        assert!(!extremely_sparse_view_admitted(
+            ViewSpec {
+                sets: 0,
+                layout: ViewLayout::Interleaved,
+            },
+            Some(SPARSE_VIEW_MIN_CHUNKS),
+            (SPARSE_VIEW_MIN_CHUNKS, Some(SPARSE_VIEW_MIN_CHUNKS)),
+        ));
+    }
+
+    #[test]
+    fn interleaved_rank_prefix_end_is_ceil_divided_and_saturating() {
+        let interleaved = ViewSpec::interleaved(4);
+        assert_eq!(interleaved_rank_prefix_end(interleaved, 0), Some(0));
+        assert_eq!(interleaved_rank_prefix_end(interleaved, 1), Some(1));
+        assert_eq!(interleaved_rank_prefix_end(interleaved, 16_384), Some(1));
+        assert_eq!(interleaved_rank_prefix_end(interleaved, 16_385), Some(2));
+        assert_eq!(
+            interleaved_rank_prefix_end(ViewSpec::interleaved(1), u64::MAX),
+            Some(PREFIX_EXCLUSIVE_END)
+        );
+        assert_eq!(
+            interleaved_rank_prefix_end(ViewSpec::interleaved(4_096), u64::MAX),
+            Some(PREFIX_EXCLUSIVE_END)
+        );
+        assert_eq!(
+            interleaved_rank_prefix_end(ViewSpec::blocked(4, 65_536), 1),
+            None
+        );
+        assert_eq!(
+            interleaved_rank_prefix_end(
+                ViewSpec {
+                    sets: 0,
+                    layout: ViewLayout::Interleaved,
+                },
+                1,
+            ),
+            None
+        );
+    }
 
     /// **The facet query**, which is the reason the language became sorted.
     ///

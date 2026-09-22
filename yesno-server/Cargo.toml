@@ -42,7 +42,7 @@ async-trait = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
 # Keep the EC2 control plane in-process and typed. Exact top-level versions and
-# the lockfile's paired Smithy releases preserve this crate's Rust 1.89 promise;
+# the lockfile's paired Smithy releases preserve this crate's Rust 1.95 promise;
 # newer SDK-family releases raise their MSRV independently.
 aws-config = { version = "=1.8.3", default-features = false, features = [
     "behavior-version-latest",

@@ -13,7 +13,7 @@ The workspace keeps storage semantics in `yesno-core` and places columnar, query
 - DataFusion lowering distinguishes `Exact`, `Inexact`, and `Unsupported`; an inexact predicate must be a superset, never a subset.
 - Replication uses tonic and raw WAL frames. Query delivery uses Arrow Flight.
 - A live `Db` holds an exclusive `<db>/LOCK`; a Flight server therefore prevents a second process from opening the directory.
-- E2E's Rust version is intentionally higher than core's MSRV.
+- Since 2026-09-21 the E2E harness and core share the workspace's Rust 1.95 floor.
 - `range_summary` and `len_in_range` answer complete chunks from index cardinalities and underpin DataFusion selection planning.
 - Packed matrix, integer, and view layouts are caller-owned lenses over ordinary sets, not new storage formats.
 - Parallelism inside a commit is opt-in and host-supplied: `DbOptions.dispatch` carries a `Dispatcher`, whose default `Sequential` spawns nothing. `yesno-core` owns no thread pool.
@@ -93,7 +93,7 @@ Both halves of a commit now run through the dispatcher -- the prefetch first, be
 
 ### Host-independent C ABI
 
-`yesno-c` is a separate Rust 1.89 workspace exposing only opaque `yesno_db` and materialized `yesno_cursor` handles. Every operation receives its database handle explicitly, so independent embedders do not share process-global state. A cursor owns an immutable ordered snapshot and deliberately spends O(cardinality) memory to avoid borrowed Rust lifetimes in foreign callers.
+`yesno-c` is a separate Rust 1.95 workspace exposing only opaque `yesno_db` and materialized `yesno_cursor` handles. Every operation receives its database handle explicitly, so independent embedders do not share process-global state. A cursor owns an immutable ordered snapshot and deliberately spends O(cardinality) memory to avoid borrowed Rust lifetimes in foreign callers.
 
 Unsafe code is confined to pointer ownership, slice construction, and bounded error-buffer copies. Every exported call catches unwinding. A strict C11 linked test covers two-database isolation, one-byte error buffers, all seek modes, stable EOF, cursor snapshot isolation, checkpoint, and reopen; direct properties add canary-guarded error buffers and `BTreeSet` seek partitions.
 

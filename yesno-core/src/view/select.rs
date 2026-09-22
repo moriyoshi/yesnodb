@@ -31,10 +31,17 @@
 //! `O(lines × container size)` — 5.5 ms to move 8 KiB. The scalar operations
 //! walk once for one requested slot; [`OrdSet::view_cardinalities`] records the
 //! whole interleaved per-slot shape in one pass when every count is requested.
-//! containers without reading their payloads. Their bitmap arm batches sibling
-//! filters in pairs: one architecture dispatch per container, and each data
-//! vector is reused for both AND-popcounts. A lone filter retains the scalar
-//! word loop because the earlier per-row SIMD dispatch was a measured loss.
+//! [`stream_view_ranks`] records the bounded prefix of every slot in the same
+//! pass; whole interleaved chunks reuse the cardinality reducer and only the
+//! final physical chunk needs ordinal mapping.
+//! For 2/4/8-way bitmap chunks it counts fixed owner masks per word instead of
+//! enumerating set bits, using NEON on little-endian AArch64 and scalar masks
+//! elsewhere; other shapes keep the generic walk. The blocked
+//! direct-intersection counter sums whole containers without reading their
+//! payloads. Its bitmap arm batches sibling filters in pairs: one architecture
+//! dispatch per container, and each data vector is reused for both
+//! AND-popcounts. A lone filter retains the scalar word loop because the
+//! earlier per-row SIMD dispatch was a measured loss.
 //!
 //! Under [`ViewLayout::Blocked`] with a stride that is a multiple of 65 536, a
 //! constituent occupies a whole number of chunks and its logical ordinals differ
@@ -45,7 +52,9 @@
 //! `O(chunks)` with no payload access at all.
 
 use super::{View, ViewLayout};
-use crate::{chunk_base, split, CodecError, Container, OrdSet, Prefix48, Result, ORDINAL_MAX};
+use crate::{
+    chunk_base, split, ChunkStream, CodecError, Container, OrdSet, Prefix48, Result, ORDINAL_MAX,
+};
 
 /// How an interleaved intersection counter consumes physical chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +202,9 @@ impl<'a> ViewIntersectionCounter<'a> {
     }
 
     fn count_selected_interleaved(&mut self, container: &Container, base: u64) {
-        let chunk_end = base + crate::CHUNK_CARD as u64;
+        // The final chunk's mathematical end is 2^64. The reserved
+        // u64::MAX sentinel is the exclusive end of every legal ordinal.
+        let chunk_end = base.saturating_add(crate::CHUNK_CARD as u64);
         let first = self.selected.partition_point(|row| row.physical_hi <= base);
         for row in &self.selected[first..] {
             if row.physical_lo >= chunk_end {
@@ -287,6 +298,283 @@ fn physical_span(v: &View, set: u32) -> Option<(u64, u64)> {
             (base <= ORDINAL_MAX).then(|| (base, base.saturating_add(stride)))
         }
     }
+}
+
+/// Accumulate owner counts from one aligned bitmap payload, if a vector arm applies.
+#[inline]
+fn count_bitmap_words_simd(words: &[u64], counts: &mut [u64]) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: NEON was detected and bitmap_words lends one complete
+        // 1024-word container payload. Each arity uses its own owner masks.
+        match counts.len() {
+            2 => counts
+                .iter_mut()
+                .zip(unsafe { neon_count::count::<2>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            4 => counts
+                .iter_mut()
+                .zip(unsafe { neon_count::count::<4>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            8 => counts
+                .iter_mut()
+                .zip(unsafe { neon_count::count::<8>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            _ => return false,
+        }
+        return true;
+    }
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected and bitmap_words lends one complete
+        // 1024-word container payload. Each arity uses its own owner masks.
+        match counts.len() {
+            2 => counts
+                .iter_mut()
+                .zip(unsafe { avx2_count::count::<2>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            4 => counts
+                .iter_mut()
+                .zip(unsafe { avx2_count::count::<4>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            8 => counts
+                .iter_mut()
+                .zip(unsafe { avx2_count::count::<8>(words) })
+                .for_each(|(count, add)| *count += u64::from(add)),
+            _ => return false,
+        }
+        return true;
+    }
+    let _ = (words, counts);
+    false
+}
+
+/// The x86_64 counterpart of [`neon_count`].
+///
+/// Structurally the same kernel -- mask per owner, count bytes, accumulate --
+/// but the two middle steps have no x86 instruction. Byte population count is
+/// synthesized with Mula's `pshufb` nibble table, which `ops::bitmap` already
+/// measured at 2.70x over scalar `popcnt` on this project's reference x86
+/// machine, and NEON's `vpadalq_u8` accumulate becomes `psadbw`, which sums
+/// each 8-byte group straight into a 64-bit lane. That second substitution is
+/// what makes the bound trivial rather than tight: NEON needs the B10 argument
+/// about u16 lanes because it accumulates in 16 bits, while a 64-bit lane
+/// cannot overflow from an 8 KiB input at all.
+///
+/// AVX2 rather than 128-bit SSE because the popcount must be synthesized
+/// either way, which is exactly the condition under which `ops::bitmap`
+/// measured the wider register to pay. There is no cross-lane step here --
+/// `psadbw` accumulates within its lane and the horizontal sum happens once
+/// per container -- so the permute that made AVX2 lose for `ops::array` has no
+/// counterpart.
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+mod avx2_count {
+    use crate::BITMAP_WORDS;
+    use std::arch::x86_64::*;
+
+    /// B10x: the bitmap has 8192 bytes, visited in 256 complete 32-byte
+    /// vectors with no tail. N is 2, 4, or 8; each owner occupies 8/N bits per
+    /// byte. Every `_mm256_sad_epu8` result is at most 8 bytes times 8 bits,
+    /// and 256 of them sum to at most 16_384 per 64-bit lane, so no
+    /// accumulator can wrap.
+    ///
+    /// # Safety
+    ///
+    /// Requires AVX2, N in 2/4/8, and exactly BITMAP_WORDS input words.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn count<const N: usize>(words: &[u64]) -> [u32; N] {
+        debug_assert!(matches!(N, 2 | 4 | 8), "B10x");
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B10x");
+        let bytes = bytemuck::cast_slice::<u64, u8>(words);
+        let base_mask = (u8::MAX as u16 / ((1u16 << N) - 1)) as u8;
+        // SAFETY: B10x bounds each 32-byte load inside the 8192-byte payload.
+        // The nibble table is indexed by values masked to 0..15, so `pshufb`
+        // never sees the high bit that would zero a lane.
+        unsafe {
+            #[rustfmt::skip]
+            let lut = _mm256_setr_epi8(
+                0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+                0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+            );
+            let low_mask = _mm256_set1_epi8(0x0f);
+            let zero = _mm256_setzero_si256();
+            // The table is a full 0..15 population count, but only a subset of
+            // its lanes is reachable: after the owner mask, every nibble is a
+            // submask of that owner's nibble -- {0,1,4,5} at arity 2, {0,1} at
+            // arity 4, a single bit at arity 8. Discovered by mutation: forcing
+            // the entry for 0b1111 to a wrong value changes no result, because
+            // no arity can index it. Keep the full table anyway ( it is a
+            // compile-time constant and the general form is the recognisable
+            // one ), but do not read an unchanged test as covering a lane the
+            // kernel cannot select.
+            let masks: [_; N] =
+                std::array::from_fn(|owner| _mm256_set1_epi8((base_mask << owner) as i8));
+            let mut sums = [zero; N];
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let input = _mm256_loadu_si256(bytes.as_ptr().add(i).cast());
+                for owner in 0..N {
+                    let masked = _mm256_and_si256(input, masks[owner]);
+                    let lo = _mm256_and_si256(masked, low_mask);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(masked, 4), low_mask);
+                    let counted =
+                        _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo), _mm256_shuffle_epi8(lut, hi));
+                    sums[owner] = _mm256_add_epi64(sums[owner], _mm256_sad_epu8(counted, zero));
+                }
+                i += 32;
+            }
+            std::array::from_fn(|owner| {
+                let mut lanes = [0u64; 4];
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast(), sums[owner]);
+                (lanes[0] + lanes[1] + lanes[2] + lanes[3]) as u32
+            })
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon_count {
+    use crate::BITMAP_WORDS;
+    use std::arch::aarch64::*;
+
+    /// B10: the bitmap has 8192 bytes, visited in 512 complete 16-byte
+    /// vectors. N is 2, 4, or 8; each owner occupies 8/N bits per byte.
+    /// A u16 accumulator lane receives at most 512 * 16/N <= 4096,
+    /// and each horizontal owner count is at most 65_536/N <= 32_768.
+    ///
+    /// # Safety
+    ///
+    /// Requires NEON, N in 2/4/8, and exactly BITMAP_WORDS input words.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn count<const N: usize>(words: &[u64]) -> [u32; N] {
+        debug_assert!(matches!(N, 2 | 4 | 8), "B10");
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B10");
+        let bytes = bytemuck::cast_slice::<u64, u8>(words);
+        let base_mask = (u8::MAX as u16 / ((1u16 << N) - 1)) as u8;
+        // SAFETY: B10 bounds each 16-byte load. Accumulators and horizontal
+        // sums remain below u16::MAX even for an all-one bitmap.
+        unsafe {
+            let masks: [_; N] = std::array::from_fn(|owner| vdupq_n_u8(base_mask << owner));
+            let mut sums = [vdupq_n_u16(0); N];
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let input = vld1q_u8(bytes.as_ptr().add(i));
+                for owner in 0..N {
+                    sums[owner] = vpadalq_u8(sums[owner], vcntq_u8(vandq_u8(input, masks[owner])));
+                }
+                i += 16;
+            }
+            std::array::from_fn(|owner| vaddvq_u16(sums[owner]) as u32)
+        }
+    }
+}
+
+fn add_view_cardinalities(
+    view: &View,
+    prefix: Prefix48,
+    container: &Container,
+    counts: &mut [u64],
+) {
+    if matches!(view.layout(), ViewLayout::Interleaved) && matches!(view.sets(), 2 | 4 | 8) {
+        if let Some(words) = crate::unstable_arrow::bitmap_words(container) {
+            if count_bitmap_words_simd(words, counts) {
+                return;
+            }
+            // Both the chunk width and a word's 64 bits divide by these
+            // arities, so owner i always occupies bit positions i mod sets.
+            let owner_mask = u64::MAX / ((1u64 << view.sets()) - 1);
+            for &word in words {
+                for (owner, count) in counts.iter_mut().enumerate() {
+                    *count += (word & (owner_mask << owner)).count_ones() as u64;
+                }
+            }
+            return;
+        }
+    }
+
+    // bitmap_words may decline a healthy mmap bitmap whose payload is not
+    // u64-aligned; it is not a kind check. Every other arity and both layouts
+    // use this representation-independent oracle.
+    let base = chunk_base(prefix);
+    for low in container.iter() {
+        if let Some((owner, _)) = view.logical_of(base | u64::from(low)) {
+            counts[owner as usize] += 1;
+        }
+    }
+}
+
+/// Count every constituent while consuming a prefix-ordered chunk stream.
+///
+/// This is the non-materializing counterpart of
+/// [`OrdSet::view_cardinalities`]. It uses the same bitmap SIMD helper for
+/// aligned 2/4/8-way interleaved chunks and the same ordinal mapping otherwise.
+/// Unlike an `OrdSet`, an arbitrary stream is fallible and untrusted, so empty
+/// chunks, repeated prefixes, prefixes outside 48 bits, and the reserved
+/// `u64::MAX` ordinal are reported as errors.
+pub fn stream_view_cardinalities(stream: &mut dyn ChunkStream, view: &View) -> Result<Vec<u64>> {
+    view.check()?;
+    let mut counts = vec![0; view.sets() as usize];
+    let mut last_prefix = None;
+    while let Some((prefix, container)) = stream.next_chunk()? {
+        super::validate_stream_chunk(&mut last_prefix, prefix, &container)?;
+        add_view_cardinalities(view, prefix, &container, &mut counts);
+    }
+    Ok(counts)
+}
+
+fn add_view_ranks(
+    view: &View,
+    prefix: Prefix48,
+    container: &Container,
+    upper: u64,
+    counts: &mut [u64],
+) {
+    if upper == 0 {
+        return;
+    }
+    if matches!(view.layout(), ViewLayout::Interleaved) {
+        let physical_end = u128::from(upper) * u128::from(view.sets());
+        let chunk_start = u128::from(prefix) << 16;
+        if chunk_start >= physical_end {
+            return;
+        }
+        if chunk_start + (1u128 << 16) <= physical_end {
+            add_view_cardinalities(view, prefix, container, counts);
+            return;
+        }
+    }
+
+    let base = chunk_base(prefix);
+    for low in container.iter() {
+        if let Some((owner, logical)) = view.logical_of(base | u64::from(low)) {
+            if logical < upper {
+                counts[owner as usize] += 1;
+            }
+        }
+    }
+}
+
+/// Rank every constituent below one strict logical upper bound while consuming
+/// a prefix-ordered chunk stream.
+///
+/// Whole interleaved chunks below the physical endpoint reuse
+/// [`stream_view_cardinalities`]' bitmap SIMD helper. The one chunk straddling
+/// the endpoint is clipped by logical ordinal, with `u128` endpoint arithmetic
+/// so `upper * sets` cannot wrap. Blocked views remain correct through the
+/// representation-independent ordinal mapping.
+pub fn stream_view_ranks(
+    stream: &mut dyn ChunkStream,
+    view: &View,
+    upper: u64,
+) -> Result<Vec<u64>> {
+    view.check()?;
+    let mut counts = vec![0; view.sets() as usize];
+    let mut last_prefix = None;
+    while let Some((prefix, container)) = stream.next_chunk()? {
+        super::validate_stream_chunk(&mut last_prefix, prefix, &container)?;
+        add_view_ranks(view, prefix, &container, upper, &mut counts);
+    }
+    Ok(counts)
 }
 
 impl OrdSet {
@@ -425,11 +713,12 @@ impl OrdSet {
 
     /// Cardinality of every constituent in one batch.
     ///
-    /// Interleaved constituents share one physical span, so asking the scalar
-    /// operation once per constituent would walk the same packed set `sets`
-    /// times. This method assigns each physical ordinal to its owner in one
-    /// pass. Blocked constituents retain the scalar range-count arm, which can
-    /// sum whole containers without reading their payloads.
+    /// Interleaved constituents share one physical span. For arities 2, 4 and
+    /// 8, an aligned bitmap word has a fixed owner-bit mask per constituent,
+    /// so it can be counted without expanding its set bits. Array, run and
+    /// unaligned bitmap chunks retain the ordinal walk. Other arities use
+    /// that generic walk throughout. Blocked constituents keep their scalar
+    /// range-count arm, which sums whole containers without payload reads.
     pub fn view_cardinalities(&self, v: &View) -> Vec<u64> {
         let mut counts = vec![0; v.sets() as usize];
         if v.check().is_err() {
@@ -441,10 +730,8 @@ impl OrdSet {
             }
             return counts;
         }
-        for ordinal in self.iter() {
-            if let Some((owner, _)) = v.logical_of(ordinal) {
-                counts[owner as usize] += 1;
-            }
+        for (prefix, container) in self.chunks() {
+            add_view_cardinalities(v, prefix, container, &mut counts);
         }
         counts
     }
@@ -696,6 +983,104 @@ fn and_popcount(data: &[u64], query: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_counts_match_scalar_owner_masks_at_word_seams() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        let mut seam = vec![0u64; crate::BITMAP_WORDS];
+        for bit in [0, 3, 4, 7, 8, 63, 64, 127, 128, 65_535] {
+            seam[bit / 64] |= 1u64 << (bit % 64);
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let dense: Vec<u64> = (0..crate::BITMAP_WORDS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state
+            })
+            .collect();
+        fn check<const N: usize>(words: &[u64]) {
+            let base_mask = u64::MAX / ((1u64 << N) - 1);
+            let expected = std::array::from_fn(|owner| {
+                words
+                    .iter()
+                    .map(|word| (word & (base_mask << owner)).count_ones())
+                    .sum::<u32>()
+            });
+            // SAFETY: NEON was detected and the input satisfies B10.
+            let got = unsafe { neon_count::count::<N>(words) };
+            assert_eq!(got, expected, "sets={N}");
+        }
+        for words in [
+            vec![0u64; crate::BITMAP_WORDS],
+            vec![u64::MAX; crate::BITMAP_WORDS],
+            seam,
+            vec![0x1111_1111_1111_1111; crate::BITMAP_WORDS],
+            dense,
+        ] {
+            check::<2>(&words);
+            check::<4>(&words);
+            check::<8>(&words);
+        }
+    }
+
+    /// The x86 companion of the NEON count differential, over the same
+    /// patterns: empty, full, one-hot bits sitting on byte / word / chunk
+    /// seams, a periodic word that puts every owner in a different phase, and
+    /// an LCG-dense payload. The scalar owner-mask sum is the oracle.
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    #[test]
+    fn avx2_counts_match_scalar_owner_masks_at_word_seams() {
+        // AVX2, unlike the SSSE3 the fold arm needs, is not universal on
+        // x86_64, so this one genuinely has to skip rather than assert. Note
+        // what that costs: on a pre-AVX2 host this test is a silent no-op and
+        // the count kernel below is never executed here. Its coverage there is
+        // the scalar arm plus the independent `BTreeSet` property, and the
+        // dispatch declines to the scalar arm on exactly the same condition.
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("avx2 absent: count differential skipped, scalar arm covers this host");
+            return;
+        }
+        let mut seam = vec![0u64; crate::BITMAP_WORDS];
+        for bit in [0, 3, 4, 7, 8, 63, 64, 127, 128, 255, 256, 65_535] {
+            seam[bit / 64] |= 1u64 << (bit % 64);
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let dense: Vec<u64> = (0..crate::BITMAP_WORDS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state
+            })
+            .collect();
+        fn check<const N: usize>(words: &[u64]) {
+            let base_mask = u64::MAX / ((1u64 << N) - 1);
+            let expected = std::array::from_fn(|owner| {
+                words
+                    .iter()
+                    .map(|word| (word & (base_mask << owner)).count_ones())
+                    .sum::<u32>()
+            });
+            // SAFETY: AVX2 was detected and the input satisfies B10x.
+            let got = unsafe { avx2_count::count::<N>(words) };
+            assert_eq!(got, expected, "sets={N}");
+        }
+        for words in [
+            vec![0u64; crate::BITMAP_WORDS],
+            vec![u64::MAX; crate::BITMAP_WORDS],
+            seam,
+            vec![0x1111_1111_1111_1111; crate::BITMAP_WORDS],
+            vec![0x8000_0000_0000_0001; crate::BITMAP_WORDS],
+            dense,
+        ] {
+            check::<2>(&words);
+            check::<4>(&words);
+            check::<8>(&words);
+        }
+    }
 
     fn set_of(xs: &[u64]) -> OrdSet {
         OrdSet::from_iter_unsorted(xs.iter().copied())

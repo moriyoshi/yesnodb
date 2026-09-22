@@ -48,7 +48,7 @@
 //! # The limb primitives, and why they are written this way
 //!
 //! `u64::carrying_add`, `u64::borrowing_sub` and `u64::widening_mul` are
-//! **unstable**. This crate's MSRV of 1.89 is a promise to its users ( see the
+//! **unstable**. This crate's MSRV of 1.95 is a promise to its users ( see the
 //! rationale in the workspace manifest ), and an arithmetic convenience is not a
 //! reason to move it. [`adc`] and [`sbb`] are therefore written against
 //! `overflowing_add` / `overflowing_sub`, which LLVM folds into the same

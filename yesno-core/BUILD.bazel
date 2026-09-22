@@ -18,8 +18,21 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "yesno_core",
     srcs = glob(["src/**/*.rs"]),
+    crate_features = select({
+        "//:jit_enabled": ["jit"],
+        "//conditions:default": [],
+    }),
     crate_name = "yesno_core",
     edition = "2021",
     version = "0.1.0",
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + select({
+        "//:jit_enabled": [
+            "@crates//:cranelift-codegen",
+            "@crates//:cranelift-frontend",
+            "@crates//:cranelift-jit",
+            "@crates//:cranelift-module",
+            "@crates//:cranelift-native",
+        ],
+        "//conditions:default": [],
+    }),
 )

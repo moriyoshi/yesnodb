@@ -21,9 +21,8 @@ name = "yesno-pg"
 description = "PostgreSQL extension for yesno: foreign data wrapper, index access method, table access method"
 version = "0.1.0"
 edition = "2021"
-# pgrx 0.19 declares 1.96. Deliberately *not* the workspace's 1.89: that number
-# is a promise `yesno-core` makes to its users, and an extension crate must not
-# be able to move it. Same reasoning as `yesno-e2e`'s 1.95.
+# pgrx 0.19 declares 1.96, above the workspace's Rust 1.95 floor. Keep
+# the extension's higher requirement explicit without raising core's floor.
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moriyoshi/yesnodb"

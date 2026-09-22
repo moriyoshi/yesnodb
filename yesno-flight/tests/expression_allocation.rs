@@ -8,28 +8,31 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use yesno_core::{Db, OrdSet};
+use yesno_core::{ChunkStream, Db, OrdSet};
 use yesno_flight::expr;
 use yesno_flight::{BoolExpr, FoldOp, IntExpr, SetExpr, VecIntExpr, VecSetExpr, ViewSpec};
 
 thread_local! {
     static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
     static COUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Counting;
 
-fn bump() {
+fn bump(bytes: usize) {
     let _ = COUNTING.try_with(|on| {
         if on.get() {
             let _ = ALLOCS.try_with(|count| count.set(count.get() + 1));
+            let _ =
+                ALLOC_BYTES.try_with(|count| count.set(count.get().saturating_add(bytes as u64)));
         }
     });
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        bump();
+        bump(layout.size());
         unsafe { System.alloc(layout) }
     }
 
@@ -38,7 +41,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        bump();
+        bump(new_size);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -52,6 +55,14 @@ fn count_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let value = f();
     COUNTING.with(|on| on.set(false));
     (value, ALLOCS.with(Cell::get))
+}
+
+fn count_alloc_bytes<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    ALLOC_BYTES.with(|count| count.set(0));
+    COUNTING.with(|on| on.set(true));
+    let value = f();
+    COUNTING.with(|on| on.set(false));
+    (value, ALLOC_BYTES.with(Cell::get))
 }
 
 fn view(sets: u32) -> VecSetExpr {
@@ -72,6 +83,13 @@ fn cardinalities(sets: u32) -> VecIntExpr {
     VecIntExpr::Map(
         Box::new(view(sets)),
         Box::new(IntExpr::Cardinality(Box::new(SetExpr::Hole))),
+    )
+}
+
+fn ranks(sets: u32, upper: u64) -> VecIntExpr {
+    VecIntExpr::Map(
+        Box::new(view(sets)),
+        Box::new(IntExpr::Rank(Box::new(SetExpr::Hole), upper)),
     )
 }
 
@@ -100,6 +118,84 @@ fn membership(sets: u32) -> SetExpr {
         Box::new(view(sets)),
         Box::new(BoolExpr::Contains(Box::new(SetExpr::Hole), 17)),
     )
+}
+
+#[test]
+fn extremely_sparse_identity_counts_and_ranks_do_not_materialize_the_packed_input() {
+    const CHUNKS: u64 = 256;
+    let db = Db::new();
+    let values: Vec<u64> = (0..CHUNKS)
+        .map(|prefix| (prefix << 16) | ((prefix * 997) % 65_535))
+        .collect();
+    db.insert_many(9, &values).unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let packed = snapshot.load(9).unwrap();
+    assert_eq!(packed.chunk_count(), CHUNKS as usize);
+    assert!(packed.chunks().all(|(_, container)| container.len() == 1));
+
+    let expression = cardinalities(4);
+    let _ = expr::vec_int(&expression, &snapshot).unwrap();
+    let (_, drain_bytes) = count_alloc_bytes(|| {
+        let mut stream = snapshot.key_stream(9).unwrap();
+        let mut total = 0u64;
+        while let Some((_, container)) = stream.next_chunk().unwrap() {
+            total += u64::from(container.len());
+        }
+        total
+    });
+    let (counts, terminal_bytes) =
+        count_alloc_bytes(|| expr::vec_int(&expression, &snapshot).unwrap());
+    assert_eq!(counts.iter().sum::<u64>(), CHUNKS);
+
+    // Both arms build the key's index plan and read every singleton payload.
+    // The terminal may additionally allocate its four-cell result and small
+    // fixed bookkeeping, but not the per-chunk vectors of a packed OrdSet.
+    // On this fixture the admitted path stays within a few hundred bytes of
+    // the drain; materializing adds tens of KiB.
+    const ALLOWANCE: u64 = 4_096;
+    assert!(
+        terminal_bytes <= drain_bytes + ALLOWANCE,
+        concat!(
+            "extremely sparse cardinalities allocated {} bytes against ",
+            "{} for a direct stream drain; more than {} extra ",
+            "bytes means the packed input was materialized"
+        ),
+        terminal_bytes,
+        drain_bytes,
+        ALLOWANCE,
+    );
+    let boundary_ordinal = values[CHUNKS as usize / 2];
+    let upper = boundary_ordinal / 4 + 1;
+    let physical_end = u128::from(upper) * 4;
+    let prefix_end = physical_end.div_ceil(1u128 << 16) as u64;
+    let expression = ranks(4, upper);
+    let _ = expr::vec_int(&expression, &snapshot).unwrap();
+    let (_, bounded_drain_bytes) = count_alloc_bytes(|| {
+        let mut stream = snapshot.key_stream_prefix_range(9, 0, prefix_end).unwrap();
+        let mut total = 0u64;
+        while let Some((_, container)) = stream.next_chunk().unwrap() {
+            total += u64::from(container.len());
+        }
+        total
+    });
+    let (rank_counts, rank_bytes) =
+        count_alloc_bytes(|| expr::vec_int(&expression, &snapshot).unwrap());
+    let want_rank = values
+        .iter()
+        .filter(|&&ordinal| ordinal / 4 < upper)
+        .count() as u64;
+    assert_eq!(rank_counts.iter().sum::<u64>(), want_rank);
+    assert!(
+        rank_bytes <= bounded_drain_bytes + ALLOWANCE,
+        concat!(
+            "extremely sparse ranks allocated {} bytes against {} for a ",
+            "bounded stream drain; more than {} extra bytes means the full ",
+            "key was planned or materialized"
+        ),
+        rank_bytes,
+        bounded_drain_bytes,
+        ALLOWANCE,
+    );
 }
 
 #[test]

@@ -9,9 +9,10 @@ repository.workspace = true
 
 [features]
 default = []
-# Keep the default core at its five-dependency budget. Applications that install
-# a tracing subscriber can opt into storage lifecycle and slow-operation spans.
+# Keep the default core at its five-dependency budget. Tracing and Cranelift
+# execution are opt-in; neither enters the default dependency graph.
 tracing = ["dep:tracing"]
+jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
 [dependencies]
 arrow-buffer.workspace = true
@@ -20,6 +21,11 @@ thiserror.workspace = true
 crc32c.workspace = true
 memmap2.workspace = true
 tracing = { workspace = true, optional = true }
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
 
 [dev-dependencies]
 roaring.workspace = true
@@ -55,3 +61,10 @@ harness = false
 [[bench]]
 name = "view"
 harness = false
+
+# Whole-expression JIT timing; this benchmark must not enable Cranelift in the
+# default core graph.
+[[bench]]
+name = "dag"
+harness = false
+required-features = ["jit"]

@@ -144,7 +144,7 @@ pub(crate) fn mul_arm(len_a: usize, len_b: usize, min: usize) -> MulArm {
 /// the identity is one test.
 ///
 /// `u64::carrying_mul` and `u64::widening_mul` are unstable and the crate's
-/// MSRV is 1.89, so this is the `u128` spelling. Keep the casts **inline at the
+/// MSRV is 1.95, so this is the `u128` spelling. Keep the casts **inline at the
 /// multiply**: LLVM recognizes `(a as u128) * (b as u128)` as a 64x64 widening
 /// multiply and emits `mulx` / `umulh`, and hoisting a cast into a variable used
 /// twice can defeat the pattern match and produce a call to `__multi3`.

@@ -187,12 +187,17 @@ impl BitStore {
         }
     }
 
-    /// Read-only word access when alignment is already known good, else `None`.
+    /// Read-only word access when alignment and native byte order both match,
+    /// else `None`. Shared bitmap bytes are little-endian on disk, so a
+    /// big-endian host must take the decoding fallback even when aligned.
     #[inline]
     pub fn try_words(&self) -> Option<&[u64]> {
         match self {
             BitStore::Mut(v) => Some(v),
-            BitStore::Shared(bb) => bytemuck::try_cast_slice::<u8, u64>(bb.values()).ok(),
+            BitStore::Shared(bb) if cfg!(target_endian = "little") => {
+                bytemuck::try_cast_slice::<u8, u64>(bb.values()).ok()
+            }
+            BitStore::Shared(_) => None,
         }
     }
 

@@ -19,7 +19,10 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "yesno_flight",
     srcs = glob(["src/**/*.rs"]),
-    crate_features = ["server"],
+    crate_features = ["server"] + select({
+        "//:jit_enabled": ["jit"],
+        "//conditions:default": [],
+    }),
     crate_name = "yesno_flight",
     edition = "2021",
     version = "0.1.0",

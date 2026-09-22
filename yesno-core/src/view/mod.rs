@@ -47,20 +47,63 @@
 //! separate catalog format and is deliberately not implied by these bits.
 //!
 //! **No lazy expression node.** Selection, folding, and expansion are set
-//! transforms. The Flight boundary currently evaluates them eagerly and then
-//! re-enters its Boolean expression as a set leaf, so adding a planner node
-//! remains a separately measured change rather than an accidental API promise.
+//! transforms. Flight normally evaluates them eagerly and then re-enters its
+//! Boolean expression as a set leaf. Direct persisted identity counts and
+//! interleaved folds may instead consume a checked chunk stream when exact
+//! source statistics prove the input has one value in each of many occupied
+//! chunks. This terminal-only arm is not an expression node; adding one remains
+//! a separately measured change rather than an accidental API promise. Direct
+//! interleaved identity ranks have a different bound: their caller may stream
+//! only the physical prefixes below the requested logical endpoint, including
+//! one clipped final chunk, without any sparsity admission heuristic.
 
 use crate::pack::Packing;
-use crate::{CodecError, Result, ORDINAL_MAX};
+use crate::{CodecError, Container, Prefix48, Result, ORDINAL_MAX};
 
 mod fold;
 mod select;
 mod sink;
 
-pub use fold::Reduce;
-pub use select::{IntersectionCountStrategy, ViewIntersectionCounter};
+pub use fold::{stream_interleaved_view_fold, Reduce};
+pub use select::{
+    stream_view_cardinalities, stream_view_ranks, IntersectionCountStrategy,
+    ViewIntersectionCounter,
+};
 pub use sink::ViewSink;
+
+/// Validate the ordering and ordinal invariants promised by a `ChunkStream`.
+///
+/// Public stream terminals cannot trust a caller-defined stream as an `OrdSet`
+/// can trust its own parallel vectors. Keep this check shared so cardinality and
+/// fold paths reject the same malformed input.
+fn validate_stream_chunk(
+    last_prefix: &mut Option<Prefix48>,
+    prefix: Prefix48,
+    container: &Container,
+) -> Result<()> {
+    if container.is_empty() {
+        return Err(CodecError::Invariant(
+            "view stream yielded an empty container",
+        ));
+    }
+    if prefix >= (1u64 << 48) {
+        return Err(CodecError::Invariant(
+            "view stream yielded a prefix outside 48 bits",
+        ));
+    }
+    if last_prefix.is_some_and(|last| prefix <= last) {
+        return Err(CodecError::Invariant(
+            "view stream prefixes are not strictly ascending",
+        ));
+    }
+    if prefix == (1u64 << 48) - 1 && container.contains(u16::MAX) {
+        return Err(CodecError::OrdinalOutOfRange {
+            ordinal: ORDINAL_MAX.saturating_add(1),
+        });
+    }
+    *last_prefix = Some(prefix);
+    Ok(())
+}
 
 /// How constituents share the ordinal space.
 ///
@@ -530,6 +573,19 @@ mod tests {
                 .count();
             assert_eq!(n, 0, "sets={sets} divides 65 536 and must never straddle");
         }
+    }
+
+    #[test]
+    fn stream_chunk_validation_rejects_ordering_and_the_reserved_ordinal() {
+        let chunk = Container::from_sorted(&[7]);
+        let mut last = None;
+        validate_stream_chunk(&mut last, 4, &chunk).unwrap();
+        assert!(validate_stream_chunk(&mut last, 4, &chunk).is_err());
+        assert!(validate_stream_chunk(&mut last, 3, &chunk).is_err());
+
+        let mut last = None;
+        let reserved = Container::from_sorted(&[u16::MAX]);
+        assert!(validate_stream_chunk(&mut last, (1u64 << 48) - 1, &reserved).is_err());
     }
 
     #[test]

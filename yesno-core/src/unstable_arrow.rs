@@ -65,19 +65,20 @@ pub fn bitmap_mask(c: &Container) -> Option<BooleanBuffer> {
 /// than pay an 8 KiB re-encode can ask here first and fall back to
 /// [`container_mask`] only when it has to.
 ///
-/// # `None` has two causes, and they are not the same
+/// # `None` has two classes of cause, and they are not the same
 ///
 /// * **Not a bitmap.** Array and run containers store positions, not bits, so
 ///   there is no word image to lend — the same condition [`bitmap_mask`]
 ///   reports.
-/// * **A bitmap whose payload cannot be viewed as `u64`.** A store-backed
-///   payload is mmap'd at whatever offset the extent landed on, and a `&[u64]`
-///   needs 8-byte alignment. `BooleanBuffer` itself is alignment-agnostic, so
-///   this case is invisible to every other accessor.
+/// * **A bitmap whose payload cannot be viewed as native `u64` words.** A
+///   store-backed payload may be at an unaligned offset, and its little-endian
+///   bytes cannot be borrowed as native words on a big-endian host.
+///   `BooleanBuffer` itself has neither restriction.
 ///
 /// **Do not read `None` as "not a bitmap".** A caller that branches on kind and
-/// then unwraps here will panic on a perfectly healthy mmap'd container at an
-/// odd offset. Treat it as "no borrow available" and take the copying path.
+/// then unwraps here will panic on a healthy shared container whose alignment
+/// or byte order prevents borrowing. Treat it as "no borrow available" and
+/// take the decoding or generic path.
 #[inline]
 pub fn bitmap_words(c: &Container) -> Option<&[u64]> {
     match c {

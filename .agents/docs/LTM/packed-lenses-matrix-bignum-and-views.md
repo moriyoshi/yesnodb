@@ -575,6 +575,175 @@ Verified at 8 constituents over a 200 000-ordinal span, both layouts: 154 285 lo
 
 What `view_fold` discards is therefore one **walk**, not the capability, which makes the ask a ratio: **4 - 8x on `Interleaved`** for a one-walk arm against the downstream construction, and **1x on `Blocked`**, where `fold_via_select` never forms a count at all and an in-crate implementation would be the loop above character for character. Three further findings survive the decision: the refusal of a `Reduce::Plane( j )` variant is correct because the enum is closed on **monoids** and `Plane( j )` for `j > 0` cannot be folded pairwise without carrying ( `Parity` escapes only because XOR is a monoid that happens to equal plane zero ); a `Vec<OrdSet>` return has a **data-dependent length**, since the natural construction yields one plane when no ordinal is held twice whatever `sets` is, so padding is an unaddressed specification decision; and the cohort-overlap use case actually wants a `count >= t` threshold, which the proposal itself observes dominates the planes and then declines to request. The decisive fact is that the proposer does not consume it -- unused public API is an R1 / R6 / R7 semver promise, and `stats.rs` is the recorded precedent.
 
+### Scratch JIT count terminal over an interleaved mapped view ( 2026-09-22 )
+
+A standalone research binary at
+`.agents-workspace/tmp/simd-jit-revisit-20260921/src/bin/view_fold.rs`
+tests cardinality( fold( map( view( packed ), identity ), Reduce ) ).
+The identity map is intentional: it isolates the first materialization
+boundary, rather than claiming general map-body compilation. Four
+interleaved constituents span 262,144 logical ordinals at 55% density,
+giving 16 aligned bitmap containers of 1,024 words each. Every Any, All,
+and Parity count is checked against shipped `view_fold( .. ).len()`.
+The JIT borrows words through `unstable_arrow::bitmap_words`, compiles a
+128-bit pairwise-popcount loop once per reduction, and counts directly
+without constructing the folded OrdSet. A Rust/LLVM AOT arm implements
+the same word formula. Both timed arms black-box input operands. Nine
+alternating batches of 16 whole-corpus calls per arm yield medians; four
+complete runs of the unchanged anti-hoisting binary gave:
+
+| Reduce | shipped fold then count | AOT count terminal | vector JIT terminal |
+|---|---:|---:|---:|
+| Any | 2.690-3.016 ms | 4.96-4.99 us | 5.32-5.33 us |
+| All | 2.072-2.109 ms | 4.93-4.95 us | 5.31-5.33 us |
+| Parity | 2.423-2.435 ms | 4.94-4.98 us | 5.32-5.33 us |
+
+The initial scalar Cranelift loop was about 11.9 us for every reduction;
+the vector lowering cut it to about 5.3 us, within 7-8% of this AOT arm.
+Compilation took about 120-421 us after process warm-up, with a 1.2 ms
+first compiler initialization observed once. These are count-only terminal
+comparisons: the shipped arm must construct a result set, whereas both
+research arms avoid it because the requested terminal is cardinality.
+The experiment does not time Flight lowering, a nontrivial map body,
+mixed container kinds, unaligned mmap payloads, blocked layouts, or
+materialized fold output. It therefore supports extending the prototype
+to a representative non-identity map and exact fallback cases; it does
+not justify a production JIT dispatch yet.
+
+### Persisted SIMD terminals retain the kernel win ( 2026-09-23 )
+
+The production Flight evaluator reaches the bitmap SIMD arms after an eager
+boundary: a key expression is collected into one packed `OrdSet`, then direct
+folds and the pointwise-map truth-table reduction call `view_fold`, while an
+identity cardinality map calls `view_cardinalities`. A streaming fold
+accumulator was still an open possibility because that first collection could
+have hidden the resident-kernel gain. It does not on the measured dense shape.
+
+A one-off crate under
+`.agents-workspace/tmp/persisted-view-simd/` uses the checked-in Stage 7
+corpus: 16 contiguous physical bitmap chunks over 1,048,576 positions, 55%
+membership from LCG seed `0x2545_f491_4f6c_dd1d`. It checkpoints the key,
+drops the database, reopens it, and asserts that all 16 recovered containers
+lend aligned bitmap words. The public Flight evaluator answers direct folds,
+`map( view( key ), cardinality( _ ) )`, and
+`fold( map( view( key ), or( _, range ) ), op )` for arities 2/4/8. The
+mapped-union body is representative rather than synthetic identity: OR and AND
+use both Any and All folds; XOR uses Parity.
+
+Runs were pinned to Cortex-X925 CPU 2. Each row is the median of seven batches
+of 100 calls after ten warm calls. Two scalar and two agreeing NEON runs were
+rotated around rebuilds; the scalar build disabled only the two AArch64 SIMD
+dispatch branches and fell through to the shipped Stage 7a/7b scalar kernels.
+Those branches were restored before verification. One extra NEON run was kept
+because an isolated resident arity-8 Any row read 142 us while its persisted
+row in the same run stayed at 106.8 us; the extra run reproduced 100.8 and
+106.8 us respectively. Raw runs and the comparison are retained beside the
+scratch crate.
+
+Collecting the reopened dense bitmap key costs only 5.53-5.78 us. It is visible
+as an approximately 6 us additive cost on direct persisted folds and is too
+small to justify a second streaming fold implementation for this shape:
+
+| Terminal | Arity | scalar persisted | NEON persisted | gain |
+|---|---:|---:|---:|---:|
+| mapped cardinalities | 2 | 46.85 us | 14.64-14.86 us | 3.18x |
+| mapped cardinalities | 4 | 93.57-93.60 us | 23.45-23.52 us | 3.98x |
+| mapped cardinalities | 8 | 114.07-114.13 us | 49.78-49.88 us | 2.29x |
+| direct Any fold | 2 / 4 / 8 | 88.60 / 82.94 / 165.59-165.68 us | 36.22-36.35 / 31.42-31.56 / 106.77-106.79 us | 2.44 / 2.63 / 1.55x |
+| direct All fold | 2 / 4 / 8 | 88.46 / 83.07-83.08 / 82.05-82.09 us | 36.22-36.26 / 31.55-31.56 / 22.74-23.03 us | 2.44 / 2.63 / 3.59x |
+| direct Parity fold | 2 / 4 / 8 | 88.59-88.71 / 82.85-82.89 / 80.69-80.75 us | 36.33-36.63 / 31.36-31.43 / 23.48-23.52 us | 2.43 / 2.64 / 3.44x |
+
+Every nested mapped-union row also wins: 1.80-2.46x at arity 2,
+2.25-2.71x at arity 4, and 1.86-3.21x at arity 8. These are complete reopened
+Flight evaluator calls, not a resident-kernel projection. Therefore the
+persisted measurement closes the dense-bitmap SIMD slice without a new stream
+API: the existing eager packed-set boundary preserves the SIMD benefit, and
+the remaining materialization prize on this workload is about 6 us rather than
+the 80-250 us vector work it would duplicate. It does not settle sparse array
+inputs; the following measurement does.
+
+### Sparse persisted terminals need an encoding-aware plan ( 2026-09-23 )
+
+The same scratch crate compares the current public Flight evaluator with a
+one-pass prototype over `Snapshot::key_stream`. The prototype never constructs
+the packed input `OrdSet`: one arm accumulates constituent cardinalities while
+the other groups adjacent interleaved ordinals and constructs only the final
+Any, All, or Parity result. Every fixture is checkpointed, dropped, reopened,
+and verified to contain only Array containers. Results agree with
+`OrdSet::view_cardinalities` and `OrdSet::view_fold` before timing.
+
+Runs were pinned to Cortex-X925 CPU 2. Each row is the median of seven batches
+after five warm calls. The compact 16-chunk, wide 256-chunk, and one-value
+4,096-chunk anchors were repeated in two complete runs; the wider crossover
+sweep was one complete run. Ratios below are current eager time divided by
+streaming time, so values above one favour streaming:
+
+| occupied chunks | values per chunk | collect / scan | mapped count | Any fold | All fold | Parity fold |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 1 | 1.33x | 1.33x | 1.31x | 1.40x | 1.32x |
+| 64 | 1 | 1.42x | 1.39x | 1.32x | 1.42x | 1.34x |
+| 256 | 1 | 1.33x | 1.32x | 1.24x | 1.33x | 1.27x |
+| 256 | 8 | 1.09x | 1.08x | 1.05x | 1.08x | 1.07x |
+| 256 | 64 | 1.08x | 1.05x | 1.01x | 1.07x | 1.04x |
+| 256 | 512 | 1.10x | 1.03x | 0.99x | 1.02x | 0.99x |
+| 1,024 | 1 | 1.33x | 1.32x | 1.25x | 1.35x | 1.27x |
+| 1,024 | 8 | 1.08x | 1.08x | 1.05x | 1.08x | 1.07x |
+| 4,096 | 1 | 1.30x | 1.30x | 1.23x | 1.31x | 1.25x |
+
+The hypothesis therefore holds conditionally. The predictor is not global
+density or prefix span; it is cardinality per occupied chunk, which also
+predicts the container encoding, plus enough chunks for the absolute saving to
+matter. Exactly one value per occupied chunk saves 24-42% across the measured
+span. Eight values per chunk saves only 5-8%, and by 512 the fold difference is
+noise or a slight streaming loss. At 16 chunks the strongest ratio is still
+only about one microsecond in absolute terms.
+
+The planner need not guess these quantities. `ChunkSource` already exposes
+exact occupied chunk count, cardinality, span, and an all-bitmap hint for keyed
+sources; `KeyStream` exposes exact chunk and cardinality information before
+payload decoding. A production route should preserve the bitmap-native SIMD arm for
+dense inputs and choose a core-owned streaming accumulator only for a measured
+sparse region. A conservative first admission is many occupied chunks with
+about one value per chunk; admitting the eight-value rows buys too little to
+justify a parallel semantic implementation without further evidence. Direct
+key intersection-cardinality maps already stream through
+`ViewIntersectionCounter`; the remaining eager cases are the identity
+cardinality map and direct materializing folds.
+
+The conservative arm landed without a core expression node. Core now owns
+checked stream terminals for interleaved identity cardinalities and
+Any/All/Parity folds. Flight admits only a valid interleaved descriptor with at
+least 64 occupied chunks and exact source cardinality equal to chunk count,
+which proves one value per occupied chunk. A declined direct-key query
+materializes the already-open `KeyStream`, preserving both source-plan
+economy and the dense bitmap SIMD path. The public allocation regression
+detects rebuilding the packed input; forcing that regression through the eager
+path increased requested bytes from 74,224 to 123,152 on 256 singleton chunks.
+
+On the same pinned production harness, admitted public calls at 64-4,096
+singleton chunks were within about 6-8% of the standalone stream reference.
+The 16-chunk case remained eager and retained its approximately 28% gap, which
+confirms the threshold is active rather than the measurement collapsing.
+
+### Bounded rank is a range plan, not a sparsity decision
+
+A direct identity rank over an interleaved persisted view has a stronger bound
+than full cardinality or fold: only physical ordinals below `upper * sets` can
+contribute. Flight now ceil-divides that endpoint into a bounded prefix range,
+with `u128` arithmetic and a cap at the legal exclusive prefix `2^48`. Core
+counts every complete streamed chunk through the existing per-owner
+cardinality reducer and maps ordinals only in the one possible partial final
+chunk. The plan is valid for array, bitmap, and run containers at any density;
+it deliberately does not use the singleton-chunk admission rule above.
+
+Pinned pre-change singleton measurements for 16, 256, 1,024, and 4,096
+occupied chunks were 4.778-4.793, 45.33-45.67, 173.00-173.80, and
+674.43-682.61 microseconds. A bounded streaming reference measured
+1.631-1.801, 17.30-20.40, 66.64-79.33, and 267.20-317.65 microseconds. After
+the production plan landed, the same public rank terminal stayed within about
+1-6% of the reference, including denser array rows. The useful planner signal
+is therefore the strict range endpoint, not estimated output sparsity.
+
 ## Files
 
 - `yesno-core/src/matrix/` - packed matrix values, readers, algebra, and GF(2) operations.

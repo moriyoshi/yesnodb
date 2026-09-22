@@ -33,7 +33,7 @@
 # "simplify" it by letting BuildKit pick the platform. That silently reintroduces
 # emulation and the build still passes, only far slower.
 
-ARG RUST_VERSION=1.89
+ARG RUST_VERSION=1.95
 
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH

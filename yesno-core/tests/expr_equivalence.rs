@@ -469,3 +469,53 @@ fn the_unbounded_complement_is_answered_from_the_input_not_the_universe() {
          ( deadline {deadline:?} )"
     );
 }
+#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod jit_lower_bound_peek {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use yesno_core::stream::{BoxedStream, ChunkSource, ChunkStream, SetStream};
+    use yesno_core::{jit::DagJit, Container, Expr, OrdSet, Prefix48, Result};
+
+    #[derive(Debug)]
+    struct LoosePeekSource(Arc<OrdSet>);
+
+    struct LoosePeekStream(SetStream);
+
+    impl ChunkStream for LoosePeekStream {
+        fn next_chunk(&mut self) -> Result<Option<(Prefix48, Container)>> {
+            self.0.next_chunk()
+        }
+
+        fn seek(&mut self, prefix: Prefix48) -> Result<()> {
+            self.0.seek(prefix)
+        }
+
+        fn peek_prefix(&mut self) -> Result<Option<Prefix48>> {
+            // Zero remains a valid lower bound even after seeking past it.
+            Ok(self.0.peek_prefix()?.map(|_| 0))
+        }
+    }
+
+    impl ChunkSource for LoosePeekSource {
+        fn open(&self) -> BoxedStream {
+            Box::new(LoosePeekStream(SetStream::new(self.0.clone())))
+        }
+    }
+
+    #[test]
+    fn jit_keeps_a_chunk_returned_after_its_peek_lower_bound() {
+        let late_values = [((128u64) << 16) | 7, ((128u64) << 16) | 11];
+        let early_values = [3u64, 5];
+        let late = Arc::new(OrdSet::from_iter_unsorted(late_values));
+        let early = Arc::new(OrdSet::from_iter_unsorted(early_values));
+        let oracle: BTreeSet<_> = late_values.into_iter().chain(early_values).collect();
+        let expr = Expr::Source(Arc::new(LoosePeekSource(late))).or(Expr::set(early));
+
+        let mut jit = DagJit::new();
+        assert_eq!(
+            jit.try_cardinality(&expr).unwrap().unwrap(),
+            oracle.len() as u64
+        );
+    }
+}

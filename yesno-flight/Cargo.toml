@@ -3,6 +3,8 @@ name = "yesno-flight"
 description = "Arrow Flight service for yesno query results and bulk ingest"
 version.workspace = true
 edition.workspace = true
+# The server's JIT is separate from its default feature. The PostgreSQL
+# client-only Bazel target enables neither feature.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +12,7 @@ repository.workspace = true
 [features]
 default = ["server"]
 server = ["dep:yesno-core", "dep:yesno-arrow", "dep:tracing", "yesno-core/tracing"]
+jit = ["server", "yesno-core/jit"]
 
 [dependencies]
 yesno-core = { workspace = true, optional = true }

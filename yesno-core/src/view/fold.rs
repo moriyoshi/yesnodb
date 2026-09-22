@@ -42,11 +42,19 @@
 //! [`ViewLayout::Interleaved`](super::ViewLayout::Interleaved) that costs
 //! `O( n · nnz )`, because each `view_select` is itself a strided filter over
 //! everything; a single grouped walk does it in `O( nnz )`, and that is the
-//! specialised arm.
+//! specialised arm. For aligned bitmap-only inputs at arity 2, 4 or 8, a
+//! byte reducer folds physical bitmap chunks into logical output chunks
+//! without enumerating set bits. Little-endian AArch64 uses a NEON reducer
+//! for these same chunks after runtime feature detection; other hosts use the
+//! scalar byte table. Mixed containers and unaligned shared bitmap payloads
+//! retain the grouped walk.
 
 use super::{View, ViewLayout};
-use crate::container::Container;
-use crate::{chunk_base, chunk_window, split, OrdSet, Prefix48, ORDINAL_MAX};
+use crate::container::{BitmapContainer, Container};
+use crate::{
+    chunk_base, chunk_window, split, ChunkStream, CodecError, OrdSet, Prefix48, Result,
+    BITMAP_WORDS, ORDINAL_MAX,
+};
 
 /// How a fold combines the constituents at one logical ordinal.
 ///
@@ -74,6 +82,557 @@ impl Reduce {
             Reduce::Any => count > 0,
             Reduce::All => count == sets,
             Reduce::Parity => count % 2 == 1,
+        }
+    }
+}
+
+/// The grouped interleaved walk shared by resident and streamed inputs.
+struct InterleavedFold {
+    sets: u64,
+    reduce: Reduce,
+    out: Vec<u64>,
+    current: Option<u64>,
+    count: u64,
+}
+
+impl InterleavedFold {
+    fn new(view: &View, reduce: Reduce) -> Result<Self> {
+        view.check()?;
+        if !matches!(view.layout(), ViewLayout::Interleaved) {
+            return Err(CodecError::Invariant(
+                "streaming view fold requires an interleaved view",
+            ));
+        }
+        Ok(Self {
+            sets: u64::from(view.sets()),
+            reduce,
+            out: Vec::new(),
+            current: None,
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, prefix: Prefix48, container: &Container) {
+        let base = chunk_base(prefix);
+        for low in container.iter() {
+            let logical = (base | u64::from(low)) / self.sets;
+            if self.current != Some(logical) {
+                self.flush();
+                self.current = Some(logical);
+                self.count = 0;
+            }
+            self.count += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(logical) = self.current {
+            if self.reduce.keep(self.count, self.sets) {
+                self.out.push(logical);
+            }
+        }
+    }
+
+    fn finish(mut self) -> OrdSet {
+        self.flush();
+        let mut out = OrdSet::from_sorted_slice(&self.out);
+        out.optimize();
+        out
+    }
+}
+
+/// Fold an interleaved view while consuming a prefix-ordered chunk stream.
+///
+/// Physical order is logical-group order only for
+/// [`ViewLayout::Interleaved`], so blocked views are rejected rather than
+/// silently grouped incorrectly. The output set is the only materialized set;
+/// the packed input remains a stream. Malformed stream ordering and the
+/// reserved `u64::MAX` ordinal are reported as errors.
+pub fn stream_interleaved_view_fold(
+    stream: &mut dyn ChunkStream,
+    view: &View,
+    reduce: Reduce,
+) -> Result<OrdSet> {
+    let mut fold = InterleavedFold::new(view, reduce)?;
+    let mut last_prefix = None;
+    while let Some((prefix, container)) = stream.next_chunk()? {
+        super::validate_stream_chunk(&mut last_prefix, prefix, &container)?;
+        fold.push(prefix, &container);
+    }
+    Ok(fold.finish())
+}
+
+/// The low bit of each sets-wide group becomes one output bit. Compile-time
+/// tables keep the per-byte hot loop independent of the reduction branches.
+const fn fold_byte(byte: u8, sets: usize, reduce: Reduce) -> u8 {
+    let mut out = 0u8;
+    let mut group = 0;
+    while group < 8 / sets {
+        let bits = ((byte as u16 >> (group * sets)) & ((1u16 << sets) - 1)) as u8;
+        let keep = match reduce {
+            Reduce::Any => bits != 0,
+            Reduce::All => bits.count_ones() as usize == sets,
+            Reduce::Parity => bits.count_ones() % 2 == 1,
+        };
+        if keep {
+            out |= 1 << group;
+        }
+        group += 1;
+    }
+    out
+}
+
+const fn fold_byte_table(sets: usize, reduce: Reduce) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = fold_byte(byte as u8, sets, reduce);
+        byte += 1;
+    }
+    table
+}
+
+const FOLD_ANY_2: [u8; 256] = fold_byte_table(2, Reduce::Any);
+const FOLD_ALL_2: [u8; 256] = fold_byte_table(2, Reduce::All);
+const FOLD_PARITY_2: [u8; 256] = fold_byte_table(2, Reduce::Parity);
+const FOLD_ANY_4: [u8; 256] = fold_byte_table(4, Reduce::Any);
+const FOLD_ALL_4: [u8; 256] = fold_byte_table(4, Reduce::All);
+const FOLD_PARITY_4: [u8; 256] = fold_byte_table(4, Reduce::Parity);
+const FOLD_ANY_8: [u8; 256] = fold_byte_table(8, Reduce::Any);
+const FOLD_ALL_8: [u8; 256] = fold_byte_table(8, Reduce::All);
+const FOLD_PARITY_8: [u8; 256] = fold_byte_table(8, Reduce::Parity);
+
+fn fold_table(sets: u32, reduce: Reduce) -> Option<&'static [u8; 256]> {
+    match (sets, reduce) {
+        (2, Reduce::Any) => Some(&FOLD_ANY_2),
+        (2, Reduce::All) => Some(&FOLD_ALL_2),
+        (2, Reduce::Parity) => Some(&FOLD_PARITY_2),
+        (4, Reduce::Any) => Some(&FOLD_ANY_4),
+        (4, Reduce::All) => Some(&FOLD_ALL_4),
+        (4, Reduce::Parity) => Some(&FOLD_PARITY_4),
+        (8, Reduce::Any) => Some(&FOLD_ANY_8),
+        (8, Reduce::All) => Some(&FOLD_ALL_8),
+        (8, Reduce::Parity) => Some(&FOLD_PARITY_8),
+        _ => None,
+    }
+}
+
+/// Try an architecture-specific vector reducer for one complete bitmap chunk.
+///
+/// Dispatch is per 8 KiB physical container, not per word or logical row.
+/// Unsupported architectures and CPUs keep the scalar byte table.
+#[inline]
+fn fold_words_simd(words: &[u64], out: &mut [u64], sets: usize, reduce: Reduce) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: NEON was detected; the caller supplies one complete bitmap
+        // and the corresponding 1024 / sets-word output segment (bound B9).
+        match sets {
+            2 => unsafe { neon::fold2(words, out, reduce) },
+            4 => unsafe { neon::fold4(words, out, reduce) },
+            8 => unsafe { neon::fold8(words, out, reduce) },
+            _ => return false,
+        }
+        return true;
+    }
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    if std::arch::is_x86_feature_detected!("ssse3") {
+        // SAFETY: SSSE3 was detected; the caller supplies one complete bitmap
+        // and the corresponding 1024 / sets-word output segment (bound B9).
+        match sets {
+            2 => unsafe { sse::fold2(words, out, reduce) },
+            4 => unsafe { sse::fold4(words, out, reduce) },
+            8 => unsafe { sse::fold8(words, out, reduce) },
+            _ => return false,
+        }
+        return true;
+    }
+    let _ = (words, out, sets, reduce);
+    false
+}
+
+/// The x86_64 counterpart of [`neon`], under the same bound B9.
+///
+/// Two NEON instructions this kernel is built on have no x86 equivalent, and
+/// the substitutes are what the arms differ by.
+///
+/// `vshlq_u8` shifts each byte by its own amount, which is how the NEON arms
+/// move a nibble's folded bits into their output positions. x86 has no
+/// per-byte variable shift at any width. Two replacements are used instead:
+/// the per-nibble shift is folded into a **second lookup table** whose entries
+/// are pre-shifted, costing nothing at all, and the cross-byte positioning
+/// becomes `pmaddubsw` / `pmaddwd`, which multiply by a per-lane weight and
+/// add adjacent lanes in one instruction -- a shift and NEON's following
+/// pairwise add, fused.
+///
+/// For arity 8 the port is abandoned outright in favour of `pmovmskb`, which
+/// takes the high bit of all 16 bytes into a 16-bit integer. That is precisely
+/// one output word's worth of bits per instruction, and NEON has no equivalent
+/// -- its arm needs a compare, a positioning shift and a three-level pairwise
+/// tree to do the same gather. Arity 8 is therefore the cheapest x86 fold and
+/// the most expensive NEON one, which is the whole lesson of
+/// `LTM/simd-arch-arms-and-kernel-selection.md` reappearing: a technique's
+/// value is a property of the instruction set, not of the algorithm.
+///
+/// 128-bit rather than AVX2 deliberately. Every arity here ends by packing
+/// bytes drawn from across the whole vector, and AVX2's byte shuffles and
+/// `packus` work inside 128-bit halves, so each kernel would need a
+/// cross-lane permute per iteration to repair the order. That is the trade
+/// `ops::array` measured and rejected. The count kernel takes AVX2 precisely
+/// because it has no such step.
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+mod sse {
+    use super::{Reduce, BITMAP_WORDS};
+    use std::arch::x86_64::*;
+
+    /// Folded bits for a nibble, in the output positions the *low* nibble of
+    /// a byte owns.
+    const fn nibble_lo(sets: usize, reduce: Reduce) -> [u8; 16] {
+        let mut table = [0u8; 16];
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[nibble] = super::fold_byte(nibble as u8, sets, reduce);
+            nibble += 1;
+        }
+        table
+    }
+
+    /// The same, pre-shifted into the positions the *high* nibble owns. A
+    /// nibble carries `4 / sets` groups, so that is the shift.
+    const fn nibble_hi(sets: usize, reduce: Reduce) -> [u8; 16] {
+        let mut table = nibble_lo(sets, reduce);
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[nibble] <<= 4 / sets;
+            nibble += 1;
+        }
+        table
+    }
+
+    /// `0x80` when the nibble has odd population, so that a byte's parity
+    /// lands in the bit `pmovmskb` reads.
+    const fn parity_high_bit() -> [u8; 16] {
+        let mut table = [0u8; 16];
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[nibble] = if (nibble as u8).count_ones() % 2 == 1 {
+                0x80
+            } else {
+                0
+            };
+            nibble += 1;
+        }
+        table
+    }
+
+    const ANY2_LO: [u8; 16] = nibble_lo(2, Reduce::Any);
+    const ANY2_HI: [u8; 16] = nibble_hi(2, Reduce::Any);
+    const ALL2_LO: [u8; 16] = nibble_lo(2, Reduce::All);
+    const ALL2_HI: [u8; 16] = nibble_hi(2, Reduce::All);
+    const PARITY2_LO: [u8; 16] = nibble_lo(2, Reduce::Parity);
+    const PARITY2_HI: [u8; 16] = nibble_hi(2, Reduce::Parity);
+    const ANY4_LO: [u8; 16] = nibble_lo(4, Reduce::Any);
+    const ANY4_HI: [u8; 16] = nibble_hi(4, Reduce::Any);
+    const ALL4_LO: [u8; 16] = nibble_lo(4, Reduce::All);
+    const ALL4_HI: [u8; 16] = nibble_hi(4, Reduce::All);
+    const PARITY4_LO: [u8; 16] = nibble_lo(4, Reduce::Parity);
+    const PARITY4_HI: [u8; 16] = nibble_hi(4, Reduce::Parity);
+    const PARITY_BIT7: [u8; 16] = parity_high_bit();
+
+    #[inline]
+    fn tables2(reduce: Reduce) -> (&'static [u8; 16], &'static [u8; 16]) {
+        match reduce {
+            Reduce::Any => (&ANY2_LO, &ANY2_HI),
+            Reduce::All => (&ALL2_LO, &ALL2_HI),
+            Reduce::Parity => (&PARITY2_LO, &PARITY2_HI),
+        }
+    }
+
+    #[inline]
+    fn tables4(reduce: Reduce) -> (&'static [u8; 16], &'static [u8; 16]) {
+        match reduce {
+            Reduce::Any => (&ANY4_LO, &ANY4_HI),
+            Reduce::All => (&ALL4_LO, &ALL4_HI),
+            Reduce::Parity => (&PARITY4_LO, &PARITY4_HI),
+        }
+    }
+
+    /// B9 for n=2: 16 source bytes produce 8 destination bytes, 512 complete
+    /// iterations, no tail.
+    ///
+    /// # Safety
+    ///
+    /// Requires SSSE3, exactly 1024 source words, and 512 output words.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn fold2(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 2, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        let (lo_table, hi_table) = tables2(reduce);
+        // SAFETY: B9 bounds all 16-byte loads and 8-byte stores; each store
+        // begins at i / 2, a multiple of eight, inside the output half-chunk.
+        // Both `pshufb` indices are masked to 0..15. `pmaddubsw` sums
+        // 15 + 15 * 16 = 255 at most, so it cannot saturate, and `packus`
+        // therefore never clamps.
+        unsafe {
+            let lo_lut = _mm_loadu_si128(lo_table.as_ptr().cast());
+            let hi_lut = _mm_loadu_si128(hi_table.as_ptr().cast());
+            let low_mask = _mm_set1_epi8(0x0f);
+            let weights = _mm_set1_epi16(0x1001);
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = _mm_loadu_si128(src.as_ptr().add(i).cast());
+                let lo = _mm_shuffle_epi8(lo_lut, _mm_and_si128(input, low_mask));
+                let hi =
+                    _mm_shuffle_epi8(hi_lut, _mm_and_si128(_mm_srli_epi16(input, 4), low_mask));
+                let folded = _mm_or_si128(lo, hi);
+                let pairs = _mm_maddubs_epi16(folded, weights);
+                let packed = _mm_packus_epi16(pairs, pairs);
+                _mm_storel_epi64(dst.as_mut_ptr().add(i / 2).cast(), packed);
+                i += 16;
+            }
+        }
+    }
+
+    /// B9 for n=4: 16 source bytes produce 4 destination bytes.
+    ///
+    /// # Safety
+    ///
+    /// Requires SSSE3, exactly 1024 source words, and 256 output words.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn fold4(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 4, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        let (lo_table, hi_table) = tables4(reduce);
+        // SAFETY: B9 bounds every 16-byte load and 4-byte store; i / 4 is a
+        // multiple of four inside the output quarter-chunk. Neither multiply
+        // step can overflow its lane: `pmaddubsw` reaches 3 + 3 * 4 = 15 and
+        // `pmaddwd` reaches 15 + 15 * 16 = 255.
+        unsafe {
+            let lo_lut = _mm_loadu_si128(lo_table.as_ptr().cast());
+            let hi_lut = _mm_loadu_si128(hi_table.as_ptr().cast());
+            let low_mask = _mm_set1_epi8(0x0f);
+            let byte_weights = _mm_set1_epi16(0x0401);
+            let word_weights = _mm_set1_epi32(0x0010_0001);
+            let gather = _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = _mm_loadu_si128(src.as_ptr().add(i).cast());
+                let lo = _mm_shuffle_epi8(lo_lut, _mm_and_si128(input, low_mask));
+                let hi =
+                    _mm_shuffle_epi8(hi_lut, _mm_and_si128(_mm_srli_epi16(input, 4), low_mask));
+                let folded = _mm_or_si128(lo, hi);
+                let pairs = _mm_maddubs_epi16(folded, byte_weights);
+                let quads = _mm_madd_epi16(pairs, word_weights);
+                let packed = _mm_shuffle_epi8(quads, gather);
+                let four = _mm_cvtsi128_si32(packed) as u32;
+                dst.as_mut_ptr()
+                    .add(i / 4)
+                    .cast::<u32>()
+                    .write_unaligned(four);
+                i += 16;
+            }
+        }
+    }
+
+    /// B9 for n=8: 16 source bytes produce 2 destination bytes -- one output
+    /// bit per input byte, which is exactly what `pmovmskb` returns.
+    ///
+    /// # Safety
+    ///
+    /// Requires SSSE3, exactly 1024 source words, and 128 output words.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn fold8(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 8, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        // SAFETY: B9 bounds all 16-byte loads and the two byte stores at
+        // i / 8, which is even and below the output eighth-chunk's length.
+        // `pmovmskb` reads bit 7 of each byte; every branch below places the
+        // fold's answer there and nothing else in the byte is read.
+        unsafe {
+            let zero = _mm_setzero_si128();
+            let full = _mm_set1_epi8(-1);
+            let parity_lut = _mm_loadu_si128(PARITY_BIT7.as_ptr().cast());
+            let low_mask = _mm_set1_epi8(0x0f);
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = _mm_loadu_si128(src.as_ptr().add(i).cast());
+                let bits = match reduce {
+                    // `cmpeq` against zero marks the bytes that are *empty*,
+                    // so the complement of the mask is the union.
+                    Reduce::Any => !(_mm_movemask_epi8(_mm_cmpeq_epi8(input, zero)) as u16),
+                    Reduce::All => _mm_movemask_epi8(_mm_cmpeq_epi8(input, full)) as u16,
+                    Reduce::Parity => {
+                        let lo = _mm_shuffle_epi8(parity_lut, _mm_and_si128(input, low_mask));
+                        let hi = _mm_shuffle_epi8(
+                            parity_lut,
+                            _mm_and_si128(_mm_srli_epi16(input, 4), low_mask),
+                        );
+                        _mm_movemask_epi8(_mm_xor_si128(lo, hi)) as u16
+                    }
+                };
+                let [low, high] = bits.to_le_bytes();
+                dst[i / 8] = low;
+                dst[i / 8 + 1] = high;
+                i += 16;
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon {
+    use super::{Reduce, BITMAP_WORDS};
+    use std::arch::aarch64::*;
+
+    const fn nibble_table(sets: usize, reduce: Reduce) -> [u8; 16] {
+        let mut table = [0u8; 16];
+        let mut nibble = 0;
+        while nibble < 16 {
+            table[nibble] = super::fold_byte(nibble as u8, sets, reduce);
+            nibble += 1;
+        }
+        table
+    }
+
+    const ANY2: [u8; 16] = nibble_table(2, Reduce::Any);
+    const ALL2: [u8; 16] = nibble_table(2, Reduce::All);
+    const PARITY2: [u8; 16] = nibble_table(2, Reduce::Parity);
+    const ANY4: [u8; 16] = nibble_table(4, Reduce::Any);
+    const ALL4: [u8; 16] = nibble_table(4, Reduce::All);
+    const PARITY4: [u8; 16] = nibble_table(4, Reduce::Parity);
+    const SHIFTS2: [i8; 16] = [0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4];
+    const SHIFTS4: [i8; 16] = [0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6];
+    const SHIFTS8: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
+
+    /// B9: exactly 1024 input words (8192 bytes) become 256 output words
+    /// (2048 bytes). Each 16-byte load produces one 4-byte store. The loop
+    /// advances by 16 and performs exactly 512 iterations, with no tail.
+    ///
+    /// # Safety
+    ///
+    /// Requires NEON and B9. The caller's output quarter must be zeroed or
+    /// exclusively owned because this kernel overwrites it.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn fold4(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 4, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        let nibble = match reduce {
+            Reduce::Any => &ANY4,
+            Reduce::All => &ALL4,
+            Reduce::Parity => &PARITY4,
+        };
+        // SAFETY: B9 bounds every 16-byte load and 4-byte store. The table
+        // and shifts are 16-byte arrays, and output stores are 4-byte aligned
+        // because the destination is a u64 slice and i / 4 is a multiple of 4.
+        unsafe {
+            let table = vld1q_u8(nibble.as_ptr());
+            let shifts = vld1q_s8(SHIFTS4.as_ptr());
+            let mask = vdupq_n_u8(15);
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = vld1q_u8(src.as_ptr().add(i));
+                let lo = vqtbl1q_u8(table, vandq_u8(input, mask));
+                let hi = vshlq_n_u8(vqtbl1q_u8(table, vshrq_n_u8(input, 4)), 1);
+                let positioned = vshlq_u8(vorrq_u8(lo, hi), shifts);
+                let pairs = vpaddlq_u8(positioned);
+                let groups = vpaddlq_u16(pairs);
+                let packed16 = vmovn_u32(groups);
+                let packed8 = vmovn_u16(vcombine_u16(packed16, vdup_n_u16(0)));
+                vst1_lane_u32(
+                    dst.as_mut_ptr().add(i / 4).cast::<u32>(),
+                    vreinterpret_u32_u8(packed8),
+                    0,
+                );
+                i += 16;
+            }
+        }
+    }
+
+    /// B9 for n=2: 16 source bytes produce 8 destination bytes.
+    ///
+    /// # Safety
+    ///
+    /// Requires NEON, exactly 1024 source words, and 512 output words.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn fold2(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 2, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        let nibble = match reduce {
+            Reduce::Any => &ANY2,
+            Reduce::All => &ALL2,
+            Reduce::Parity => &PARITY2,
+        };
+        // SAFETY: B9 bounds all 16-byte loads and 8-byte stores. Each store
+        // begins at i / 2, a multiple of eight, inside the output half-chunk.
+        unsafe {
+            let table = vld1q_u8(nibble.as_ptr());
+            let shifts = vld1q_s8(SHIFTS2.as_ptr());
+            let mask = vdupq_n_u8(15);
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = vld1q_u8(src.as_ptr().add(i));
+                let lo = vqtbl1q_u8(table, vandq_u8(input, mask));
+                let hi = vshlq_n_u8(vqtbl1q_u8(table, vshrq_n_u8(input, 4)), 2);
+                let positioned = vshlq_u8(vorrq_u8(lo, hi), shifts);
+                let packed = vmovn_u16(vpaddlq_u8(positioned));
+                vst1_u8(dst.as_mut_ptr().add(i / 2), packed);
+                i += 16;
+            }
+        }
+    }
+
+    /// B9 for n=8: 16 source bytes produce 2 destination bytes.
+    ///
+    /// # Safety
+    ///
+    /// Requires NEON, exactly 1024 source words, and 128 output words.
+    pub(super) unsafe fn fold8(words: &[u64], out: &mut [u64], reduce: Reduce) {
+        match reduce {
+            Reduce::Any => unsafe { fold8_op::<0>(words, out) },
+            Reduce::All => unsafe { fold8_op::<1>(words, out) },
+            Reduce::Parity => unsafe { fold8_op::<2>(words, out) },
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn fold8_op<const OP: u8>(words: &[u64], out: &mut [u64]) {
+        debug_assert_eq!(words.len(), BITMAP_WORDS, "B9");
+        debug_assert_eq!(out.len(), BITMAP_WORDS / 8, "B9");
+        let src = bytemuck::cast_slice::<u64, u8>(words);
+        let dst = bytemuck::cast_slice_mut::<u64, u8>(out);
+        // SAFETY: B9 bounds all 16-byte loads and two byte stores. Pairwise
+        // additions combine disjoint positioned bits, so no carries cross
+        // logical output positions.
+        unsafe {
+            let zero = vdupq_n_u8(0);
+            let one = vdupq_n_u8(1);
+            let full = vdupq_n_u8(u8::MAX);
+            let shifts = vld1q_s8(SHIFTS8.as_ptr());
+            let mut i = 0usize;
+            while i < src.len() {
+                let input = vld1q_u8(src.as_ptr().add(i));
+                let bits = match OP {
+                    0 => vandq_u8(vcgtq_u8(input, zero), one),
+                    1 => vandq_u8(vceqq_u8(input, full), one),
+                    2 => vandq_u8(vcntq_u8(input), one),
+                    _ => unreachable!("only Any, All and Parity are instantiated"),
+                };
+                let positioned = vshlq_u8(bits, shifts);
+                let packed = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(positioned)));
+                dst[i / 8] = vgetq_lane_u64(packed, 0) as u8;
+                dst[i / 8 + 1] = vgetq_lane_u64(packed, 1) as u8;
+                i += 16;
+            }
         }
     }
 }
@@ -176,6 +735,9 @@ impl OrdSet {
         if v.check().is_err() {
             return OrdSet::new();
         }
+        if let Some(out) = self.fold_interleaved_bitmaps(v, reduce) {
+            return out;
+        }
         if let Some(out) = self.fold_interleaved(v, reduce) {
             return out;
         }
@@ -216,6 +778,82 @@ impl OrdSet {
         out
     }
 
+    /// Each physical chunk contributes 65_536 / n consecutive logical bits.
+    /// Since n divides both 65_536 and 64, n consecutive physical chunks fit
+    /// exactly in one logical output chunk and n input words fill one output
+    /// word. Empty source prefixes contribute zeroes without being visited.
+    /// Decline the entire arm on a non-bitmap or unaligned shared payload so
+    /// the grouped ordinal walk remains the one mixed-kind implementation.
+    fn fold_interleaved_bitmaps(&self, v: &View, reduce: Reduce) -> Option<OrdSet> {
+        if v.layout() != ViewLayout::Interleaved {
+            return None;
+        }
+        let table = fold_table(v.sets(), reduce)?;
+        if self.is_empty() {
+            return Some(OrdSet::new());
+        }
+        if self
+            .chunks()
+            .any(|(_, container)| crate::unstable_arrow::bitmap_words(container).is_none())
+        {
+            return None;
+        }
+
+        let n = v.sets() as usize;
+        let mut chunks = Vec::new();
+        let mut current_prefix = None;
+        let mut output_words = vec![0u64; BITMAP_WORDS];
+        let mut cardinality = 0u32;
+        for (prefix, container) in self.chunks() {
+            let output_prefix = prefix / n as u64;
+            if current_prefix != Some(output_prefix) {
+                if let Some(old_prefix) = current_prefix {
+                    if cardinality != 0 {
+                        let words = std::mem::replace(&mut output_words, vec![0; BITMAP_WORDS]);
+                        chunks.push((
+                            old_prefix,
+                            Container::Bitmap(BitmapContainer::from_words(words, cardinality)),
+                        ));
+                    }
+                }
+                current_prefix = Some(output_prefix);
+                cardinality = 0;
+            }
+            let words = crate::unstable_arrow::bitmap_words(container)
+                .expect("the preflight checked every bitmap payload");
+            let output_base = (prefix % n as u64) as usize * (BITMAP_WORDS / n);
+            let output_range = output_base..output_base + BITMAP_WORDS / n;
+            if fold_words_simd(words, &mut output_words[output_range.clone()], n, reduce) {
+                cardinality += output_words[output_range]
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>();
+                continue;
+            }
+            for (word_index, &word) in words.iter().enumerate() {
+                let mut folded = 0u64;
+                for (byte_index, byte) in word.to_le_bytes().into_iter().enumerate() {
+                    folded |= u64::from(table[byte as usize]) << (byte_index * (8 / n));
+                }
+                let output_index = output_base + word_index / n;
+                let shift = (word_index % n) * (64 / n);
+                output_words[output_index] |= folded << shift;
+                cardinality += folded.count_ones();
+            }
+        }
+        if let Some(prefix) = current_prefix {
+            if cardinality != 0 {
+                chunks.push((
+                    prefix,
+                    Container::Bitmap(BitmapContainer::from_words(output_words, cardinality)),
+                ));
+            }
+        }
+        let mut out = OrdSet::from_chunks(chunks);
+        out.optimize();
+        Some(out)
+    }
+
     /// The interleaved arm: one grouped walk instead of `n` strided filters.
     ///
     /// Correct because under `Interleaved` the physical order **is** the logical
@@ -225,37 +863,11 @@ impl OrdSet {
     /// restarts at every constituent, and is why this arm declines there rather
     /// than being generalised.
     fn fold_interleaved(&self, v: &View, reduce: Reduce) -> Option<OrdSet> {
-        let ViewLayout::Interleaved = v.layout() else {
-            return None;
-        };
-        let n = v.sets() as u64;
-        let mut out = Vec::new();
-        let mut cur: Option<u64> = None;
-        let mut count = 0u64;
-
-        for (p, c) in self.chunks() {
-            for val in c.iter() {
-                let x = (chunk_base(p) | val as u64) / n;
-                if cur != Some(x) {
-                    if let Some(prev) = cur {
-                        if reduce.keep(count, n) {
-                            out.push(prev);
-                        }
-                    }
-                    cur = Some(x);
-                    count = 0;
-                }
-                count += 1;
-            }
+        let mut fold = InterleavedFold::new(v, reduce).ok()?;
+        for (prefix, container) in self.chunks() {
+            fold.push(prefix, container);
         }
-        if let Some(prev) = cur {
-            if reduce.keep(count, n) {
-                out.push(prev);
-            }
-        }
-        let mut s = OrdSet::from_iter_unsorted(out);
-        s.optimize();
-        Some(s)
+        Some(fold.finish())
     }
 
     /// The inverse image: every constituent's slot, for each logical ordinal here.
@@ -385,6 +997,118 @@ mod tests {
     use super::*;
     use crate::view::ViewSink;
     use std::collections::BTreeSet;
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_folds_match_scalar_at_byte_word_and_chunk_seams() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        let mut one_hot = vec![0u64; BITMAP_WORDS];
+        for bit in [0, 3, 4, 7, 8, 31, 63, 64, 127, 128, 511, 65_535] {
+            one_hot[bit / 64] |= 1u64 << (bit % 64);
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let dense: Vec<u64> = (0..BITMAP_WORDS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state
+            })
+            .collect();
+        for words in [
+            vec![0u64; BITMAP_WORDS],
+            vec![u64::MAX; BITMAP_WORDS],
+            one_hot,
+            vec![0x1111_1111_1111_1111; BITMAP_WORDS],
+            dense,
+        ] {
+            for sets in [2usize, 4, 8] {
+                for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                    let table = fold_table(sets as u32, reduce).unwrap();
+                    let mut scalar = vec![0u64; BITMAP_WORDS / sets];
+                    for (i, &word) in words.iter().enumerate() {
+                        let mut folded = 0u64;
+                        for (byte_index, byte) in word.to_le_bytes().into_iter().enumerate() {
+                            folded |= u64::from(table[byte as usize]) << ((8 / sets) * byte_index);
+                        }
+                        scalar[i / sets] |= folded << ((64 / sets) * (i % sets));
+                    }
+                    let mut vector = vec![0u64; BITMAP_WORDS / sets];
+                    // SAFETY: NEON was detected and both slices satisfy B9.
+                    unsafe {
+                        match sets {
+                            2 => neon::fold2(&words, &mut vector, reduce),
+                            4 => neon::fold4(&words, &mut vector, reduce),
+                            8 => neon::fold8(&words, &mut vector, reduce),
+                            _ => unreachable!(),
+                        }
+                    }
+                    assert_eq!(vector, scalar, "sets={sets} {reduce:?}");
+                }
+            }
+        }
+    }
+
+    /// The x86 companion of the NEON fold differential. Same five payloads,
+    /// all three arities and all three reductions, against the same scalar
+    /// byte-table oracle, so the two arms are checked against one definition
+    /// rather than against each other.
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    #[test]
+    fn sse_folds_match_scalar_at_byte_word_and_chunk_seams() {
+        // Asserted, not skipped. SSSE3 predates every x86_64 CPU this project
+        // targets, and a test that returns early on a missing feature is
+        // indistinguishable in the log from one that ran -- the degradation
+        // `ops::bitmap` records as staying "green for a kernel it never
+        // executed".
+        assert!(std::arch::is_x86_feature_detected!("ssse3"));
+        let mut one_hot = vec![0u64; BITMAP_WORDS];
+        for bit in [0, 3, 4, 7, 8, 31, 63, 64, 127, 128, 511, 512, 65_535] {
+            one_hot[bit / 64] |= 1u64 << (bit % 64);
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let dense: Vec<u64> = (0..BITMAP_WORDS)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state
+            })
+            .collect();
+        for words in [
+            vec![0u64; BITMAP_WORDS],
+            vec![u64::MAX; BITMAP_WORDS],
+            one_hot,
+            vec![0x1111_1111_1111_1111; BITMAP_WORDS],
+            vec![0x8000_0000_0000_0001; BITMAP_WORDS],
+            dense,
+        ] {
+            for sets in [2usize, 4, 8] {
+                for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                    let table = fold_table(sets as u32, reduce).unwrap();
+                    let mut scalar = vec![0u64; BITMAP_WORDS / sets];
+                    for (i, &word) in words.iter().enumerate() {
+                        let mut folded = 0u64;
+                        for (byte_index, byte) in word.to_le_bytes().into_iter().enumerate() {
+                            folded |= u64::from(table[byte as usize]) << ((8 / sets) * byte_index);
+                        }
+                        scalar[i / sets] |= folded << ((64 / sets) * (i % sets));
+                    }
+                    let mut vector = vec![0u64; BITMAP_WORDS / sets];
+                    // SAFETY: SSSE3 was detected and both slices satisfy B9.
+                    unsafe {
+                        match sets {
+                            2 => sse::fold2(&words, &mut vector, reduce),
+                            4 => sse::fold4(&words, &mut vector, reduce),
+                            8 => sse::fold8(&words, &mut vector, reduce),
+                            _ => unreachable!(),
+                        }
+                    }
+                    assert_eq!(vector, scalar, "sets={sets} {reduce:?}");
+                }
+            }
+        }
+    }
 
     fn as_btree(s: &OrdSet) -> BTreeSet<u64> {
         s.iter().collect()

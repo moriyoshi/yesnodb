@@ -37,6 +37,19 @@ config_setting(
     flag_values = {":pg_version": "18"},
 )
 
+# Keep executable-code generation out of default Bazel builds. The same flag
+# must select both core and Flight features so they share one core crate type.
+string_flag(
+    name = "jit",
+    build_setting_default = "off",
+    values = ["off", "on"],
+)
+
+config_setting(
+    name = "jit_enabled",
+    flag_values = {":jit": "on"},
+)
+
 exports_files([
     "Cargo.toml",
     "Cargo.lock",

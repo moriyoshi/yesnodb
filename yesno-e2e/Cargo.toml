@@ -2,11 +2,8 @@
 name = "yesno-e2e"
 version.workspace = true
 edition.workspace = true
-# monty requires 1.95, above the workspace's 1.89. Declared here rather than
-# raised workspace-wide on purpose: `yesno-core`'s MSRV is a promise to its
-# users, and a test harness must not be able to move it. Cargo resolves the
-# member's own `rust-version`, so core keeps 1.89 and this crate gets monty.
-rust-version = "1.95"
+# The harness now shares the workspace's Rust 1.95 floor. Monty requires 1.95.
+rust-version.workspace = true
 # Load-bearing. `src/bin/` gained `yesno-aws-cleanup` and `yesno-prepare-search`,
 # which made a bare `cargo run -p yesno-e2e` ambiguous and broke the deep gate's
 # three measurement steps — silently, because they are the only gate steps whose

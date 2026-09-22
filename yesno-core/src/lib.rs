@@ -23,6 +23,8 @@ pub mod dispatch;
 pub(crate) mod error;
 pub mod events;
 pub(crate) mod index;
+#[cfg(feature = "jit")]
+pub mod jit;
 pub mod matrix;
 pub mod mvcc;
 pub mod ops;

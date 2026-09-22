@@ -40,7 +40,7 @@ The project repeatedly found machinery that had been implemented and unit-tested
 - The `roaring` crate is a dev-dependency oracle, not a runtime implementation dependency.
 - Replication ships raw WAL frames because crash recovery is the canonical decoder. Query results use Flight because those payloads are genuinely columnar.
 - Flight SQL and `do_exchange` are deliberately absent. SQL composition belongs in DataFusion rather than in the storage engine.
-- `yesno-e2e` has its own Rust 1.95 requirement because monty needs it; `yesno-core` keeps its Rust 1.89 MSRV promise.
+- Since 2026-09-21 the Cargo workspace, including `yesno-core` and `yesno-e2e`, promises Rust 1.95; `yesno-pg` separately requires 1.96. The MSRV change itself did not move JIT dependencies into core. A later opt-in `jit` feature moved the implementation into core while retaining its five-dependency default graph.
 - MIRI cannot execute the mmap boundary. Pure casts are covered by MIRI, while mmap lifetime and race properties are covered by Valgrind, ASan, TSan, and targeted tests.
 
 ### Post-milestone integration boundaries
@@ -75,7 +75,7 @@ The broader milestone evidence also includes satellite-crate tests, E2E scenario
 ## Pitfalls
 
 - Do not infer milestone completion from module existence or isolated unit tests.
-- Do not raise the workspace MSRV to match the E2E harness.
+- Keep the declared Rust floor, CI MSRV job, and release-image toolchains aligned; evaluate future MSRV raises as explicit compatibility changes.
 - Do not add async or transport dependencies to `yesno-core`.
 - Do not treat post-M7 integrations as permission to move their runtimes or language dependencies into core.
 - Do not change only the inherited workspace license field; two crates carry literal declarations for build-boundary reasons.

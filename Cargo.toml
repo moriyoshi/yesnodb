@@ -10,12 +10,10 @@ default-members = ["yesno-core", "yesno-arrow"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# 1.89 is where `File::{try_lock, unlock}` stabilized, which `Db::open` uses to
-# take the database's exclusive lock. The alternative was a `libc` / `rustix`
-# dependency for `flock`, in a crate whose whole thesis is four dependencies and
-# whose CI guard pins `cargo tree | wc -l`. It costs nothing here: this project
-# already targets DataFusion 55, whose own MSRV is 1.94.
-rust-version = "1.89"
+# The workspace now promises Rust 1.95. This matches the Cranelift-backed JIT
+# and the Monty scenario harness; PostgreSQL's pgrx extension requires 1.96
+# independently. Keep the core's declared floor aligned with this promise.
+rust-version = "1.95"
 # Dual, in the Rust ecosystem's convention, and inherited by every member below
 # with `license.workspace = true`. The MIT arm is the default expectation on
 # crates.io and is GPLv2-compatible, which Apache-2.0 alone is not; the Apache
@@ -65,6 +63,11 @@ yesno-wire = { path = "yesno-wire", version = "0.1.0" }
 # on arrow ^59.2, so the pair aligns with the rest of the workspace exactly.
 datafusion = { version = "55", default-features = false, features = ["sql"] }
 tantivy = { version = "0.26.1", default-features = false }
+cranelift-codegen = "0.135.2"
+cranelift-frontend = "0.135.2"
+cranelift-jit = "0.135.2"
+cranelift-module = "0.135.2"
+cranelift-native = "0.135.2"
 
 # dev-only: differential oracle. We reimplement containers because roaring-rs keeps
 # `Store` pub(crate), but it remains the ideal round-trip oracle.

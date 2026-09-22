@@ -33,7 +33,7 @@
 //!
 //! Every rule preserves the *set*, not merely the cardinality. Several are
 //! conditional on an operand being contained in a range, which [`bounds`]
-//! answers conservatively — it may say "unknown" and lose an optimization, but
+//! answers conservatively — it may return a universe-wide bound and lose an optimization, but
 //! it must never claim containment that does not hold. `plan_preserves_meaning`
 //! in `tests/expr_equivalence.rs` checks planned against unplanned against the
 //! `BTreeSet` oracle over random trees, which is what makes adding a rule safe.
@@ -368,7 +368,8 @@ fn cheaper(original: &Expr, candidate: Expr) -> Expr {
 /// optimization, while a wrong narrow one would change results. `And` is the
 /// only operator that could tighten by intersecting both sides, and it does —
 /// but it falls back to either side alone rather than guessing when one is
-/// unknown.
+/// unknown. A source with no span gets the whole universe: `None` is reserved
+/// for proven emptiness because identity rewrites use it to discard operands.
 pub fn bounds(e: &Expr) -> Option<(u64, u64)> {
     match e {
         Expr::Empty => None,
@@ -377,14 +378,18 @@ pub fn bounds(e: &Expr) -> Option<(u64, u64)> {
         // A source reports a *prefix* span, so this widens it to the ordinals
         // those chunks could hold. Wider than the truth by up to a chunk at each
         // end, which is the direction this function documents as safe: it costs
-        // an optimization and cannot change a result. A source that will not say
-        // gets `None`, which is "unknown", not "empty".
-        Expr::Source(src) => src.prefix_span().map(|(lo, hi)| {
-            (
-                crate::join(lo, 0),
-                crate::join(hi, u16::MAX).min(crate::ORDINAL_MAX),
-            )
-        }),
+        // an optimization and cannot change a result. An unknown span covers
+        // the universe: `None` is treated as empty by `pass_b` identity rules.
+        Expr::Source(src) => Some(
+            src.prefix_span()
+                .map(|(lo, hi)| {
+                    (
+                        crate::join(lo, 0),
+                        crate::join(hi, u16::MAX).min(crate::ORDINAL_MAX),
+                    )
+                })
+                .unwrap_or((0, crate::ORDINAL_MAX)),
+        ),
         // A complement is contained in its own range, whatever the input is.
         Expr::Not(_, lo, hi) => (hi > lo).then(|| (*lo, hi - 1)),
         // `a \ b` is contained in `a`.

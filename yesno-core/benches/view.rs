@@ -146,6 +146,62 @@ fn cardinality(c: &mut Criterion) {
     g.finish();
 }
 
+/// Whole-vector cardinalities on one fixed 16-bitmap physical corpus.
+/// The arity changes only the owner masks, not the input volume or encoding.
+fn bitmap_cardinalities(c: &mut Criterion) {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let packed =
+        OrdSet::from_iter_unsorted((0..16 * 65_536u64).filter(|_| lcg(&mut state) % 100 < 55));
+    assert_eq!(packed.chunk_count(), 16);
+    assert_eq!(
+        packed
+            .chunks()
+            .filter(|(_, container)| container.kind() == ContainerKind::Bitmap)
+            .count(),
+        16,
+        "cardinality fixture must be all bitmap containers",
+    );
+    let mut group = c.benchmark_group("view/cardinalities");
+    for sets in [2, 4, 8] {
+        let view = View::interleaved(sets);
+        group.bench_function(format!("interleaved_{sets}"), |b| {
+            b.iter(|| black_box(&packed).view_cardinalities(black_box(&view)))
+        });
+    }
+    group.finish();
+}
+
+/// Materializing folds on the same fixed physical bitmap corpus as the
+/// cardinalities above. The timer includes output container construction.
+fn bitmap_folds(c: &mut Criterion) {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let packed =
+        OrdSet::from_iter_unsorted((0..16 * 65_536u64).filter(|_| lcg(&mut state) % 100 < 55));
+    assert_eq!(packed.chunk_count(), 16);
+    assert_eq!(
+        packed
+            .chunks()
+            .filter(|(_, container)| container.kind() == ContainerKind::Bitmap)
+            .count(),
+        16,
+        "fold fixture must be all bitmap containers",
+    );
+    let mut group = c.benchmark_group("view/bitmap_folds");
+    for sets in [2, 4, 8] {
+        let view = View::interleaved(sets);
+        for (name, reduce) in [
+            ("any", Reduce::Any),
+            ("all", Reduce::All),
+            ("parity", Reduce::Parity),
+        ] {
+            group.bench_function(format!("{sets}/{name}"), |b| {
+                b.iter(|| black_box(&packed).view_fold(black_box(&view), reduce))
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Direct blocked intersection counts against the public select-and-count
 /// oracle that the Flight fallback used before the grouped scalar arm.
 fn intersection_cardinalities(c: &mut Criterion) {
@@ -292,6 +348,8 @@ criterion_group!(
     benches,
     select,
     cardinality,
+    bitmap_cardinalities,
+    bitmap_folds,
     intersection_cardinalities,
     fold,
     expand,

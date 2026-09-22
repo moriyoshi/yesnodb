@@ -6,12 +6,32 @@
 //! interesting code would go untested while the suite stayed green.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 use yesno_core::container::codec;
 use yesno_core::roaring_format::{deserialize_u64, serialize_u64};
-use yesno_core::view::View;
+use yesno_core::view::{
+    stream_interleaved_view_fold, stream_view_cardinalities, stream_view_ranks,
+    IntersectionCountStrategy, Reduce, View, ViewIntersectionCounter,
+};
 use yesno_core::{ContainerKind, OrdSet, RangeSummary, ORDINAL_MAX};
+
+#[test]
+fn selective_view_intersection_counts_final_legal_ordinal() {
+    let view = View::interleaved(1);
+    let packed = OrdSet::from_iter_unsorted([ORDINAL_MAX]);
+    let filter = OrdSet::from_iter_unsorted([ORDINAL_MAX]);
+    let count = |strategy| {
+        let mut counter = ViewIntersectionCounter::new(view, [&filter], strategy).unwrap();
+        for (prefix, container) in packed.chunks() {
+            counter.push(prefix, container).unwrap();
+        }
+        counter.finish()
+    };
+    assert_eq!(count(IntersectionCountStrategy::FullScan), vec![vec![1]]);
+    assert_eq!(count(IntersectionCountStrategy::Selective), vec![vec![1]]);
+}
 
 /// Ordinals clustered into a handful of chunks, so containers actually fill up.
 fn clustered_ordinals() -> impl Strategy<Value = Vec<u64>> {
@@ -647,6 +667,190 @@ proptest! {
             // Touching every ordinal is what caught the u16 overflow: the
             // container looked fine until something read `end`.
             prop_assert_eq!(c.iter().count() as u32, c.len());
+        }
+    }
+}
+
+fn fold_rows(rows: &[BTreeSet<u64>], reduce: Reduce) -> BTreeSet<u64> {
+    match reduce {
+        Reduce::Any => rows.iter().flat_map(|row| row.iter().copied()).collect(),
+        Reduce::All => rows.iter().skip(1).fold(rows[0].clone(), |acc, row| {
+            acc.intersection(row).copied().collect()
+        }),
+        Reduce::Parity => rows.iter().fold(BTreeSet::new(), |acc, row| {
+            acc.symmetric_difference(row).copied().collect()
+        }),
+        _ => unreachable!("the test covers the three public reductions"),
+    }
+}
+
+#[test]
+fn interleaved_cardinalities_accept_an_unaligned_shared_bitmap() {
+    let values: Vec<u64> = (0..65_536u64).filter(|x| x % 3 != 0).collect();
+    let original = OrdSet::from_iter_unsorted(values.iter().copied());
+    let (_, container) = original.chunks().next().unwrap();
+    assert_eq!(container.kind(), ContainerKind::Bitmap);
+    let payload = codec::encode(container);
+    let mut bytes = vec![0u8; payload.len() + 8];
+    let offset = usize::from((bytes.as_ptr() as usize).is_multiple_of(8));
+    bytes[offset..offset + payload.len()].copy_from_slice(&payload);
+    let buffer = yesno_core::unstable_arrow::arrow_buffer::Buffer::from(bytes);
+    let shared = codec::decode_buffer(
+        ContainerKind::Bitmap,
+        &buffer,
+        offset,
+        payload.len(),
+        container.len(),
+    )
+    .unwrap();
+    assert!(
+        yesno_core::unstable_arrow::bitmap_words(&shared).is_none(),
+        "the regression must exercise the unaligned fallback",
+    );
+    let packed = OrdSet::from_chunks(vec![(0, shared)]);
+    for sets in [2u32, 4, 8] {
+        let mut want = vec![0u64; sets as usize];
+        let mut rows = vec![BTreeSet::new(); sets as usize];
+        for &ordinal in &values {
+            want[(ordinal % sets as u64) as usize] += 1;
+            rows[(ordinal % sets as u64) as usize].insert(ordinal / sets as u64);
+        }
+        let view = View::interleaved(sets);
+        assert_eq!(packed.view_cardinalities(&view), want);
+        for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+            let got = packed.view_fold(&view, reduce);
+            assert_invariants(&got);
+            assert_eq!(
+                got.iter().collect::<BTreeSet<_>>(),
+                fold_rows(&rows, reduce)
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// A periodic bitmap, array tail and contiguous run cross chunk seams.
+    /// The high sparse prefix catches code that accidentally uses only low bits
+    /// for the logical ordinal. Uniform u64 values would never form a bitmap.
+    #[test]
+    fn interleaved_view_cardinalities_match_independent_rows(
+        sets in prop::sample::select(vec![2u32, 4, 8]),
+        phase in 0u64..64,
+    ) {
+        let high_base = ORDINAL_MAX & !0xffff;
+        let values: Vec<u64> = (0..65_536u64 + 1_024)
+            .filter(|ordinal| (ordinal + phase) % 3 != 0)
+            .chain((2 * 65_536u64)..(2 * 65_536u64 + 5_000))
+            .chain(
+                (0..256u64)
+                    .filter(|low| (low + phase) % 5 == 0)
+                    .map(|low| high_base + low),
+            )
+            .collect();
+        let mut packed = OrdSet::from_iter_unsorted(values.iter().copied());
+        packed.optimize();
+        assert_invariants(&packed);
+        let kinds: Vec<_> = packed.chunks().map(|(_, c)| c.kind()).collect();
+        prop_assert_eq!(kinds, [ContainerKind::Bitmap, ContainerKind::Array, ContainerKind::Run, ContainerKind::Array]);
+
+        let mut rows = vec![BTreeSet::new(); sets as usize];
+        for ordinal in values {
+            rows[(ordinal % sets as u64) as usize].insert(ordinal / sets as u64);
+        }
+        let want: Vec<u64> = rows.iter().map(|row| row.len() as u64).collect();
+        let view = View::interleaved(sets);
+        prop_assert_eq!(packed.view_cardinalities(&view), want.clone());
+
+        let packed = Arc::new(packed);
+        let mut count_stream = packed.stream();
+        prop_assert_eq!(
+            stream_view_cardinalities(&mut count_stream, &view).unwrap(),
+            want
+        );
+        let chunk_logicals = 65_536 / u64::from(sets);
+        let high_logical = high_base / u64::from(sets);
+        for upper in [
+            0,
+            1,
+            chunk_logicals - 1,
+            chunk_logicals,
+            chunk_logicals + 1,
+            high_logical,
+            high_logical + 1,
+            u64::MAX,
+        ] {
+            let want: Vec<u64> = rows
+                .iter()
+                .map(|row| row.range(..upper).count() as u64)
+                .collect();
+            let mut rank_stream = packed.stream();
+            prop_assert_eq!(
+                stream_view_ranks(&mut rank_stream, &view, upper).unwrap(),
+                want
+            );
+        }
+        for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+            let eager = packed.view_fold(&view, reduce);
+            assert_invariants(&eager);
+            let mut stream = packed.stream();
+            let streamed = stream_interleaved_view_fold(&mut stream, &view, reduce).unwrap();
+            assert_invariants(&streamed);
+            let want = fold_rows(&rows, reduce);
+            prop_assert_eq!(eager.iter().collect::<BTreeSet<_>>(), want.clone());
+            prop_assert_eq!(streamed.iter().collect::<BTreeSet<_>>(), want);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4))]
+
+    /// Eight physical bitmap chunks force every arity to cross physical chunk
+    /// seams; at arity eight they combine into one logical output chunk. A
+    /// ninth bitmap at the final prefix checks the sparse output-prefix jump.
+    #[test]
+    fn interleaved_bitmap_folds_match_independent_rows(phase in 0u64..32) {
+        let values: Vec<u64> = (0..8 * 65_536u64)
+            .filter(|&ordinal| {
+                let bits = ordinal
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(phase.wrapping_mul(1_442_695_040_888_963_407));
+                (bits >> 32) % 100 < 55
+            })
+            .chain(
+                (0..65_536u64)
+                    .filter(|low| low % 4 == 0)
+                    .map(|low| (ORDINAL_MAX & !0xffff) + low),
+            )
+            .collect();
+        let packed = OrdSet::from_iter_unsorted(values.iter().copied());
+        prop_assert_eq!(packed.chunk_count(), 9);
+        prop_assert!(packed
+            .chunks()
+            .all(|(_, container)| yesno_core::unstable_arrow::bitmap_words(container).is_some()));
+        for sets in [2u32, 4, 8] {
+            let mut rows = vec![BTreeSet::new(); sets as usize];
+            for &ordinal in &values {
+                rows[(ordinal % sets as u64) as usize].insert(ordinal / sets as u64);
+            }
+            let view = View::interleaved(sets);
+            let want_counts: Vec<u64> = rows.iter().map(|row| row.len() as u64).collect();
+            prop_assert_eq!(
+                packed.view_cardinalities(&view),
+                want_counts,
+                "sets={} bitmap owner counts", sets
+            );
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let got = packed.view_fold(&view, reduce);
+                assert_invariants(&got);
+                let want = fold_rows(&rows, reduce);
+                prop_assert!(
+                    got.iter().eq(want.iter().copied()),
+                    "sets={sets} reduce={reduce:?} got={} want={}", got.len(), want.len()
+                );
+            }
         }
     }
 }
