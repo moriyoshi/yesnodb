@@ -4072,3 +4072,92 @@ attributes, no metadata and no service, and must not be substituted for that
 result. The consumer owns it. haiiie was not modified.
 
 All four gates pass.
+
+---
+## 2026-09-24 -- The patch operation cost 39% on the path it does not touch
+
+`747d02a` passed four gates, fifteen tests, a sabotage check and a live/replay
+agreement proof, and regressed ordinary point ingest by 39%. A downstream
+consumer found it. Nothing in this repository would have.
+
+### The defect
+
+`Op::PatchChunk` held two `Option<Container>` inline. A `Container` is 56
+bytes, so that variant is 128 where the next largest, `PutChunk`, needs 72.
+**`Op` is the element type of every `WriteBatch`'s op vector**, and the
+overwhelmingly common variant is `Insert` -- two `u64`s, of which a bulk
+ingest pushes millions. Every point insert went from 72 bytes to 128, and a
+batch containing no patches at all paid it on every operation it stored.
+
+Isolated point-ingest benchmark, 96,903 documents, three runs each:
+
+| | runs | mean |
+| --- | --- | ---: |
+| `Op` = 128 B | 2.563 / 2.413 / 2.437 | 2.471 s |
+| masks boxed, `Op` = 72 B | 1.779 / 1.723 / 1.788 | 1.763 s |
+
+1.78 s is **exactly** the number the original hand-off recorded for this path,
+so boxing restored the pre-change figure rather than merely improving on the
+regression. The fix is one `Box`: 8 bytes rather than 112, paid only by the
+operation that uses them.
+
+### What the consumer's report looked like, and why it was actionable
+
+They reported 12-17% slower ingest with the controls that make such a claim
+usable: a pure-CPU encode step that cannot reach this code held to 0.3%, and
+**query latency moved the other way over the same runs**. No machine-wide
+slowdown produces slower writes and faster reads at once. That one observation
+is what made it worth dropping everything for.
+
+Their guess at the cause was `apply.rs` or `memtable.rs`, the files the write
+path runs through. It was neither; both were untouched in effect. The cost was
+an enum definition in `db/mod.rs`.
+
+### The hazard travelled with the interface
+
+They then found **the same defect in their own batch enum**, 32 bytes to 128,
+introduced by mirroring this API while wiring up their tile writer. Their gate
+is 173 tests including allocation budgets and it passed on it, the same day
+mine did.
+
+Two independently written suites, different authors, different conventions,
+blind to the same thing. That is the line worth carrying: a green gate proves
+less than it appears to, and what it is silent about is not visible from
+inside it.
+
+So the warning belongs on `patch_chunk` itself, which is where a batching
+consumer looks and where they did not find out. My doc comment had discussed
+clear/set semantics and live/replay agreement at length and omitted the only
+constraint that bit both trees. It now carries both measurements, because a
+number is what stops the next reader raising a bound instead of boxing a
+payload. The guard is
+`the_op_enum_does_not_grow_past_its_widest_necessary_variant`, asserted
+relatively so a legitimate change to `Container` cannot turn it into a
+constant someone edits to go green.
+
+### Two lessons that are not mine
+
+**A gate can be blind to the resource the workload is bound by.** They
+produced 89.4 s and 83.3 s on a run, recognised that a 32-byte `Op` *cannot*
+be slower than the 128-byte one whose cost it removes, traced it to an
+unrelated `qemu-img` build pushing 500 MB/s, and discarded the measurement
+rather than reporting it. CPU idle read 90% throughout. Rejecting a
+measurement because it is impossible given the mechanism, rather than merely
+bad, is the inference worth keeping.
+
+**An artifact that cannot be misread is cheaper than a reader who never
+misreads.** They attributed a green gate to the wrong commit after reading a
+log in this session's scratchpad -- a file that records four exit codes and
+nothing identifying what they describe. They had to infer the commit from
+mtime because the format offered no handle. The repair is the file, not the
+reader: gate results here now carry their SHA, and the misleading log was
+stamped retroactively so it cannot mislead again.
+
+### The shape of the mistake, restated
+
+My gate was rigorous about semantics and silent about cost. Both of today's
+audits and this regression share one form: **a check placed where the
+cooperative path runs rather than where the real cost or the real input
+arrives.** The poison bug validated per record batch while clients send per
+call. The I8 check guarded `WriteBatch` while records arrive from the log.
+This one measured the operation it added and not the vector it widened.
