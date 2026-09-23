@@ -3129,16 +3129,24 @@ enum Op {
     InsertRange(u64, u64, u64),
     RemoveRange(u64, u64, u64),
     PutChunk(u64, Prefix48, crate::Container),
-    /// `key, prefix, clear, set` -- apply `( old \ clear ) union set` to one
-    /// chunk. Either mask may be `None`, meaning empty.
-    PatchChunk(
-        u64,
-        Prefix48,
-        Option<crate::Container>,
-        Option<crate::Container>,
-    ),
+    /// `key, prefix, ( clear, set )` -- apply `( old \ clear ) union set` to
+    /// one chunk. Either mask may be `None`, meaning empty.
+    ///
+    /// **The masks are boxed because this enum is the element type of every
+    /// batch's op vector.** A `Container` is 56 bytes, so holding two inline
+    /// made `size_of::<Op>()` 128 where the next largest variant needs 72 --
+    /// and the overwhelmingly common variant is `Insert`, two `u64`s, of which
+    /// a bulk ingest pushes millions. A consumer measured 12-17% slower ingest
+    /// on a point-write path that never calls `patch_chunk` at all; the cost
+    /// was memory traffic over a vector whose elements this variant had
+    /// widened by 60%. One pointer costs 8 bytes and is paid only by the
+    /// operation that uses it.
+    PatchChunk(u64, Prefix48, Box<PatchMasks>),
     DeleteKey(u64),
 }
+
+/// A patch's two masks, boxed out of [`Op`] so they do not widen it.
+type PatchMasks = (Option<crate::Container>, Option<crate::Container>);
 
 /// Round a record's on-disk footprint up to the 8-byte record alignment.
 #[inline]
@@ -3405,7 +3413,8 @@ impl Op {
                 }
                 (RecType::ChunkImage, body)
             }
-            Op::PatchChunk(k, prefix, clear, set) => {
+            Op::PatchChunk(k, prefix, masks) => {
+                let (clear, set) = masks.as_ref();
                 let empty = crate::Container::new_array();
                 (
                     RecType::ChunkPatch,
@@ -3428,7 +3437,7 @@ impl Op {
             | Op::InsertRange(k, _, _)
             | Op::RemoveRange(k, _, _)
             | Op::PutChunk(k, _, _)
-            | Op::PatchChunk(k, _, _, _)
+            | Op::PatchChunk(k, _, _)
             | Op::DeleteKey(k) => *k,
         }
     }
@@ -3622,8 +3631,10 @@ impl WriteBatch {
         self.push_op(Op::PatchChunk(
             key,
             prefix,
-            (!clear.is_empty()).then(|| clear.clone()),
-            (!set.is_empty()).then(|| set.clone()),
+            Box::new((
+                (!clear.is_empty()).then(|| clear.clone()),
+                (!set.is_empty()).then(|| set.clone()),
+            )),
         ));
         self
     }
@@ -3977,7 +3988,7 @@ impl WriteBatch {
                     // A patch is `( old \ clear ) union set`, so unlike a
                     // replace it reads the chunk it lands on and wants that
                     // chunk prefetched.
-                    Planned::Whole(Op::PatchChunk(key, prefix, _, _)) => {
+                    Planned::Whole(Op::PatchChunk(key, prefix, _)) => {
                         if want.len() >= PREFETCH_MAX {
                             break 'units;
                         }
@@ -4118,7 +4129,8 @@ impl WriteBatch {
                         local += c.len() as u64;
                         mem.put_chunk(*k, *p, c.clone(), version);
                     }
-                    Op::PatchChunk(k, p, clear, set) => {
+                    Op::PatchChunk(k, p, masks) => {
+                        let (clear, set) = masks.as_ref();
                         // The same routine replay calls, so the committed state
                         // and the recovered state cannot differ. The base comes
                         // from the prefetched map when it is there and from the
@@ -5804,6 +5816,36 @@ mod tests {
         }
         let s = db.snapshot().unwrap();
         assert!(s.cardinality(0).unwrap() > 0);
+    }
+
+    /// `Op` must not grow past its widest *necessary* variant.
+    ///
+    /// This enum is the element type of every batch's op vector, and the
+    /// overwhelmingly common variant is `Insert` -- two `u64`s, of which a bulk
+    /// ingest pushes millions. `PutChunk` has to carry a `Container` inline and
+    /// sets the floor; anything wider is paid by every operation in every
+    /// batch, including the ones that never touch the wide variant.
+    ///
+    /// `PatchChunk` held two `Option<Container>` inline when it was added,
+    /// taking the enum from 72 bytes to 128. A consumer measured **12-17%
+    /// slower ingest on a point-write path that never calls `patch_chunk`**,
+    /// and an isolated point-ingest benchmark here moved 1.78 s -> 2.47 s and
+    /// back again when the masks were boxed. Nothing else about the operation
+    /// changed; the cost was entirely memory traffic over a wider vector.
+    ///
+    /// So: box a payload rather than widen this enum, and keep this assertion
+    /// relative so it survives a legitimate change to `Container`'s size.
+    #[test]
+    fn the_op_enum_does_not_grow_past_its_widest_necessary_variant() {
+        let floor = std::mem::size_of::<(u64, Prefix48, crate::Container)>();
+        assert_eq!(
+            std::mem::size_of::<Op>(),
+            floor,
+            "Op is {} bytes but only needs {}; a variant is carrying a large \
+             payload inline that should be boxed",
+            std::mem::size_of::<Op>(),
+            floor
+        );
     }
 
     /// `store_set` must replay to exactly what it committed.
