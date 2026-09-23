@@ -84,9 +84,13 @@ pub struct ChunkId(pub u64);
 /// A fresh filter-set epoch, distinct from every other this process hands out.
 ///
 /// Callers that hold a fixed filter set for a scan should take one at
-/// construction and reuse it for every chunk. See
-/// [`Accelerator::and_cardinalities`] for why equality of epochs is a promise
-/// about the filters themselves.
+/// construction and reuse it for every chunk.
+///
+/// Equality of epochs is a **promise about the filters themselves**: equal
+/// epochs mean identical filter contents, so an accelerator holding them
+/// device-side may skip re-sending them. A caller that reuses an epoch across
+/// filters that are not identical produces wrong counts rather than slow ones.
+/// See [`Accelerator::enqueue`], which takes it.
 pub fn next_filters_epoch() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);

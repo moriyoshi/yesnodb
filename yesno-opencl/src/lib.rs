@@ -38,7 +38,7 @@
 //!
 //! # Status: correct, measured, and currently slower than the CPU
 //!
-//! [`crate::opencl`] is a real device backend and it agrees with the CPU on
+//! The `opencl` module is a real device backend and it agrees with the CPU on
 //! every count. **It is also slower than the CPU at every shape measured but
 //! one**, and the reason is the call site rather than the device:
 //!
