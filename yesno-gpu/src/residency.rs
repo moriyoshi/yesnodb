@@ -142,6 +142,17 @@ struct Entry {
     tick: u64,
     /// Whether this chunk has been touched again since it was filled.
     used: bool,
+    /// Outstanding references from queued work. A pinned entry is never
+    /// evicted.
+    ///
+    /// # Why this exists
+    ///
+    /// Deferred batches queue a *slot*, not a payload. Without pinning,
+    /// admitting a later chunk could recycle a slot that queued work still
+    /// points at, and the batch would count the wrong chunk -- a plausible
+    /// answer, with nothing reporting an error. Every other failure in this
+    /// crate degrades to the CPU path; this one would not.
+    pins: u32,
 }
 
 /// Device-slot bookkeeping. Holds no device memory itself.
@@ -220,6 +231,28 @@ impl Residency {
         }
     }
 
+    /// Hold `chunk` against eviction until a matching [`Residency::unpin`].
+    ///
+    /// Returns `false` if it is not resident, which a caller should treat as a
+    /// bug rather than a condition: pinning follows a `Resident` or `Admit`
+    /// decision.
+    pub fn pin(&mut self, chunk: ChunkId) -> bool {
+        match self.resident.get_mut(&chunk) {
+            Some(entry) => {
+                entry.pins += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Release one pin taken by [`Residency::pin`].
+    pub fn unpin(&mut self, chunk: ChunkId) {
+        if let Some(entry) = self.resident.get_mut(&chunk) {
+            entry.pins = entry.pins.saturating_sub(1);
+        }
+    }
+
     /// Undo an [`Decision::Admit`] the caller could not fulfil.
     ///
     /// A failed upload must not leave a slot marked as holding a payload it
@@ -280,6 +313,7 @@ impl Residency {
                 slot,
                 tick: self.tick,
                 used: false,
+                pins: 0,
             },
         );
         self.order.insert((self.tick, chunk));
@@ -292,7 +326,15 @@ impl Residency {
     }
 
     fn evict(&mut self) -> Option<Slot> {
-        let &(tick, victim) = self.order.iter().next()?;
+        // Least-recently-used first, skipping anything queued work still
+        // references. If everything is pinned there is nothing to give, and
+        // the caller declines rather than recycling a live slot under a job
+        // that names it.
+        let (tick, victim) = self
+            .order
+            .iter()
+            .find(|(_, c)| self.resident.get(c).is_some_and(|e| e.pins == 0))
+            .copied()?;
         self.order.remove(&(tick, victim));
         let entry = self
             .resident
@@ -468,6 +510,49 @@ mod tests {
         assert_eq!(r.stats().evictions, 1);
         // Chunk 1 must start over rather than re-enter on one sight.
         assert_eq!(r.touch(ChunkId(1)), Decision::Decline);
+    }
+
+    #[test]
+    fn a_pinned_chunk_is_never_evicted() {
+        // The hazard deferral introduces: queued work names a slot, so
+        // recycling that slot under it would count the wrong chunk and report
+        // nothing wrong.
+        let mut r = Residency::new(policy(2, 1));
+        let a = slots_of(r.touch(ChunkId(1))).expect("a");
+        assert!(r.pin(ChunkId(1)));
+        r.touch(ChunkId(2));
+        // Chunk 3 must take chunk 2's slot, not the pinned chunk 1's.
+        let c = slots_of(r.touch(ChunkId(3))).expect("c");
+        assert_ne!(c, a, "a pinned slot was recycled");
+        assert!(matches!(r.touch(ChunkId(1)), Decision::Resident(s) if s == a));
+    }
+
+    #[test]
+    fn a_fully_pinned_cache_declines_rather_than_recycling() {
+        let mut r = Residency::new(policy(2, 1));
+        for k in [1u64, 2] {
+            r.touch(ChunkId(k));
+            assert!(r.pin(ChunkId(k)));
+        }
+        assert_eq!(r.touch(ChunkId(3)), Decision::Decline, "nothing is free");
+        assert_eq!(r.resident_count(), 2);
+    }
+
+    #[test]
+    fn unpinning_makes_a_slot_available_again() {
+        let mut r = Residency::new(policy(1, 1));
+        let a = slots_of(r.touch(ChunkId(1))).expect("a");
+        assert!(r.pin(ChunkId(1)));
+        assert_eq!(r.touch(ChunkId(2)), Decision::Decline);
+        r.unpin(ChunkId(1));
+        assert_eq!(slots_of(r.touch(ChunkId(2))), Some(a));
+    }
+
+    #[test]
+    fn pinning_something_absent_reports_it_rather_than_pretending() {
+        let mut r = Residency::new(policy(2, 5));
+        assert!(!r.pin(ChunkId(1)), "nothing resident to pin");
+        r.unpin(ChunkId(1));
     }
 
     #[test]

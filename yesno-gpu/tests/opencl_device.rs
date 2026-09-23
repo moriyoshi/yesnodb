@@ -12,10 +12,10 @@
 //! counts to the host backend, and the admission path exercised rather than
 //! declined.
 
-use yesno_core::accel::{Accel, Accelerator, ChunkId};
+use yesno_core::accel::{next_scan, Accel, Accelerator, ChunkId};
 use yesno_core::view::{IntersectionCountStrategy, View, ViewIntersectionCounter};
 use yesno_core::{Container, OrdSet};
-use yesno_gpu::backend::{Backend, HostBackend};
+use yesno_gpu::backend::{Backend, HostBackend, Job};
 use yesno_gpu::opencl::OpenClBackend;
 use yesno_gpu::residency::Policy;
 use yesno_gpu::Offload;
@@ -67,8 +67,13 @@ fn the_device_agrees_with_the_host_backend_on_every_count() {
         assert!(host.upload(yesno_gpu::residency::Slot(2), &chunk));
         let mut got = vec![0u32; nfilters * ROWS];
         let mut want = vec![0u32; nfilters * ROWS];
-        assert!(dev.and_cardinalities(yesno_gpu::residency::Slot(2), ROW_WORDS, &refs, &mut got));
-        assert!(host.and_cardinalities(yesno_gpu::residency::Slot(2), ROW_WORDS, &refs, &mut want));
+        let jobs = [Job {
+            slot: yesno_gpu::residency::Slot(2),
+            rows: ROWS,
+            owner_base: 0,
+        }];
+        assert!(dev.run_batch(&jobs, ROW_WORDS, &refs, 1, &mut got));
+        assert!(host.run_batch(&jobs, ROW_WORDS, &refs, 1, &mut want));
         assert_eq!(got, want, "seed {seed}, {nfilters} filters");
         assert!(
             want.iter().any(|&c| c > 0),
@@ -91,9 +96,20 @@ fn a_partial_chunk_is_counted_at_its_own_width() {
     assert!(host.upload(s, &chunk));
     let mut got = vec![0u32; 8 * rows];
     let mut want = vec![0u32; 8 * rows];
-    assert!(dev.and_cardinalities(s, ROW_WORDS, &refs, &mut got));
-    assert!(host.and_cardinalities(s, ROW_WORDS, &refs, &mut want));
+    // `rows` here is 5, not the full 64 a chunk holds: `count_blocked`
+    // presents only the prefix of a container that belongs to the view.
+    let jobs = [Job {
+        slot: s,
+        rows,
+        owner_base: 0,
+    }];
+    assert!(dev.run_batch(&jobs, ROW_WORDS, &refs, 1, &mut got));
+    assert!(host.run_batch(&jobs, ROW_WORDS, &refs, 1, &mut want));
     assert_eq!(got, want);
+    assert!(
+        want.iter().any(|&c| c > 0),
+        "all-zero counts assert nothing"
+    );
 }
 
 #[test]
@@ -102,11 +118,113 @@ fn a_slot_never_uploaded_is_refused_rather_than_answering_from_stale_memory() {
     let f = words(1, ROW_WORDS);
     let refs: Vec<&[u64]> = vec![&f];
     let mut out = [7u32; ROWS];
-    assert!(!dev.and_cardinalities(yesno_gpu::residency::Slot(0), ROW_WORDS, &refs, &mut out));
+    assert!(!dev.run_batch(
+        &[Job {
+            slot: yesno_gpu::residency::Slot(0),
+            rows: ROWS,
+            owner_base: 0
+        }],
+        ROW_WORDS,
+        &refs,
+        1,
+        &mut out
+    ));
     assert_eq!(
         out, [7u32; ROWS],
         "a refusal must not scribble on the caller"
     );
+}
+
+#[test]
+fn changing_the_filter_epoch_replaces_the_device_copy() {
+    // The filter set is cached device-side and keyed by epoch, so a caller
+    // that changes filters must change the epoch. If the cache ignored the
+    // epoch -- or if it keyed on something that collides -- the second set
+    // would silently be counted against the first set's filters, and every
+    // count would be wrong with nothing reporting an error.
+    let Some(dev) = device(2) else { return };
+    let host = HostBackend::new(2, SLOT_WORDS);
+    let chunk = words(31, SLOT_WORDS);
+    let s = yesno_gpu::residency::Slot(0);
+    assert!(dev.upload(s, &chunk));
+    assert!(host.upload(s, &chunk));
+
+    for (epoch, seed) in [(10u64, 40u64), (11, 41), (12, 42)] {
+        let filters: Vec<Vec<u64>> = (0..8u64)
+            .map(|f| words(seed * 100 + f, ROW_WORDS))
+            .collect();
+        let refs: Vec<&[u64]> = filters.iter().map(|v| v.as_slice()).collect();
+        let mut got = vec![0u32; 8 * ROWS];
+        let mut want = vec![0u32; 8 * ROWS];
+        assert!(dev.run_batch(
+            &[Job {
+                slot: s,
+                rows: ROWS,
+                owner_base: 0
+            }],
+            ROW_WORDS,
+            &refs,
+            epoch,
+            &mut got
+        ));
+        assert!(host.run_batch(
+            &[Job {
+                slot: s,
+                rows: ROWS,
+                owner_base: 0
+            }],
+            ROW_WORDS,
+            &refs,
+            epoch,
+            &mut want
+        ));
+        assert_eq!(got, want, "epoch {epoch} was served another set's filters");
+        assert!(
+            want.iter().any(|&c| c > 0),
+            "all-zero counts assert nothing"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_epoch_still_produces_the_right_counts() {
+    // The other half: reusing an epoch for the *same* filters must be correct
+    // as well as cheap, which is the case the whole optimization exists for.
+    let Some(dev) = device(2) else { return };
+    let host = HostBackend::new(2, SLOT_WORDS);
+    let chunk = words(51, SLOT_WORDS);
+    let s = yesno_gpu::residency::Slot(1);
+    assert!(dev.upload(s, &chunk));
+    assert!(host.upload(s, &chunk));
+    let filters: Vec<Vec<u64>> = (0..8u64).map(|f| words(600 + f, ROW_WORDS)).collect();
+    let refs: Vec<&[u64]> = filters.iter().map(|v| v.as_slice()).collect();
+    let mut want = vec![0u32; 8 * ROWS];
+    assert!(host.run_batch(
+        &[Job {
+            slot: s,
+            rows: ROWS,
+            owner_base: 0
+        }],
+        ROW_WORDS,
+        &refs,
+        7,
+        &mut want
+    ));
+    for _ in 0..5 {
+        let mut got = vec![0u32; 8 * ROWS];
+        assert!(dev.run_batch(
+            &[Job {
+                slot: s,
+                rows: ROWS,
+                owner_base: 0
+            }],
+            ROW_WORDS,
+            &refs,
+            7,
+            &mut got
+        ));
+        assert_eq!(got, want);
+    }
 }
 
 #[test]
@@ -148,7 +266,7 @@ fn a_blocked_view_counted_on_the_device_equals_the_cpu() {
                 c.push(p, container).expect("push");
             }
         }
-        c.finish()
+        c.finish().expect("flush")
     };
 
     let want = count(None);
@@ -193,29 +311,48 @@ fn a_resident_chunk_is_served_from_the_device_without_re_uploading() {
     let chunk = words(21, SLOT_WORDS);
     let filters: Vec<Vec<u64>> = (0..8u64).map(|f| words(500 + f, ROW_WORDS)).collect();
     let refs: Vec<&[u64]> = filters.iter().map(|v| v.as_slice()).collect();
-    let mut first = vec![0u32; 8 * ROWS];
-    assert!(offload.and_cardinalities(ChunkId(77), &chunk, ROW_WORDS, &refs, &mut first));
 
     // Against the host oracle, not only against itself. Comparing the device
-    // to its own earlier answer is how this test passed while the backend
-    // returned all zeros: zeros equal zeros, ten times over.
+    // to its own earlier answer is how an earlier version of this test passed
+    // while the backend returned all zeros: zeros equal zeros, ten times over.
     let host = HostBackend::new(1, SLOT_WORDS);
     let s0 = yesno_gpu::residency::Slot(0);
     assert!(host.upload(s0, &chunk));
-    let mut want = vec![0u32; 8 * ROWS];
-    assert!(host.and_cardinalities(s0, ROW_WORDS, &refs, &mut want));
-    assert_eq!(first, want, "the device disagreed with the host backend");
+    let mut want_flat = vec![0u32; 8 * ROWS];
+    assert!(host.run_batch(
+        &[Job {
+            slot: s0,
+            rows: ROWS,
+            owner_base: 0
+        }],
+        ROW_WORDS,
+        &refs,
+        7,
+        &mut want_flat
+    ));
+    let mut want = vec![vec![0u64; ROWS]; 8];
+    for f in 0..8 {
+        for r in 0..ROWS {
+            want[f][r] = u64::from(want_flat[f * ROWS + r]);
+        }
+    }
     assert!(
-        want.iter().any(|&c| c > 0),
-        "all-zero counts assert nothing"
+        want.iter().flatten().any(|&c| c > 0),
+        "all-zero asserts nothing"
     );
 
-    for _ in 0..10 {
-        let mut again = vec![0u32; 8 * ROWS];
-        assert!(offload.and_cardinalities(ChunkId(77), &chunk, ROW_WORDS, &refs, &mut again));
-        assert_eq!(again, first, "a resident chunk changed its own answer");
+    // Ten separate scans over the same chunk: one fill, nine hits.
+    for pass in 0..10 {
+        let scan = next_scan();
+        assert!(offload.enqueue(scan, ChunkId(77), &chunk, ROW_WORDS, &refs, 7, 0, ROWS));
+        let mut got = vec![vec![0u64; ROWS]; 8];
+        {
+            let mut borrowed: Vec<&mut [u64]> = got.iter_mut().map(|v| v.as_mut_slice()).collect();
+            assert!(offload.flush(scan, &mut borrowed));
+        }
+        assert_eq!(got, want, "pass {pass}");
     }
     let s = offload.stats();
     assert_eq!(s.admissions, 1, "one fill");
-    assert_eq!(s.hits, 10, "ten uses");
+    assert_eq!(s.hits, 9, "nine reuses");
 }

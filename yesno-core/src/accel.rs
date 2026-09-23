@@ -11,46 +11,37 @@
 //! The satellite that implements this is `yesno-gpu`. It depends on this
 //! crate; nothing here depends on it, and nothing here mentions CUDA.
 //!
-//! # What is offered, and why only this
+//! # What is offered, and why the contract is deferred
 //!
-//! One operation: **`| row AND filter |` for every `( row, filter )` pair of
-//! one chunk against a set of filters.** A deliberately narrow surface, narrow
-//! because it is the only shape with a measurement behind it -- and
-//! two-dimensional because its call site is.
+//! One operation: `| row AND filter |` over the rows of a chunk against a set
+//! of filters. Narrow because it is the only shape with a measurement behind
+//! it, and two-dimensional because `count_blocked` is.
 //!
-//! Measured on an NVIDIA GB10, the naive arrangement -- one thread block per
-//! `( chunk, filter )` pair -- ran at **1.06x to 1.23x** of the CPU, because
-//! blocks touching the same chunk were scattered across the grid and each
-//! re-read it from memory. Restructured to **one block per chunk, with the
-//! chunk held in registers and every filter applied to it**, the same work
-//! measured **6.71x to 11.08x**. The win is entirely in the reuse of a chunk
-//! across filters, so the batch *is* the unit: an interface that offered one
-//! intersection at a time could not express the thing that pays.
+//! **It is enqueue-and-flush rather than compute-now, and that is the whole
+//! design.** The first version computed per chunk, which is the cadence
+//! `ViewIntersectionCounter::push` produces -- and it measured *slower than
+//! the CPU it replaces*, 0.36x to 0.89x. Isolating the cause in a standalone
+//! harness, changing only the launch granularity and nothing else, cost
+//! **16.69x, or 15 microseconds per chunk**, against roughly 1 microsecond of
+//! actual work. Adding the per-chunk readback and accumulation on top took the
+//! wired path to 39 microseconds per chunk.
 //!
-//! This is why the trait takes a slice of filters rather than one, and why it
-//! is not a general "evaluate this expression" hook.
+//! A streaming producer and a device that needs batch submission are at odds,
+//! and the synchronous contract resolved that tension in the wrong direction.
+//! Deferring lets one launch cover a scan: 256 launches become 1, 256
+//! readbacks become 1, and 256 accumulate passes become 1.
 //!
-//! **It is two-dimensional because `count_blocked` is.** A blocked view splits
-//! one container into rows of `stride` bits and counts every row against every
-//! filter, so the batch is `rows x filters` and the reuse runs both ways: a
-//! row is read once for all filters, a filter once for all rows. An interface
-//! offering one row at a time would have had to be called in a loop by the one
-//! call site it exists for, which is a good sign the interface is wrong.
+//! # The obligation deferral creates
 //!
-//! # Declining is normal, not an error
+//! **If [`Accelerator::enqueue`] returns `true`, the caller must not compute
+//! those counts**, so [`Accelerator::flush`] either delivers them or the
+//! result is silently short. That is why `flush` reports failure and why
+//! `ViewIntersectionCounter::finish` is fallible: an accelerator that loses
+//! enqueued work must produce an error, never a plausible undercount.
 //!
-//! [`Accelerator::and_cardinalities`] returns `bool`, and `false` means the
-//! caller should use its ordinary CPU path. Every caller must have one, and
-//! the CPU path is the oracle: no accelerator may return an answer that
-//! differs from it.
-//!
-//! **That is what makes the whole arrangement safe to be wrong about.** An
-//! implementation declines when the device is busy, when the batch is too
-//! small to amortize a launch, when the chunk is not resident and admission
-//! says not to make it so, or when there is no device at all. A wrong decline
-//! costs one CPU operation that was going to happen anyway; there is no tail
-//! regression to trade against, which is the same property that lets
-//! [`crate::jit::cardinality`] fall back transparently.
+//! It is also why declining is still free. An implementation that cannot take
+//! responsibility -- no device, a full queue, a batch too small to amortize --
+//! returns `false` from `enqueue`, and the caller counts it inline as before.
 //!
 //! # Identity, because residency needs it
 //!
@@ -90,38 +81,79 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkId(pub u64);
 
+/// A fresh filter-set epoch, distinct from every other this process hands out.
+///
+/// Callers that hold a fixed filter set for a scan should take one at
+/// construction and reuse it for every chunk. See
+/// [`Accelerator::and_cardinalities`] for why equality of epochs is a promise
+/// about the filters themselves.
+pub fn next_filters_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Identifies one scan, so an accelerator can hold work for several at once.
+///
+/// Taken by a counter at construction and used for every call it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScanId(pub u64);
+
+/// A fresh scan identity, distinct from every other this process hands out.
+pub fn next_scan() -> ScanId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    ScanId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A device that can count bitmap intersections in batches.
 ///
-/// See the module documentation for the contract. In short: fill every element
-/// of `out` and return `true`, or touch nothing and return `false`.
+/// See the module documentation for the contract. In short: take
+/// responsibility for a chunk or decline it, and deliver everything taken.
 pub trait Accelerator: Send + Sync {
-    /// Set `out[ f * rows + r ]` to `| row r AND filters[ f ] |`.
+    /// Take responsibility for one chunk's counts, or decline.
     ///
-    /// `rows` is `data.len() / row_words`. Every filter is `row_words` long,
-    /// and `out` is filter-major with `filters.len() * rows` slots.
+    /// `data` is `rows * row_words` words; every filter is `row_words` long.
+    /// `owner_base` is where this chunk's first row lands in each filter's
+    /// count vector, so the accelerator can place results without knowing
+    /// anything about views.
     ///
-    /// Returns `false` to decline, leaving `out` untouched and the work to the
-    /// caller. An implementation returning `true` must have written every slot,
-    /// and each must equal what the CPU path would have produced.
-    ///
-    /// The counts are *absolute*, not accumulated: callers add them into their
-    /// own totals. An accelerator that accumulated would need to know which
-    /// chunk of a scan it was in the middle of, which is exactly the state
-    /// this interface exists not to carry.
-    fn and_cardinalities(
+    /// `true` means the caller **must not** count this chunk itself. `false`
+    /// means it must.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
         &self,
+        scan: ScanId,
         chunk: ChunkId,
         data: &[u64],
         row_words: usize,
         filters: &[&[u64]],
-        out: &mut [u32],
+        filters_epoch: u64,
+        owner_base: usize,
+        rows: usize,
     ) -> bool;
 
-    /// Advisory: is a batch of this size worth offering at all?
+    /// Deliver every count enqueued for `scan`, adding into `counts`.
     ///
-    /// Lets a caller skip gathering filter slices for a batch that would be
-    /// declined anyway. Answering `true` and then declining is allowed; the
-    /// reverse is not, because the caller may not ask.
+    /// `counts[ f ]` is filter `f`'s vector over owners. Accumulates rather
+    /// than overwrites, because chunks the accelerator declined were counted
+    /// into the same vectors by the caller.
+    ///
+    /// **Failure is not recoverable by the caller**: it skipped the work on
+    /// the strength of `enqueue`. Returning `false` must therefore be
+    /// surfaced as an error, and an implementation should prefer declining at
+    /// `enqueue` over failing here.
+    ///
+    /// Clears the scan's state either way.
+    fn flush(&self, scan: ScanId, counts: &mut [&mut [u64]]) -> bool;
+
+    /// Discard a scan's state without delivering it.
+    ///
+    /// Called when a counter is dropped without finishing. Nothing was
+    /// promised to anyone, so there is nothing to report.
+    fn cancel(&self, scan: ScanId);
+
+    /// Advisory: is a batch of this width worth offering at all?
     fn worth_offering(&self, filters: usize) -> bool {
         let _ = filters;
         true
@@ -135,16 +167,26 @@ pub trait Accelerator: Send + Sync {
 pub struct Declines;
 
 impl Accelerator for Declines {
-    fn and_cardinalities(
+    fn enqueue(
         &self,
+        _: ScanId,
         _: ChunkId,
         _: &[u64],
         _: usize,
         _: &[&[u64]],
-        _: &mut [u32],
+        _: u64,
+        _: usize,
+        _: usize,
     ) -> bool {
         false
     }
+
+    fn flush(&self, _: ScanId, _: &mut [&mut [u64]]) -> bool {
+        // Nothing was ever taken, so nothing can be lost.
+        true
+    }
+
+    fn cancel(&self, _: ScanId) {}
 
     fn worth_offering(&self, _: usize) -> bool {
         false
@@ -183,24 +225,43 @@ impl Accel {
         self.0.worth_offering(filters)
     }
 
-    /// See [`Accelerator::and_cardinalities`].
+    /// See [`Accelerator::enqueue`].
+    #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn and_cardinalities(
+    pub fn enqueue(
         &self,
+        scan: ScanId,
         chunk: ChunkId,
         data: &[u64],
         row_words: usize,
         filters: &[&[u64]],
-        out: &mut [u32],
+        filters_epoch: u64,
+        owner_base: usize,
+        rows: usize,
     ) -> bool {
-        debug_assert!(row_words > 0 && data.len().is_multiple_of(row_words));
-        debug_assert_eq!(
-            out.len(),
-            filters.len() * (data.len() / row_words),
-            "filter-major, one count per ( filter, row )"
-        );
-        self.0
-            .and_cardinalities(chunk, data, row_words, filters, out)
+        debug_assert!(row_words > 0 && data.len() == rows * row_words);
+        self.0.enqueue(
+            scan,
+            chunk,
+            data,
+            row_words,
+            filters,
+            filters_epoch,
+            owner_base,
+            rows,
+        )
+    }
+
+    /// See [`Accelerator::flush`].
+    #[inline]
+    pub fn flush(&self, scan: ScanId, counts: &mut [&mut [u64]]) -> bool {
+        self.0.flush(scan, counts)
+    }
+
+    /// See [`Accelerator::cancel`].
+    #[inline]
+    pub fn cancel(&self, scan: ScanId) {
+        self.0.cancel(scan);
     }
 }
 
@@ -227,7 +288,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// The CPU path this trait's implementations must agree with.
+    /// The CPU path an accelerator must agree with.
     fn reference(row: &[u64], filter: &[u64]) -> u32 {
         row.iter()
             .zip(filter)
@@ -235,100 +296,162 @@ mod tests {
             .sum()
     }
 
-    struct Counting {
-        seen: Mutex<Vec<ChunkId>>,
-        answer: bool,
+    /// Takes everything and delivers it at flush, which is the contract in
+    /// its simplest honest form.
+    #[derive(Default)]
+    struct Deferring {
+        taken: Mutex<Vec<(usize, Vec<u32>, usize)>>,
+        fail_flush: bool,
     }
 
-    impl Accelerator for Counting {
-        fn and_cardinalities(
+    impl Accelerator for Deferring {
+        fn enqueue(
             &self,
-            chunk: ChunkId,
+            _: ScanId,
+            _: ChunkId,
             data: &[u64],
             row_words: usize,
             filters: &[&[u64]],
-            out: &mut [u32],
+            _: u64,
+            owner_base: usize,
+            rows: usize,
         ) -> bool {
-            self.seen.lock().expect("lock").push(chunk);
-            if !self.answer {
-                return false;
-            }
-            let rows = data.len() / row_words;
+            let mut block = vec![0u32; filters.len() * rows];
             for (f, filter) in filters.iter().enumerate() {
                 for r in 0..rows {
-                    out[f * rows + r] =
+                    block[f * rows + r] =
                         reference(&data[r * row_words..(r + 1) * row_words], filter);
+                }
+            }
+            self.taken
+                .lock()
+                .expect("lock")
+                .push((owner_base, block, rows));
+            true
+        }
+
+        fn flush(&self, _: ScanId, counts: &mut [&mut [u64]]) -> bool {
+            if self.fail_flush {
+                self.taken.lock().expect("lock").clear();
+                return false;
+            }
+            for (owner_base, block, rows) in self.taken.lock().expect("lock").drain(..) {
+                for (f, owners) in counts.iter_mut().enumerate() {
+                    for r in 0..rows {
+                        owners[owner_base + r] += u64::from(block[f * rows + r]);
+                    }
                 }
             }
             true
         }
+
+        fn cancel(&self, _: ScanId) {
+            self.taken.lock().expect("lock").clear();
+        }
     }
 
     #[test]
-    fn the_default_declines_and_leaves_the_output_alone() {
+    fn the_default_declines_everything_and_flushes_successfully() {
+        // Nothing was taken, so nothing can be lost -- a `false` here would
+        // make every caller report an error for a scan that went fine.
         let a = Accel::none();
         let data = [u64::MAX; 4];
         let f = [u64::MAX; 2];
-        let filters: Vec<&[u64]> = vec![&f, &f, &f];
-        let mut out = [7u32; 6];
-        assert!(!a.and_cardinalities(ChunkId(1), &data, 2, &filters, &mut out));
-        assert_eq!(out, [7; 6], "a decline must not scribble on the caller");
+        let filters: Vec<&[u64]> = vec![&f, &f];
         assert!(!a.worth_offering(64));
+        assert!(!a.enqueue(ScanId(1), ChunkId(1), &data, 2, &filters, 1, 0, 2));
+        let mut c0 = vec![0u64; 2];
+        let mut c1 = vec![0u64; 2];
+        let mut counts: Vec<&mut [u64]> = vec![&mut c0, &mut c1];
+        assert!(a.flush(ScanId(1), &mut counts));
+        assert_eq!((c0, c1), (vec![0, 0], vec![0, 0]));
     }
 
     #[test]
-    fn a_device_that_accepts_fills_every_slot_filter_major() {
-        let a = Accel::new(Counting {
-            seen: Mutex::new(Vec::new()),
-            answer: true,
-        });
-        // Two rows of two words, two filters.
-        let data = [0b1011u64, 0xff, 0b0110, 0x0f];
+    fn enqueued_work_arrives_at_flush_and_accumulates() {
+        let a = Accel::new(Deferring::default());
+        // Two chunks of two rows, two filters, landing at owner 0 and 2.
+        let d0 = [0b1011u64, 0xff, 0b0110, 0x0f];
+        let d1 = [0b1111u64, 0x01, 0b1000, 0xf0];
         let f0 = [0b0011u64, 0x0f];
         let f1 = [u64::MAX, 0];
         let filters: Vec<&[u64]> = vec![&f0, &f1];
-        let mut out = [0u32; 4];
-        assert!(a.and_cardinalities(ChunkId(9), &data, 2, &filters, &mut out));
+        assert!(a.enqueue(ScanId(9), ChunkId(1), &d0, 2, &filters, 1, 0, 2));
+        assert!(a.enqueue(ScanId(9), ChunkId(2), &d1, 2, &filters, 1, 2, 2));
+
+        let mut c0 = vec![0u64; 4];
+        let mut c1 = vec![0u64; 4];
+        {
+            let mut counts: Vec<&mut [u64]> = vec![&mut c0, &mut c1];
+            assert!(a.flush(ScanId(9), &mut counts));
+        }
         for (f, filter) in filters.iter().enumerate() {
-            for r in 0..2 {
-                assert_eq!(
-                    out[f * 2 + r],
-                    reference(&data[r * 2..(r + 1) * 2], filter),
-                    "filter {f} row {r}"
-                );
+            for (chunk, data) in [&d0, &d1].iter().enumerate() {
+                for r in 0..2 {
+                    let want = u64::from(reference(&data[r * 2..(r + 1) * 2], filter));
+                    let got = if f == 0 { &c0 } else { &c1 }[chunk * 2 + r];
+                    assert_eq!(got, want, "filter {f} chunk {chunk} row {r}");
+                }
             }
         }
     }
 
     #[test]
-    fn one_row_is_the_degenerate_case_and_still_works() {
-        let a = Accel::new(Counting {
-            seen: Mutex::new(Vec::new()),
-            answer: true,
-        });
-        let data = [0b1111u64];
-        let f = [0b0101u64];
+    fn flush_adds_to_what_the_caller_already_counted() {
+        // Declined chunks are counted inline by the caller into the same
+        // vectors, so flush must accumulate rather than overwrite.
+        let a = Accel::new(Deferring::default());
+        let d = [0xffff_ffff_ffff_ffffu64, u64::MAX];
+        let f = [u64::MAX, u64::MAX];
         let filters: Vec<&[u64]> = vec![&f];
-        let mut out = [0u32; 1];
-        assert!(a.and_cardinalities(ChunkId(1), &data, 1, &filters, &mut out));
-        assert_eq!(out[0], 2);
+        assert!(a.enqueue(ScanId(3), ChunkId(1), &d, 2, &filters, 1, 0, 1));
+        let mut c0 = vec![100u64];
+        {
+            let mut counts: Vec<&mut [u64]> = vec![&mut c0];
+            assert!(a.flush(ScanId(3), &mut counts));
+        }
+        assert_eq!(
+            c0[0],
+            100 + 128,
+            "the caller's existing count was discarded"
+        );
+    }
+
+    #[test]
+    fn a_failing_flush_reports_rather_than_undercounting() {
+        // The hazard deferral introduces: the caller skipped this work, so a
+        // silent `true` here produces a plausible, wrong, smaller answer.
+        let a = Accel::new(Deferring {
+            fail_flush: true,
+            ..Default::default()
+        });
+        let d = [u64::MAX; 2];
+        let f = [u64::MAX; 2];
+        let filters: Vec<&[u64]> = vec![&f];
+        assert!(a.enqueue(ScanId(5), ChunkId(1), &d, 2, &filters, 1, 0, 1));
+        let mut c0 = vec![0u64];
+        let mut counts: Vec<&mut [u64]> = vec![&mut c0];
+        assert!(!a.flush(ScanId(5), &mut counts));
+    }
+
+    #[test]
+    fn cancelling_discards_without_delivering() {
+        let a = Accel::new(Deferring::default());
+        let d = [u64::MAX; 2];
+        let f = [u64::MAX; 2];
+        let filters: Vec<&[u64]> = vec![&f];
+        assert!(a.enqueue(ScanId(7), ChunkId(1), &d, 2, &filters, 1, 0, 1));
+        a.cancel(ScanId(7));
+        let mut c0 = vec![0u64];
+        let mut counts: Vec<&mut [u64]> = vec![&mut c0];
+        assert!(a.flush(ScanId(7), &mut counts));
+        assert_eq!(c0[0], 0, "a cancelled scan must deliver nothing");
     }
 
     #[test]
     fn identity_compares_by_value_because_residency_depends_on_it() {
-        // An implementation that could not tell two chunks apart would have to
-        // hash 8 KiB to find out, which costs more than the work it is
-        // accelerating. See the module header on why a pointer will not do.
         assert_eq!(ChunkId(3), ChunkId(3));
         assert_ne!(ChunkId(3), ChunkId(17));
-    }
-
-    #[test]
-    fn worth_offering_defaults_to_yes_for_a_real_device() {
-        let a = Accel::new(Counting {
-            seen: Mutex::new(Vec::new()),
-            answer: true,
-        });
-        assert!(a.worth_offering(1), "the default trait method says yes");
+        assert_ne!(next_scan(), next_scan());
     }
 }

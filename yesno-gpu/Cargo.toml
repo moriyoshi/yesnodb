@@ -27,6 +27,11 @@ opencl = ["dep:opencl3"]
 name = "opencl_device"
 required-features = ["opencl"]
 
+[[bench]]
+name = "offload"
+harness = false
+required-features = ["opencl"]
+
 [dependencies]
 opencl3 = { version = "0.12.3", optional = true }
 yesno-core.workspace = true

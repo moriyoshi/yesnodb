@@ -47,29 +47,32 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_
 use opencl3::program::Program;
 use opencl3::types::{cl_uint, cl_ulong, CL_BLOCKING};
 
-use crate::backend::Backend;
+use crate::backend::{total_rows, Backend, Job};
 use crate::residency::Slot;
 
 const KERNEL: &str = r#"
-__kernel void andpop(__global const ulong *slots,
-                     ulong slot_base,
-                     __global const ulong *filters,
-                     __global uint *out,
-                     __local ulong *row,
-                     int row_words,
-                     int rows,
-                     int nfilters) {
-  int r = get_group_id(0);
+// One work group per row of the whole batch. `row_base[ g ]` is the word
+// offset of global row g inside the slot arena, which is what lets a single
+// launch cover chunks scattered across slots.
+__kernel void andpop_batch(__global const ulong *slots,
+                           __global const ulong *row_base,
+                           __global const ulong *filters,
+                           __global uint *out,
+                           __local ulong *row,
+                           int row_words,
+                           long total_rows,
+                           int nfilters) {
+  long g = get_group_id(0);
   int t = get_local_id(0);
   int nt = get_local_size(0);
-  __global const ulong *data = slots + slot_base;
-  for (int w = t; w < row_words; w += nt) row[w] = data[(long)r * row_words + w];
+  __global const ulong *data = slots + row_base[g];
+  for (int w = t; w < row_words; w += nt) row[w] = data[w];
   barrier(CLK_LOCAL_MEM_FENCE);
   for (int f = t; f < nfilters; f += nt) {
     uint acc = 0;
     __global const ulong *fl = filters + (long)f * row_words;
     for (int w = 0; w < row_words; ++w) acc += popcount(row[w] & fl[w]);
-    out[(long)f * rows + r] = acc;
+    out[(long)f * total_rows + g] = acc;
   }
 }
 "#;
@@ -88,6 +91,14 @@ struct Inner {
     lens: Vec<usize>,
     filters: Buffer<cl_ulong>,
     filters_cap: usize,
+    /// Epoch of the filter set currently on the device, and its width. `None`
+    /// means nothing is loaded. Keeping this is the difference between
+    /// copying the filters once per scan and once per chunk -- measured as
+    /// the dominant cost of the whole offload path.
+    filters_loaded: Option<(u64, usize)>,
+    /// Per-global-row word offsets for the batch currently staged.
+    row_base: Buffer<cl_ulong>,
+    row_base_cap: usize,
     out: Buffer<cl_uint>,
     out_cap: usize,
 }
@@ -115,7 +126,7 @@ impl OpenClBackend {
         let context = Context::from_device(&device).ok()?;
         let queue = CommandQueue::create_default_with_properties(&context, 0, 0).ok()?;
         let program = Program::create_and_build_from_source(&context, KERNEL, "").ok()?;
-        let kernel = Kernel::create(&program, "andpop").ok()?;
+        let kernel = Kernel::create(&program, "andpop_batch").ok()?;
 
         // SAFETY: `Buffer::create` is unsafe because a non-null `host_ptr`
         // must outlive the buffer and match the flags. Null is passed, so the
@@ -136,6 +147,9 @@ impl OpenClBackend {
         let out =
             unsafe { Buffer::<cl_uint>::create(&context, CL_MEM_WRITE_ONLY, 1, ptr::null_mut()) }
                 .ok()?;
+        let row_base =
+            unsafe { Buffer::<cl_ulong>::create(&context, CL_MEM_READ_ONLY, 1, ptr::null_mut()) }
+                .ok()?;
 
         Some(OpenClBackend {
             capacity,
@@ -151,6 +165,9 @@ impl OpenClBackend {
                 lens: vec![0; capacity],
                 filters,
                 filters_cap: 1,
+                filters_loaded: None,
+                row_base,
+                row_base_cap: 1,
                 out,
                 out_cap: 1,
             }),
@@ -166,7 +183,21 @@ impl OpenClBackend {
 impl Inner {
     /// Grow a scratch buffer if it is too small. Buffers only ever grow, so a
     /// steady-state workload stops reallocating.
-    fn ensure(&mut self, filters_words: usize, out_len: usize) -> bool {
+    fn ensure(&mut self, filters_words: usize, out_len: usize, rows: usize) -> bool {
+        if rows > self.row_base_cap {
+            // SAFETY: as elsewhere -- null `host_ptr`, device-owned storage.
+            let Ok(b) = (unsafe {
+                Buffer::<cl_ulong>::create(&self.context, CL_MEM_READ_ONLY, rows, ptr::null_mut())
+            }) else {
+                return false;
+            };
+            self.row_base = b;
+            self.row_base_cap = rows;
+        }
+        self.ensure_inner(filters_words, out_len)
+    }
+
+    fn ensure_inner(&mut self, filters_words: usize, out_len: usize) -> bool {
         if filters_words > self.filters_cap {
             // SAFETY: as in `open` -- null `host_ptr`, device-owned storage.
             let Ok(b) = (unsafe {
@@ -181,6 +212,8 @@ impl Inner {
             };
             self.filters = b;
             self.filters_cap = filters_words;
+            // A new buffer holds nothing, whatever the epoch said.
+            self.filters_loaded = None;
         }
         if out_len > self.out_cap {
             // SAFETY: as above.
@@ -256,63 +289,100 @@ impl Backend for OpenClBackend {
         ok
     }
 
-    fn and_cardinalities(
+    fn run_batch(
         &self,
-        slot: Slot,
+        jobs: &[Job],
         row_words: usize,
         filters: &[&[u64]],
+        filters_epoch: u64,
         out: &mut [u32],
     ) -> bool {
-        if slot.0 >= self.capacity || row_words == 0 || filters.is_empty() {
+        if row_words == 0 || jobs.is_empty() || filters.iter().any(|f| f.len() != row_words) {
+            return false;
+        }
+        let total = total_rows(jobs);
+        if out.len() != filters.len() * total {
             return false;
         }
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
-        let len = inner.lens[slot.0];
-        if len == 0 || !len.is_multiple_of(row_words) {
-            return false;
-        }
-        let rows = len / row_words;
-        if out.len() != filters.len() * rows || filters.iter().any(|f| f.len() != row_words) {
-            return false;
-        }
 
-        let flat: Vec<u64> = filters.iter().flat_map(|f| f.iter().copied()).collect();
-        if !inner.ensure(flat.len(), out.len()) {
-            return false;
-        }
-        {
-            let Inner { queue, filters, .. } = &mut *inner;
-            // SAFETY: blocking write of a host slice that outlives the call,
-            // into a buffer just sized to at least `flat.len()` by `ensure`.
-            if unsafe { queue.enqueue_write_buffer(filters, CL_BLOCKING, 0, &flat, &[]) }.is_err() {
+        // Validate every job before touching the device, so a bad one cannot
+        // leave the caller holding half an answer it believes is whole.
+        for job in jobs {
+            if job.slot.0 >= self.capacity || inner.lens[job.slot.0] < job.rows * row_words {
                 return false;
             }
         }
 
-        let slot_base = (slot.0 * self.slot_words) as cl_ulong;
+        // One entry per row of the batch: the word offset of that row inside
+        // the slot arena. This is what makes a single launch able to cover
+        // chunks sitting in unrelated slots.
+        let mut bases = Vec::with_capacity(total);
+        for job in jobs {
+            let base = job.slot.0 * self.slot_words;
+            for r in 0..job.rows {
+                bases.push((base + r * row_words) as cl_ulong);
+            }
+        }
+
+        if !inner.ensure(filters.len() * row_words, out.len(), total) {
+            return false;
+        }
+
+        // Filters are the constant half of a scan and are kept device-side
+        // while the epoch is unchanged; re-sending them per batch was
+        // measured as 2.45 ms of a 12.22 ms scan back when batches were one
+        // chunk each.
+        if inner.filters_loaded != Some((filters_epoch, filters.len() * row_words)) {
+            let flat: Vec<u64> = filters.iter().flat_map(|f| f.iter().copied()).collect();
+            {
+                let Inner { queue, filters, .. } = &mut *inner;
+                // SAFETY: blocking write of a host slice that outlives the
+                // call, into a buffer `ensure` just sized to at least
+                // `flat.len()`.
+                if unsafe { queue.enqueue_write_buffer(filters, CL_BLOCKING, 0, &flat, &[]) }
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            inner.filters_loaded = Some((filters_epoch, flat.len()));
+        }
+
+        {
+            let Inner {
+                queue, row_base, ..
+            } = &mut *inner;
+            // SAFETY: blocking write of `bases`, which outlives the call, into
+            // a buffer just sized to at least `total`.
+            if unsafe { queue.enqueue_write_buffer(row_base, CL_BLOCKING, 0, &bases, &[]) }.is_err()
+            {
+                return false;
+            }
+        }
+
         let rw = row_words as i32;
-        let nrows = rows as i32;
+        let trows = total as i64;
         let nf = filters.len() as i32;
-        // SAFETY: every argument below matches the kernel's declared
-        // signature in order and type -- two buffers, a scalar, a buffer, a
-        // local allocation, three `int`s. The local buffer is `row_words`
-        // `ulong`s, which is what the kernel indexes `0 .. row_words`. The
-        // global size is a whole multiple of the group size, as
-        // `enqueue_nd_range` requires. Any mismatch here is caught by the
-        // differential against the CPU path rather than by inspection.
+        // SAFETY: the arguments match the kernel's declared signature in order
+        // and type -- three buffers, a buffer, a local allocation of
+        // `row_words` `ulong`s which is what the kernel indexes, and three
+        // scalars. The global size is a whole multiple of the group size, as
+        // `enqueue_nd_range` requires. Any mismatch is caught by the
+        // differential against the host backend rather than by inspection.
         let run = unsafe {
             ExecuteKernel::new(&inner.kernel)
                 .set_arg(&inner.slots)
-                .set_arg(&slot_base)
+                .set_arg(&inner.row_base)
                 .set_arg(&inner.filters)
                 .set_arg(&inner.out)
                 .set_arg_local_buffer(row_words * std::mem::size_of::<cl_ulong>())
                 .set_arg(&rw)
-                .set_arg(&nrows)
+                .set_arg(&trows)
                 .set_arg(&nf)
-                .set_global_work_size(rows * GROUP)
+                .set_global_work_size(total * GROUP)
                 .set_local_work_size(GROUP)
                 .enqueue_nd_range(&inner.queue)
         };

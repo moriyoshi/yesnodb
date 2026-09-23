@@ -96,9 +96,34 @@ pub struct ViewIntersectionCounter<'a> {
     /// residency table keys on. See [`ViewIntersectionCounter::with_accelerator`].
     accel: crate::accel::Accel,
     source: u64,
-    /// Reused across chunks so the offload path does not allocate the larger
-    /// of its two buffers per chunk.
-    offload_out: Vec<u32>,
+    /// Identifies this counter's filter set to a device, so the filters are
+    /// copied once for the whole scan rather than once per chunk. Taken at
+    /// construction because `filters` is fixed for the counter's life.
+    filters_epoch: u64,
+    /// This counter's scan identity, so an accelerator can hold work for
+    /// several scans at once.
+    scan: crate::accel::ScanId,
+    /// Whether anything was handed to the accelerator. Nothing was, in the
+    /// overwhelmingly common case of no device, and then `finish` has no
+    /// flush to do and cannot fail.
+    deferred: bool,
+    /// Set by `finish`, so `Drop` knows whether the scan still owes a cancel.
+    flushed: bool,
+}
+
+impl Drop for ViewIntersectionCounter<'_> {
+    /// Release scan state an accelerator is holding for a counter that was
+    /// dropped instead of finished.
+    ///
+    /// Without this an abandoned scan's enqueued work would sit in the
+    /// accelerator until the process ended, and enough of them would make it
+    /// decline forever. Nothing was promised to anyone, so nothing is
+    /// reported.
+    fn drop(&mut self) {
+        if self.deferred && !self.flushed {
+            self.accel.cancel(self.scan);
+        }
+    }
 }
 
 impl<'a> ViewIntersectionCounter<'a> {
@@ -143,7 +168,10 @@ impl<'a> ViewIntersectionCounter<'a> {
             last_selected,
             accel: crate::accel::Accel::none(),
             source: 0,
-            offload_out: Vec::new(),
+            filters_epoch: crate::accel::next_filters_epoch(),
+            scan: crate::accel::next_scan(),
+            deferred: false,
+            flushed: false,
         })
     }
 
@@ -212,8 +240,32 @@ impl<'a> ViewIntersectionCounter<'a> {
     }
 
     /// Complete filter-major vectors in the same order passed to [`Self::new`].
-    pub fn finish(self) -> Vec<Vec<u64>> {
-        self.counts
+    ///
+    /// # Why this is fallible
+    ///
+    /// An accelerator that accepted a chunk took responsibility for its
+    /// counts, and this counter did not compute them. If delivering them
+    /// fails there is nothing left to fall back to -- the stream is consumed
+    /// -- so the only honest outcomes are the right answer or an error. A
+    /// plausible undercount is the one thing that must not happen.
+    ///
+    /// With no accelerator, or one that declined everything, nothing was
+    /// deferred and this cannot fail.
+    pub fn finish(mut self) -> Result<Vec<Vec<u64>>> {
+        // `mem::take` rather than moving out: this type has a `Drop` impl.
+        let mut counts = std::mem::take(&mut self.counts);
+        self.flushed = true;
+        if !self.deferred {
+            return Ok(counts);
+        }
+        let mut borrowed: Vec<&mut [u64]> = counts.iter_mut().map(|v| v.as_mut_slice()).collect();
+        if !self.accel.flush(self.scan, &mut borrowed) {
+            return Err(CodecError::Invariant(
+                "view intersection accelerator failed to deliver enqueued counts",
+            ));
+        }
+        drop(borrowed);
+        Ok(counts)
     }
 
     fn count_generic(&mut self, container: &Container, base: u64) {
@@ -269,17 +321,18 @@ impl<'a> ViewIntersectionCounter<'a> {
             let last_owner = first_owner + rows;
             let data = &bitmap.words()[..rows * row_words];
 
-            if try_offload_blocked(
+            if try_enqueue_blocked(
                 &self.accel,
+                self.scan,
                 chunk_identity(self.source, base),
                 data,
                 row_words,
                 query_words,
-                &mut self.counts,
                 first_owner,
                 rows,
-                &mut self.offload_out,
+                self.filters_epoch,
             ) {
+                self.deferred = true;
                 return;
             }
 
@@ -572,50 +625,48 @@ fn chunk_identity(source: u64, base: u64) -> crate::accel::ChunkId {
     crate::accel::ChunkId(x ^ (x >> 31))
 }
 
-/// Offer one blocked chunk to an accelerator, accumulating on success.
+/// Offer one blocked chunk to an accelerator, which either takes
+/// responsibility for it or declines.
 ///
-/// Returns `false` for every reason -- no device, a batch too small to pay,
-/// a chunk not resident and not yet worth filling, a device that simply said
-/// no -- and the caller then runs its ordinary loop. Declining is the normal
-/// case and costs a comparison.
+/// Returns `false` for every reason -- no device, a batch too small to pay, a
+/// chunk not resident and not yet worth filling, a queue that is full -- and
+/// the caller then runs its ordinary loop. Declining is the normal case and
+/// costs a comparison.
 ///
-/// A free function rather than a method so the three fields it needs can be
-/// borrowed disjointly: `counts` mutably while `query_words` stays shared.
+/// `true` means the counts for this chunk will arrive at
+/// [`ViewIntersectionCounter::finish`] and **must not** be computed here.
+///
+/// A free function rather than a method so `query_words` can stay shared
+/// while the caller's other fields are borrowed.
 #[allow(clippy::too_many_arguments)]
-fn try_offload_blocked(
+fn try_enqueue_blocked(
     accel: &crate::accel::Accel,
+    scan: crate::accel::ScanId,
     chunk: crate::accel::ChunkId,
     data: &[u64],
     row_words: usize,
     query_words: &[Vec<u64>],
-    counts: &mut [Vec<u64>],
     first_owner: usize,
     rows: usize,
-    scratch: &mut Vec<u32>,
+    filters_epoch: u64,
 ) -> bool {
     if rows == 0 || !accel.worth_offering(query_words.len()) {
         return false;
     }
-    // Only the pointer vector is built per chunk; the wider count buffer is
-    // the caller's scratch and is reused.
     let filters: Vec<&[u64]> = query_words.iter().map(|q| q.as_slice()).collect();
     if filters.iter().any(|f| f.len() != row_words) {
         return false;
     }
-    scratch.clear();
-    scratch.resize(filters.len() * rows, 0);
-    if !accel.and_cardinalities(chunk, data, row_words, &filters, scratch) {
-        return false;
-    }
-    // The accelerator returns absolute counts; accumulation across chunks is
-    // the caller's, which is what keeps the device free of scan state.
-    for (f, owner_counts) in counts.iter_mut().enumerate().take(filters.len()) {
-        let row_counts = &scratch[f * rows..(f + 1) * rows];
-        for (r, got) in row_counts.iter().enumerate() {
-            owner_counts[first_owner + r] += u64::from(*got);
-        }
-    }
-    true
+    accel.enqueue(
+        scan,
+        chunk,
+        data,
+        row_words,
+        &filters,
+        filters_epoch,
+        first_owner,
+        rows,
+    )
 }
 
 pub fn stream_view_cardinalities(stream: &mut dyn ChunkStream, view: &View) -> Result<Vec<u64>> {
@@ -934,7 +985,11 @@ impl OrdSet {
                 }
             }
         }
-        counter.finish()
+        // Infallible here: no accelerator is installed on this counter, so
+        // nothing was ever deferred and there is nothing to deliver.
+        counter
+            .finish()
+            .expect("a counter with no accelerator defers nothing")
     }
 }
 
@@ -1378,7 +1433,11 @@ mod tests {
         for (prefix, container) in packed.chunks() {
             counter.push(prefix, container).expect("ascending chunks");
         }
-        counter.finish()
+        // Infallible here: no accelerator is installed on this counter, so
+        // nothing was ever deferred and there is nothing to deliver.
+        counter
+            .finish()
+            .expect("a counter with no accelerator defers nothing")
     }
 
     #[test]

@@ -630,7 +630,7 @@ fn count_key_intersections(
             counter.push(prefix, &container)?;
         }
     }
-    Ok(counter.finish())
+    counter.finish()
 }
 
 fn monotone_stream_contains(

@@ -3604,3 +3604,249 @@ true in every cargo build and Bazel does not reproduce -- and no amount of care
 inside the cargo gate would have found it.
 
 ---
+
+## 2026-09-23 -- The offload path loses end to end, and the reason is structural
+
+First measurement of the thing a caller would actually get: a blocked view
+scanned through `ViewIntersectionCounter` with and without an accelerator, same
+corpus, same process, pinned and rotated. `yesno-gpu/benches/offload.rs`.
+
+```text
+  chunks  filters      cpu      opencl warm    vs cpu
+      64       16   0.51ms         1.24ms      0.41x
+      64       64   2.20ms         1.94ms      1.13x
+     256       16   2.09ms         5.06ms      0.41x
+     256       64   8.71ms        10.01ms      0.87x
+    1024       16   8.58ms        24.15ms      0.36x
+    1024       64  35.06ms        39.25ms      0.89x
+```
+
+**Offloading is slower than the CPU it replaces at every shape but one.** The
+kernel is not the problem; the interface is.
+
+### What the control proved, and then what fixed 2.45 ms of it
+
+The first run read `cpu 8.67ms, opencl 12.22ms ( 0.71x ), host backend
+12.15ms ( 0.71x )`. The host backend runs the identical plumbing without a
+device, and landing within 0.6% of the real one said the device was
+contributing nothing against the overhead.
+
+The dominant overhead was that **filters were flattened and copied per chunk**
+-- the same 8 KiB sent 256 times for data fixed across the whole scan. Filters
+are the constant half of this operation and chunks are the varying half; the
+design made the varying half resident and re-sent the constant one. The
+`Accelerator` contract now carries a `filters_epoch`, taken once per counter,
+and the backend keeps the set device-side while it is unchanged. That moved
+the warm arm from 12.22 ms to **9.77 ms**, and left the host row untouched at
+12.38 ms, which is the right control behaviour since it never copied filters.
+
+### What remains is a launch per chunk, and micro-optimizing will not fix it
+
+OpenCL time is nearly linear in chunk count and nearly *flat* in filter count:
+quadrupling the work costs 1.6x to 2x the time. At 1024 chunks and 16 filters
+that is **23.6 us per chunk**, against roughly **0.3 us per chunk** of actual
+compute measured by the standalone harness -- about **78 times more overhead
+than work**.
+
+The cause is the shape of the call site rather than anything in the backend.
+`ViewIntersectionCounter::push` hands over one chunk at a time, so the
+accelerator launches, finishes and reads back once per chunk. The 6.71x-11.08x
+this project measured earlier batched **4096 chunks into a single grid**; that
+number was never available through this interface.
+
+**So further tuning of the present shape is wasted effort**, including the
+work-group sweep that was queued next. A per-chunk round trip at 23.6 us
+cannot be optimized into a win when the work is 0.3 us.
+
+### What would have to change
+
+The hook would have to become *deferred*: accumulate chunks across `push` and
+flush once at `finish`, so one launch covers the scan. That is a different
+contract -- "enqueue, results at the end" rather than "compute now" -- and it
+pushes the output buffer and the chunk staging into the accelerator for the
+duration of a scan.
+
+It is worth recording that this was invisible until the end-to-end measurement.
+The kernel microbenchmark, the differentials and the residency tests were all
+green and all correct; none of them could see that the interface serializes the
+one thing the device needs batched.
+
+**Nobody should enable this backend expecting a speedup.** It is correct, it is
+measured, and at present it is slower.
+
+---
+
+## 2026-09-23 -- Reconciling 6.71x with 0.87x: they measured different things
+
+The end-to-end result ( offload at 0.36x-0.89x ) looked contrary to every
+earlier GPU measurement in this project ( 6.71x-11.08x ). It is not. The gap is
+fully accounted for, and the error was in how I quoted the earlier numbers.
+
+Same shape throughout -- 256 chunks x 64 rows x 16 words, 64 filters, one
+device:
+
+```text
+  kernel, one launch for the whole scan        0.245 ms
+  same kernel, one launch per chunk            4.082 ms   16.69x
+  the wired path through ViewIntersectionCounter 10.01 ms
+  the CPU it replaces                           8.71 ms
+```
+
+**The old measurements were right about the kernel.** 0.245 ms against the
+CPU's 8.71 ms is roughly 35x, which is better than the 6.71x-11.08x ever
+claimed. Nothing about the device or the kernel has been contradicted.
+
+**They were never a claim about the wired path**, and I repeated them in the
+crate documentation as though a caller would see them. That was the mistake.
+
+### The two costs the kernel benchmarks structurally could not contain
+
+**Launch granularity, measured rather than inferred.** Adding a per-chunk arm
+to the existing harness -- identical device, data, kernel, total work and
+bytes read back, with only the number of launches changed -- costs **16.69x,
+or 15.0 us per chunk**. Both arms still agree with the CPU reference, so it is
+the same work. This is the cleanest possible isolation: one variable.
+
+**Host-side plumbing**, which is the larger share and which I had wrongly
+folded into "launch overhead" when first explaining the result. From 4.08 ms
+to 10.01 ms is another ~5.9 ms, about 23 us per chunk: the per-chunk
+`Vec<&[u64]>`, the scratch clear and resize of 4096 `u32`, the residency
+touch, the OpenCL wrapper call, and accumulating 4096 `u32` into `u64` counts
+-- a million adds across the scan.
+
+So the honest decomposition is roughly **0.25 ms of work, 3.8 ms of launch
+granularity, 5.9 ms of plumbing**, against a CPU at 8.71 ms.
+
+### What that changes about the plan
+
+Batching alone does not rescue this. Even with one launch per scan the
+plumbing would still cost ~5.9 ms against a CPU at 8.71 ms, so a deferred hook
+has to remove the per-chunk host work too -- staging chunks directly and
+accumulating on the device -- not merely coalesce the launches.
+
+**The lesson worth keeping**: a kernel benchmark measures a kernel. Quoting it
+as what an integration will deliver is a category error, and it survived here
+through four green test suites and two correct microbenchmarks because every
+one of them measured the part that was already fast.
+
+---
+
+## 2026-09-23 -- The u32-to-u64 accumulate is already vectorized
+
+Asked whether the widening accumulate in the offload path --
+`counts[ i ] += u32 count`, about a million times per scan -- should be
+hand-vectorized. It should not, for two independent reasons.
+
+**LLVM already does it.** Indexed ( the shape the code uses, with a bounds
+check ), zipped, and manually chunked all compile to the same 4-wide unrolled
+NEON and all measure **0.33 ns per element**, roughly one element per cycle:
+
+```text
+  ldp    q2, q1, [x11, #-32]
+  uaddw2 v1.2d, v1.2d, v0.4s
+  uaddw  v0.2d, v2.2d, v0.2s
+  stp    q0, q1, [x11, #-32]
+```
+
+`uaddw` is exactly `u64 += u32`. The bounds check is hoisted, so the obvious
+"rewrite it as `zip` to help the optimizer" change buys nothing -- measured at
+0.353 ns/elem against the indexed form's 0.329, i.e. noise.
+
+**And it is 6% of the problem.** 0.33 ms against ~5.9 ms of per-chunk host
+overhead. Removing it entirely leaves the offload path slower than the CPU.
+
+Where the host overhead actually is, by subtraction: the harness's per-chunk
+arm costs 16 us per chunk for launch, finish and readback, while the wired
+path costs 39 us. Of the 23 us difference, the Rust data movement accounts for
+about 2.5 us ( accumulate, scratch memset, pointer vector ). The rest is
+**OpenCL API calls**: the backend issues eight `clSetKernelArg` per chunk plus
+an `ExecuteKernel` builder, when only `slot_base` changes between chunks.
+
+Setting the invariant arguments once is the cheap lever, and it is testable in
+the existing harness by varying only the number of args set per launch. It
+does not change the conclusion -- launch granularity alone costs 3.8 ms
+against a CPU at 8.71 ms -- so it is worth doing only as part of the deferred
+hook, not instead of it.
+
+Recorded so the vectorization question is not reopened: this one is already
+done by the compiler, and was measured rather than assumed.
+
+---
+
+## 2026-09-23 -- The deferred hook makes offload win, and a 4 MiB allocation nearly hid it
+
+`Accelerator` is now enqueue-and-flush rather than compute-now. The result,
+same corpus and machine as the entry that measured 0.87x:
+
+```text
+  arm                    median       min       max   vs cpu
+  cpu ( no accel )       8.60ms    8.59ms    9.76ms    1.00x
+  opencl, warm           3.35ms    1.61ms    4.71ms    2.56x
+  host backend          11.28ms   11.25ms   11.37ms    0.76x
+  opencl, cold fill      8.15ms
+```
+
+**2.56x median and 5.34x at best**, against 0.87x for the synchronous
+contract. The projection was "near 1 ms, roughly 8x"; the real number is
+better than the old design and short of the projection, which is the usual
+direction.
+
+### The contract, and the obligation it creates
+
+`enqueue` takes responsibility for a chunk or declines it; `flush` delivers
+everything taken. Once `enqueue` returns `true` the caller does *not* compute
+those counts, so a lost flush is a silent undercount rather than a fallback.
+That is why `ViewIntersectionCounter::finish` is now fallible: the only honest
+outcomes are the right answer or an error.
+
+Two hazards deferral introduced, both now tested:
+
+**A queued job names a slot, not a payload.** Admitting a later chunk could
+recycle a slot that queued work still points at, and the batch would count the
+wrong chunk -- a plausible answer with nothing reporting an error, which is the
+one failure mode this design cannot absorb. `Residency` now pins, `evict`
+skips pinned entries, and a fully pinned cache declines rather than recycling.
+
+**A counter dropped without finishing would leak its scan.** `Drop` cancels,
+which releases the pins. Without it, enough abandoned scans would pin every
+slot and the device would decline forever.
+
+### The measurement that nearly went wrong
+
+The first run of the deferred version measured **0.28x -- worse than the
+synchronous one** -- with warm at 31 ms against a *cold fill* of 9 ms, which is
+backwards and was the clue that it was a bug rather than a cost.
+
+The rounds read `5.1, 31, 31, 31, 31, 1.8, 1.7`, and identically so across
+three separate runs. A load average of 26 made "machine contention" the
+obvious explanation and it was wrong: contention does not reproduce its own
+shape three times.
+
+Isolating it took two steps. A standalone probe driving
+`OpenClBackend::run_batch` directly held **0.27 ms across twelve calls**, so
+the device was not the problem. Phase timings inside `flush` then showed
+`alloc 0.03ms, accumulate 1.0ms, run_batch 0.32-34.5ms` -- the swing was
+inside the device call, yet the same call was steady in the probe.
+
+The difference was that the probe allocated its 4 MiB output **once** and
+`flush` allocated it per call. A multi-megabyte allocation is served by `mmap`
+with fresh zero pages, which the driver then faults in while copying results
+back; the cost lands in the readback, not in the allocation. glibc's *dynamic*
+mmap threshold adapts after a few frees, which is precisely why it looked like
+four slow rounds followed by fast ones rather than uniform slowness. Reusing
+the buffer made `run_batch` steady at 0.32-0.39 ms and turned 0.28x into
+2.56x.
+
+**The lesson is about the diagnosis, not the fix.** "Bimodal timings under
+load average 26" is a conclusion that explains itself too easily. The thing
+that broke it open was noticing the pattern was *identical across runs*, which
+load cannot do.
+
+### Where the remaining time is
+
+Per flush at this shape: `alloc 0.11ms, run_batch 0.36ms, accumulate 0.85ms`.
+The accumulate is the largest single piece and is already vectorized; the
+warm-round trend ( 4.71 down to 1.61 ) is the same cold-page effect on buffers
+allocated per scan by the counter itself, which both arms pay.
+
+---

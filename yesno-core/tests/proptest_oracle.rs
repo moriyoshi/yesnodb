@@ -27,7 +27,8 @@ fn selective_view_intersection_counts_final_legal_ordinal() {
         for (prefix, container) in packed.chunks() {
             counter.push(prefix, container).unwrap();
         }
-        counter.finish()
+        // Infallible: no accelerator, so nothing is ever deferred.
+        counter.finish().unwrap()
     };
     assert_eq!(count(IntersectionCountStrategy::FullScan), vec![vec![1]]);
     assert_eq!(count(IntersectionCountStrategy::Selective), vec![vec![1]]);

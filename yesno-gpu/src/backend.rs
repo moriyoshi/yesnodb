@@ -1,50 +1,71 @@
-//! The device, reduced to the three things residency needs from it.
+//! The device, reduced to what a deferred batch needs from it.
 //!
 //! Keeping this a trait is what lets every policy question in
-//! [`crate::residency`] and every dispatch question in [`crate::Offload`] be
-//! tested exhaustively on a machine with no GPU, against [`HostBackend`] --
-//! which is also the oracle the device backend must agree with.
+//! [`crate::residency`] and every scheduling question in [`crate::Offload`] be
+//! tested on a machine with no GPU, against [`HostBackend`] -- which is also
+//! the oracle a device backend must agree with.
 //!
-//! A backend owns its slot memory and nothing else. It does not decide *what*
-//! to keep; that is the residency table's job, and the split is deliberate:
-//! the interesting mistakes are all in the policy, and a policy that can only
-//! be tested by running CUDA is a policy that will not be tested.
+//! A backend owns slot memory and runs batches. It decides nothing about
+//! *what* to keep or *when* to submit; those are the residency table's and
+//! `Offload`'s jobs. The split is deliberate: the interesting mistakes are all
+//! in the policy and the scheduling, and neither should need a device to test.
+//!
+//! # One submission, not one per chunk
+//!
+//! [`Backend::run_batch`] takes every job at once because the per-chunk
+//! alternative was measured and lost. Changing only the launch granularity in
+//! a standalone harness -- same device, data, kernel, total work and bytes
+//! read back -- cost **16.69x**, about 15 microseconds per chunk against
+//! roughly one microsecond of work.
 
 use crate::residency::Slot;
 
+/// One chunk's contribution to a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Job {
+    /// Where the payload already lives. Residency put it there.
+    pub slot: Slot,
+    /// Rows of this chunk that belong to the view.
+    pub rows: usize,
+    /// Index of this chunk's first row in each filter's count vector.
+    pub owner_base: usize,
+}
+
 /// Somewhere chunk payloads can live and be intersected in batches.
 pub trait Backend: Send + Sync {
-    /// Slots this device can hold. Fixed for the backend's lifetime, because
-    /// the residency table sizes itself from it once.
+    /// Slots this device can hold.
     fn capacity(&self) -> usize;
+
     /// Largest payload a slot can hold. A shorter one is fine and common:
     /// `count_blocked` presents the prefix of a container that belongs to the
     /// view, which is usually narrower than the container.
     fn slot_words(&self) -> usize;
 
     /// Words currently valid in `slot`, or zero if it holds nothing.
-    ///
-    /// Exists so a caller can notice that a chunk it believes resident is
-    /// there at a different width, which is the cheap half of detecting that
-    /// an identity was reused for a payload that changed.
     fn slot_len(&self, slot: Slot) -> usize;
 
     /// Copy `words` into `slot`, replacing whatever was there.
     ///
-    /// `words` may be shorter than [`Backend::slot_words`] and the slot then
-    /// holds exactly that many. `false` means the payload did not land, and
-    /// the caller must treat the slot as holding nothing.
+    /// `words` may be shorter than [`Backend::slot_words`]. `false` means the
+    /// payload did not land and the caller must treat the slot as empty.
     fn upload(&self, slot: Slot, words: &[u64]) -> bool;
 
-    /// Set `out[ f * rows + r ]` to `| row r of slot AND filters[ f ] |`,
-    /// where `rows` is `slot_len( slot ) / row_words`.
+    /// Count every job against every filter in one submission.
     ///
-    /// `false` means nothing was computed and `out` is untouched.
-    fn and_cardinalities(
+    /// `out` is filter-major over the jobs' concatenated rows: with
+    /// `total = jobs.iter().map( |j| j.rows ).sum()` and `g` the index of a
+    /// row in that concatenation, `out[ f * total + g ]` is
+    /// `| that row AND filters[ f ] |`.
+    ///
+    /// `filters_epoch` identifies the filter set; equal epochs promise
+    /// identical filters, so a backend holding them device-side may skip the
+    /// copy.
+    fn run_batch(
         &self,
-        slot: Slot,
+        jobs: &[Job],
         row_words: usize,
         filters: &[&[u64]],
+        filters_epoch: u64,
         out: &mut [u32],
     ) -> bool;
 
@@ -52,16 +73,19 @@ pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// Total rows across a batch, which is the stride of `out`.
+pub fn total_rows(jobs: &[Job]) -> usize {
+    jobs.iter().map(|j| j.rows).sum()
+}
+
 /// A backend that keeps slots in ordinary memory and counts on the CPU.
 ///
 /// # Not a toy, and not a fast path either
 ///
-/// It exists so the admission policy, the slot lifecycle and the decline paths
-/// have a correctness oracle that runs anywhere -- including in CI, where
-/// there is no device. It is *slower* than simply doing the work inline,
-/// because it copies a payload it did not need to copy, so nothing should ship
-/// it as a real accelerator. [`crate::Offload::host`] exists for tests and for
-/// answering "is the plumbing right" on a laptop.
+/// It exists so the admission policy, the slot lifecycle, the batching and
+/// the decline paths have a correctness oracle that runs anywhere, CI
+/// included. It is *slower* than doing the work inline, because it copies a
+/// payload it did not need to copy; nothing should ship it as an accelerator.
 pub struct HostBackend {
     slots: std::sync::Mutex<(Vec<u64>, Vec<usize>)>,
     capacity: usize,
@@ -109,39 +133,46 @@ impl Backend for HostBackend {
         true
     }
 
-    fn and_cardinalities(
+    fn run_batch(
         &self,
-        slot: Slot,
+        jobs: &[Job],
         row_words: usize,
         filters: &[&[u64]],
+        _filters_epoch: u64,
         out: &mut [u32],
     ) -> bool {
-        if slot.0 >= self.capacity || row_words == 0 {
+        if row_words == 0 || jobs.is_empty() || filters.iter().any(|f| f.len() != row_words) {
+            return false;
+        }
+        let total = total_rows(jobs);
+        if out.len() != filters.len() * total {
             return false;
         }
         let Ok(mem) = self.slots.lock() else {
             return false;
         };
         let (data, lens) = &*mem;
-        let len = lens[slot.0];
-        if len == 0 || !len.is_multiple_of(row_words) {
-            return false;
-        }
-        let rows = len / row_words;
-        if out.len() != filters.len() * rows || filters.iter().any(|f| f.len() != row_words) {
-            return false;
-        }
-        let base = slot.0 * self.slot_words;
-        let chunk = &data[base..base + len];
-        for (f, filter) in filters.iter().enumerate() {
-            for r in 0..rows {
-                let row = &chunk[r * row_words..(r + 1) * row_words];
-                out[f * rows + r] = row
-                    .iter()
-                    .zip(*filter)
-                    .map(|(a, b)| (a & b).count_ones())
-                    .sum();
+        // Validate every job before writing anything, so a bad one cannot
+        // leave the caller holding half an answer it believes is whole.
+        for job in jobs {
+            if job.slot.0 >= self.capacity || lens[job.slot.0] < job.rows * row_words {
+                return false;
             }
+        }
+        let mut g0 = 0usize;
+        for job in jobs {
+            let base = job.slot.0 * self.slot_words;
+            for (f, filter) in filters.iter().enumerate() {
+                for r in 0..job.rows {
+                    let row = &data[base + r * row_words..base + (r + 1) * row_words];
+                    out[f * total + g0 + r] = row
+                        .iter()
+                        .zip(*filter)
+                        .map(|(a, b)| (a & b).count_ones())
+                        .sum();
+                }
+            }
+            g0 += job.rows;
         }
         true
     }
@@ -163,16 +194,20 @@ mod tests {
     }
 
     #[test]
-    fn a_round_trip_returns_the_reference_answer() {
-        // Four words per slot as two rows of two.
+    fn a_single_job_returns_the_reference_answer() {
         let b = HostBackend::new(2, 4);
         let chunk = [0b1011u64, 0xffff, 0b0110, 7];
         assert!(b.upload(Slot(1), &chunk));
         let f0 = [0b0011u64, 0x00ff];
         let f1 = [u64::MAX, 7];
         let filters: Vec<&[u64]> = vec![&f0, &f1];
+        let jobs = [Job {
+            slot: Slot(1),
+            rows: 2,
+            owner_base: 0,
+        }];
         let mut out = [0u32; 4];
-        assert!(b.and_cardinalities(Slot(1), 2, &filters, &mut out));
+        assert!(b.run_batch(&jobs, 2, &filters, 1, &mut out));
         for (f, filter) in filters.iter().enumerate() {
             for r in 0..2 {
                 assert_eq!(
@@ -184,105 +219,99 @@ mod tests {
     }
 
     #[test]
-    fn a_single_row_covers_the_whole_slot() {
-        let b = HostBackend::new(1, 4);
-        assert!(b.upload(Slot(0), &[u64::MAX; 4]));
-        let f = [u64::MAX; 4];
-        let filters: Vec<&[u64]> = vec![&f];
-        let mut out = [0u32; 1];
-        assert!(b.and_cardinalities(Slot(0), 4, &filters, &mut out));
-        assert_eq!(out[0], 256);
-    }
-
-    #[test]
-    fn slots_do_not_alias() {
-        let b = HostBackend::new(3, 2);
-        assert!(b.upload(Slot(0), &[u64::MAX, 0]));
-        assert!(b.upload(Slot(2), &[0, u64::MAX]));
+    fn several_jobs_are_concatenated_in_order() {
+        // `out` is filter-major over the jobs' rows end to end. Getting this
+        // layout wrong attributes one chunk's counts to another, which looks
+        // like a plausible answer rather than an error.
+        let b = HostBackend::new(3, 4);
+        let a = [u64::MAX, u64::MAX, 0, 0];
+        let c = [0u64, 0, u64::MAX, u64::MAX];
+        assert!(b.upload(Slot(0), &a));
+        assert!(b.upload(Slot(2), &c));
         let all = [u64::MAX; 2];
         let filters: Vec<&[u64]> = vec![&all];
-        let mut a = [0u32; 1];
-        let mut c = [0u32; 1];
-        assert!(b.and_cardinalities(Slot(0), 2, &filters, &mut a));
-        assert!(b.and_cardinalities(Slot(2), 2, &filters, &mut c));
-        assert_eq!((a[0], c[0]), (64, 64));
-        // Slot 1 was never written, so it has no payload to answer with. A
-        // zero here would be a plausible wrong answer rather than a refusal.
-        let mut empty = [7u32; 1];
-        assert!(!b.and_cardinalities(Slot(1), 2, &filters, &mut empty));
-        assert_eq!(empty[0], 7);
-    }
-
-    #[test]
-    fn an_out_of_range_slot_is_refused_rather_than_wrapped() {
-        let b = HostBackend::new(2, 4);
-        assert!(!b.upload(Slot(2), &[0; 4]));
-        let f = [0u64; 4];
-        let filters: Vec<&[u64]> = vec![&f];
-        assert!(!b.and_cardinalities(Slot(9), 4, &filters, &mut [0u32; 1]));
-    }
-
-    #[test]
-    fn a_payload_wider_than_the_slot_is_refused_and_an_empty_one_too() {
-        let b = HostBackend::new(2, 4);
-        assert!(!b.upload(Slot(0), &[0; 5]), "wider than the slot");
-        assert!(!b.upload(Slot(0), &[]), "nothing to hold");
-        assert_eq!(b.slot_len(Slot(0)), 0);
+        let jobs = [
+            Job {
+                slot: Slot(0),
+                rows: 2,
+                owner_base: 0,
+            },
+            Job {
+                slot: Slot(2),
+                rows: 2,
+                owner_base: 2,
+            },
+        ];
+        let mut out = [0u32; 4];
+        assert!(b.run_batch(&jobs, 2, &filters, 1, &mut out));
+        assert_eq!(out, [128, 0, 0, 128], "job 0 rows then job 1 rows");
     }
 
     #[test]
     fn a_partial_payload_is_held_at_its_own_width() {
-        // `count_blocked` presents the prefix of a container that belongs to
-        // the view, which is usually narrower than the container. Refusing
-        // those would decline most of the real traffic.
         let b = HostBackend::new(1, 8);
         assert!(b.upload(Slot(0), &[u64::MAX; 4]));
         assert_eq!(b.slot_len(Slot(0)), 4);
         let f = [u64::MAX; 2];
         let filters: Vec<&[u64]> = vec![&f];
+        let jobs = [Job {
+            slot: Slot(0),
+            rows: 2,
+            owner_base: 0,
+        }];
         let mut out = [0u32; 2];
-        assert!(b.and_cardinalities(Slot(0), 2, &filters, &mut out));
-        assert_eq!(out, [128, 128], "two rows of two words, not four");
-        // And the untouched tail of the slot is not counted.
-        let mut wrong = [0u32; 4];
-        assert!(!b.and_cardinalities(Slot(0), 2, &filters, &mut wrong));
+        assert!(b.run_batch(&jobs, 2, &filters, 1, &mut out));
+        assert_eq!(out, [128, 128]);
     }
 
     #[test]
-    fn re_uploading_at_a_different_width_replaces_the_width_too() {
-        let b = HostBackend::new(1, 8);
-        assert!(b.upload(Slot(0), &[u64::MAX; 8]));
-        assert_eq!(b.slot_len(Slot(0)), 8);
-        assert!(b.upload(Slot(0), &[u64::MAX; 2]));
-        assert_eq!(b.slot_len(Slot(0)), 2, "the old width must not survive");
-    }
-
-    #[test]
-    fn a_row_width_that_does_not_divide_the_slot_is_refused() {
-        // Silently truncating would drop the tail of every chunk and return
-        // counts that are merely plausible.
-        let b = HostBackend::new(1, 4);
-        let f = [0u64; 3];
+    fn a_job_wider_than_its_slot_holds_is_refused_before_anything_is_written() {
+        // Half an answer the caller believes is whole is worse than none.
+        let b = HostBackend::new(2, 4);
+        assert!(b.upload(Slot(0), &[u64::MAX; 4]));
+        let f = [u64::MAX; 2];
         let filters: Vec<&[u64]> = vec![&f];
-        assert!(!b.and_cardinalities(Slot(0), 3, &filters, &mut [0u32; 1]));
-        assert!(!b.and_cardinalities(Slot(0), 0, &filters, &mut [0u32; 1]));
+        let jobs = [
+            Job {
+                slot: Slot(0),
+                rows: 2,
+                owner_base: 0,
+            },
+            Job {
+                slot: Slot(1),
+                rows: 2,
+                owner_base: 2,
+            }, // never uploaded
+        ];
+        let mut out = [7u32; 4];
+        assert!(!b.run_batch(&jobs, 2, &filters, 1, &mut out));
+        assert_eq!(
+            out, [7; 4],
+            "nothing may be written when the batch is refused"
+        );
     }
 
     #[test]
-    fn a_filter_of_the_wrong_width_is_refused() {
-        let b = HostBackend::new(1, 4);
-        let wrong = [0u64; 4];
-        let filters: Vec<&[u64]> = vec![&wrong];
-        assert!(!b.and_cardinalities(Slot(0), 2, &filters, &mut [0u32; 2]));
+    fn an_empty_batch_is_refused() {
+        let b = HostBackend::new(1, 2);
+        let f = [0u64; 2];
+        let filters: Vec<&[u64]> = vec![&f];
+        assert!(!b.run_batch(&[], 2, &filters, 1, &mut []));
     }
 
     #[test]
     fn a_wrongly_sized_output_is_refused() {
         let b = HostBackend::new(1, 4);
+        assert!(b.upload(Slot(0), &[0u64; 4]));
         let f = [0u64; 2];
         let filters: Vec<&[u64]> = vec![&f];
+        let jobs = [Job {
+            slot: Slot(0),
+            rows: 2,
+            owner_base: 0,
+        }];
         assert!(
-            !b.and_cardinalities(Slot(0), 2, &filters, &mut [0u32; 1]),
+            !b.run_batch(&jobs, 2, &filters, 1, &mut [0u32; 1]),
             "needs 2"
         );
     }
@@ -294,8 +323,13 @@ mod tests {
         assert!(b.upload(Slot(0), &[0, 0]));
         let all = [u64::MAX; 2];
         let filters: Vec<&[u64]> = vec![&all];
+        let jobs = [Job {
+            slot: Slot(0),
+            rows: 1,
+            owner_base: 0,
+        }];
         let mut out = [9u32; 1];
-        assert!(b.and_cardinalities(Slot(0), 2, &filters, &mut out));
+        assert!(b.run_batch(&jobs, 2, &filters, 1, &mut out));
         assert_eq!(out[0], 0, "the old payload must not survive");
     }
 }

@@ -79,7 +79,7 @@ fn count(chunks: &[(u64, OrdSet)], filters: &[OrdSet], accel: Option<Accel>) -> 
             counter.push(p, container).expect("push");
         }
     }
-    counter.finish()
+    counter.finish().expect("flush must deliver what it took")
 }
 
 #[test]
