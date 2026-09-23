@@ -644,6 +644,157 @@ func decodeAck(metadata []byte) (Ack, error) {
 	return ack, nil
 }
 
+// WriteTxn names an open write transaction.
+type WriteTxn uint64
+
+// Supports reports whether the server implements every bit in features.
+//
+// Ask before calling Apply or BeginWrite. A server predating the capability
+// field reports zero and treats an unrecognised DoPut command as insert, so an
+// unchecked mixed batch would have its removals applied as insertions with no
+// error anywhere.
+func (c *Client) Supports(ctx context.Context, features uint64) (bool, error) {
+	stats, err := c.Stats(ctx)
+	if err != nil {
+		return false, err
+	}
+	return stats.Features&features == features, nil
+}
+
+// Apply applies mixed operations as one commit.
+//
+// Every record batch accumulates into a single write batch that commits once
+// at end of stream, so the returned version is the single instant at which
+// every row became visible. Operations apply in the order given, which is what
+// lets a change-data feed replay a delete-then-reinsert of one key without the
+// two reordering. This is the difference from Insert, which commits per record
+// batch and can only report the last of several versions.
+func (c *Client) Apply(ctx context.Context, mutations []Mutation) (Ack, error) {
+	return c.putMutations(ctx, "apply", mutations)
+}
+
+// BeginWrite opens a write transaction spanning several calls.
+func (c *Client) BeginWrite(ctx context.Context) (WriteTxn, error) {
+	handle, err := c.uint64Action(ctx, "begin_write", nil)
+	return WriteTxn(handle), err
+}
+
+// Stage stages mutations into an open transaction, returning the rows accepted.
+//
+// Staged rows are invisible to readers until CommitWrite.
+func (c *Client) Stage(ctx context.Context, txn WriteTxn, mutations []Mutation) (uint64, error) {
+	command := make([]byte, 0, 12)
+	command = append(command, "txn:"...)
+	command = binary.LittleEndian.AppendUint64(command, uint64(txn))
+	ack, err := c.putMutations(ctx, string(command), mutations)
+	return ack.Rows, err
+}
+
+// CommitWrite publishes everything staged in txn and returns its version.
+//
+// Idempotent: a retry after a lost response returns the original version
+// rather than committing twice, which is what lets a pipe recover from an
+// ambiguous network failure without double application.
+func (c *Client) CommitWrite(ctx context.Context, txn WriteTxn) (uint64, error) {
+	return c.uint64Action(ctx, "commit_write", binary.LittleEndian.AppendUint64(nil, uint64(txn)))
+}
+
+// AbortWrite discards everything staged in txn.
+//
+// Aborting a transaction the server no longer knows about succeeds: it was
+// already aborted or it expired, and either way the caller's intent -- that
+// none of it is visible -- already holds. Aborting one that committed is an
+// error, because a version exists that says otherwise.
+func (c *Client) AbortWrite(ctx context.Context, txn WriteTxn) error {
+	_, err := c.uint64Action(ctx, "abort_write", binary.LittleEndian.AppendUint64(nil, uint64(txn)))
+	return err
+}
+
+func (c *Client) mutationRecord(mutations []Mutation) arrow.RecordBatch {
+	builder := array.NewRecordBuilder(c.allocator, MutationsSchema())
+	defer builder.Release()
+	keys := builder.Field(0).(*array.Uint64Builder)
+	lo := builder.Field(1).(*array.Uint64Builder)
+	hi := builder.Field(2).(*array.Uint64Builder)
+	op := builder.Field(3).(*array.Uint8Builder)
+	keys.Reserve(len(mutations))
+	lo.Reserve(len(mutations))
+	hi.Reserve(len(mutations))
+	op.Reserve(len(mutations))
+	for _, m := range mutations {
+		keys.Append(m.Key)
+		lo.Append(m.Lo)
+		hi.Append(m.Hi)
+		op.Append(m.Op)
+	}
+	return builder.NewRecordBatch()
+}
+
+func (c *Client) putMutations(ctx context.Context, command string, mutations []Mutation) (Ack, error) {
+	for _, m := range mutations {
+		if err := m.Validate(); err != nil {
+			return Ack{}, err
+		}
+	}
+	ctx, err := c.rpcContext(ctx)
+	if err != nil {
+		return Ack{}, err
+	}
+	stream, err := c.flight.DoPut(ctx)
+	if err != nil {
+		return Ack{}, err
+	}
+	writer := flight.NewRecordWriter(stream, ipc.WithSchema(MutationsSchema()), ipc.WithAllocator(c.allocator))
+	writer.SetFlightDescriptor(commandDescriptor([]byte(command)))
+	sent := uint64(0)
+	for start := 0; start < len(mutations); start += batchRows {
+		end := start + batchRows
+		if end > len(mutations) {
+			end = len(mutations)
+		}
+		record := c.mutationRecord(mutations[start:end])
+		err := writer.Write(record)
+		record.Release()
+		if err != nil {
+			return Ack{}, err
+		}
+		sent += uint64(end - start)
+	}
+	if err := writer.Close(); err != nil {
+		return Ack{}, err
+	}
+	if err := stream.CloseSend(); err != nil {
+		return Ack{}, err
+	}
+	if headers, headerErr := stream.Header(); headerErr == nil {
+		if err := c.observeHeaders(headers); err != nil {
+			return Ack{}, err
+		}
+	}
+	var acknowledged *Ack
+	for {
+		result, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return Ack{}, err
+		}
+		ack, err := decodeAck(result.AppMetadata)
+		if err != nil {
+			return Ack{}, err
+		}
+		acknowledged = &ack
+	}
+	if acknowledged == nil {
+		return Ack{}, protocolError("ingest", "server returned no acknowledgement")
+	}
+	if acknowledged.Rows != sent {
+		return Ack{}, protocolErrorf("ingest", "server acknowledged %d of %d mutations", acknowledged.Rows, sent)
+	}
+	return *acknowledged, nil
+}
+
 // Stats returns typed server space and reader counters.
 func (c *Client) Stats(ctx context.Context) (ServerStats, error) {
 	body, err := c.action(ctx, "stats", nil)

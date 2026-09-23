@@ -24,6 +24,7 @@ import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.UInt1Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -47,6 +48,14 @@ public final class YesnoClient implements AutoCloseable {
       new Field("key", FieldType.notNullable(new ArrowType.Int(64, false)), null);
   private static final Field ORDINAL_FIELD =
       new Field("ordinal", FieldType.notNullable(new ArrowType.Int(64, false)), null);
+  private static final byte[] PUT_APPLY = "apply".getBytes(StandardCharsets.US_ASCII);
+  private static final byte[] PUT_TXN_PREFIX = "txn:".getBytes(StandardCharsets.US_ASCII);
+  private static final Field LO_FIELD =
+      new Field("lo", FieldType.notNullable(new ArrowType.Int(64, false)), null);
+  private static final Field HI_FIELD =
+      new Field("hi", FieldType.notNullable(new ArrowType.Int(64, false)), null);
+  private static final Field OP_FIELD =
+      new Field("op", FieldType.notNullable(new ArrowType.Int(8, false)), null);
 
   private final BufferAllocator allocator;
   private final FlightClient flight;
@@ -246,6 +255,69 @@ public final class YesnoClient implements AutoCloseable {
   }
 
   /** Return typed server space and reader counters. */
+  /**
+   * Whether the server implements every bit in {@code features}.
+   *
+   * <p>Ask before calling {@link #apply} or {@link #beginWrite}. A server predating the capability
+   * field reports zero and treats an unrecognised DoPut command as insert, so an unchecked mixed
+   * batch would have its removals applied as insertions with no error anywhere.
+   */
+  public boolean supports(long features, CallOption... options) {
+    return stats(options).supports(features);
+  }
+
+  /**
+   * Applies mixed operations as <b>one</b> commit.
+   *
+   * <p>Every batch accumulates into a single write batch that commits once at end of stream, so the
+   * returned version is the single instant at which every row became visible. Operations apply in
+   * the order given, which is what lets a change-data feed replay a delete-then-reinsert of one key
+   * without the two reordering. This is the difference from {@link #insert}, which commits per
+   * record batch and can only report the last of several versions.
+   */
+  public IngestAck apply(Iterable<Mutation> mutations, CallOption... options) {
+    return putMutations(mutations, PUT_APPLY, options);
+  }
+
+  /** Opens a write transaction spanning several calls. */
+  public long beginWrite(CallOption... options) {
+    return decodeLong("begin_write", action("begin_write", options));
+  }
+
+  /**
+   * Stages mutations into an open transaction, returning the rows accepted.
+   *
+   * <p>Staged rows are invisible to readers until {@link #commitWrite}.
+   */
+  public long stage(long txn, Iterable<Mutation> mutations, CallOption... options) {
+    byte[] command = new byte[PUT_TXN_PREFIX.length + 8];
+    System.arraycopy(PUT_TXN_PREFIX, 0, command, 0, PUT_TXN_PREFIX.length);
+    ByteBuffer.wrap(command, PUT_TXN_PREFIX.length, 8).order(ByteOrder.LITTLE_ENDIAN).putLong(txn);
+    return putMutations(mutations, command, options).rows();
+  }
+
+  /**
+   * Publishes everything staged in {@code txn} and returns its version.
+   *
+   * <p>Idempotent: a retry after a lost response returns the original version rather than
+   * committing twice, which is what lets a pipe recover from an ambiguous network failure without
+   * double application.
+   */
+  public long commitWrite(long txn, CallOption... options) {
+    return decodeLong("commit_write", action("commit_write", longBody(txn), options));
+  }
+
+  /**
+   * Discards everything staged in {@code txn}.
+   *
+   * <p>Aborting a transaction the server no longer knows about succeeds: it was already aborted or
+   * it expired, and either way the caller's intent -- that none of it is visible -- already holds.
+   * Aborting one that committed is an error, because a version exists that says otherwise.
+   */
+  public void abortWrite(long txn, CallOption... options) {
+    action("abort_write", longBody(txn), options);
+  }
+
   public ServerStats stats(CallOption... options) {
     return decodeStats(action("stats", options));
   }
@@ -337,12 +409,89 @@ public final class YesnoClient implements AutoCloseable {
   }
 
   private byte[] action(String name, CallOption... options) {
+    return action(name, new byte[0], options);
+  }
+
+  private byte[] action(String name, byte[] request, CallOption... options) {
     ensureOpen();
     ByteArrayOutputStream body = new ByteArrayOutputStream();
     Iterator<org.apache.arrow.flight.Result> chunks =
-        flight.doAction(new Action(name, new byte[0]), options);
+        flight.doAction(new Action(name, request), options);
     chunks.forEachRemaining(result -> body.writeBytes(result.getBody()));
     return body.toByteArray();
+  }
+
+  private static byte[] longBody(long value) {
+    byte[] body = new byte[8];
+    ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN).putLong(value);
+    return body;
+  }
+
+  private static long decodeLong(String name, byte[] body) {
+    if (body.length != 8) {
+      throw new IllegalStateException(
+          "yesnodb " + name + " returned " + body.length + " bytes instead of 8");
+    }
+    return ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN).getLong();
+  }
+
+  private IngestAck putMutations(
+      Iterable<Mutation> mutations, byte[] command, CallOption... options) {
+    ensureOpen();
+    Objects.requireNonNull(mutations, "mutations");
+    Iterator<Mutation> iterator = mutations.iterator();
+    AckListener acknowledgements = new AckListener();
+    long sent = 0;
+
+    try (VectorSchemaRoot root =
+        VectorSchemaRoot.of(
+            new UInt8Vector(KEY_FIELD, allocator),
+            new UInt8Vector(LO_FIELD, allocator),
+            new UInt8Vector(HI_FIELD, allocator),
+            new UInt1Vector(OP_FIELD, allocator))) {
+      UInt8Vector keys = (UInt8Vector) root.getVector("key");
+      UInt8Vector lo = (UInt8Vector) root.getVector("lo");
+      UInt8Vector hi = (UInt8Vector) root.getVector("hi");
+      UInt1Vector op = (UInt1Vector) root.getVector("op");
+      keys.allocateNew(BATCH_ROWS);
+      lo.allocateNew(BATCH_ROWS);
+      hi.allocateNew(BATCH_ROWS);
+      op.allocateNew(BATCH_ROWS);
+      FlightClient.ClientStreamListener writer =
+          flight.startPut(FlightDescriptor.command(command), root, acknowledgements, options);
+      try {
+        while (iterator.hasNext()) {
+          int row = 0;
+          while (row < BATCH_ROWS && iterator.hasNext()) {
+            Mutation mutation = Objects.requireNonNull(iterator.next(), "mutation");
+            keys.set(row, mutation.key());
+            lo.set(row, mutation.lo());
+            hi.set(row, mutation.hi());
+            op.set(row, mutation.op());
+            row++;
+          }
+          keys.setValueCount(row);
+          lo.setValueCount(row);
+          hi.setValueCount(row);
+          op.setValueCount(row);
+          root.setRowCount(row);
+          writer.putNext();
+          sent = Math.addExact(sent, row);
+        }
+      } catch (RuntimeException | Error exception) {
+        writer.error(exception);
+        throw exception;
+      }
+      writer.completed();
+      writer.getResult();
+    }
+
+    IngestAck acknowledged = acknowledgements.ack();
+    if (acknowledged.rows() != sent) {
+      throw new IllegalStateException(
+          "yesnodb acknowledged " + acknowledged.rows() + " of " + sent + " mutations");
+    }
+    return acknowledged;
   }
 
   private static ServerStats decodeStats(byte[] body) {
@@ -352,6 +501,7 @@ public final class YesnoClient implements AutoCloseable {
     long walBytes = 0;
     long liveReaders = 0;
     long shards = 0;
+    long features = 0;
     try {
       while (!input.isAtEnd()) {
         int tag = input.readTag();
@@ -361,6 +511,7 @@ public final class YesnoClient implements AutoCloseable {
           case 24 -> walBytes = input.readUInt64();
           case 32 -> liveReaders = input.readUInt64();
           case 40 -> shards = input.readUInt64();
+          case 48 -> features = input.readUInt64();
           default -> {
             if (!input.skipField(tag)) {
               throw new IOException("unexpected end-group tag");
@@ -371,7 +522,7 @@ public final class YesnoClient implements AutoCloseable {
     } catch (IOException exception) {
       throw new IllegalStateException("yesnodb stats returned invalid protobuf", exception);
     }
-    return new ServerStats(allocatedBytes, deferredBytes, walBytes, liveReaders, shards);
+    return new ServerStats(allocatedBytes, deferredBytes, walBytes, liveReaders, shards, features);
   }
 
   private static byte[] littleEndianBytes(long value) {

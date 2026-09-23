@@ -13,6 +13,10 @@ type ServerStats struct {
 	WALBytes       uint64
 	LiveReaders    uint64
 	Shards         uint64
+	// Features is the server's capability bitmask. A server predating the
+	// field reports zero, because protobuf decodes an absent field as its
+	// default.
+	Features uint64
 }
 
 // DecodeServerStats decodes the public yesno.flight.v1.ServerStats protobuf.
@@ -25,7 +29,7 @@ func DecodeServerStats(payload []byte) (ServerStats, error) {
 			return ServerStats{}, protowire.ParseError(consumed)
 		}
 		payload = payload[consumed:]
-		if number >= 1 && number <= 5 {
+		if number >= 1 && number <= 6 {
 			if wireType != protowire.VarintType {
 				return ServerStats{}, fmt.Errorf("stats field %d is not a uint64", number)
 			}
@@ -45,6 +49,8 @@ func DecodeServerStats(payload []byte) (ServerStats, error) {
 				stats.LiveReaders = value
 			case 5:
 				stats.Shards = value
+			case 6:
+				stats.Features = value
 			}
 			continue
 		}

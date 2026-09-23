@@ -1,6 +1,7 @@
 package dev.yesnodb.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -93,7 +94,14 @@ class YesnoClientTest {
         client.insert(List.of(new OrdinalPair(9, 1L << 32)));
         assertThrows(ArithmeticException.class, () -> client.getRoaringBitmap(9));
 
-        assertEquals(new ServerStats(1024, 64, 128, 2, 4), client.stats());
+        assertEquals(new ServerStats(1024, 64, 128, 2, 4, 3), client.stats());
+        assertTrue(
+            client.supports(
+                ServerStats.FEATURE_MIXED_PUT | ServerStats.FEATURE_WRITE_TRANSACTIONS));
+        // A server predating the field reports zero, because protobuf decodes
+        // an absent field as its default.
+        assertFalse(
+            new ServerStats(1024, 64, 128, 2, 4, 0).supports(ServerStats.FEATURE_MIXED_PUT));
 
         // The commit version the server reports, which is what makes a
         // read-your-writes read expressible: it is passed to prepareQueryAt.
@@ -258,9 +266,10 @@ class YesnoClientTest {
       byte[] body =
           switch (action.getType()) {
             case "stats" ->
+                // Fields 1-5, then field 6 -- the capability bitmask.
                 new byte[] {
                   0x08, (byte) 0x80, 0x08, 0x10, 0x40, 0x18, (byte) 0x80, 0x01,
-                  0x20, 0x02, 0x28, 0x04
+                  0x20, 0x02, 0x28, 0x04, 0x30, 0x03
                 };
             default -> throw new IllegalArgumentException("unknown action");
           };

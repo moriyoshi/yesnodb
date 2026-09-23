@@ -53,6 +53,12 @@ pub const TERM: &str = "yesno-term";
 /// caller could simply have been told about.
 pub type DbSlot = Arc<std::sync::RwLock<Option<Arc<Db>>>>;
 
+/// The service built for the database currently in the slot.
+///
+/// A pair rather than a bare service, because the cache is only valid for the
+/// database it was built from; see [`GuardedFlight::service`].
+type ServiceCache = Arc<std::sync::Mutex<Option<(Arc<Db>, YesnoFlightService)>>>;
+
 pub fn slot_of(db: Arc<Db>) -> DbSlot {
     Arc::new(std::sync::RwLock::new(Some(db)))
 }
@@ -60,6 +66,29 @@ pub fn slot_of(db: Arc<Db>) -> DbSlot {
 #[derive(Clone)]
 pub struct GuardedFlight {
     db: DbSlot,
+    /// One service per database, because the service owns state that must
+    /// outlive a single RPC.
+    ///
+    /// **This used to be built per request, and that silently broke two
+    /// features.** `YesnoFlightService` began as `{ db }`, for which
+    /// "construct it per call" really was an `Arc` clone. It has since grown
+    /// two tables that only mean anything *across* calls: ticket leases, parked
+    /// by `GetFlightInfo` and read by `DoGet`, and write transactions, opened
+    /// by one action and staged and committed by later ones. A fresh instance
+    /// per RPC gave each call empty tables, so a lease was never found and
+    /// `begin_write` handed out a transaction that the next call could not see.
+    ///
+    /// Leasing degraded quietly -- `DoGet` falls back to re-opening by version
+    /// and still answers correctly -- which is why it went unnoticed. Write
+    /// transactions cannot fall back and failed outright with "write
+    /// transaction N is not open".
+    ///
+    /// Keyed by database identity rather than cached outright: a replica that
+    /// falls off its leader closes and reopens, and the new database must not
+    /// inherit leases pinning versions it never had or transactions staged
+    /// against the old one. `Arc::ptr_eq` is the identity that matters here --
+    /// the same allocation, not merely an equal path.
+    service: ServiceCache,
     version: &'static str,
 }
 
@@ -67,30 +96,48 @@ impl GuardedFlight {
     pub fn new(db: DbSlot) -> GuardedFlight {
         GuardedFlight {
             db,
+            service: Arc::new(std::sync::Mutex::new(None)),
             version: env!("CARGO_PKG_VERSION"),
         }
     }
 
     /// The service and the term to answer with, or a refusal saying why not.
     ///
-    /// Read **per request**, and that is a change from the fixed-handle
-    /// version: it used to be captured once on the argument that
+    /// The **term** is read per request, and that is a change from the
+    /// fixed-handle version: it used to be captured once on the argument that
     /// `promote_database` refuses while the database is open, so a term could
     /// not move under a running server. With a slot the database itself can be
     /// replaced — a replica rebuilds and reopens — so the term must be asked of
-    /// whatever is in the slot now. Building the service is an `Arc` clone.
+    /// whatever is in the slot now.
+    ///
+    /// The **service** is not; see the field. It is built once per database and
+    /// reused, so the state it holds between calls survives to the call that
+    /// needs it. Cloning it is an `Arc` clone per field, so every clone shares
+    /// those tables.
     fn current(&self) -> Result<(YesnoFlightService, u32), Status> {
         let g = self
             .db
             .read()
             .map_err(|_| Status::internal("the database slot is poisoned"))?;
-        match g.as_ref() {
-            Some(db) => Ok((YesnoFlightService::new(db.clone()), db.term())),
-            None => Err(Status::unavailable(
+        let Some(db) = g.as_ref() else {
+            return Err(Status::unavailable(
                 "this node is rebuilding its copy of the database from its leader and is \
                  not serving. Retry, or read from the leader.",
-            )),
+            ));
+        };
+        let term = db.term();
+        let mut cached = self
+            .service
+            .lock()
+            .map_err(|_| Status::internal("the flight service cache is poisoned"))?;
+        if let Some((cached_db, service)) = cached.as_ref() {
+            if Arc::ptr_eq(cached_db, db) {
+                return Ok((service.clone(), term));
+            }
         }
+        let service = YesnoFlightService::new(db.clone());
+        *cached = Some((db.clone(), service.clone()));
+        Ok((service, term))
     }
 
     /// Refuse a caller that has seen a **newer** leadership than this server is.

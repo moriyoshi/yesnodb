@@ -7,7 +7,21 @@ import pyarrow.flight as flight
 import pytest
 
 import yesnodb
-from yesnodb.client import And, At, Client, Key, Literal, Or, Range, TLSConfig, View, ViewSpec
+from yesnodb.client import (
+    FEATURE_MIXED_PUT,
+    FEATURE_WRITE_TRANSACTIONS,
+    And,
+    At,
+    Client,
+    Key,
+    Literal,
+    Mutation,
+    Or,
+    Range,
+    TLSConfig,
+    View,
+    ViewSpec,
+)
 
 
 def test_yesnodb_is_a_namespace_and_does_not_reexport_client() -> None:
@@ -136,3 +150,92 @@ def test_mutual_tls_authenticates_a_python_writer(
         pytest.raises((flight.FlightUnavailableError, flight.FlightUnauthenticatedError)),
     ):
         anonymous.cardinality(5)
+
+
+@pytest.mark.integration
+def test_apply_commits_mixed_operations_at_one_version(
+    server_factory: Callable[..., object],
+) -> None:
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        assert client.supports(FEATURE_MIXED_PUT | FEATURE_WRITE_TRANSACTIONS)
+
+        seed = client.insert_batch_acked([(1, 10), (1, 11), (2, 20)])
+        assert seed.rows == 3
+
+        ack = client.apply(
+            [
+                Mutation.remove(1, 10),
+                Mutation.insert(1, 12),
+                Mutation.insert_range(3, 100, 104),
+                Mutation.delete_key(2),
+            ]
+        )
+        assert ack.rows == 4
+        assert ack.version is not None and ack.version > seed.version
+
+        assert sorted(client.get(1).collect_ordinals()) == [11, 12]
+        assert client.cardinality(2) == 0
+        assert sorted(client.get(3).collect_ordinals()) == [100, 101, 102, 103, 104]
+
+
+@pytest.mark.integration
+def test_apply_preserves_order_within_one_key(
+    server_factory: Callable[..., object],
+) -> None:
+    """A removal *after* an insertion must not be reordered before it.
+
+    Replaying these grouped by kind would leave 5 present, because the delete
+    would run first. This is the property a change-data feed depends on when
+    it replays a delete-then-reinsert of one key.
+    """
+
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        client.apply([Mutation.insert(4, 5), Mutation.delete_key(4), Mutation.insert(4, 6)])
+        assert client.get(4).collect_ordinals() == [6]
+
+        client.apply([Mutation.insert(5, 7), Mutation.remove(5, 7)])
+        assert client.cardinality(5) == 0
+
+
+@pytest.mark.integration
+def test_a_write_transaction_is_invisible_until_commit(
+    server_factory: Callable[..., object],
+) -> None:
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        txn = client.begin_write()
+        assert client.stage(txn, [Mutation.insert(8, 80), Mutation.insert(8, 81)]) == 2
+        assert client.stage(txn, [Mutation.insert_range(8, 90, 92)]) == 1
+
+        # Nothing staged is visible to a reader yet.
+        assert client.cardinality(8) == 0
+
+        version = client.commit_write(txn)
+        assert version > 0
+        assert sorted(client.get(8).collect_ordinals()) == [80, 81, 90, 91, 92]
+
+        # Commit is idempotent: a retry after a lost response returns the
+        # original version rather than committing a second time.
+        assert client.commit_write(txn) == version
+
+
+@pytest.mark.integration
+def test_an_aborted_write_transaction_applies_nothing(
+    server_factory: Callable[..., object],
+) -> None:
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        txn = client.begin_write()
+        assert client.stage(txn, [Mutation.insert(9, 90)]) == 1
+        client.abort_write(txn)
+
+        assert client.cardinality(9) == 0
+        # Aborting one the server no longer knows about still succeeds: the
+        # caller's intent already holds.
+        client.abort_write(txn)

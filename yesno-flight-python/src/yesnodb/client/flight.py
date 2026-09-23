@@ -25,6 +25,31 @@ PAIR_SCHEMA = pa.schema(
         pa.field("ordinal", pa.uint64(), nullable=False),
     ]
 )
+MUTATIONS_SCHEMA = pa.schema(
+    [
+        pa.field("key", pa.uint64(), nullable=False),
+        pa.field("lo", pa.uint64(), nullable=False),
+        pa.field("hi", pa.uint64(), nullable=False),
+        pa.field("op", pa.uint8(), nullable=False),
+    ]
+)
+
+#: Row operations carried by :data:`MUTATIONS_SCHEMA`. These numbers go on the
+#: wire and are never reordered.
+OP_INSERT = 0
+OP_REMOVE = 1
+OP_INSERT_RANGE = 2
+OP_REMOVE_RANGE = 3
+OP_DELETE_KEY = 4
+
+#: Capability bits reported by :attr:`ServerStats.features`.
+#:
+#: A server predating the field reports zero, because protobuf decodes an
+#: absent field as its default. Check before sending a new ``do_put`` command:
+#: an older server treats an unrecognised command as insert, which turns a
+#: mixed batch's removals into insertions with no error anywhere.
+FEATURE_MIXED_PUT = 1 << 0
+FEATURE_WRITE_TRANSACTIONS = 1 << 1
 
 TokenProvider: TypeAlias = str | Callable[[], str]
 PemSource: TypeAlias = bytes | bytearray | memoryview | str | os.PathLike[str]
@@ -115,10 +140,12 @@ class ServerStats:
     wal_bytes: int
     live_readers: int
     shards: int
+    #: Capability bits; zero from a server predating the field.
+    features: int = 0
 
     @classmethod
     def from_protobuf(cls, body: bytes) -> ServerStats:
-        values = [0, 0, 0, 0, 0]
+        values = [0, 0, 0, 0, 0, 0]
         offset = 0
         while offset < len(body):
             tag, offset = _protobuf_varint(body, offset)
@@ -152,6 +179,52 @@ class ServerStats:
                 raise ProtocolError("yesnodb stats returned truncated protobuf")
 
         return cls(*values)
+
+
+@dataclass(frozen=True, slots=True)
+class WriteTxn:
+    """An open write transaction, named by the handle the server returned."""
+
+    handle: int
+
+
+@dataclass(frozen=True, slots=True)
+class Mutation:
+    """One row of :data:`MUTATIONS_SCHEMA`.
+
+    Build these with the classmethods rather than by hand: a single-ordinal
+    operation is a range whose bounds are equal, and getting that wrong is not
+    something the wire can detect.
+    """
+
+    key: int
+    lo: int
+    hi: int
+    op: int
+
+    @classmethod
+    def insert(cls, key: int, ordinal: int) -> Mutation:
+        key, ordinal = _pair((key, ordinal))
+        return cls(key, ordinal, ordinal, OP_INSERT)
+
+    @classmethod
+    def remove(cls, key: int, ordinal: int) -> Mutation:
+        key, ordinal = _pair((key, ordinal))
+        return cls(key, ordinal, ordinal, OP_REMOVE)
+
+    @classmethod
+    def insert_range(cls, key: int, lo: int, hi: int) -> Mutation:
+        return cls(*_range(key, lo, hi), OP_INSERT_RANGE)
+
+    @classmethod
+    def remove_range(cls, key: int, lo: int, hi: int) -> Mutation:
+        return cls(*_range(key, lo, hi), OP_REMOVE_RANGE)
+
+    @classmethod
+    def delete_key(cls, key: int) -> Mutation:
+        """Drop every ordinal under ``key``."""
+
+        return cls(_u64(key, name="key"), 0, 0, OP_DELETE_KEY)
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +512,74 @@ class Client:
     def stats(self) -> ServerStats:
         return ServerStats.from_protobuf(self._action("stats"))
 
+    def supports(self, features: int) -> bool:
+        """Whether the server implements every bit in ``features``.
+
+        Ask before sending :meth:`apply` or opening a write transaction. A
+        server predating the capability field reports zero and treats an
+        unrecognised ``do_put`` command as insert, so an unchecked mixed batch
+        would have its removals applied as insertions with no error anywhere.
+        """
+
+        features = _u64(features, name="features")
+        return self.stats().features & features == features
+
+    def apply(self, mutations: Iterable[Mutation]) -> Ack:
+        """Apply mixed operations as **one** commit.
+
+        Every batch of the stream accumulates into a single write batch that
+        commits once at end of stream, so the returned version is the single
+        instant at which every row became visible. Operations apply in the
+        order given, which is what lets a change-data feed replay a
+        delete-then-reinsert of one key without the two reordering.
+
+        This is the difference from :meth:`insert`, which commits per record
+        batch and can only report the last of several versions.
+        """
+
+        return self._put_mutations(b"apply", mutations)
+
+    def begin_write(self) -> WriteTxn:
+        """Open a write transaction spanning several calls."""
+
+        body = self._action("begin_write")
+        if len(body) != 8:
+            raise ProtocolError(f"yesnodb begin_write returned {len(body)} bytes instead of 8")
+        return WriteTxn(int.from_bytes(body, "little"))
+
+    def stage(self, txn: WriteTxn, mutations: Iterable[Mutation]) -> int:
+        """Stage mutations into ``txn``, returning the rows accepted.
+
+        Staged rows are invisible to readers until :meth:`commit_write`.
+        """
+
+        command = b"txn:" + _txn_handle(txn).to_bytes(8, "little")
+        return self._put_mutations(command, mutations).rows
+
+    def commit_write(self, txn: WriteTxn) -> int:
+        """Publish everything staged in ``txn``, returning its version.
+
+        **Idempotent.** A retry after a lost response returns the original
+        version rather than committing twice, which is what lets a pipe
+        recover from an ambiguous network failure without double application.
+        """
+
+        body = self._action("commit_write", _txn_handle(txn).to_bytes(8, "little"))
+        if len(body) != 8:
+            raise ProtocolError(f"yesnodb commit_write returned {len(body)} bytes instead of 8")
+        return int.from_bytes(body, "little")
+
+    def abort_write(self, txn: WriteTxn) -> None:
+        """Discard everything staged in ``txn``.
+
+        Aborting a transaction the server no longer knows about succeeds: it
+        was already aborted or it expired, and either way the caller's intent
+        -- that none of it is visible -- already holds. Aborting one that
+        committed is an error, because a version exists that says otherwise.
+        """
+
+        self._action("abort_write", _txn_handle(txn).to_bytes(8, "little"))
+
     def clear(self, key: int) -> int:
         """Atomically remove every ordinal under one key."""
 
@@ -498,6 +639,34 @@ class Client:
         else:
             batches = _pair_batches(pairs)
         return self._put_batches_acked(batches, command)
+
+    def _put_mutations(self, command: bytes, mutations: Iterable[Mutation]) -> Ack:
+        descriptor = flight.FlightDescriptor.for_command(command)
+        writer, acknowledgements = self._flight.do_put(
+            descriptor, MUTATIONS_SCHEMA, self._call_options()
+        )
+        sent = 0
+        acknowledged: Ack | None = None
+        try:
+            for batch in _mutation_batches(mutations):
+                writer.write_batch(batch)
+                sent += batch.num_rows
+            writer.done_writing()
+
+            while True:
+                metadata = acknowledgements.read()
+                if metadata is None:
+                    break
+                acknowledged = Ack._decode(bytes(metadata))
+        finally:
+            # PyArrow reports some server-side DoPut failures only here.
+            writer.close()
+
+        if acknowledged is None:
+            raise ProtocolError("yesnodb returned no ingest acknowledgement")
+        if acknowledged.rows != sent:
+            raise ProtocolError(f"yesnodb acknowledged {acknowledged.rows} of {sent} mutations")
+        return acknowledged
 
     def _put_batches(self, batches: Iterable[pa.RecordBatch], command: bytes) -> int:
         return self._put_batches_acked(batches, command).rows
@@ -622,6 +791,48 @@ def _pair_batches(pairs: Iterable[tuple[int, int]]) -> Iterator[pa.RecordBatch]:
             ordinals = []
     if keys:
         yield _pair_batch(keys, ordinals)
+
+
+def _range(key: int, lo: int, hi: int) -> tuple[int, int, int]:
+    key = _u64(key, name="key")
+    lo = _u64(lo, name="lo")
+    hi = _u64(hi, name="hi")
+    if lo == ORDINAL_LIMIT or hi == ORDINAL_LIMIT:
+        raise ValueError("u64::MAX is reserved and cannot be stored as an ordinal")
+    if lo > hi:
+        raise ValueError(f"range lower bound {lo} is above upper bound {hi}")
+    return key, lo, hi
+
+
+def _txn_handle(txn: WriteTxn) -> int:
+    if not isinstance(txn, WriteTxn):
+        raise TypeError("expected a WriteTxn from begin_write()")
+    return _u64(txn.handle, name="transaction handle")
+
+
+def _mutation_batch(rows: list[Mutation]) -> pa.RecordBatch:
+    return pa.record_batch(
+        [
+            pa.array([row.key for row in rows], type=pa.uint64()),
+            pa.array([row.lo for row in rows], type=pa.uint64()),
+            pa.array([row.hi for row in rows], type=pa.uint64()),
+            pa.array([row.op for row in rows], type=pa.uint8()),
+        ],
+        schema=MUTATIONS_SCHEMA,
+    )
+
+
+def _mutation_batches(mutations: Iterable[Mutation]) -> Iterator[pa.RecordBatch]:
+    rows: list[Mutation] = []
+    for mutation in mutations:
+        if not isinstance(mutation, Mutation):
+            raise TypeError("mutations must be Mutation values")
+        rows.append(mutation)
+        if len(rows) == BATCH_ROWS:
+            yield _mutation_batch(rows)
+            rows = []
+    if rows:
+        yield _mutation_batch(rows)
 
 
 def _check_pair_batch(batch: pa.RecordBatch) -> None:
