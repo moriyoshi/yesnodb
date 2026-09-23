@@ -8,7 +8,7 @@
 //! So this crate opens nothing, ever. [`Declines`] is the default and answers
 //! every request with "no", which is exactly what every embedder gets today.
 //!
-//! The satellite that implements this is `yesno-gpu`. It depends on this
+//! The satellite that implements this is `yesno-opencl`. It depends on this
 //! crate; nothing here depends on it, and nothing here mentions CUDA.
 //!
 //! # What is offered, and why the contract is deferred

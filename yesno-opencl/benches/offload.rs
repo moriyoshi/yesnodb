@@ -5,7 +5,7 @@
 //! get: `ViewIntersectionCounter` over a blocked view, with and without an
 //! accelerator installed, on the same corpus in the same process.
 //!
-//! Run with `cargo bench -p yesno-gpu --features opencl --bench offload`,
+//! Run with `cargo bench -p yesno-opencl --features opencl --bench offload`,
 //! pinned ( `taskset -c 3` ). Without a device it prints why and exits, rather
 //! than reporting the CPU arm twice as though that meant something.
 //!
@@ -23,10 +23,10 @@ use std::time::Instant;
 use yesno_core::accel::Accel;
 use yesno_core::view::{IntersectionCountStrategy, View, ViewIntersectionCounter};
 use yesno_core::{Container, OrdSet};
-use yesno_gpu::backend::HostBackend;
-use yesno_gpu::opencl::OpenClBackend;
-use yesno_gpu::residency::Policy;
-use yesno_gpu::Offload;
+use yesno_opencl::backend::HostBackend;
+use yesno_opencl::opencl::OpenClBackend;
+use yesno_opencl::residency::Policy;
+use yesno_opencl::Offload;
 
 const STRIDE: u64 = 1024;
 const ROWS_PER_CHUNK: usize = (65_536 / STRIDE) as usize;

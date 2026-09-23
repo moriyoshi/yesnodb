@@ -15,10 +15,10 @@
 use yesno_core::accel::{next_scan, Accel, Accelerator, ChunkId};
 use yesno_core::view::{IntersectionCountStrategy, View, ViewIntersectionCounter};
 use yesno_core::{Container, OrdSet};
-use yesno_gpu::backend::{Backend, HostBackend, Job};
-use yesno_gpu::opencl::OpenClBackend;
-use yesno_gpu::residency::Policy;
-use yesno_gpu::Offload;
+use yesno_opencl::backend::{Backend, HostBackend, Job};
+use yesno_opencl::opencl::OpenClBackend;
+use yesno_opencl::residency::Policy;
+use yesno_opencl::Offload;
 
 const ROW_WORDS: usize = 16; // 1024-bit rows
 const ROWS: usize = 64; // a 65536-bit chunk
@@ -63,12 +63,12 @@ fn the_device_agrees_with_the_host_backend_on_every_count() {
             .collect();
         let refs: Vec<&[u64]> = filters.iter().map(|v| v.as_slice()).collect();
 
-        assert!(dev.upload(yesno_gpu::residency::Slot(2), &chunk));
-        assert!(host.upload(yesno_gpu::residency::Slot(2), &chunk));
+        assert!(dev.upload(yesno_opencl::residency::Slot(2), &chunk));
+        assert!(host.upload(yesno_opencl::residency::Slot(2), &chunk));
         let mut got = vec![0u32; nfilters * ROWS];
         let mut want = vec![0u32; nfilters * ROWS];
         let jobs = [Job {
-            slot: yesno_gpu::residency::Slot(2),
+            slot: yesno_opencl::residency::Slot(2),
             rows: ROWS,
             owner_base: 0,
         }];
@@ -91,7 +91,7 @@ fn a_partial_chunk_is_counted_at_its_own_width() {
     let filters: Vec<Vec<u64>> = (0..8u64).map(|f| words(900 + f, ROW_WORDS)).collect();
     let refs: Vec<&[u64]> = filters.iter().map(|v| v.as_slice()).collect();
 
-    let s = yesno_gpu::residency::Slot(1);
+    let s = yesno_opencl::residency::Slot(1);
     assert!(dev.upload(s, &chunk));
     assert!(host.upload(s, &chunk));
     let mut got = vec![0u32; 8 * rows];
@@ -120,7 +120,7 @@ fn a_slot_never_uploaded_is_refused_rather_than_answering_from_stale_memory() {
     let mut out = [7u32; ROWS];
     assert!(!dev.run_batch(
         &[Job {
-            slot: yesno_gpu::residency::Slot(0),
+            slot: yesno_opencl::residency::Slot(0),
             rows: ROWS,
             owner_base: 0
         }],
@@ -145,7 +145,7 @@ fn changing_the_filter_epoch_replaces_the_device_copy() {
     let Some(dev) = device(2) else { return };
     let host = HostBackend::new(2, SLOT_WORDS);
     let chunk = words(31, SLOT_WORDS);
-    let s = yesno_gpu::residency::Slot(0);
+    let s = yesno_opencl::residency::Slot(0);
     assert!(dev.upload(s, &chunk));
     assert!(host.upload(s, &chunk));
 
@@ -193,7 +193,7 @@ fn a_repeated_epoch_still_produces_the_right_counts() {
     let Some(dev) = device(2) else { return };
     let host = HostBackend::new(2, SLOT_WORDS);
     let chunk = words(51, SLOT_WORDS);
-    let s = yesno_gpu::residency::Slot(1);
+    let s = yesno_opencl::residency::Slot(1);
     assert!(dev.upload(s, &chunk));
     assert!(host.upload(s, &chunk));
     let filters: Vec<Vec<u64>> = (0..8u64).map(|f| words(600 + f, ROW_WORDS)).collect();
@@ -316,7 +316,7 @@ fn a_resident_chunk_is_served_from_the_device_without_re_uploading() {
     // to its own earlier answer is how an earlier version of this test passed
     // while the backend returned all zeros: zeros equal zeros, ten times over.
     let host = HostBackend::new(1, SLOT_WORDS);
-    let s0 = yesno_gpu::residency::Slot(0);
+    let s0 = yesno_opencl::residency::Slot(0);
     assert!(host.upload(s0, &chunk));
     let mut want_flat = vec![0u32; 8 * ROWS];
     assert!(host.run_batch(

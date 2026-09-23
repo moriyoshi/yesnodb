@@ -159,10 +159,11 @@ yesno/
         decode_container.rs     # decode must Err or validate, never panic
         roaring_import.rs       # the whole-file import boundary
   yesno-arrow/                  # masks, RecordBatch streams, the S4 container dump
-  yesno-gpu/                    # batched bitmap intersection counts on an accelerator,
-                                #   admitted by residency. Implements yesno-core's
-                                #   Accelerator; yesno-core knows nothing of it and names
-                                #   no device. The device backend is not built yet.
+  yesno-opencl/                 # batched bitmap intersection counts offloaded to a
+                                #   device, admitted by residency. Implements
+                                #   yesno-core's Accelerator; yesno-core knows nothing of
+                                #   it and names no device. Only the backend is OpenCL --
+                                #   residency, batching and the host oracle are not.
   yesno-datafusion/             # yesno_lookup UDTF, filter lowering. Outside default-members.
   yesno-wire/                   # the set-expression wire format. Zero dependencies by
                                 #   design: it is compiled into both yesno-flight ( which

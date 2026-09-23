@@ -17,8 +17,8 @@
 use yesno_core::accel::Accel;
 use yesno_core::view::{IntersectionCountStrategy, View, ViewIntersectionCounter};
 use yesno_core::{Container, OrdSet};
-use yesno_gpu::residency::Policy;
-use yesno_gpu::Offload;
+use yesno_opencl::residency::Policy;
+use yesno_opencl::Offload;
 
 /// 1024-bit rows, so 64 of them per 65 536-bit chunk.
 const STRIDE: u64 = 1024;
@@ -93,7 +93,7 @@ fn an_accelerated_blocked_count_equals_the_cpu_count() {
     // pass having never run the device at all -- green, and asserting nothing.
     let device = std::sync::Arc::new(
         Offload::with_policy(
-            yesno_gpu::backend::HostBackend::new(8, CHUNK_WORDS),
+            yesno_opencl::backend::HostBackend::new(8, CHUNK_WORDS),
             Policy {
                 capacity: 8,
                 admit_after: 1,
@@ -127,7 +127,7 @@ fn the_answer_is_the_same_whether_or_not_anything_was_admitted() {
     let want = count(&chunks, &f, None);
 
     let device = std::sync::Arc::new(Offload::with_policy(
-        yesno_gpu::backend::HostBackend::new(8, CHUNK_WORDS),
+        yesno_opencl::backend::HostBackend::new(8, CHUNK_WORDS),
         Policy::measured(8),
     ));
     // Repeat the whole scan: the first passes are declined, later ones hit.
@@ -161,7 +161,7 @@ fn a_batch_below_the_floor_never_reaches_the_device() {
     let f = filters(2, 17);
     let want = count(&chunks, &f, None);
 
-    let device = std::sync::Arc::new(Offload::new(yesno_gpu::backend::HostBackend::new(
+    let device = std::sync::Arc::new(Offload::new(yesno_opencl::backend::HostBackend::new(
         8,
         CHUNK_WORDS,
     )));

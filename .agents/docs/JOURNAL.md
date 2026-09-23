@@ -3850,3 +3850,31 @@ warm-round trend ( 4.71 down to 1.61 ) is the same cold-page effect on buffers
 allocated per scan by the counter itself, which both arms pay.
 
 ---
+
+## 2026-09-23 -- `yesno-gpu` renamed to `yesno-opencl`
+
+Entries above name the crate `yesno-gpu`, which is accurate as history and is
+left alone -- this file is append-only.
+
+The case for the new name is "name what it is, not what it aspires to be":
+there is one device backend and it is OpenCL.
+
+**The argument against, recorded because the rename does not settle it.** Most
+of the crate is not OpenCL. `residency` ( the admission policy ) knows nothing
+about devices, `backend` is a trait plus a host oracle that runs anywhere, and
+`Offload` is the join between them; `opencl.rs` is the minority of the crate
+and sits behind a non-default feature. The `Backend` trait exists precisely so
+that a second API is a *module* rather than a second crate -- and this
+project's own measurement found CUDA and OpenCL identical on its GB10
+( 0.99x-1.03x at every size and batch width ), so OpenCL was chosen for reach
+rather than because it is the only option. If a CUDA or Vulkan backend is ever
+added, the crate name will be the part that is wrong.
+
+Renamed on the owner's call. If a sibling backend does arrive, this entry is
+the argument for revisiting it, and the structure already supports doing so
+without moving any code.
+
+The rename is its own commit for reviewability, and `JOURNAL.md` is the only
+file that keeps the old name.
+
+---

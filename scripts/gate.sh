@@ -234,7 +234,7 @@ check cargo test -p yesno-tantivy --features flight
 # exactly what made the gap invisible the first time.
 check cargo test -p yesno-core --features jit
 # And a third of the same class, added 2026-09-23 with the OpenCL device
-# backend. `yesno-gpu/tests/opencl_device.rs` carries
+# backend. `yesno-opencl/tests/opencl_device.rs` carries
 # `required-features = ["opencl"]`, so `cargo test --workspace` above compiles
 # it to nothing -- the same invisibility as the two cases above, for the same
 # reason, and it would have hidden the only tests that run device code.
@@ -242,7 +242,7 @@ check cargo test -p yesno-core --features jit
 # It is safe on a machine with no GPU: `opencl3` loads the ICD at run time
 # rather than linking it, so this builds anywhere, and each test prints why it
 # skipped rather than passing silently.
-check cargo test -p yesno-gpu --features opencl
+check cargo test -p yesno-opencl --features opencl
 
 step "ARCHITECTURE.md layout matches the tree"
 # Cheap, and it catches a class review cannot: a diagram that is 90% right reads

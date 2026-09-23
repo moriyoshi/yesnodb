@@ -1,5 +1,5 @@
 [package]
-name = "yesno-gpu"
+name = "yesno-opencl"
 description = "Batched bitmap intersection counts offloaded to a GPU, with residency-based admission"
 version.workspace = true
 edition.workspace = true
@@ -21,7 +21,7 @@ default = []
 opencl = ["dep:opencl3"]
 
 # Only compiled when there is a backend for it to drive. Without this the
-# default `cargo test -p yesno-gpu` fails to build rather than skipping, which
+# default `cargo test -p yesno-opencl` fails to build rather than skipping, which
 # would make the feature effectively mandatory.
 [[test]]
 name = "opencl_device"
