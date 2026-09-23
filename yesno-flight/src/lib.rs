@@ -276,6 +276,18 @@ pub const ACTION_REMOVE_ONE: &str = "remove_one";
 /// source transaction, persisted with the commit, or an equivalent durable
 /// outcome query. Neither exists; see `durable-write-transaction-idempotency`
 /// in `TODO.md`.
+///
+/// **What an exclusive writer can do instead**, stated because it is a weaker
+/// contract and should not be mistaken for the one above: these operations are
+/// replay-idempotent -- inserting a present ordinal or removing an absent one
+/// changes nothing -- so replaying a whole source transaction after a
+/// `NotFound` converges on the same final set. That recovers *state*, not
+/// *identity*: it may publish a second version for one source transaction, and
+/// readers may observe the committed state at a version for which the pipe
+/// never recorded a source-position mapping. There is no partial application
+/// at any point, because the original commit and the replay are each atomic --
+/// the exposure is an unrecorded mapping, not a torn state. Sound only for a
+/// single writer whose source transactions are replayable in full.
 pub const ACTION_BEGIN_WRITE: &str = "begin_write";
 pub const ACTION_COMMIT_WRITE: &str = "commit_write";
 pub const ACTION_ABORT_WRITE: &str = "abort_write";

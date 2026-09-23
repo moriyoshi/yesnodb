@@ -541,47 +541,91 @@ fn txn_of(txn: WriteTxn) -> WriteTxn {
     txn
 }
 
-/// A `stage` call that fails in a **later** record batch poisons the
-/// transaction.
+/// A `do_put` that fails in a **later** record batch poisons the transaction.
 ///
-/// `a_rejected_batch_stages_none_of_its_rows` puts both rows in one batch and
-/// therefore cannot tell two different contracts apart, which a follow-up
-/// audit pointed out. A `stage` call is split into batches of 8192 rows, and
-/// each is applied before the next arrives, so a failure in the second batch
-/// leaves the first one staged and there is no way to withdraw it -- the core
-/// `WriteBatch` has no rollback.
+/// `a_rejected_batch_stages_none_of_its_rows` puts its rows in one batch and
+/// therefore cannot tell two contracts apart, which a follow-up audit pointed
+/// out. This drives `DoPut` directly, because **the Rust client cannot express
+/// the case**: `put_mutations` collects every mutation into a single
+/// `RecordBatch` regardless of count, so no number of mutations passed to
+/// `stage` produces a second one. An earlier version of this test passed 8193
+/// of them and claimed two batches; it passed for the single-batch reason
+/// while its name promised the other, which is the defect this whole audit
+/// thread has been about.
 ///
-/// So the transaction fails closed: commit is refused and abort is the only
-/// way out. This is what makes "a rejected stage" safe without asking every
-/// client to remember to abort.
+/// The server applies each record batch as it arrives, so a failure in the
+/// second leaves the first staged with no way to withdraw it -- the core
+/// `WriteBatch` has no rollback. The transaction therefore fails closed:
+/// commit is refused, abort is the only way out, and none of the first batch
+/// becomes visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_in_a_later_batch_poisons_the_transaction() {
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use futures::StreamExt;
+
     let dir = tempfile::tempdir().unwrap();
     let (url, _stop) = serve(open(dir.path())).await;
-    let mut client = YesnoClient::connect(url).await.unwrap();
-
+    let mut client = YesnoClient::connect(url.clone()).await.unwrap();
     let txn = client.begin_write().await.unwrap();
 
-    // 8192 is the client's batch size, so this is two record batches in one
-    // call, with the invalid row in the second.
-    let mut mutations: Vec<Mutation> = (0..8192u64)
-        .map(|o| Mutation::Insert {
-            key: 80,
-            ordinal: o,
-        })
-        .collect();
-    mutations.push(Mutation::RemoveRange {
-        key: 80,
-        lo: 9,
-        hi: 4,
-    });
+    // Two record batches under one `txn:` descriptor. The first is valid; the
+    // second carries an inverted range and must be refused.
+    let rows = |spec: &[(u64, u64, u64, u8)]| {
+        arrow_array::RecordBatch::try_new(
+            yesno_flight::mutations_schema(),
+            vec![
+                Arc::new(arrow_array::UInt64Array::from(
+                    spec.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::UInt64Array::from(
+                    spec.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::UInt64Array::from(
+                    spec.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::UInt8Array::from(
+                    spec.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let first = rows(&[
+        (80, 1, 1, yesno_flight::OP_INSERT),
+        (80, 2, 2, yesno_flight::OP_INSERT),
+    ]);
+    // Inverted bounds: refused, and it arrives after the first batch is staged.
+    let second = rows(&[(80, 9, 4, yesno_flight::OP_REMOVE_RANGE)]);
 
-    let refused = client.stage(txn, mutations).await;
-    assert!(refused.is_err(), "the inverted range must be refused");
+    let mut command = yesno_flight::PUT_TXN_PREFIX.to_vec();
+    command.extend_from_slice(&txn.0.to_le_bytes());
+    let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        .with_schema(yesno_flight::mutations_schema())
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(command)))
+        .build(futures::stream::iter(vec![Ok(first), Ok(second)]))
+        .map(|r| r.unwrap());
 
-    // The first batch is staged and cannot be withdrawn, so the transaction is
-    // no longer committable. Without the poison it would commit 8192 rows the
-    // caller was told had failed.
+    let channel = tonic::transport::Channel::from_shared(url)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut raw = FlightServiceClient::new(channel);
+    let staged = match raw.do_put(input).await {
+        Err(_) => Err(()),
+        Ok(response) => {
+            let mut acks = response.into_inner();
+            let mut outcome = Ok(());
+            while let Some(r) = acks.next().await {
+                if r.is_err() {
+                    outcome = Err(());
+                }
+            }
+            outcome
+        }
+    };
+    assert!(staged.is_err(), "the second batch must be refused");
+
     let err = client
         .commit_write(txn)
         .await
@@ -592,7 +636,10 @@ async fn a_failure_in_a_later_batch_poisons_the_transaction() {
         "the refusal has to say what to do about it: {message}"
     );
 
-    // Abort is the way out, and it leaves nothing behind.
     client.abort_write(txn).await.unwrap();
-    assert_eq!(members(&mut client, 80).await, Vec::<u64>::new());
+    assert_eq!(
+        members(&mut client, 80).await,
+        Vec::<u64>::new(),
+        "no row from the first batch may become visible"
+    );
 }
