@@ -70,7 +70,7 @@
 //!   survived unnoticed in a file.
 //! * **The cross-process hash contract disappeared.** Container identity is
 //!   now the posting-list key itself, so nothing has to agree about hashing.
-//!   Only [`shape_key`] still hashes, and its value is produced and consumed
+//!   Only `shape_key` still hashes, and its value is produced and consumed
 //!   as an opaque id.
 //! * **The hand-rolled enabled-flag disappeared.** `tracing`'s macros check
 //!   callsite interest *before* evaluating field expressions, so the
