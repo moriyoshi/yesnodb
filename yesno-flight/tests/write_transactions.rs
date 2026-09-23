@@ -412,3 +412,120 @@ async fn a_point_operation_carrying_a_range_is_refused() {
         "an inverted range is a transposed pair of arguments, not an empty set"
     );
 }
+
+// The cases below come from an external audit of this feature ( haiiie,
+// 2026-09-23 ). Both passed review and passed every test in this file at the
+// time, which is why they are written as behaviour rather than as notes.
+
+/// A staging call the server **rejected** must leave nothing behind.
+///
+/// `a_point_operation_carrying_a_range_is_refused` above asserts the refusal
+/// and stops there, and that gap was the bug: rows were applied as they were
+/// validated, so an invalid row left every *earlier* row of the same batch in
+/// the resident batch. `commit_write` re-validates nothing, so the caller
+/// could publish work the server had told it was refused.
+///
+/// The row-bound refusal shares this path and is now ordered the same way --
+/// checked before anything is staged -- but is not asserted separately here,
+/// because `MAX_TRANSACTION_ROWS` is sixteen million and a fixture that cannot
+/// reach it would assert nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_batch_stages_none_of_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _stop) = serve(open(dir.path())).await;
+    let mut client = YesnoClient::connect(url).await.unwrap();
+
+    let txn = client.begin_write().await.unwrap();
+    // One batch, two rows: a valid insert followed by an inverted range. The
+    // insert is what must not survive the refusal.
+    let refused = client
+        .stage(
+            txn,
+            [
+                Mutation::Insert {
+                    key: 50,
+                    ordinal: 1,
+                },
+                Mutation::RemoveRange {
+                    key: 50,
+                    lo: 9,
+                    hi: 4,
+                },
+            ],
+        )
+        .await;
+    assert!(refused.is_err(), "an inverted range must be refused");
+
+    let version = client.commit_write(txn).await.unwrap();
+    assert_eq!(
+        members_at(&mut client, 50, version).await,
+        Vec::<u64>::new(),
+        "a refused batch must contribute nothing, even to a later commit"
+    );
+}
+
+/// A handle must never be reissued, so a stale retry fails closed.
+///
+/// Handles were a counter from zero, so a server restarted over the same
+/// database issued handle 1 again and a delayed `commit_write` from before the
+/// restart resolved a **different** transaction, publishing another caller's
+/// staged work under the retrying caller's identity. The audit reproduced that
+/// with no hostile client. Two sequential services over one database is the
+/// same aliasing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_from_a_previous_service_is_not_reissued() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+
+    let (first_url, stop_first) = serve(db.clone()).await;
+    let mut first = YesnoClient::connect(first_url).await.unwrap();
+    let stale = first.begin_write().await.unwrap();
+    first
+        .stage(
+            txn_of(stale),
+            [Mutation::Insert {
+                key: 70,
+                ordinal: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    drop(first);
+    let _ = stop_first.send(());
+
+    let (second_url, _stop) = serve(db.clone()).await;
+    let mut second = YesnoClient::connect(second_url).await.unwrap();
+    let fresh = second.begin_write().await.unwrap();
+    second
+        .stage(
+            txn_of(fresh),
+            [Mutation::Insert {
+                key: 71,
+                ordinal: 2,
+            }],
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        stale.0, fresh.0,
+        "a handle issued by a previous service must not be reissued"
+    );
+    assert!(
+        second.commit_write(stale).await.is_err(),
+        "a stale handle must resolve nothing rather than commit another transaction"
+    );
+    // And the transaction that really is open is untouched by that attempt.
+    let version = second.commit_write(fresh).await.unwrap();
+    assert_eq!(members_at(&mut second, 71, version).await, vec![2]);
+    assert_eq!(
+        members_at(&mut second, 70, version).await,
+        Vec::<u64>::new(),
+        "the first service's staged work died with it"
+    );
+}
+
+/// `WriteTxn` is a newtype; this keeps the call sites above readable.
+fn txn_of(txn: WriteTxn) -> WriteTxn {
+    txn
+}

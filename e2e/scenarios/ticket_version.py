@@ -90,12 +90,54 @@ b = flight_fetch(f, t["raw"])
 assert a == b, "two readers holding one ticket saw two different databases"
 assert set(a) == want
 
+# ---- a live lease keeps the ticket honourable across a checkpoint
+#
+# This is what the lease is *for*. `GetFlightInfo` parks a clone of the
+# snapshot, which is a registered reader, so the version cannot be reclaimed
+# under a caller still holding the ticket it was handed.
+#
+# **This assertion is new on 2026-09-23 and it used to assert the opposite.**
+# Leasing was dead in `yesnod`: a fresh Flight service was built per RPC, so
+# `DoGet` never found the lease `GetFlightInfo` had parked and fell back to
+# re-opening by version, which the checkpoint below had collapsed. The refusal
+# this file asserted was therefore real but reached for the wrong reason, and
+# it was the only evidence anywhere that the lease mechanism did nothing.
+assert srv_checkpoint(node) > 0
+assert set(flight_fetch(f, t["raw"])) == want, (
+    "a checkpoint must not collapse a version a live lease is holding"
+)
+
 # ---- a ticket the server can no longer honour is refused, not approximated
 #
 # `FailedPrecondition`, and the code is the whole point: it means "do not
 # retry until you have fixed something", and the something is asking for a new
 # ticket. `Unavailable` or an internal error would put a client in a loop
 # against a version the floor only recedes further from.
+#
+# Reached by restarting rather than by waiting: leases live in the service, so
+# a restart drops every one of them, and the checkpoint above already collapsed
+# the version this ticket names. Waiting out the lease would mean sleeping for
+# its full term in a gate.
+assert srv_stop(node)["clean"] is True
+restarted = srv_config("leader", shards=2, interval_secs=60)
+srv_control_admin(restarted, "all")
+srv_replication(restarted)
+node = srv_launch(restarted)
+f = srv_flight(node)
+
+# The checkpoint above could not collapse this version -- the lease was holding
+# it, which is the previous assertion's whole point -- so it survived into the
+# restarted database. Writing and checkpointing again, with nothing pinning it
+# now, is what moves the floor past it.
+post = set()
+keys = []
+ords = []
+for i in range(N // 5):
+    o = i * 3 + 200000000
+    keys.append(1)
+    ords.append(o)
+    post.add(o)
+flight_put(f, keys, ords)
 assert srv_checkpoint(node) > 0
 
 refused = False
@@ -111,7 +153,7 @@ assert refused, "a collapsed version was answered instead of refused"
 
 # ---- and the server is fine. A stale ticket is the client's problem.
 fresh = flight_ticket(f, 1)
-assert set(flight_fetch(f, fresh["raw"])) == want | later | mid
+assert set(flight_fetch(f, fresh["raw"])) == want | later | mid | post
 assert fresh["version"] > t["version"]
 
 flight_stop(f)

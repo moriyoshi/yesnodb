@@ -3878,3 +3878,117 @@ The rename is its own commit for reviewability, and `JOURNAL.md` is the only
 file that keeps the old name.
 
 ---
+
+---
+## 2026-09-23 -- An external audit found three holes in the write transaction, and the server never ran it
+
+Two separate things went wrong with the same feature on the same day, and only
+one of them was found by this project.
+
+### The one found here: it did not work at all
+
+`yesno-server`'s `GuardedFlight::current` built a **fresh**
+`YesnoFlightService` per RPC. The constructor allocates new `leases` and
+`writes` tables, so `begin_write` registered a transaction into an instance
+that was dropped when the action returned, and the next call answered *"write
+transaction N is not open"*. The doc comment asserting that building the
+service is an `Arc` clone was true when the service was `{ db }` and silently
+stopped being true when those two tables were added.
+
+**Ticket leasing had the identical bug and predates it** -- `get_flight_info`
+parks a lease, `do_get` reads it, two RPCs, two instances. It degrades quietly,
+because `DoGet` falls back to re-opening by version and still returns the right
+rows, which is exactly why nothing noticed for however long it has been there.
+
+**Nothing in the suite could see either.** `yesno-flight`'s nine acceptance
+tests hold one service and call it directly; the PostgreSQL and MySQL fixtures
+use an in-process Flight service for the same reason. Every gate was green on a
+feature that could not work in production, and the driver migration in
+`9ccc3ec` was broken along with it. The fix is one cached service per database,
+keyed by `Arc::ptr_eq` so a replica that reopens does not inherit leases
+pinning versions it never had.
+
+`yesno-server/tests/write_transactions.rs` is the layer that was missing: begin,
+two stages, a read, commit and a retry, each a separate RPC through the real
+server. It fails with the cache disabled. That check was run rather than
+assumed, because the whole bug was a test that could not fail.
+
+**It was found by writing a client**, not by reviewing the server. The Python
+integration test was the first thing in the repository to cross the gRPC
+boundary twice with one handle.
+
+### The three found by haiiie
+
+An audit against `74f4ba5` with an out-of-tree probe found three more, each
+demonstrated rather than argued.
+
+**A rejected staging call left its earlier rows staged.** `stage_mutations`
+applied each row as it validated it, so `[ Insert, invalid RemoveRange ]` in one
+batch refused the call *and kept the insert* -- and `commit_write` re-validates
+nothing, so the caller could publish work it had been told was refused. The row
+bound had the same shape from the other direction: rows were staged, then the
+total was incremented, then `ResourceExhausted` was returned, leaving the
+over-limit rows in the batch and committable. Decoding is now separated from
+application, so a batch is all or nothing and the bound is tested before a
+single row lands.
+
+**Handles recurred.** `next` started at zero per service, so a server restarted
+over the same database issued handle 1 again and a delayed `commit_write` from
+before the restart resolved a *different* transaction -- publishing another
+caller's staged work under the retrying caller's identity, with no hostile
+client anywhere. Handles are now drawn through a per-service `RandomState`,
+which is dependency-free on purpose: adding one here would mean a
+`crate_universe` repin for eight bytes of entropy. **Non-reuse is a correctness
+property, not a security one**, and it is independent of the ownership and
+fencing this surface still lacks.
+
+**The idempotency claim was wider than the mechanism.** Committed outcomes live
+in a bounded in-memory `VecDeque`; a restart loses all of them. The
+documentation said this let a CDC pipe recover from an ambiguous network
+failure, which is true only for a prompt retry against a still-running server
+-- not for the case that pipe actually has to survive. The claim is narrowed to
+what is implemented, and `durable-write-transaction-idempotency` records the
+rest as open.
+
+### The scenario that had been asserting the broken behaviour
+
+Fixing the service cache turned `e2e/scenarios/ticket_version.py` red, and that
+file is the reason the lease bug is datable at all: it asserted that a
+checkpoint collapses a version out from under a live ticket, and it passed --
+because leasing did nothing. **It was the only evidence anywhere that the
+mechanism was dead, and it read as a feature.**
+
+The property it names is right and was kept: a ticket the server can no longer
+honour must be refused with `FailedPrecondition` naming `GetFlightInfo`, not
+approximated. What stopped being true is its *setup*. The fixture now asserts
+both halves -- that a live lease **keeps** a ticket honourable across a
+checkpoint, which nothing tested because nothing could, and that a version
+nothing pins is refused once a checkpoint moves the floor past it.
+
+Reaching the second honestly took three tries, each of which taught something
+about what a lease actually does. Restarting the server was not enough: the
+lease had *already* stopped the first checkpoint from collapsing the version,
+so it survived into the restarted database. Checkpointing again was not enough
+either, because a checkpoint with no newer writes has nothing to collapse
+toward. The sequence that works is restart, write, checkpoint -- which is the
+original file's own sequence with the lease removed first.
+
+I considered exposing the lease TTL as server configuration so the scenario
+could disable leasing, and rejected it. Adding public configuration surface to
+make a test reachable is the wrong direction when a restart already expresses
+the same precondition out of behaviour the server has. The alternative,
+sleeping out the thirty-second lease inside the gate, was never serious.
+
+### What to carry away
+
+**An in-process fixture and a deployed binary are different systems**, and a
+feature whose state lives between calls can only be tested across calls. Three
+gates and nine acceptance tests agreed the feature worked. A consumer writing a
+real client found it broken in the first minute.
+
+And an audit from outside found what review from inside did not, on code that
+had already passed four gates. All three of its findings were *partial* failures
+-- a refusal that half-applied, a handle that resolved the wrong thing, a
+guarantee that held sometimes -- which is the class that tests written by the
+implementer are worst at catching, because the implementer tests the path they
+were thinking about.

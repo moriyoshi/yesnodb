@@ -258,11 +258,24 @@ pub const ACTION_REMOVE_ONE: &str = "remove_one";
 /// and `abort` take those bytes back; `commit` returns the version every
 /// staged row became visible at.
 ///
-/// **`commit` is idempotent.** A committed transaction's outcome is remembered
-/// for [`COMMIT_MEMORY`] entries, so a retry after a lost response returns the
-/// original version instead of failing or committing twice. That is the
-/// property a CDC pipe needs to recover from an ambiguous network failure
-/// without risking double application.
+/// **`commit` is idempotent within one live service, and only there.** A
+/// committed transaction's outcome is remembered for [`COMMIT_MEMORY`]
+/// entries, so a *prompt* retry after a lost response returns the original
+/// version instead of failing or committing twice.
+///
+/// That memory is in process memory and bounded. A restart loses every
+/// outcome, and later traffic evicts older ones. So this covers a retry
+/// against the same running server before eviction, and **not** the case a
+/// change-data pipe actually has to survive: losing the response and then
+/// finding the server restarted. Such a caller cannot recover the version its
+/// transaction committed at, and must not assume replaying under the old
+/// handle is safe -- handles do not recur, so the replay fails closed rather
+/// than resolving something else, but the original outcome is simply gone.
+///
+/// Durable idempotency needs a client-supplied identity derived from the
+/// source transaction, persisted with the commit, or an equivalent durable
+/// outcome query. Neither exists; see `durable-write-transaction-idempotency`
+/// in `TODO.md`.
 pub const ACTION_BEGIN_WRITE: &str = "begin_write";
 pub const ACTION_COMMIT_WRITE: &str = "commit_write";
 pub const ACTION_ABORT_WRITE: &str = "abort_write";
@@ -292,6 +305,10 @@ pub const MAX_OPEN_TRANSACTIONS: usize = 256;
 pub const MAX_TRANSACTION_ROWS: u64 = 16 * 1024 * 1024;
 
 /// Committed transaction outcomes remembered for idempotent retry.
+///
+/// In memory, bounded, and lost on restart. This is the whole extent of the
+/// idempotency guarantee; see [`ACTION_COMMIT_WRITE`] for what that does and
+/// does not cover.
 pub const COMMIT_MEMORY: usize = 1024;
 
 /// Rows per `RecordBatch`. 64 KiB of `u64`, which fits L2 and matches
@@ -458,7 +475,48 @@ fn stage_pairs(
 /// per-row default turns *part* of a batch into the wrong operation, which is
 /// harder to notice than a whole stream going the wrong way.
 #[cfg(feature = "server")]
-fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u64, Status> {
+/// One validated row, ready to apply and unable to fail.
+///
+/// Decoding is separated from application so that a batch is **all or
+/// nothing**. It used to apply row by row as it validated, so an invalid row
+/// left every earlier row of the same batch already in the resident
+/// `WriteBatch` -- the staging call reported failure and the transaction could
+/// still be committed with the partial work. A caller was told its write did
+/// not happen and could then publish it.
+#[cfg(feature = "server")]
+enum Staged {
+    Insert(u64, u64),
+    Remove(u64, u64),
+    InsertRange(u64, u64, u64),
+    RemoveRange(u64, u64, u64),
+    DeleteKey(u64),
+}
+
+#[cfg(feature = "server")]
+fn apply_staged(wb: &mut yesno_core::WriteBatch, ops: Vec<Staged>) {
+    for op in ops {
+        match op {
+            Staged::Insert(key, ordinal) => {
+                wb.insert(key, ordinal);
+            }
+            Staged::Remove(key, ordinal) => {
+                wb.remove(key, ordinal);
+            }
+            Staged::InsertRange(key, lo, hi) => {
+                wb.insert_range(key, lo, hi);
+            }
+            Staged::RemoveRange(key, lo, hi) => {
+                wb.remove_range(key, lo, hi);
+            }
+            Staged::DeleteKey(key) => {
+                wb.delete_key(key);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+fn decode_mutations(b: &RecordBatch) -> Result<Vec<Staged>, Status> {
     let col = |name: &str| -> Result<&UInt64Array, Status> {
         b.column_by_name(name)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -480,6 +538,7 @@ fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u
             )
         })?;
 
+    let mut staged = Vec::with_capacity(b.num_rows());
     for i in 0..b.num_rows() {
         let (key, lo, hi) = (keys.value(i), los.value(i), his.value(i));
         let point = |what: &str| -> Result<(), Status> {
@@ -492,22 +551,22 @@ fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u
                 )))
             }
         };
-        match ops.value(i) {
+        staged.push(match ops.value(i) {
             OP_INSERT => {
                 point("insert")?;
-                wb.insert(key, lo);
+                Staged::Insert(key, lo)
             }
             OP_REMOVE => {
                 point("remove")?;
-                wb.remove(key, lo);
+                Staged::Remove(key, lo)
             }
             OP_INSERT_RANGE => {
                 range_bounds(i, lo, hi)?;
-                wb.insert_range(key, lo, hi);
+                Staged::InsertRange(key, lo, hi)
             }
             OP_REMOVE_RANGE => {
                 range_bounds(i, lo, hi)?;
-                wb.remove_range(key, lo, hi);
+                Staged::RemoveRange(key, lo, hi)
             }
             OP_DELETE_KEY => {
                 if lo != 0 || hi != 0 {
@@ -516,7 +575,7 @@ fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u
                          a whole-key delete names no range"
                     )));
                 }
-                wb.delete_key(key);
+                Staged::DeleteKey(key)
             }
             other => {
                 return Err(Status::invalid_argument(format!(
@@ -525,9 +584,9 @@ fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u
                      remove_range, or {OP_DELETE_KEY} delete_key"
                 )))
             }
-        }
+        });
     }
-    Ok(b.num_rows() as u64)
+    Ok(staged)
 }
 
 /// Inclusive bounds must not be inverted.
@@ -595,10 +654,53 @@ impl Drop for StagingGuard {
 struct WriteTransactions {
     open: std::collections::HashMap<u64, PendingWrite>,
     /// `( transaction, version )` for recently committed transactions, oldest
-    /// first. Makes `commit` idempotent: a retry after a lost response finds
-    /// its own outcome instead of a missing transaction.
+    /// first. Makes `commit` idempotent **within one live service**: a prompt
+    /// retry after a lost response finds its own outcome instead of a missing
+    /// transaction. See [`COMMIT_MEMORY`] for what this does not promise.
     committed: std::collections::VecDeque<(u64, u64)>,
-    next: u64,
+    counter: u64,
+    /// Randomly seeded per service, which is what keeps handles from repeating
+    /// across a restart.
+    ///
+    /// Handles used to be a plain counter from zero. A server restarted over
+    /// the same database therefore issued handle 1 again, and a delayed
+    /// `commit_write` from *before* the restart would resolve whatever
+    /// transaction now held that number -- publishing another caller's staged
+    /// work under the retrying caller's identity. An audit reproduced it with
+    /// no hostile client: two sequential servers and one stale retry.
+    ///
+    /// `RandomState` is seeded from the OS per process, so hashing the counter
+    /// through it yields handles that are unique within a service and do not
+    /// recur after one. A dependency-free source is deliberate -- adding one
+    /// here would mean a `crate_universe` repin for eight bytes of entropy.
+    ///
+    /// Non-reuse is a **correctness** property, separate from the ownership
+    /// and fencing this surface still lacks: it makes a stale handle fail
+    /// closed rather than succeed against the wrong transaction.
+    ids: std::collections::hash_map::RandomState,
+}
+
+#[cfg(feature = "server")]
+impl WriteTransactions {
+    /// A handle no live transaction holds and no remembered outcome names.
+    fn mint(&mut self) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        loop {
+            self.counter += 1;
+            let mut h = self.ids.build_hasher();
+            h.write_u64(self.counter);
+            let id = h.finish();
+            // Zero is reserved so that a client's zeroed handle cannot name a
+            // real transaction, and a collision -- astronomically unlikely, but
+            // free to exclude -- simply draws again.
+            if id != 0
+                && !self.open.contains_key(&id)
+                && !self.committed.iter().any(|&(t, _)| t == id)
+            {
+                return id;
+            }
+        }
+    }
 }
 
 #[cfg(feature = "server")]
@@ -1184,14 +1286,19 @@ impl FlightService for YesnoFlightService {
                     version = version.max(n.1);
                 }
                 PutMode::Apply => {
-                    let wb = pending.as_mut().expect("created for this mode");
-                    rows += stage_mutations(wb, &b)?;
-                    if rows > MAX_TRANSACTION_ROWS {
+                    let staged = decode_mutations(&b)?;
+                    // Checked before applying. `apply` discards its batch on
+                    // any error, so the ordering matters less here than in a
+                    // transaction, but the two paths should not differ in when
+                    // a bound is enforced.
+                    if rows + staged.len() as u64 > MAX_TRANSACTION_ROWS {
                         return Err(Status::resource_exhausted(format!(
                             "apply exceeded {MAX_TRANSACTION_ROWS} staged rows; \
                              split the work or use a write transaction"
                         )));
                     }
+                    rows += staged.len() as u64;
+                    apply_staged(pending.as_mut().expect("created for this mode"), staged);
                 }
                 PutMode::Txn(id) => {
                     // Staged under the lock so the row bound is enforced
@@ -1211,18 +1318,31 @@ impl FlightService for YesnoFlightService {
                             "write transaction {id} expired before this batch"
                         )));
                     }
-                    let staged = stage_mutations(&mut tx.batch, &b)?;
-                    tx.rows += staged;
-                    if tx.rows > MAX_TRANSACTION_ROWS {
+                    // **Decoded, validated and bound-checked before a single
+                    // row reaches `tx.batch`.** Both halves of this used to run
+                    // the other way round: rows were applied as they were
+                    // validated, and the row total was incremented before the
+                    // limit was tested. Either error therefore left the
+                    // rejected work in the resident batch, and `commit_write`
+                    // re-checks neither -- so a caller could commit a
+                    // transaction the server had told it was invalid or
+                    // over-limit, and an audit demonstrated exactly that.
+                    let staged = decode_mutations(&b)?;
+                    let staged_rows = staged.len() as u64;
+                    if tx.rows + staged_rows > MAX_TRANSACTION_ROWS {
                         // Left open rather than aborted: the client asked for
                         // atomicity, so silently discarding half of it is worse
-                        // than telling it to abort.
+                        // than telling it to abort. Nothing from this batch was
+                        // staged, so what is open is exactly what was accepted.
                         return Err(Status::resource_exhausted(format!(
-                            "write transaction {id} exceeded {MAX_TRANSACTION_ROWS} \
-                             staged rows; abort it"
+                            "write transaction {id} would exceed {MAX_TRANSACTION_ROWS} \
+                             staged rows; nothing from this batch was staged, so it can \
+                             be committed as it stands or aborted"
                         )));
                     }
-                    rows += staged;
+                    apply_staged(&mut tx.batch, staged);
+                    tx.rows += staged_rows;
+                    rows += staged_rows;
                 }
             }
             batch_count += 1;
@@ -1321,8 +1441,7 @@ impl FlightService for YesnoFlightService {
                         "{MAX_OPEN_TRANSACTIONS} write transactions are already open"
                     )));
                 }
-                w.next += 1;
-                let id = w.next;
+                let id = w.mint();
                 w.open.insert(
                     id,
                     PendingWrite {
