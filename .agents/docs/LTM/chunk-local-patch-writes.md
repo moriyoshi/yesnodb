@@ -105,12 +105,40 @@ under a microsecond; the tail maximum is the same. The difference tracks commit
 *rate* -- patch sustains about 161 commits/s against 1.6 -- rather than any per
 query cost.
 
-## What was not measured
+## The end-to-end measurement, supplied by the consumer
 
-The end-to-end comparison through haiiie's ordered writer and service at
-matched encoder thread counts. These are direct-`Db` figures and must not be
-substituted for that: there are no attributes, no metadata and no service in
-this harness. The consumer owns that measurement.
+This entry originally said the end-to-end comparison was not measured and that
+the consumer owned it. It has since been produced, and is recorded here **as a
+consumer measurement rather than an upstream one** -- taken on haiiie's tree,
+by haiiie's agent, with haiiie's controls, against yesno `f7f9daf` with
+`yesno-core` clean and both SHAs re-read at the end.
+
+| haiiie arm, its own writer and corpora | result |
+| --- | --- |
+| binary point ingest, 1,048,576 docs, D=256 | 35.462 / 35.830 s ( 29,265-29,569 docs/s ) |
+| residual point ingest, 96,903 docs | 2.717 / 2.719 s |
+| **residual packed ingest, `try_put_residual_tile` on `patch_chunk`** | **0.031 / 0.042 s** |
+
+The packed path turns the write step into **1.1%** of the point path's, and
+their build becomes 97% encoding afterwards. 95 tiles taken, 0 declined, so
+there was no silent fallback; recall@10 was identical to the point path at
+0.7600, and reopen-and-verify found every row live.
+
+Two provenance notes, because they are what make the numbers usable. Their
+in-band control -- a pure-CPU encode step that cannot reach this code -- held
+at 15.007 / 14.995 s against a 15.011 s baseline. And an earlier attempt
+produced 89.4 and 83.3 s, which they discarded rather than reported: an
+unrelated `qemu-img` build was pushing ~500 MB/s of block output, and their
+ingest is WAL-bound. **A gate can be blind to the resource the workload is
+actually bound by** -- CPU idle read 90% throughout. Their gate now checks
+`vmstat` bi+bo alongside CPU, and the binary arm carries a disk-free in-band
+control.
+
+## What is still not measured here
+
+Everything above is theirs. Nothing in this repository measures the end-to-end
+path, and the direct-`Db` figures in the previous section must still not be
+substituted for it.
 
 ## Reproduction
 

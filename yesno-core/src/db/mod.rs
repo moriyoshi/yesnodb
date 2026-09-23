@@ -3602,6 +3602,31 @@ impl WriteBatch {
     /// Both masks are validated against invariant I8 before the batch can
     /// commit: a chunk at the maximum prefix cannot carry the reserved maximum
     /// ordinal.
+    ///
+    /// # If you buffer these masks, box them
+    ///
+    /// The masks arrive by reference and this call is cheap. **Storing them is
+    /// not**, and a caller batching operations of its own has to store them.
+    /// A [`crate::Container`] is 56 bytes, so a variant holding two inline is
+    /// 128 -- and if that variant lives in an enum whose other arm is a point
+    /// insert, every point insert in every batch grows to 128 bytes too,
+    /// including in batches containing no patches at all.
+    ///
+    /// This is not hypothetical and it is not only a caller's problem. It
+    /// happened here first: `Op::PatchChunk` held both masks inline, taking
+    /// `Op` from 72 bytes to 128, and an isolated point-ingest benchmark moved
+    /// **1.763 s to 2.471 s** over 96,903 documents -- a 40% regression on a
+    /// path that never calls this method. It then happened again downstream,
+    /// in a consumer that mirrored this interface into its own batch enum:
+    /// 32 bytes to 128, a 4x widening, **29,146 to 24,922 documents per
+    /// second** end to end. Two test suites, written independently, were blind
+    /// to it on the same day; one of them had allocation budgets.
+    ///
+    /// So box the payload rather than widen the enum. One pointer is 8 bytes
+    /// and is paid only by the operation that uses it. The guard here is
+    /// `the_op_enum_does_not_grow_past_its_widest_necessary_variant`, asserted
+    /// relatively so a legitimate change to `Container` does not turn it into
+    /// a constant someone raises to go green.
     pub fn patch_chunk(
         &mut self,
         key: u64,
