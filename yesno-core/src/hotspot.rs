@@ -1,5 +1,15 @@
 //! Capture point for the hotspot observer, published as `tracing` events.
 //!
+//! Research capture, and semver-exempt for that reason.
+//!
+//! The module is unconditional on purpose: gating it on `tracing` broke the
+//! Bazel build, which compiles this crate without the feature while
+//! `yesno-flight` calls into it. Only the emission inside is gated. This
+//! rationale belongs here rather than on the `pub mod` declaration -- an
+//! outer doc comment there merges with this block and makes rustdoc resolve
+//! every link below in the crate root's scope, where none of these items are
+//! named.
+//!
 //! # Why this exists
 //!
 //! Two open questions -- GPU residency in
@@ -117,9 +127,9 @@
 //!   measurement worth taking.
 //! * `hotspot.done` -- once, when a budget is spent.
 //!
-//! Consumed by the offline observer under `.agents-workspace/tmp/`, which
-//! parses whatever the operator's subscriber formatted. That tool is research
-//! and deliberately outside the tree; this module is the half that has to be
+//! Consumed by the offline observer, which parses whatever the operator's
+//! subscriber formatted. That tool is research and deliberately outside the
+//! tree, under the agent scratch directory; this module is the half that has to be
 //! where the queries are.
 //!
 //! # Fidelity, stated rather than assumed
