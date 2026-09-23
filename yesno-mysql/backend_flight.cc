@@ -120,35 +120,62 @@ class FlightBackend final : public Backend {
     std::lock_guard<std::mutex> guard(mutex_);
     return Assign(client_->Remove(key, ordinal), changed, error);
   }
-  /// `InsertMany` and `RemoveMany` already take `( key, ordinal )` pairs, so a
-  /// whole multi-key transaction goes out as **two** calls rather than two per
-  /// key. An ordinal appears in exactly one of the two lists, because the
-  /// buffer is keyed by ordinal, so the order between them cannot change the
-  /// outcome; removals go first so that a partial failure leaves the set
-  /// smaller rather than larger. A `TRUNCATE` inside the transaction is a
-  /// separate `Clear` per key ahead of both.
+  /// One MySQL transaction becomes **one** yesno commit.
+  ///
+  /// This used to be a `Clear` per cleared key, then one `RemoveMany`, then
+  /// one `InsertMany` -- so a transaction that truncated *c* keys published
+  /// `c + 2` separate versions, and a reader could observe the removals
+  /// without the insertions, or a truncation without its replacement. The
+  /// embedded backend already applied the whole plan atomically through one
+  /// `yesno_batch`; this brings the Flight backend to the same guarantee
+  /// rather than leaving the two backends semantically different.
+  ///
+  /// **Order is the point, not just atomicity.** A key's `DeleteKey` is staged
+  /// ahead of its own removals and insertions, and the server applies
+  /// operations on one key in the order they were staged. Grouping them by
+  /// kind would still commit atomically and would turn a whole-key
+  /// replacement into an empty key.
   bool Apply(const std::vector<KeyWrites> &writes,
              std::string *error) override {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> inserts;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> removes;
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::vector<yesno::flight::Client::Mutation> mutations;
     for (const KeyWrites &w : writes) {
-      if (w.clear_first && !Discard(client_->Clear(w.key), error)) return false;
-      for (std::uint64_t o : w.removes) removes.emplace_back(w.key, o);
-      for (std::uint64_t o : w.inserts) inserts.emplace_back(w.key, o);
-    }
-    if (!removes.empty()) {
-      auto result = client_->RemoveMany(removes);
-      if (!result.ok()) {
-        *error = result.status().ToString();
-        return false;
+      if (w.clear_first) {
+        mutations.push_back(
+            yesno::flight::Client::Mutation::DeleteKey(w.key));
+      }
+      for (std::uint64_t o : w.removes) {
+        mutations.push_back(
+            yesno::flight::Client::Mutation::Remove(w.key, o));
+      }
+      for (std::uint64_t o : w.inserts) {
+        mutations.push_back(
+            yesno::flight::Client::Mutation::Insert(w.key, o));
       }
     }
-    if (!inserts.empty()) {
-      auto result = client_->InsertMany(inserts);
-      if (!result.ok()) {
-        *error = result.status().ToString();
-        return false;
-      }
+    if (mutations.empty()) {
+      error->clear();
+      return true;
+    }
+
+    auto txn = client_->BeginWrite();
+    if (!txn.ok()) {
+      *error = txn.status().ToString();
+      return false;
+    }
+    auto staged = client_->Stage(*txn, mutations);
+    if (!staged.ok()) {
+      // Best effort: release the server's staged memory rather than waiting
+      // for the deadline. The staging failure is what the caller must see.
+      static_cast<void>(client_->AbortWrite(*txn));
+      *error = staged.status().ToString();
+      return false;
+    }
+    auto version = client_->CommitWrite(*txn);
+    if (!version.ok()) {
+      static_cast<void>(client_->AbortWrite(*txn));
+      *error = version.status().ToString();
+      return false;
     }
     error->clear();
     return true;

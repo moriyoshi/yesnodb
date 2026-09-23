@@ -44,6 +44,12 @@ arrow::Result<IngestAck> DecodeIngestAck(std::string_view bytes);
 
 std::shared_ptr<arrow::Schema> PairsSchema();
 
+/// `( key, lo, hi, op )`, one row per staged `WriteBatch` operation.
+///
+/// Ranges travel as ranges: the engine writes one record and one container
+/// call per chunk for one, and expanding client-side throws both away.
+std::shared_ptr<arrow::Schema> MutationsSchema();
+
 // Validate one server batch and append it without partially modifying output
 // on a validation failure. Ordering is checked across batch boundaries too.
 arrow::Status ValidateAndAppendOrdinals(

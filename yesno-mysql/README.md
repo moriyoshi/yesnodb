@@ -24,9 +24,14 @@ identity; renaming the SQL table does not move data.
 - `UPDATE` is rejected; use `DELETE` followed by `INSERT`.
 - Cursors read a stable snapshot. A scan does not see rows inserted after that
   scan starts.
-- The engine is nontransactional. A successful write is committed to yesnodb
-  immediately and is not rolled back by MySQL. Cross-engine commits are not
-  atomic.
+- Writes are **transactional**. They are buffered per connection and applied
+  when MySQL commits, so `ROLLBACK` discards them and `SAVEPOINT` unwinds to a
+  point. One SQL transaction becomes one yesnodb version, whichever backend is
+  in use.
+- There is deliberately **no two-phase prepare**, so cross-engine commits are
+  still not atomic: a crash between this engine's commit and MySQL's binlog
+  write leaves the two disagreeing. Closing that needs a durable
+  prepare/resolve protocol yesnodb does not expose.
 - `TRUNCATE` and `DROP TABLE` clear the selected yesnodb key. Two SQL tables
   using the same `CONNECTION` therefore alias the same set, and dropping either
   clears what both see.
@@ -42,7 +47,9 @@ For a remote server, start MySQL with `--yesno-backend=flight` and
 endpoint and fails if it is unavailable. Each scan materializes one remote
 snapshot into a C++ cursor, while point writes use atomic Flight actions so
 duplicate and missing-row results are not implemented as racy read-then-write
-sequences. The remote server owns checkpoint policy and durability; clean
+sequences. A committed transaction is staged through one Flight write
+transaction and published as a single version, so the remote backend gives the
+same atomicity as the embedded one rather than a weaker approximation of it. The remote server owns checkpoint policy and durability; clean
 plugin unload only releases the client connection.
 
 ## Build and test against pinned MySQL 8.4
@@ -72,8 +79,8 @@ server: embedded mode exercises the C ABI and byte-exact `mysqltest` corpus;
 Flight mode loads the native C++ client against the harness's in-process Flight
 service. Both modes assert schema rejection, unsigned boundaries, ordered and
 range scans, exact lookup and cardinality, duplicate and NULL refusal, update
-refusal, shared-key aliasing, delete/drop behavior, nontransactional rollback
-semantics, and plugin lifecycle. It also rejects a plugin that leaks the
+refusal, shared-key aliasing, delete/drop behavior, transactional rollback
+and savepoint semantics, and plugin lifecycle. It also rejects a plugin that leaks the
 standalone `yesno_*` C ABI. No host MySQL installation is used.
 
 For interactive inspection, build `//third_party/mysql:gen_dir`; its output is

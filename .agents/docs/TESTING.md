@@ -552,7 +552,7 @@ byte-exact two-session isolation output without host `stdbuf`. MySQL initializes
 runs the C ABI backend and byte-exact `mysqltest` corpus; Flight mode loads the
 native C++ client against the same in-process Flight primitive used by
 PostgreSQL. Both modes assert the engine's schema, boundary, scan, mutation,
-aliasing, nontransactional, and plugin-lifecycle contracts. Both suites keep
+aliasing, transactional rollback, and plugin-lifecycle contracts. Both suites keep
 every mutable file under the scenario's temporary world.
 
 Operator integration is an opt-in scenario through that same runner, not a

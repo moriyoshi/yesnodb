@@ -601,6 +601,7 @@ struct WriteTransactions {
     next: u64,
 }
 
+#[cfg(feature = "server")]
 impl YesnoFlightService {
     /// A lease long enough to cross a `GetFlightInfo` / `DoGet` round trip and
     /// short enough that an abandoned one is not a retention leak.

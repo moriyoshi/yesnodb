@@ -1253,10 +1253,15 @@ state machine. Point lookups and mutations stay atomic in either backend;
 SQL tables naming the same key intentionally alias and either drop clears both
 views.
 
-**Transaction boundaries do not pretend to align.** YESNO advertises
-`HA_NO_TRANSACTIONS`; insert and delete commit to yesnodb immediately, and MySQL
-rollback cannot reverse them. A scan is nevertheless internally stable because
-its materialized cursor comes from one yesno snapshot. The plugin owns one
+**Transactions are real; the two-phase boundary is what does not align.**
+Writes are buffered per connection and applied when MySQL commits, so
+`ROLLBACK` discards them and `SAVEPOINT` unwinds. One SQL transaction becomes
+one yesnodb version on either backend -- the embedded one through a single
+C-ABI `yesno_batch`, the remote one through a Flight write transaction. There
+is deliberately no `prepare`, so a crash between this engine's commit and
+MySQL's binlog write leaves the two disagreeing: the same gap
+`fdw-two-phase-commit` records on the PostgreSQL side. A scan is separately
+stable because its materialized cursor comes from one yesno snapshot. The plugin owns one
 backend, checkpoints or remotely compacts it during clean unload, and defaults
 embedded files to a `yesno` directory under the MySQL data directory. Startup
 selects `embedded` or `flight`; remote initialization probes the configured
@@ -1278,8 +1283,8 @@ of that exact server. Embedded mode exercises the C ABI and byte-exact
 mysqltest corpus; Flight mode loads the native C++ client against the shared
 in-process Flight fixture. Both modes assert schema rejection, the unsigned
 ordinal boundaries, forward and reverse range seeks, exact cardinality,
-duplicate/NULL/update refusal, key aliasing and clearing, nontransactional
-rollback semantics, and plugin lifecycle. The source-tree CMake path remains a
+duplicate/NULL/update refusal, key aliasing and clearing, transactional
+rollback and savepoint semantics, and plugin lifecycle. The source-tree CMake path remains a
 developer fallback and may consume either the adjacent Cargo workspace or
 Bazel's prebuilt library and header.
 

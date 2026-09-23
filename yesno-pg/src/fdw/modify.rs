@@ -51,7 +51,7 @@
 //! posting list holds each ordinal at most once, by construction.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pgrx::prelude::*;
 
@@ -742,32 +742,35 @@ pub fn has_pinned(endpoint: &str, key: u64) -> bool {
 fn flush() {
     let work: Vec<((String, u64), HashMap<u64, bool>)> =
         PENDING.with(|p| p.borrow_mut().drain_flattened());
+
+    // Grouped by endpoint, not by key. One PostgreSQL transaction becomes one
+    // yesno commit per endpoint, where it used to become **two commits per
+    // key** -- removals then insertions, each separately visible, and each on
+    // its own freshly opened connection.
+    //
+    // **Atomicity is per endpoint and cannot be more than that.** A foreign
+    // table set spanning two yesnod servers is two commits, because there is
+    // no distributed transaction between them and this does not pretend
+    // otherwise. The common case is one endpoint.
+    let mut by_endpoint: BTreeMap<String, Vec<(u64, u64, bool)>> = BTreeMap::new();
     for ((endpoint, key), writes) in work {
+        let ops = by_endpoint.entry(endpoint).or_default();
+        for (&ordinal, &removed) in writes.iter() {
+            ops.push((key, ordinal, removed));
+        }
+    }
+
+    for (endpoint, mut ops) in by_endpoint {
+        // The buffer is a `HashMap`, so its iteration order varies between
+        // runs. Sorting makes a flush reproducible, which matters for reading
+        // a WAL or a trace of one. It costs nothing the commit does not
+        // already pay: the engine sorts by key anyway.
+        ops.sort_unstable();
         let mut transport = match FlightTransport::new(&endpoint) {
             Ok(t) => t,
             Err(e) => error!("yesno_fdw: {e}"),
         };
-        let (removes, inserts): (Vec<u64>, Vec<u64>) = {
-            let mut r = Vec::new();
-            let mut i = Vec::new();
-            for (&o, &removed) in writes.iter() {
-                if removed {
-                    r.push(o)
-                } else {
-                    i.push(o)
-                }
-            }
-            (r, i)
-        };
-        // An ordinal appears in exactly one of the two lists, because the
-        // buffer is keyed by ordinal — so unlike the two-list version this
-        // replaced, the order of these two calls no longer decides the outcome.
-        // Removals still go first so that a partial failure leaves the set
-        // smaller rather than larger.
-        if let Err(e) = transport.put(key, &removes, true) {
-            error!("yesno_fdw: {e}");
-        }
-        if let Err(e) = transport.put(key, &inserts, false) {
+        if let Err(e) = transport.apply(&ops) {
             error!("yesno_fdw: {e}");
         }
     }

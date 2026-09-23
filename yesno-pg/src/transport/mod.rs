@@ -71,6 +71,19 @@ pub trait Transport {
     /// that per row would make an ordinary `INSERT … SELECT` unusable.
     fn put(&mut self, key: u64, ordinals: &[u64], remove: bool) -> Result<u64, TransportError>;
 
+    /// Apply every buffered change as **one** server-side commit.
+    ///
+    /// `ops` is `( key, ordinal, remove )` and may span keys. One PostgreSQL
+    /// transaction is one yesno version, which is what [`Transport::put`]
+    /// could not express: it takes one key and one direction, so a transaction
+    /// touching *n* keys with both insertions and removals became `2n`
+    /// commits, each briefly visible to readers.
+    ///
+    /// Order does not matter here and the buffer guarantees it: pending writes
+    /// are keyed by ordinal, so an ordinal is either inserted or removed, never
+    /// both.
+    fn apply(&mut self, ops: &[(u64, u64, bool)]) -> Result<u64, TransportError>;
+
     /// Every populated key, ascending.
     ///
     /// Needed by the index AM's `ambulkdelete`, which must visit every key

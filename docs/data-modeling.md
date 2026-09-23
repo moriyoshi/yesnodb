@@ -130,9 +130,11 @@ does not assign a new ordinal or key.
 
 Use one write batch when several memberships must become visible together. A
 reader sees either side of a committed batch, never a partially visible subset.
-When using Arrow Flight, each Arrow record batch is a separate database write
-batch; split a stream only at boundaries where separate visibility is
-acceptable.
+When using Arrow Flight, an `insert` or `remove` stream commits one database
+write batch per Arrow record batch, so split such a stream only at boundaries
+where separate visibility is acceptable. When a larger unit has to be atomic,
+send the operations as a mixed-operation `apply` call, which commits the whole
+call at once, or stage several calls into a write transaction and commit that.
 
 The `yesno put` command inserts pairs. Removal is available through the
 embedded API and through Flight `DoPut` with the `remove` command, but there is

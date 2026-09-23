@@ -158,6 +158,98 @@ arrow::Result<std::uint64_t> Client::RemoveMany(
   return Put("remove", pairs);
 }
 
+arrow::Result<Client::WriteTxn> Client::BeginWrite() {
+  return U64Action("begin_write", std::string());
+}
+
+arrow::Result<std::uint64_t> Client::Stage(
+    WriteTxn txn, const std::vector<Mutation>& mutations) {
+  std::string command = "txn:";
+  command.append(internal::EncodeU64(txn));
+  return PutMutations(command, mutations);
+}
+
+arrow::Result<std::uint64_t> Client::CommitWrite(WriteTxn txn) {
+  return U64Action("commit_write", internal::EncodeU64(txn));
+}
+
+arrow::Status Client::AbortWrite(WriteTxn txn) {
+  return U64Action("abort_write", internal::EncodeU64(txn)).status();
+}
+
+arrow::Result<std::uint64_t> Client::Apply(
+    const std::vector<Mutation>& mutations) {
+  return PutMutations("apply", mutations);
+}
+
+arrow::Result<std::uint64_t> Client::PutMutations(
+    std::string_view command, const std::vector<Mutation>& mutations) {
+  auto schema = internal::MutationsSchema();
+  ARROW_ASSIGN_OR_RAISE(
+      auto put,
+      impl_->flight->DoPut(
+          arrow::flight::FlightDescriptor::Command(std::string(command)),
+          schema));
+
+  for (std::size_t offset = 0; offset < mutations.size();
+       offset += kBatchRows) {
+    const std::size_t count = std::min(kBatchRows, mutations.size() - offset);
+    arrow::UInt64Builder keys;
+    arrow::UInt64Builder los;
+    arrow::UInt64Builder his;
+    arrow::UInt8Builder ops;
+    ARROW_RETURN_NOT_OK(keys.Reserve(static_cast<std::int64_t>(count)));
+    ARROW_RETURN_NOT_OK(los.Reserve(static_cast<std::int64_t>(count)));
+    ARROW_RETURN_NOT_OK(his.Reserve(static_cast<std::int64_t>(count)));
+    ARROW_RETURN_NOT_OK(ops.Reserve(static_cast<std::int64_t>(count)));
+    for (std::size_t i = 0; i < count; ++i) {
+      const Mutation& m = mutations[offset + i];
+      ARROW_RETURN_NOT_OK(keys.Append(m.key));
+      ARROW_RETURN_NOT_OK(los.Append(m.lo));
+      ARROW_RETURN_NOT_OK(his.Append(m.hi));
+      ARROW_RETURN_NOT_OK(ops.Append(m.op));
+    }
+    std::shared_ptr<arrow::Array> key_array;
+    std::shared_ptr<arrow::Array> lo_array;
+    std::shared_ptr<arrow::Array> hi_array;
+    std::shared_ptr<arrow::Array> op_array;
+    ARROW_RETURN_NOT_OK(keys.Finish(&key_array));
+    ARROW_RETURN_NOT_OK(los.Finish(&lo_array));
+    ARROW_RETURN_NOT_OK(his.Finish(&hi_array));
+    ARROW_RETURN_NOT_OK(ops.Finish(&op_array));
+    auto batch = arrow::RecordBatch::Make(
+        schema, static_cast<std::int64_t>(count),
+        {std::move(key_array), std::move(lo_array), std::move(hi_array),
+         std::move(op_array)});
+    ARROW_RETURN_NOT_OK(put.writer->WriteRecordBatch(*batch));
+  }
+  ARROW_RETURN_NOT_OK(put.writer->DoneWriting());
+
+  std::shared_ptr<arrow::Buffer> acknowledgement;
+  ARROW_RETURN_NOT_OK(put.reader->ReadMetadata(&acknowledgement));
+  if (acknowledgement == nullptr) {
+    return arrow::Status::Invalid("yesno returned no ingest acknowledgement");
+  }
+  const std::string_view bytes(
+      reinterpret_cast<const char*>(acknowledgement->data()),
+      static_cast<std::size_t>(acknowledgement->size()));
+  ARROW_ASSIGN_OR_RAISE(auto ack, internal::DecodeIngestAck(bytes));
+  const std::uint64_t acknowledged = ack.rows;
+
+  std::shared_ptr<arrow::Buffer> extra;
+  ARROW_RETURN_NOT_OK(put.reader->ReadMetadata(&extra));
+  if (extra != nullptr) {
+    return arrow::Status::Invalid(
+        "yesno returned more than one ingest acknowledgement");
+  }
+  ARROW_RETURN_NOT_OK(put.writer->Close());
+  if (acknowledged != mutations.size()) {
+    return arrow::Status::Invalid("yesno acknowledged ", acknowledged, " of ",
+                                  mutations.size(), " staged mutations");
+  }
+  return acknowledged;
+}
+
 arrow::Result<std::uint64_t> Client::Put(
     std::string_view command,
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pairs) {

@@ -112,9 +112,28 @@ that interval passes, a checkpoint may reclaim the version; `DoGet` then refuses
 rather than answering from a different instant, and the client should request new
 `FlightInfo` and retry at a fresh snapshot.
 
-Bulk ingest uses Arrow `DoPut` with two non-null `UInt64` columns named `key` and
-`ordinal`. The default command inserts; the recognized descriptor commands are
-`insert` and `remove`.
+Bulk ingest uses Arrow `DoPut`. The descriptor command is required -- an absent,
+empty or unrecognized command is an error rather than a silent default, so a
+client asking for an operation the server does not implement is told so instead
+of having its stream reinterpreted. `insert` and `remove` carry two non-null
+`UInt64` columns named `key` and `ordinal`, and commit one version per record
+batch.
+
+`apply` carries a mixed-operation stream and commits the whole call as one
+version. Its columns are `key`, `lo`, `hi` and `op`, all non-null: `op` selects
+insert, remove, insert-range, remove-range, or delete-key, `lo` and `hi` bound
+an inclusive range, and a single-ordinal operation sets them equal. Operations
+apply in stream order, which is what lets a change-data feed replay a
+delete-then-reinsert of the same key without the two reordering.
+
+A write spanning several calls uses a write transaction: an action opens one and
+returns its identifier, `DoPut` calls with the command `txn:<id>` stage
+mixed-operation batches into it, and a commit action applies the accumulated
+operations as one version or an abort discards them. Staged rows are not visible
+to readers until the commit. A server advertises `apply` and write-transaction
+support in its capability flags; open transactions are bounded in number, in
+staged rows, and by a deadline, so an abandoned one is reclaimed rather than
+held.
 
 The ingest acknowledgement is little-endian `app_metadata`: the accepted row count
 first, then the version those rows were committed at. Read the count from the

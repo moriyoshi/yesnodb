@@ -76,6 +76,15 @@ std::shared_ptr<arrow::Schema> PairsSchema() {
   });
 }
 
+std::shared_ptr<arrow::Schema> MutationsSchema() {
+  return arrow::schema({
+      arrow::field("key", arrow::uint64(), false),
+      arrow::field("lo", arrow::uint64(), false),
+      arrow::field("hi", arrow::uint64(), false),
+      arrow::field("op", arrow::uint8(), false),
+  });
+}
+
 arrow::Status ValidateAndAppendOrdinals(
     const arrow::RecordBatch& batch,
     std::vector<std::uint64_t>* output) {

@@ -230,3 +230,131 @@ Per-cohort counts under a filter, checked against a `BTreeSet` oracle. That is t
 **`gate-pg.sh` earned its place twice over.** It failed with three non-exhaustive matches in `yesno-pg` that **no cargo command can see**, because that crate is outside the workspace and built only by Bazel. One of the four sites fixed was inside `#[cfg(test)]` and so was not even reached by the cdylib build that reported the others. The re-run then died fetching Bazel's pinned LLVM toolchain -- `Unknown host: release-assets.githubusercontent.com` -- and while that lasted the exhaustiveness was confirmed instead by lifting the three non-test functions **verbatim** into a scratch crate over `yesno-wire` and compiling them against the real enums. A third run, once the network returned, **passed**: PostgreSQL 17 and 18 fixtures and `yesno-pg` rustfmt. `gate-search.sh` ( 3 scenarios ), the Go client gate and the Python client gate are green too, so every gate the `QUALITY_GATE.md` table requires for a `yesno-wire` change has run.
 
 **Two process lessons, both of which cost a run.** A Docker gate snapshots the tree at build time, so editing while one runs produces a result describing a checkout that never existed -- one `gate-pg` run had to be discarded for exactly that. And `cargo test --workspace` exceeds a single 600 s foreground call, so it has to be split by package when background execution is unavailable.
+
+## 2026-09-23 -- Flight write transactions, and four things I got wrong on the way
+
+Answered the CDC handoff and its haiiie addendum, then built what they asked
+for. Branch `write-transactions` off `main`. The contract analysis is in
+`LTM/flight-write-transactions.md`; this entry is the working record.
+
+**No write transaction existed.** `Ticket` is `{ version, key, prefix range,
+expr }` and is entirely about reading; the action surface was single-shot;
+`do_put` never saw a ticket; neither `yesno-flight` nor `yesno-wire` mentioned
+a transaction. The atomicity unit was one Arrow record batch.
+
+**But the gap was narrower than the handoff assumed.** `WriteBatch` already
+took insert, remove, insert_range, remove_range and delete_key, mixed, across
+arbitrary keys, in one commit -- `do_put` itself called `wb.insert` and
+`wb.remove` on the same object. And order survives: commit sorts through a
+`( key, arrival index )` pair, which the core documents as *"stability is
+structural here rather than a property of the algorithm"*. Only the wire could
+not say any of it.
+
+### The wire break, taken deliberately
+
+`do_put` treated an **absent or unrecognised** command as insert. That made
+every future command a trap: `apply` sent to a server that did not know it
+would have had its *removals applied as insertions*, silently. A command is
+now required.
+
+This was originally going to be a careful narrowing -- keep absent meaning
+insert, reject only unknown spellings -- because the doc comment said the
+default was load-bearing for callers that send no descriptor. Being told
+nothing has been released publicly turned a mitigation into a fix: absent,
+empty and unrecognised are all errors now, and the hazard class is gone rather
+than reduced.
+
+### Four things I got wrong
+
+**One: I said two callers relied on the default. There were six.** I grepped
+`yesno-server/src/bin` and `yesno-e2e/src`, declared "only two call sites",
+and moved on. The flight suite then hung for twenty-three minutes on
+`reactor.rs`, which builds a `do_put` by hand. A proper audit -- every
+`FlightDataEncoderBuilder::new()` in the tree, checked for
+`with_flight_descriptor` -- found six, plus one that correctly has none
+because it encodes a `DoGet` *response*. Grep the construct, not the
+directories you expect it in.
+
+**Two: the order fixture did not discriminate.** The addendum warns that
+*"replaying operations grouped by kind would fail this fixture while still
+appearing atomic"*, so I wrote one. It passed against a server deliberately
+mutated to group by kind. Every case I had written put removals *before*
+insertions -- which is exactly what grouping produces anyway. The
+discriminating case is a removal that *follows* an insertion: insert then
+delete-key must leave the key empty; insert then remove must leave it absent.
+With those added the mutation fails with the message that explains why.
+
+A fixture that cannot fail is worth less than no fixture, because it is
+evidence in the wrong direction.
+
+**Three: a `#[cfg]` attribute got orphaned by a text insertion.** Inserting
+helper types before `impl YesnoFlightService` put them between that block and
+its `#[cfg( feature = "server" )]`, so the attribute silently moved to my
+struct. Twenty-seven errors -- in the *Bazel* build, six minutes in, because
+the cargo default build has `server` on and never sees it. Reproduced locally
+in seconds with `cargo build -p yesno-flight --no-default-features`, which is
+the configuration Bazel uses for the client-only `yesno-pg` path. That check
+belongs in the routine loop for this crate, not only in the gate.
+
+**Four: I piped a gate into `tail` earlier in the session and got `tail`'s
+exit code.** Not repeated here -- this run redirected to a file and reported
+`GATE EXIT CODE: 1` honestly, which is how the orphaned `cfg` was caught at
+all.
+
+### The drivers
+
+Both were doing the thing the handoff described, and both are now one commit.
+
+`yesno-pg`'s `flush()` grouped by `( endpoint, key )`, opened a **fresh
+connection per key**, and called `put` twice -- so a transaction touching *n*
+keys published `2n` versions. It now groups by endpoint and stages through one
+write transaction. Atomicity is per endpoint and cannot be more: a table set
+spanning two servers is two commits, and that is recorded rather than hidden.
+
+`yesno-mysql`'s Flight backend issued a `Clear` per cleared key, then
+`RemoveMany`, then `InsertMany` -- `c + 2` versions, with removals visible
+without insertions. The *embedded* backend already applied the whole plan
+atomically through one `yesno_batch`, so the two backends differed in
+semantics and not merely in speed. They now agree. A key's `DeleteKey` is
+staged ahead of its own writes, which is the ordering the fixture above
+exists to protect.
+
+That needed a transaction surface on the C++ client, which had none.
+
+### Not done, and named
+
+Ownership and leadership fencing. The Flight service authenticates nobody, so
+a handle is bound to whoever holds its eight bytes. Acceptance item 5 of the
+addendum is unmet and is recorded as unmet rather than tested vacuously.
+
+### The documents had drifted further than the one file I first noticed
+
+I first found `yesno-mysql/README.md` and
+`LTM/database-apis-and-satellite-crates.md` describing a nontransactional
+MySQL engine while `ha_yesno.cc` had stopped advertising `HA_NO_TRANSACTIONS`
+and implemented savepoints. Grepping the claim rather than the file found
+**eight** places saying it, spread across `README.md` ( twice ), `OVERVIEW.md`,
+`ARCHITECTURE.md` ( twice ), `TESTING.md` and both of the above. One of them
+asserted the *opposite* of what the fixture asserts: the LTM said a buffered
+insert is "still present" after `ROLLBACK`, and `e2e/mysql/mysql.py` fails with
+"ROLLBACK must discard a buffered INSERT". A document that contradicts a
+running assertion is not merely stale.
+
+All eight are corrected to say what is true -- writes buffered per connection,
+applied as one version at commit, `ROLLBACK` discards, `SAVEPOINT` unwinds --
+while keeping the limitation that *is* still real: there is deliberately no
+two-phase `prepare`, so a crash between this engine's commit and MySQL's binlog
+write leaves the two disagreeing. That is the same gap `fdw-two-phase-commit`
+records on the PostgreSQL side, and saying so links them instead of stating it
+twice.
+
+The write-transaction surface itself is now documented in `docs/integrations.md`
+( the required command, `apply`, and the stage-and-commit flow ) and in
+`docs/data-modeling.md` ( which unit of a Flight write is atomic ). The
+`docs/` self-containment checker still reports an empty baseline.
+
+**The lesson is the grep, not the edits.** Finding one wrong document is
+evidence about the claim, not about the file. Searching for the claim across
+the tree cost one command and found seven more.
+
+---

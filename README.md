@@ -82,7 +82,8 @@ Known limitations relevant to deployment:
 - Snapshot eviction can occur to enforce the configured space-amplification
   policy.
 - PostgreSQL integration has the consistency and recovery limitations above.
-- MySQL integration is nontransactional.
+- MySQL integration has no two-phase prepare, so a crash between its commit
+  and MySQL's binlog write can leave the two disagreeing.
 
 These are design constraints, not a claim that the remaining work is small.
 Evaluate yesnodb against your durability, availability, and recovery
@@ -598,9 +599,12 @@ supports inserts, deletes, exact and range reads, ordered scans, exact counts,
 truncate, rename, and drop. The `CONNECTION` value `key=<u64>` selects the
 underlying ordinal set.
 
-The engine is deliberately nontransactional: successful writes commit to
-yesnodb immediately, MySQL rollback cannot undo them, and cross-engine commits
-are not atomic. Scans do hold stable yesnodb snapshots. At startup the plugin
+Writes are transactional: they are buffered per connection and applied when
+MySQL commits, so `ROLLBACK` discards them, `SAVEPOINT` unwinds, and one SQL
+transaction becomes one yesnodb version. There is deliberately no two-phase
+prepare, so cross-engine commits are still not atomic -- a crash between this
+engine's commit and MySQL's binlog write leaves the two disagreeing. Scans
+hold stable yesnodb snapshots. At startup the plugin
 selects either the embedded [`yesno-c`](yesno-c/README.md) backend or a remote
 backend implemented by [`yesno-flight-c++`](yesno-flight-c++/README.md).
 `scripts/gate-mysql.sh` builds both clients, pinned Arrow C++, pinned MySQL

@@ -24,6 +24,7 @@
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use futures::StreamExt;
 use tonic::transport::Channel;
+use yesno_flight::client::Mutation;
 use yesno_flight::YesnoClient;
 
 use super::{OrdinalBatch, Transport, TransportError};
@@ -31,6 +32,12 @@ use crate::ordinal::ordinal_to_i64;
 
 /// The column `yesno-flight`'s S1 schema carries.
 const ORDINAL_COLUMN: &str = "ordinal";
+
+/// Rows per staging request inside one write transaction.
+///
+/// The transaction bounds the *commit*; this bounds each *request*, so a flush
+/// of any size stays one commit without one enormous message.
+const STAGE_ROWS: usize = 8192;
 
 pub struct FlightTransport {
     endpoint: String,
@@ -189,6 +196,45 @@ impl Transport for FlightTransport {
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
         self.runtime.block_on(client.keys()).map_err(client_error)
+    }
+
+    fn apply(&mut self, ops: &[(u64, u64, bool)]) -> Result<u64, TransportError> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        self.client()?;
+        let client = self.client.as_mut().expect("connected above");
+        self.runtime.block_on(async move {
+            // A write transaction rather than the one-shot `apply`, because a
+            // flush can be arbitrarily large -- `INSERT ... SELECT` buffers the
+            // whole statement -- and staging in chunks keeps one request
+            // bounded while still producing one commit.
+            let txn = client.begin_write().await.map_err(client_error)?;
+            let staged = async {
+                for chunk in ops.chunks(STAGE_ROWS) {
+                    let mutations = chunk.iter().map(|&(key, ordinal, remove)| {
+                        if remove {
+                            Mutation::Remove { key, ordinal }
+                        } else {
+                            Mutation::Insert { key, ordinal }
+                        }
+                    });
+                    client.stage(txn, mutations).await?;
+                }
+                client.commit_write(txn).await
+            }
+            .await;
+            match staged {
+                Ok(_) => Ok(ops.len() as u64),
+                Err(e) => {
+                    // Release the server's staged memory rather than leaving it
+                    // to expire. The abort is best effort: the original failure
+                    // is what the caller needs to see.
+                    let _ = client.abort_write(txn).await;
+                    Err(client_error(e))
+                }
+            }
+        })
     }
 
     fn put(&mut self, key: u64, ordinals: &[u64], remove: bool) -> Result<u64, TransportError> {
