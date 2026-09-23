@@ -24,10 +24,67 @@ use futures::{Stream, TryStreamExt};
 use tonic::codegen::{Body, Bytes, StdError};
 use tonic::transport::{Channel, Endpoint};
 
+use crate::mutations_schema;
 use crate::{
-    pairs_schema, QueryRequest, ServerStats, SetExpr, Ticket, ACTION_CLEAR, ACTION_CONTAINS,
-    ACTION_INSERT_ONE, ACTION_REMOVE_ONE, BATCH_ROWS, PUT_INSERT, PUT_REMOVE,
+    pairs_schema, QueryRequest, ServerStats, SetExpr, Ticket, ACTION_ABORT_WRITE,
+    ACTION_BEGIN_WRITE, ACTION_CLEAR, ACTION_COMMIT_WRITE, ACTION_CONTAINS, ACTION_INSERT_ONE,
+    ACTION_REMOVE_ONE, BATCH_ROWS, OP_DELETE_KEY, OP_INSERT, OP_INSERT_RANGE, OP_REMOVE,
+    OP_REMOVE_RANGE, PUT_APPLY, PUT_INSERT, PUT_REMOVE, PUT_TXN_PREFIX,
 };
+
+/// An open write transaction.
+///
+/// Opaque and deliberately *not* a [`crate::Ticket`]. A read ticket names an
+/// immutable version and prefix range and is safe to cache, copy and replay; a
+/// write handle owns mutable staged state with an expiry and a single
+/// resolution. Sharing an encoding would not make their lifecycles the same,
+/// and would turn every cached ticket into a potential mutation capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WriteTxn(pub u64);
+
+/// One operation in a mixed batch.
+///
+/// Ranges are inclusive and are carried as ranges rather than expanded into
+/// ordinals: the engine writes one record and one container call per chunk for
+/// a range, and expanding client-side throws both away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mutation {
+    Insert {
+        key: u64,
+        ordinal: u64,
+    },
+    Remove {
+        key: u64,
+        ordinal: u64,
+    },
+    InsertRange {
+        key: u64,
+        lo: u64,
+        hi: u64,
+    },
+    RemoveRange {
+        key: u64,
+        lo: u64,
+        hi: u64,
+    },
+    /// Drop every ordinal under `key`.
+    DeleteKey {
+        key: u64,
+    },
+}
+
+impl Mutation {
+    /// `( key, lo, hi, op )` as `mutations_schema` carries it.
+    fn columns(self) -> (u64, u64, u64, u8) {
+        match self {
+            Mutation::Insert { key, ordinal } => (key, ordinal, ordinal, OP_INSERT),
+            Mutation::Remove { key, ordinal } => (key, ordinal, ordinal, OP_REMOVE),
+            Mutation::InsertRange { key, lo, hi } => (key, lo, hi, OP_INSERT_RANGE),
+            Mutation::RemoveRange { key, lo, hi } => (key, lo, hi, OP_REMOVE_RANGE),
+            Mutation::DeleteKey { key } => (key, 0, 0, OP_DELETE_KEY),
+        }
+    }
+}
 
 /// What the server acknowledged for one ingest call.
 ///
@@ -446,6 +503,110 @@ where
         })
     }
 
+    /// Whether the server advertises every bit in `features`.
+    ///
+    /// **Check this before sending a mixed batch or a transaction to a server
+    /// you did not start.** A server older than these features treats an
+    /// unrecognised `do_put` command as *insert*, so a mixed batch's removals
+    /// would be applied as insertions with no error anywhere. The bit is
+    /// absent from an old server's `ServerStats` and protobuf decodes that as
+    /// zero, which is the right answer.
+    pub async fn supports(&mut self, features: u64) -> Result<bool> {
+        Ok(self.stats().await?.features & features == features)
+    }
+
+    /// Open a write transaction.
+    ///
+    /// Stage with [`Self::stage`] and publish with [`Self::commit_write`].
+    /// Nothing staged is visible to any reader until the commit, which
+    /// publishes all of it at one version.
+    pub async fn begin_write(&mut self) -> Result<WriteTxn> {
+        Ok(WriteTxn(
+            self.u64_action(ACTION_BEGIN_WRITE, Vec::new()).await?,
+        ))
+    }
+
+    /// Append operations to an open transaction, returning the rows staged.
+    ///
+    /// Operations take effect in the order they are staged, across calls, so
+    /// `DeleteKey` followed by inserts means replacement. **One stream at a
+    /// time per transaction**: the server refuses a concurrent one rather than
+    /// interleave two streams into an order the caller cannot predict.
+    pub async fn stage(
+        &mut self,
+        txn: WriteTxn,
+        mutations: impl IntoIterator<Item = Mutation>,
+    ) -> Result<u64> {
+        let mut command = PUT_TXN_PREFIX.to_vec();
+        command.extend_from_slice(&txn.0.to_le_bytes());
+        Ok(self.put_mutations(mutations, &command).await?.rows)
+    }
+
+    /// Publish a transaction, returning the one version its work became
+    /// visible at.
+    ///
+    /// **Idempotent per handle.** A retry after a lost response returns the
+    /// original version rather than applying the work twice, which is what
+    /// lets a change-data-capture pipe resume from an ambiguous failure.
+    pub async fn commit_write(&mut self, txn: WriteTxn) -> Result<u64> {
+        self.u64_action(ACTION_COMMIT_WRITE, txn.0.to_le_bytes().to_vec())
+            .await
+    }
+
+    /// Discard a transaction's staged work.
+    ///
+    /// Aborting one that already committed is an error: a version exists that
+    /// says otherwise. Aborting one already gone -- aborted before, or expired
+    /// -- succeeds, because the caller's intent already holds.
+    pub async fn abort_write(&mut self, txn: WriteTxn) -> Result<()> {
+        self.u64_action(ACTION_ABORT_WRITE, txn.0.to_le_bytes().to_vec())
+            .await
+            .map(|_| ())
+    }
+
+    /// Apply mixed operations as **one** commit, without a transaction.
+    ///
+    /// The one-shot form: everything fits in one request, so there is no
+    /// handle to begin, abort or expire. Use [`Self::begin_write`] when the
+    /// work spans several requests.
+    pub async fn apply(&mut self, mutations: impl IntoIterator<Item = Mutation>) -> Result<Ack> {
+        self.put_mutations(mutations, PUT_APPLY).await
+    }
+
+    async fn put_mutations(
+        &mut self,
+        mutations: impl IntoIterator<Item = Mutation>,
+        command: &[u8],
+    ) -> Result<Ack> {
+        let (mut keys, mut los, mut his, mut ops) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for m in mutations {
+            let (key, lo, hi, op) = m.columns();
+            keys.push(key);
+            los.push(lo);
+            his.push(hi);
+            ops.push(op);
+        }
+        let sent = u64::try_from(keys.len())
+            .map_err(|_| FlightError::protocol("mutation count does not fit in u64"))?;
+        let batches = if keys.is_empty() {
+            Vec::new()
+        } else {
+            vec![RecordBatch::try_new(
+                mutations_schema(),
+                vec![
+                    Arc::new(UInt64Array::new(keys.into(), None)),
+                    Arc::new(UInt64Array::new(los.into(), None)),
+                    Arc::new(UInt64Array::new(his.into(), None)),
+                    Arc::new(arrow_array::UInt8Array::new(ops.into(), None)),
+                ],
+            )
+            .map_err(FlightError::from)?]
+        };
+        self.put_batches_with(batches, sent, command, mutations_schema())
+            .await
+    }
+
     /// Atomically remove every ordinal under `key`, returning its commit version.
     pub async fn clear(&mut self, key: u64) -> Result<u64> {
         self.u64_action(ACTION_CLEAR, key.to_le_bytes().to_vec())
@@ -539,9 +700,20 @@ where
         sent: u64,
         command: &[u8],
     ) -> Result<Ack> {
+        self.put_batches_with(batches, sent, command, pairs_schema())
+            .await
+    }
+
+    async fn put_batches_with(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        sent: u64,
+        command: &[u8],
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<Ack> {
         let descriptor = FlightDescriptor::new_cmd(command.to_vec());
         let input = FlightDataEncoderBuilder::new()
-            .with_schema(pairs_schema())
+            .with_schema(schema)
             .with_flight_descriptor(Some(descriptor))
             .build(futures::stream::iter(batches.into_iter().map(Ok)));
         let mut acknowledgements = self.flight.do_put(input).await?;

@@ -845,8 +845,13 @@ async fn put_pairs(c: &mut Client, keys: Vec<u64>, ords: Vec<u64>) -> Result<(),
             std::sync::Arc::new(UInt64Array::new(ords.into(), None)),
         ],
     )?;
+    // Named explicitly: `do_put` no longer defaults to insert, so that a
+    // command it does not recognise cannot be applied as one.
     let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
         .with_schema(schema)
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(
+            yesno_flight::PUT_INSERT.to_vec(),
+        )))
         .build(futures::stream::iter(vec![Ok(batch)]))
         .map(|r| r.expect("locally built batches encode"));
     let mut acked = c.do_put(input).await?.into_inner();

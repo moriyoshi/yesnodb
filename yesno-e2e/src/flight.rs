@@ -632,8 +632,12 @@ impl World {
                     ],
                 )
                 .map_err(|e| db_err(verb, e))?;
+                // Named explicitly: `do_put` no longer defaults to insert.
                 let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
                     .with_schema(schema)
+                    .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(
+                        yesno_flight::PUT_INSERT.to_vec(),
+                    )))
                     .build(futures::stream::iter(vec![Ok(batch)]))
                     .map(|r| r.expect("a locally built batch encodes"));
 

@@ -134,6 +134,13 @@ pub struct ServerStats {
     pub live_readers: u64,
     #[prost(uint64, tag = "5")]
     pub shards: u64,
+    /// Capability bits: see [`FEATURE_MIXED_PUT`].
+    ///
+    /// Tag 6, added after the first release. An older server does not send it
+    /// and prost decodes the absence as zero, which is exactly the right
+    /// answer: it supports none of the features the bits name.
+    #[prost(uint64, tag = "6")]
+    pub features: u64,
 }
 
 impl ServerStats {
@@ -161,14 +168,78 @@ pub fn pairs_schema() -> SchemaRef {
     ]))
 }
 
-/// `do_put` descriptor commands.
+/// S3: `( key, lo, hi, op )` for a mixed-operation ingest.
 ///
-/// An **absent or unrecognised** command means insert, which is what keeps
-/// every existing client working: `yesno put` and the e2e scenarios send no
-/// descriptor at all. Do not make removal the default for any spelling — a
-/// client that meant to ingest and silently deleted instead is unrecoverable.
+/// One row is one `WriteBatch` operation, and the operation set is the core's:
+/// point insert and remove, **inclusive range** insert and remove, and whole-key
+/// delete. `yesno-core`'s `WriteBatch` has always accepted all of these mixed
+/// across arbitrary keys in one commit; only the wire could not say so.
+///
+/// # Why ranges are on the wire rather than expanded by the client
+///
+/// A range is one WAL record and one container call per chunk. Expanding it
+/// into ordinals client-side discards both, which is the difference between
+/// clearing a contiguous encoded row and writing 65 536 WAL operations to say
+/// the same thing. A surface advertised as *the* remote atomic-batch API has to
+/// carry the cheap form.
+///
+/// # Why three integer columns rather than two
+///
+/// `lo` and `hi` are the inclusive bounds for range operations. Point
+/// operations set `hi == lo`, which is checked rather than ignored: a row with
+/// `hi != lo` under [`OP_INSERT`] almost certainly meant a range, and silently
+/// dropping `hi` would apply a fraction of what the caller asked for.
+/// [`OP_DELETE_KEY`] names a whole key, so both bounds must be zero.
+pub fn mutations_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt64, false),
+        Field::new("lo", DataType::UInt64, false),
+        Field::new("hi", DataType::UInt64, false),
+        Field::new("op", DataType::UInt8, false),
+    ]))
+}
+
+/// Row operations for [`mutations_schema`].
+///
+/// Numbered explicitly and never reordered: these go on the wire.
+pub const OP_INSERT: u8 = 0;
+pub const OP_REMOVE: u8 = 1;
+pub const OP_INSERT_RANGE: u8 = 2;
+pub const OP_REMOVE_RANGE: u8 = 3;
+pub const OP_DELETE_KEY: u8 = 4;
+
+/// `do_put` descriptor commands. **One is required.**
+///
+/// An absent or unrecognised command used to mean insert. That made every
+/// future command a trap -- a client sending [`PUT_APPLY`] to a server that did
+/// not know it would have had its *removals applied as insertions*, with no
+/// error anywhere -- and it made the wire not self-describing: a stream's
+/// meaning depended on what the server happened to recognise.
+///
+/// Both now fail. The two callers that relied on the default, the `yesno put`
+/// CLI and the e2e harness, send [`PUT_INSERT`] explicitly instead; the Go and
+/// C++ clients always did. Nothing is guessed, so no future command can be
+/// mistaken for insert.
 pub const PUT_INSERT: &[u8] = b"insert";
 pub const PUT_REMOVE: &[u8] = b"remove";
+
+/// Mixed inserts and removals, published as **one** commit.
+///
+/// Carries [`mutations_schema`]. Every record batch in the stream accumulates
+/// into a single `WriteBatch` which commits once at end of stream, so the
+/// returned version is the single instant at which every row became visible.
+/// This is the difference from [`PUT_INSERT`], which commits per record batch
+/// and can only report the last of several versions.
+pub const PUT_APPLY: &[u8] = b"apply";
+
+/// Prefix of a `do_put` command naming an open write transaction.
+///
+/// The full command is this prefix followed by the transaction's eight
+/// little-endian bytes. Flight's `DoPut` carries a descriptor rather than a
+/// `Ticket`, so the handle has to ride there; putting it in the command keeps
+/// it on the *first* message, which is the only one the server inspects before
+/// handing the stream to the decoder.
+pub const PUT_TXN_PREFIX: &[u8] = b"txn:";
 
 /// Point and key-level actions used by remote storage adapters.
 ///
@@ -180,6 +251,48 @@ pub const ACTION_CLEAR: &str = "clear";
 pub const ACTION_CONTAINS: &str = "contains";
 pub const ACTION_INSERT_ONE: &str = "insert_one";
 pub const ACTION_REMOVE_ONE: &str = "remove_one";
+
+/// Write-transaction actions.
+///
+/// `begin` returns eight little-endian bytes naming the transaction. `commit`
+/// and `abort` take those bytes back; `commit` returns the version every
+/// staged row became visible at.
+///
+/// **`commit` is idempotent.** A committed transaction's outcome is remembered
+/// for [`COMMIT_MEMORY`] entries, so a retry after a lost response returns the
+/// original version instead of failing or committing twice. That is the
+/// property a CDC pipe needs to recover from an ambiguous network failure
+/// without risking double application.
+pub const ACTION_BEGIN_WRITE: &str = "begin_write";
+pub const ACTION_COMMIT_WRITE: &str = "commit_write";
+pub const ACTION_ABORT_WRITE: &str = "abort_write";
+
+/// Capability bits reported by [`ServerStats::features`].
+///
+/// A server that predates the field reports zero, because protobuf decodes an
+/// absent field as its default. **A client must check before sending a new
+/// `do_put` command**: an older server treats an unknown command as insert,
+/// which turns a mixed batch's removals into insertions with no error
+/// anywhere.
+pub const FEATURE_MIXED_PUT: u64 = 1 << 0;
+pub const FEATURE_WRITE_TRANSACTIONS: u64 = 1 << 1;
+
+/// Everything this build implements.
+pub const FEATURES: u64 = FEATURE_MIXED_PUT | FEATURE_WRITE_TRANSACTIONS;
+
+/// Live write transactions a server will hold at once.
+pub const MAX_OPEN_TRANSACTIONS: usize = 256;
+
+/// Rows a single write transaction may stage.
+///
+/// Staged work is held in memory until commit, so this is a real bound rather
+/// than a formality. Exceeding it fails the `do_put` that crossed it and
+/// leaves the transaction open to be aborted: silently splitting into two
+/// commits would break the one guarantee the caller asked for.
+pub const MAX_TRANSACTION_ROWS: u64 = 16 * 1024 * 1024;
+
+/// Committed transaction outcomes remembered for idempotent retry.
+pub const COMMIT_MEMORY: usize = 1024;
 
 /// Rows per `RecordBatch`. 64 KiB of `u64`, which fits L2 and matches
 /// DataFusion's default `batch_size`.
@@ -223,6 +336,16 @@ pub struct YesnoFlightService {
     /// affected: it sits **below** the watermark, so the wait returns at once and
     /// `snapshot_at` reports `VersionReclaimed` with no added latency.
     visibility_wait: std::time::Duration,
+    /// Open write transactions and the outcomes of recently committed ones.
+    writes: Arc<std::sync::Mutex<WriteTransactions>>,
+    /// How long an untouched write transaction survives.
+    ///
+    /// Staged work is memory the client is holding on the server, so an
+    /// abandoned transaction has to be reclaimable without the client. It is a
+    /// *deadline* rather than a lease renewed by use: a transaction that keeps
+    /// streaming still expires, which bounds the worst case at one deadline's
+    /// worth of memory per open transaction rather than an unbounded one.
+    write_ttl: std::time::Duration,
 }
 
 #[cfg(feature = "server")]
@@ -232,6 +355,252 @@ struct TicketLease {
 }
 
 #[cfg(feature = "server")]
+/// What a `do_put` stream is doing, decided from the first descriptor.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PutMode {
+    Insert,
+    Remove,
+    Apply,
+    Txn(u64),
+}
+
+#[cfg(feature = "server")]
+impl PutMode {
+    fn name(self) -> &'static str {
+        match self {
+            PutMode::Insert => "insert",
+            PutMode::Remove => "remove",
+            PutMode::Apply => "apply",
+            PutMode::Txn(_) => "transaction",
+        }
+    }
+}
+
+/// Decide the mode. Every stream must name one.
+///
+/// Absent, empty and unrecognised are all errors. Nothing here guesses, which
+/// is what stops a command this server does not know from being applied as
+/// some other operation the caller did not ask for.
+#[cfg(feature = "server")]
+fn put_mode(cmd: Option<&[u8]>) -> Result<PutMode, Status> {
+    match cmd {
+        None | Some([]) => Err(Status::invalid_argument(
+            "do_put needs a descriptor command: insert, remove, apply, or a transaction \
+             handle. It used to default to insert, which meant a command this server did \
+             not recognise silently inserted rows a client meant to remove",
+        )),
+        Some(c) if c == PUT_INSERT => Ok(PutMode::Insert),
+        Some(c) if c == PUT_REMOVE => Ok(PutMode::Remove),
+        Some(c) if c == PUT_APPLY => Ok(PutMode::Apply),
+        Some(c) if c.starts_with(PUT_TXN_PREFIX) => {
+            let rest = &c[PUT_TXN_PREFIX.len()..];
+            let bytes: [u8; 8] = rest.try_into().map_err(|_| {
+                Status::invalid_argument(
+                    "a transaction do_put command is the prefix plus eight little-endian bytes",
+                )
+            })?;
+            Ok(PutMode::Txn(u64::from_le_bytes(bytes)))
+        }
+        Some(other) => Err(Status::invalid_argument(format!(
+            "unknown do_put command {:?}; this server understands insert, remove, apply \
+             and a transaction handle. Check ServerStats::features before sending a \
+             command an older server would silently treat as insert",
+            String::from_utf8_lossy(other)
+        ))),
+    }
+}
+
+/// The `( key, ordinal )` columns of [`pairs_schema`].
+#[cfg(feature = "server")]
+fn pair_columns(b: &RecordBatch) -> Result<(&UInt64Array, &UInt64Array), Status> {
+    let keys = b
+        .column_by_name("key")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| Status::invalid_argument("expected a UInt64 `key` column"))?;
+    let ords = b
+        .column_by_name("ordinal")
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| Status::invalid_argument("expected a UInt64 `ordinal` column"))?;
+    Ok((keys, ords))
+}
+
+/// Record a homogeneous batch, returning the rows staged.
+#[cfg(feature = "server")]
+fn stage_pairs(
+    wb: &mut yesno_core::WriteBatch,
+    b: &RecordBatch,
+    remove: bool,
+) -> Result<u64, Status> {
+    let (keys, ords) = pair_columns(b)?;
+    for i in 0..b.num_rows() {
+        if remove {
+            wb.remove(keys.value(i), ords.value(i));
+        } else {
+            wb.insert(keys.value(i), ords.value(i));
+        }
+    }
+    Ok(b.num_rows() as u64)
+}
+
+/// Record a mixed batch carrying [`mutations_schema`].
+///
+/// **Rows are recorded in arrival order and never grouped by kind.** That is
+/// the whole correctness argument for mixing: `WriteBatch` sorts by key through
+/// a `( key, arrival index )` pair, so operations on one key keep the order
+/// they were recorded in. `delete_key` followed by inserts therefore means
+/// replacement, and `remove` followed by `insert` of the same membership means
+/// present. Regrouping by operation would still look atomic and would silently
+/// invert both.
+///
+/// An unrecognised `op` is rejected rather than defaulted, for the reason
+/// [`put_mode`] gives one level up -- and here it would be worse, because a
+/// per-row default turns *part* of a batch into the wrong operation, which is
+/// harder to notice than a whole stream going the wrong way.
+#[cfg(feature = "server")]
+fn stage_mutations(wb: &mut yesno_core::WriteBatch, b: &RecordBatch) -> Result<u64, Status> {
+    let col = |name: &str| -> Result<&UInt64Array, Status> {
+        b.column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "expected a UInt64 `{name}` column; a mixed batch uses mutations_schema()"
+                ))
+            })
+    };
+    let keys = col("key")?;
+    let los = col("lo")?;
+    let his = col("hi")?;
+    let ops = b
+        .column_by_name("op")
+        .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt8Array>())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "expected a UInt8 `op` column; a mixed batch uses mutations_schema()",
+            )
+        })?;
+
+    for i in 0..b.num_rows() {
+        let (key, lo, hi) = (keys.value(i), los.value(i), his.value(i));
+        let point = |what: &str| -> Result<(), Status> {
+            if hi == lo {
+                Ok(())
+            } else {
+                Err(Status::invalid_argument(format!(
+                    "row {i} is a point {what} with lo {lo} and hi {hi}; set hi == lo, \
+                     or use the range operation if a range was meant"
+                )))
+            }
+        };
+        match ops.value(i) {
+            OP_INSERT => {
+                point("insert")?;
+                wb.insert(key, lo);
+            }
+            OP_REMOVE => {
+                point("remove")?;
+                wb.remove(key, lo);
+            }
+            OP_INSERT_RANGE => {
+                range_bounds(i, lo, hi)?;
+                wb.insert_range(key, lo, hi);
+            }
+            OP_REMOVE_RANGE => {
+                range_bounds(i, lo, hi)?;
+                wb.remove_range(key, lo, hi);
+            }
+            OP_DELETE_KEY => {
+                if lo != 0 || hi != 0 {
+                    return Err(Status::invalid_argument(format!(
+                        "row {i} deletes key {key} but carries bounds {lo}..={hi}; \
+                         a whole-key delete names no range"
+                    )));
+                }
+                wb.delete_key(key);
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "row {i} has op {other}; expected {OP_INSERT} insert, {OP_REMOVE} \
+                     remove, {OP_INSERT_RANGE} insert_range, {OP_REMOVE_RANGE} \
+                     remove_range, or {OP_DELETE_KEY} delete_key"
+                )))
+            }
+        }
+    }
+    Ok(b.num_rows() as u64)
+}
+
+/// Inclusive bounds must not be inverted.
+///
+/// The core would treat `lo > hi` as an empty range and do nothing, which is a
+/// silent no-op for what is almost always a transposed pair of arguments.
+#[cfg(feature = "server")]
+fn range_bounds(row: usize, lo: u64, hi: u64) -> Result<(), Status> {
+    if lo > hi {
+        return Err(Status::invalid_argument(format!(
+            "row {row} has an inverted range {lo}..={hi}; bounds are inclusive and ascending"
+        )));
+    }
+    Ok(())
+}
+
+/// One transaction's staged work.
+///
+/// Holds a live `WriteBatch` rather than a list of tuples, because
+/// `WriteBatch` owns a refcounted `Db` handle and is therefore `'static` --
+/// accumulating straight into it means commit is one call with no second
+/// representation to keep in step.
+#[cfg(feature = "server")]
+struct PendingWrite {
+    batch: yesno_core::WriteBatch,
+    rows: u64,
+    deadline: std::time::Instant,
+    /// A `do_put` stream is currently appending to this transaction.
+    ///
+    /// **Concurrent staging is refused rather than interleaved.** Operations on
+    /// one key take effect in the order they were recorded, so the order has to
+    /// be one the client can predict -- and arrival order across two HTTP/2
+    /// streams is not. Refusing is the simplest rule that keeps "stage clear,
+    /// then stage the replacement" meaning what it says; the alternative is
+    /// per-stream sequence numbers and a commit that rejects gaps.
+    staging: bool,
+}
+
+/// Clears [`PendingWrite::staging`] however the stream ends.
+///
+/// A guard rather than a clear at the end of the loop: `do_put` returns early
+/// on a decode error, an expired deadline and a row-bound breach, and a leaked
+/// flag would make the transaction permanently unstageable while still
+/// appearing open.
+#[cfg(feature = "server")]
+struct StagingGuard {
+    writes: Arc<std::sync::Mutex<WriteTransactions>>,
+    id: u64,
+}
+
+#[cfg(feature = "server")]
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut w) = self.writes.lock() {
+            if let Some(tx) = w.open.get_mut(&self.id) {
+                tx.staging = false;
+            }
+        }
+    }
+}
+
+/// Open transactions, plus a bounded memory of committed ones.
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct WriteTransactions {
+    open: std::collections::HashMap<u64, PendingWrite>,
+    /// `( transaction, version )` for recently committed transactions, oldest
+    /// first. Makes `commit` idempotent: a retry after a lost response finds
+    /// its own outcome instead of a missing transaction.
+    committed: std::collections::VecDeque<(u64, u64)>,
+    next: u64,
+}
+
 impl YesnoFlightService {
     /// A lease long enough to cross a `GetFlightInfo` / `DoGet` round trip and
     /// short enough that an abandoned one is not a retention leak.
@@ -240,6 +609,45 @@ impl YesnoFlightService {
     /// Long enough to cover one fsync, short enough that a version which will
     /// never arrive is reported quickly. See [`Self::with_visibility_wait`].
     pub const DEFAULT_VISIBILITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Default deadline for an open write transaction. See
+    /// [`YesnoFlightService::with_write_ttl`].
+    pub const DEFAULT_WRITE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Override how long an open write transaction survives.
+    pub fn with_write_ttl(mut self, write_ttl: std::time::Duration) -> Self {
+        self.write_ttl = write_ttl;
+        self
+    }
+
+    /// Take exclusive staging rights on an open transaction.
+    fn claim_staging(&self, id: u64) -> Result<StagingGuard, Status> {
+        let mut w = self
+            .writes
+            .lock()
+            .map_err(|_| Status::internal("write transaction table poisoned"))?;
+        let tx = w
+            .open
+            .get_mut(&id)
+            .ok_or_else(|| Status::not_found(format!("write transaction {id} is not open")))?;
+        if std::time::Instant::now() > tx.deadline {
+            w.open.remove(&id);
+            return Err(Status::deadline_exceeded(format!(
+                "write transaction {id} expired"
+            )));
+        }
+        if tx.staging {
+            return Err(Status::failed_precondition(format!(
+                "write transaction {id} already has a do_put stream; stage one at a time \
+                 so the order operations take effect in is the order you sent them"
+            )));
+        }
+        tx.staging = true;
+        Ok(StagingGuard {
+            writes: Arc::clone(&self.writes),
+            id,
+        })
+    }
 
     pub fn new(db: Arc<Db>) -> Self {
         Self::with_ticket_lease(db, Self::DEFAULT_TICKET_LEASE)
@@ -260,6 +668,8 @@ impl YesnoFlightService {
             leases: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             lease_ttl,
             visibility_wait: Self::DEFAULT_VISIBILITY_WAIT,
+            writes: Arc::new(std::sync::Mutex::new(WriteTransactions::default())),
+            write_ttl: Self::DEFAULT_WRITE_TTL,
         }
     }
 
@@ -694,12 +1104,13 @@ impl FlightService for YesnoFlightService {
         let first = inner.next().await.transpose().map_err(|e| {
             Status::invalid_argument(format!("do_put stream failed immediately: {e}"))
         })?;
-        let remove = first
-            .as_ref()
-            .and_then(|d| d.flight_descriptor.as_ref())
-            .map(|d| d.cmd.as_ref() == PUT_REMOVE)
-            .unwrap_or(false);
-        let operation = if remove { "remove" } else { "insert" };
+        let mode = put_mode(
+            first
+                .as_ref()
+                .and_then(|d| d.flight_descriptor.as_ref())
+                .map(|d| d.cmd.as_ref()),
+        )?;
+        let operation = mode.name();
         tracing::Span::current().record("operation", operation);
 
         let head = futures::stream::iter(first.map(Ok));
@@ -712,70 +1123,126 @@ impl FlightService for YesnoFlightService {
         let mut rows = 0u64;
         let mut batch_count = 0u64;
         let mut version = 0u64;
+
+        // One accumulating batch for the whole stream, for the modes whose
+        // point is that every row becomes visible at the same instant.
+        // `Insert` and `Remove` keep their per-record-batch commit: changing
+        // that would alter what an existing client's version means.
+        let mut pending = match mode {
+            PutMode::Apply => Some(self.db.batch()),
+            _ => None,
+        };
+
+        // Claimed for the whole stream, released by the guard however it ends.
+        let _staging = match mode {
+            PutMode::Txn(id) => Some(self.claim_staging(id)?),
+            _ => None,
+        };
+
         while let Some(b) = decoded.next().await {
             let b = b.map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let db = self.db.clone();
-
-            // `spawn_blocking`, for the same reason `do_get` uses it and a
-            // stronger one. A commit appends to the WAL and **fsyncs**, and it
-            // may synchronously trigger a whole checkpoint — serializing dirty
-            // chunks, rebuilding the index and syncing again, which is seconds
-            // of work under a sustained ingest. Running that inline parked a
-            // reactor thread for the duration, which is the failure this
-            // module's header describes for reads and the write path was doing
-            // anyway.
-            //
-            // Awaited before the next batch is pulled, so "one batch, one
-            // commit" still holds and batches still commit in the order they
-            // arrived: a partially applied ingest batch would be visible to
-            // readers, and the write path is atomic per batch anyway.
             let batch_rows = b.num_rows() as u64;
+
+            match mode {
+                PutMode::Insert | PutMode::Remove => {
+                    let db = self.db.clone();
+                    let remove = matches!(mode, PutMode::Remove);
+
+                    // `spawn_blocking`, for the same reason `do_get` uses it and
+                    // a stronger one. A commit appends to the WAL and **fsyncs**,
+                    // and it may synchronously trigger a whole checkpoint —
+                    // serializing dirty chunks, rebuilding the index and syncing
+                    // again, which is seconds of work under a sustained ingest.
+                    //
+                    // Awaited before the next batch is pulled, so "one batch, one
+                    // commit" still holds and batches still commit in the order
+                    // they arrived.
+                    let commit_span = tracing::debug_span!(
+                        "yesno.flight.do_put.commit",
+                        batch = batch_count + 1,
+                        rows = batch_rows,
+                        operation,
+                    );
+                    let n = tokio::task::spawn_blocking(move || {
+                        commit_span.in_scope(move || -> Result<(u64, u64), Status> {
+                            let mut wb = db.batch();
+                            let staged = stage_pairs(&mut wb, &b, remove)?;
+                            let committed = wb.commit().map_err(engine_status)?;
+                            tracing::debug!(
+                                version = committed.version,
+                                changed = committed.changed,
+                                "Flight ingest batch committed"
+                            );
+                            Ok((staged, committed.version))
+                        })
+                    })
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))??;
+                    rows += n.0;
+                    // The **last** batch's version, which is the highest.
+                    version = version.max(n.1);
+                }
+                PutMode::Apply => {
+                    let wb = pending.as_mut().expect("created for this mode");
+                    rows += stage_mutations(wb, &b)?;
+                    if rows > MAX_TRANSACTION_ROWS {
+                        return Err(Status::resource_exhausted(format!(
+                            "apply exceeded {MAX_TRANSACTION_ROWS} staged rows; \
+                             split the work or use a write transaction"
+                        )));
+                    }
+                }
+                PutMode::Txn(id) => {
+                    // Staged under the lock so the row bound is enforced
+                    // against the transaction's running total rather than this
+                    // stream's, which is what a caller streaming in several
+                    // `do_put` calls is actually accumulating.
+                    let mut open = self
+                        .writes
+                        .lock()
+                        .map_err(|_| Status::internal("write transaction table poisoned"))?;
+                    let tx = open.open.get_mut(&id).ok_or_else(|| {
+                        Status::not_found(format!("write transaction {id} is not open"))
+                    })?;
+                    if std::time::Instant::now() > tx.deadline {
+                        open.open.remove(&id);
+                        return Err(Status::deadline_exceeded(format!(
+                            "write transaction {id} expired before this batch"
+                        )));
+                    }
+                    let staged = stage_mutations(&mut tx.batch, &b)?;
+                    tx.rows += staged;
+                    if tx.rows > MAX_TRANSACTION_ROWS {
+                        // Left open rather than aborted: the client asked for
+                        // atomicity, so silently discarding half of it is worse
+                        // than telling it to abort.
+                        return Err(Status::resource_exhausted(format!(
+                            "write transaction {id} exceeded {MAX_TRANSACTION_ROWS} \
+                             staged rows; abort it"
+                        )));
+                    }
+                    rows += staged;
+                }
+            }
+            batch_count += 1;
+        }
+
+        // `Apply`'s single commit: every row in the stream becomes visible at
+        // one version, which is the whole difference from `Insert`.
+        if let Some(wb) = pending {
             let commit_span = tracing::debug_span!(
                 "yesno.flight.do_put.commit",
-                batch = batch_count + 1,
-                rows = batch_rows,
+                batches = batch_count,
+                rows,
                 operation,
             );
-            let n = tokio::task::spawn_blocking(move || {
-                commit_span.in_scope(move || -> Result<(u64, u64), Status> {
-                    let keys = b
-                        .column_by_name("key")
-                        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                        .ok_or_else(|| {
-                            Status::invalid_argument("expected a UInt64 `key` column")
-                        })?;
-                    let ords = b
-                        .column_by_name("ordinal")
-                        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                        .ok_or_else(|| {
-                            Status::invalid_argument("expected a UInt64 `ordinal` column")
-                        })?;
-
-                    let mut wb = db.batch();
-                    for i in 0..b.num_rows() {
-                        if remove {
-                            wb.remove(keys.value(i), ords.value(i));
-                        } else {
-                            wb.insert(keys.value(i), ords.value(i));
-                        }
-                    }
-                    let committed = wb.commit().map_err(engine_status)?;
-                    tracing::debug!(
-                        version = committed.version,
-                        changed = committed.changed,
-                        "Flight ingest batch committed"
-                    );
-                    Ok((batch_rows, committed.version))
+            version = tokio::task::spawn_blocking(move || {
+                commit_span.in_scope(move || -> Result<u64, Status> {
+                    Ok(wb.commit().map_err(engine_status)?.version)
                 })
             })
             .await
             .map_err(|e| Status::internal(e.to_string()))??;
-            rows += n.0;
-            // The **last** batch's version, which is the highest: batches are
-            // awaited in arrival order, so this names a version at or after
-            // which every row in this stream is present.
-            version = version.max(n.1);
-            batch_count += 1;
         }
 
         tracing::Span::current().record("batches", batch_count);
@@ -794,8 +1261,9 @@ impl FlightService for YesnoFlightService {
         // not wait for it, and could not bind a read to it. Rows stay first so
         // the field is read the same way it always was; the version is appended.
         //
-        // A `version` of 0 means no batch committed ( an empty stream ), and
-        // is not a version any commit is ever assigned.
+        // A `version` of 0 means no batch committed — an empty stream, or a
+        // transaction-bound stream whose rows are staged and not yet visible —
+        // and is not a version any commit is ever assigned.
         let mut metadata = Vec::with_capacity(16);
         metadata.extend_from_slice(&rows.to_le_bytes());
         metadata.extend_from_slice(&version.to_le_bytes());
@@ -835,7 +1303,137 @@ impl FlightService for YesnoFlightService {
                 wal_bytes: self.db.wal_bytes(),
                 live_readers: self.db.live_readers() as u64,
                 shards: self.db.shard_count() as u64,
+                features: FEATURES,
             }),
+            ACTION_BEGIN_WRITE => {
+                let mut w = self
+                    .writes
+                    .lock()
+                    .map_err(|_| Status::internal("write transaction table poisoned"))?;
+                // Swept here rather than on a timer: this crate spawns no
+                // tasks of its own, and `begin` is the moment the answer to
+                // "is there room" is about to be needed.
+                let now = std::time::Instant::now();
+                w.open.retain(|_, tx| tx.deadline > now);
+                if w.open.len() >= MAX_OPEN_TRANSACTIONS {
+                    return Err(Status::resource_exhausted(format!(
+                        "{MAX_OPEN_TRANSACTIONS} write transactions are already open"
+                    )));
+                }
+                w.next += 1;
+                let id = w.next;
+                w.open.insert(
+                    id,
+                    PendingWrite {
+                        batch: self.db.batch(),
+                        rows: 0,
+                        deadline: now + self.write_ttl,
+                        staging: false,
+                    },
+                );
+                tracing::debug!(transaction = id, "write transaction begun");
+                id.to_le_bytes().to_vec()
+            }
+            ACTION_COMMIT_WRITE => {
+                let id = u64::from_le_bytes(a.body.as_ref().try_into().map_err(|_| {
+                    Status::invalid_argument("commit_write body must be one 8-byte LE transaction")
+                })?);
+                let taken = {
+                    let mut w = self
+                        .writes
+                        .lock()
+                        .map_err(|_| Status::internal("write transaction table poisoned"))?;
+                    // **Idempotent by identity.** A retry after a lost response
+                    // finds its own outcome and returns the original version
+                    // rather than committing a second time. This is the
+                    // property a CDC pipe needs to resume after an ambiguous
+                    // network failure without risking double application.
+                    if let Some(&(_, version)) = w.committed.iter().find(|&&(tx, _)| tx == id) {
+                        tracing::debug!(
+                            transaction = id,
+                            version,
+                            "write transaction commit replayed from memory"
+                        );
+                        return Ok(Response::new(
+                            futures::stream::once(async move {
+                                Ok(arrow_flight::Result {
+                                    body: version.to_le_bytes().to_vec().into(),
+                                })
+                            })
+                            .boxed(),
+                        ));
+                    }
+                    let tx = w.open.get(&id).ok_or_else(|| {
+                        Status::not_found(format!(
+                            "write transaction {id} is not open; it was never begun, was \
+                             aborted, or expired"
+                        ))
+                    })?;
+                    if tx.staging {
+                        return Err(Status::failed_precondition(format!(
+                            "write transaction {id} still has a do_put stream in flight"
+                        )));
+                    }
+                    if std::time::Instant::now() > tx.deadline {
+                        w.open.remove(&id);
+                        return Err(Status::deadline_exceeded(format!(
+                            "write transaction {id} expired before commit; nothing was applied"
+                        )));
+                    }
+                    w.open.remove(&id).expect("checked above")
+                };
+
+                let rows = taken.rows;
+                let batch = taken.batch;
+                let span = tracing::Span::current();
+                let version = tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || batch.commit().map(|r| r.version))
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(engine_status)?;
+
+                {
+                    let mut w = self
+                        .writes
+                        .lock()
+                        .map_err(|_| Status::internal("write transaction table poisoned"))?;
+                    w.committed.push_back((id, version));
+                    while w.committed.len() > COMMIT_MEMORY {
+                        w.committed.pop_front();
+                    }
+                }
+                tracing::info!(
+                    transaction = id,
+                    version,
+                    rows,
+                    "write transaction committed"
+                );
+                version.to_le_bytes().to_vec()
+            }
+            ACTION_ABORT_WRITE => {
+                let id = u64::from_le_bytes(a.body.as_ref().try_into().map_err(|_| {
+                    Status::invalid_argument("abort_write body must be one 8-byte LE transaction")
+                })?);
+                let mut w = self
+                    .writes
+                    .lock()
+                    .map_err(|_| Status::internal("write transaction table poisoned"))?;
+                // Aborting something already committed is an error, not a
+                // no-op: the caller believes nothing was applied, and a
+                // version exists that says otherwise.
+                if let Some(&(_, version)) = w.committed.iter().find(|&&(tx, _)| tx == id) {
+                    return Err(Status::failed_precondition(format!(
+                        "write transaction {id} already committed at version {version}"
+                    )));
+                }
+                // An unknown transaction is *not* an error. It was aborted, or
+                // it expired, and either way the caller's intent -- that none of
+                // it is visible -- already holds.
+                let dropped = w.open.remove(&id).is_some();
+                tracing::debug!(transaction = id, dropped, "write transaction aborted");
+                0u64.to_le_bytes().to_vec()
+            }
             ACTION_CLEAR => {
                 let bytes: [u8; 8] = a.body.as_ref().try_into().map_err(|_| {
                     Status::invalid_argument("clear action body must be one 8-byte LE key")
@@ -922,6 +1520,20 @@ impl FlightService for YesnoFlightService {
             ActionType {
                 r#type: ACTION_CLEAR.into(),
                 description: "atomically clear one key; returns committed version".into(),
+            },
+            ActionType {
+                r#type: ACTION_BEGIN_WRITE.into(),
+                description: "open a write transaction; returns its 8-byte LE handle".into(),
+            },
+            ActionType {
+                r#type: ACTION_COMMIT_WRITE.into(),
+                description: "publish a write transaction as one version; idempotent per \
+                              handle, returns the version"
+                    .into(),
+            },
+            ActionType {
+                r#type: ACTION_ABORT_WRITE.into(),
+                description: "discard a write transaction's staged work".into(),
             },
             ActionType {
                 r#type: ACTION_CONTAINS.into(),

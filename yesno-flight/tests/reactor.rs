@@ -115,6 +115,11 @@ async fn a_committing_do_put_does_not_park_the_reactor() {
             .unwrap();
     let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
         .with_schema(schema)
+        // `do_put` requires an explicit command; it no longer defaults
+        // to insert, so that an unrecognised one cannot be applied as one.
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(
+            yesno_flight::PUT_INSERT.to_vec(),
+        )))
         .build(futures::stream::iter(vec![Ok(batch)]))
         .map(|r| r.unwrap());
     let put = tokio::spawn(async move {

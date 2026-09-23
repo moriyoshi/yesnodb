@@ -83,6 +83,11 @@ async fn a_clean_shutdown_releases_the_database_lock() {
             .unwrap();
     let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
         .with_schema(schema)
+        // `do_put` requires an explicit command; it no longer defaults
+        // to insert, so that an unrecognised one cannot be applied as one.
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(
+            yesno_flight::PUT_INSERT.to_vec(),
+        )))
         .build(futures::stream::iter(vec![Ok(batch)]))
         .map(|r| r.unwrap());
     let _: Vec<_> = c.do_put(input).await.unwrap().into_inner().collect().await;

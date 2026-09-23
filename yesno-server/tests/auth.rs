@@ -180,6 +180,11 @@ async fn try_write(c: &mut Client) -> Result<(), Code> {
     .unwrap();
     let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
         .with_schema(schema)
+        // `do_put` requires an explicit command; it no longer defaults
+        // to insert, so that an unrecognised one cannot be applied as one.
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(
+            yesno_flight::PUT_INSERT.to_vec(),
+        )))
         .build(futures::stream::iter(vec![Ok(batch)]))
         .map(|r| r.unwrap());
     match c.do_put(input).await {
