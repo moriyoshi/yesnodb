@@ -202,6 +202,37 @@ class Mutation:
     hi: int
     op: int
 
+    def __post_init__(self) -> None:
+        """Reject everything the server rejects, on every construction path.
+
+        The factory methods below cannot be the only check: this is a
+        dataclass, so ``Mutation( key, lo, hi, op )`` reaches the wire too.
+        Validating here means a malformed mutation fails before a round trip
+        and a partially staged transaction, which is what the Go and Java
+        clients do.
+        """
+
+        _u64(self.key, name="key")
+        if self.op == OP_DELETE_KEY:
+            # Carries no ordinals, and the server refuses a whole-key delete
+            # that carries bounds rather than ignoring them.
+            if self.lo != 0 or self.hi != 0:
+                raise ValueError(
+                    f"delete of key {self.key} carries bounds "
+                    f"{self.lo}..={self.hi}; it names no range"
+                )
+            return
+        if self.op not in (OP_INSERT, OP_REMOVE, OP_INSERT_RANGE, OP_REMOVE_RANGE):
+            raise ValueError(f"unknown mutation op {self.op}")
+        _range(self.key, self.lo, self.hi)
+        if self.op in (OP_INSERT, OP_REMOVE) and self.lo != self.hi:
+            # A point operation is a range whose bounds are equal. Sending one
+            # with hi != lo is a transposed argument, not a range.
+            raise ValueError(
+                f"point operation on key {self.key} has lo {self.lo} and hi "
+                f"{self.hi}; set hi == lo, or use the range operation"
+            )
+
     @classmethod
     def insert(cls, key: int, ordinal: int) -> Mutation:
         key, ordinal = _pair((key, ordinal))
@@ -551,6 +582,13 @@ class Client:
         """Stage mutations into ``txn``, returning the rows accepted.
 
         Staged rows are invisible to readers until :meth:`commit_write`.
+
+        A staging error is fatal to the whole transaction. Mutations are sent
+        in batches, and a failure in a later batch leaves earlier ones staged
+        with no way to withdraw them, so the server poisons the transaction:
+        :meth:`commit_write` will refuse it and :meth:`abort_write` is the only
+        way out. Do not retry a failed stage in place. A mutation this client
+        can reject never reaches the server, so it costs nothing.
         """
 
         command = b"txn:" + _txn_handle(txn).to_bytes(8, "little")
@@ -559,9 +597,16 @@ class Client:
     def commit_write(self, txn: WriteTxn) -> int:
         """Publish everything staged in ``txn``, returning its version.
 
-        **Idempotent.** A retry after a lost response returns the original
-        version rather than committing twice, which is what lets a pipe
-        recover from an ambiguous network failure without double application.
+        Idempotent **within one live service, and only there**. The server
+        remembers a bounded number of recent outcomes in memory, so a prompt
+        retry after a lost response returns the original version rather than
+        committing twice. A restart loses every outcome and later traffic
+        evicts older ones, so this does not cover the case a change-data pipe
+        has to survive: losing the response and then finding the server
+        restarted. Such a caller cannot learn the version its transaction
+        committed at. Handles do not recur, so replaying the old one fails
+        closed rather than resolving a different transaction, but failing
+        closed is not recovering.
         """
 
         body = self._action("commit_write", _txn_handle(txn).to_bytes(8, "little"))

@@ -10,6 +10,10 @@ import yesnodb
 from yesnodb.client import (
     FEATURE_MIXED_PUT,
     FEATURE_WRITE_TRANSACTIONS,
+    OP_DELETE_KEY,
+    OP_INSERT,
+    OP_INSERT_RANGE,
+    OP_REMOVE_RANGE,
     And,
     At,
     Client,
@@ -239,3 +243,46 @@ def test_an_aborted_write_transaction_applies_nothing(
         # Aborting one the server no longer knows about still succeeds: the
         # caller's intent already holds.
         client.abort_write(txn)
+
+
+@pytest.mark.integration
+def test_a_locally_refused_stage_leaves_the_transaction_usable(
+    server_factory: Callable[..., object],
+) -> None:
+    """Validation happens before a stream is opened, so nothing is sent.
+
+    That is the difference between a client-side refusal and a server-side
+    one. A failure the client cannot see coming -- the row bound, a dropped
+    connection -- leaves earlier batches of the same call staged, and the
+    server then poisons the transaction so they cannot be published. This
+    client rejects the malformed mutation first, so the transaction is
+    untouched and still usable.
+    """
+
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        txn = client.begin_write()
+        with pytest.raises(ValueError):
+            client.stage(
+                txn,
+                [Mutation.insert(4, 40), Mutation(key=5, lo=9, hi=4, op=OP_REMOVE_RANGE)],
+            )
+        # Untouched: a later stage and the commit both succeed, and the valid
+        # row from the refused call was never sent.
+        assert client.stage(txn, [Mutation.insert(4, 41)]) == 1
+        client.commit_write(txn)
+        assert client.get(4).collect_ordinals() == [41]
+
+
+def test_a_mutation_is_validated_on_every_construction_path() -> None:
+    """The factories are not the only way in; this is a dataclass."""
+
+    with pytest.raises(ValueError):
+        Mutation(key=1, lo=2, hi=3, op=OP_INSERT)
+    with pytest.raises(ValueError):
+        Mutation(key=1, lo=5, hi=0, op=OP_DELETE_KEY)
+    with pytest.raises(ValueError):
+        Mutation(key=1, lo=9, hi=4, op=OP_INSERT_RANGE)
+    with pytest.raises(ValueError):
+        Mutation(key=1, lo=0, hi=0, op=99)

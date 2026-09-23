@@ -9,4 +9,11 @@ message ServerStats {
   uint64 wal_bytes = 3;
   uint64 live_readers = 4;
   uint64 shards = 5;
+  // Capability bitmask. A server predating this field reports zero, because
+  // protobuf decodes an absent field as its default -- so a client must check
+  // it before sending a `do_put` command the server may not know.
+  //
+  // Bit 0: mixed-operation `apply` streams.
+  // Bit 1: write transactions spanning several calls.
+  uint64 features = 6;
 }

@@ -682,6 +682,12 @@ func (c *Client) BeginWrite(ctx context.Context) (WriteTxn, error) {
 // Stage stages mutations into an open transaction, returning the rows accepted.
 //
 // Staged rows are invisible to readers until CommitWrite.
+//
+// A Stage error is fatal to the whole transaction. Mutations are sent in
+// batches, and a failure in a later batch leaves earlier ones staged with no
+// way to withdraw them, so the server poisons the transaction: CommitWrite
+// will refuse it and AbortWrite is the only way out. Do not retry a failed
+// Stage in place.
 func (c *Client) Stage(ctx context.Context, txn WriteTxn, mutations []Mutation) (uint64, error) {
 	command := make([]byte, 0, 12)
 	command = append(command, "txn:"...)
@@ -692,9 +698,15 @@ func (c *Client) Stage(ctx context.Context, txn WriteTxn, mutations []Mutation) 
 
 // CommitWrite publishes everything staged in txn and returns its version.
 //
-// Idempotent: a retry after a lost response returns the original version
-// rather than committing twice, which is what lets a pipe recover from an
-// ambiguous network failure without double application.
+// Idempotent within one live service, and only there. The server remembers a
+// bounded number of recent outcomes in memory, so a prompt retry after a lost
+// response returns the original version rather than committing twice. A
+// restart loses every outcome and later traffic evicts older ones, so this
+// does not cover the case a change-data pipe has to survive: losing the
+// response and then finding the server restarted. Such a caller cannot learn
+// the version its transaction committed at. Handles do not recur, so replaying
+// the old one fails closed rather than resolving a different transaction, but
+// failing closed is not recovering.
 func (c *Client) CommitWrite(ctx context.Context, txn WriteTxn) (uint64, error) {
 	return c.uint64Action(ctx, "commit_write", binary.LittleEndian.AppendUint64(nil, uint64(txn)))
 }

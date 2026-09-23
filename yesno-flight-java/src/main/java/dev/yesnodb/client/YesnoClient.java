@@ -288,6 +288,12 @@ public final class YesnoClient implements AutoCloseable {
    * Stages mutations into an open transaction, returning the rows accepted.
    *
    * <p>Staged rows are invisible to readers until {@link #commitWrite}.
+   *
+   * <p>A staging error is fatal to the whole transaction. Mutations are sent in batches, and a
+   * failure in a later batch leaves earlier ones staged with no way to withdraw them, so the
+   * server poisons the transaction: {@link #commitWrite} will refuse it and {@link #abortWrite} is
+   * the only way out. Do not retry a failed stage in place. A mutation this client can reject --
+   * everything {@link Mutation} validates -- never reaches the server, so it costs nothing.
    */
   public long stage(long txn, Iterable<Mutation> mutations, CallOption... options) {
     byte[] command = new byte[PUT_TXN_PREFIX.length + 8];
@@ -299,9 +305,13 @@ public final class YesnoClient implements AutoCloseable {
   /**
    * Publishes everything staged in {@code txn} and returns its version.
    *
-   * <p>Idempotent: a retry after a lost response returns the original version rather than
-   * committing twice, which is what lets a pipe recover from an ambiguous network failure without
-   * double application.
+   * <p>Idempotent within one live service, and only there. The server remembers a bounded number
+   * of recent outcomes in memory, so a prompt retry after a lost response returns the original
+   * version rather than committing twice. A restart loses every outcome and later traffic evicts
+   * older ones, so this does not cover the case a change-data pipe has to survive: losing the
+   * response and then finding the server restarted. Such a caller cannot learn the version its
+   * transaction committed at. Handles do not recur, so replaying the old one fails closed rather
+   * than resolving a different transaction, but failing closed is not recovering.
    */
   public long commitWrite(long txn, CallOption... options) {
     return decodeLong("commit_write", action("commit_write", longBody(txn), options));

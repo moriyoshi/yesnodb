@@ -43,11 +43,26 @@ public record Mutation(long key, long lo, long hi, byte op) {
     return new Mutation(key, 0, 0, OP_DELETE_KEY);
   }
 
-  /** Rejects an unknown op, the reserved ordinal, and an inverted range. */
+  /**
+   * Rejects everything the server rejects, so a malformed mutation fails here rather than after a
+   * round trip and a partially staged transaction.
+   */
   public Mutation {
     switch (op) {
       case OP_DELETE_KEY -> {
-        // Carries no ordinals, so neither the ceiling nor the ordering applies.
+        // Carries no ordinals, so the ceiling and the ordering do not apply --
+        // but the server refuses a whole-key delete that carries bounds rather
+        // than ignoring them, so this does too.
+        if (lo != 0 || hi != 0) {
+          throw new IllegalArgumentException(
+              "delete of key "
+                  + UnsignedLongs.toString(key)
+                  + " carries bounds "
+                  + UnsignedLongs.toString(lo)
+                  + "..="
+                  + UnsignedLongs.toString(hi)
+                  + "; it names no range");
+        }
       }
       case OP_INSERT, OP_REMOVE, OP_INSERT_RANGE, OP_REMOVE_RANGE -> {
         if (lo == -1L || hi == -1L) {
@@ -60,6 +75,18 @@ public record Mutation(long key, long lo, long hi, byte op) {
                   + UnsignedLongs.toString(lo)
                   + " is above upper bound "
                   + UnsignedLongs.toString(hi));
+        }
+        // A point operation is a range whose bounds are equal. Sending one
+        // with hi != lo is a transposed argument, not a range.
+        if ((op == OP_INSERT || op == OP_REMOVE) && lo != hi) {
+          throw new IllegalArgumentException(
+              "point operation on key "
+                  + UnsignedLongs.toString(key)
+                  + " has lo "
+                  + UnsignedLongs.toString(lo)
+                  + " and hi "
+                  + UnsignedLongs.toString(hi)
+                  + "; set hi == lo, or use the range operation");
         }
       }
       default -> throw new IllegalArgumentException("unknown mutation op " + op);

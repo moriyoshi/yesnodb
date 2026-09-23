@@ -309,4 +309,22 @@ class YesnoClientTest {
   private static long littleEndianLong(byte[] value) {
     return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getLong();
   }
+
+  @org.junit.jupiter.api.Test
+  void aMutationIsValidatedOnEveryConstructionPath() {
+    // The factories are not the only way in; this is a record.
+    assertThrows(
+        IllegalArgumentException.class, () -> new Mutation(1, 2, 3, Mutation.OP_INSERT));
+    assertThrows(
+        IllegalArgumentException.class, () -> new Mutation(1, 5, 0, Mutation.OP_DELETE_KEY));
+    assertThrows(
+        IllegalArgumentException.class, () -> new Mutation(1, 9, 4, Mutation.OP_INSERT_RANGE));
+    assertThrows(IllegalArgumentException.class, () -> new Mutation(1, 0, 0, (byte) 99));
+    assertThrows(
+        IllegalArgumentException.class, () -> new Mutation(1, -1L, -1L, Mutation.OP_INSERT));
+
+    assertEquals(new Mutation(1, 2, 2, Mutation.OP_INSERT), Mutation.insert(1, 2));
+    assertEquals(new Mutation(7, 0, 0, Mutation.OP_DELETE_KEY), Mutation.deleteKey(7));
+    assertEquals(new Mutation(1, 5, 9, Mutation.OP_INSERT_RANGE), Mutation.insertRange(1, 5, 9));
+  }
 }

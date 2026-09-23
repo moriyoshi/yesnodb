@@ -367,3 +367,137 @@ func TestMutualTLSWriter(t *testing.T) {
 		t.Fatalf("TLS connection without client identity was accepted: %v", err)
 	}
 }
+
+// TestWriteTransactionsAgainstRealServer covers the surface the unit tests
+// cannot: Apply, BeginWrite, multi-call Stage, visibility before commit, the
+// commit retry, and AbortWrite, all against the shipped yesnod.
+//
+// Added after a follow-up audit observed that Go exercised only the feature
+// bits and the mutation constructors, so the whole transaction path was
+// unverified in this client.
+func TestWriteTransactionsAgainstRealServer(t *testing.T) {
+	server := startServer(t, serverOpen)
+	client, err := Dial(server.address, WithInsecureTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if ok, err := client.Supports(ctx, FeatureMixedPut|FeatureWriteTransactions); err != nil || !ok {
+		t.Fatalf("Supports = %v, %v; the shipped server implements both", ok, err)
+	}
+
+	// One-shot mixed apply, ordered: the delete must not be reordered ahead of
+	// the insert that follows it.
+	if _, err := client.Insert(ctx, []Pair{{Key: 1, Ordinal: 10}, {Key: 1, Ordinal: 11}}); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := client.Apply(ctx, []Mutation{
+		Remove(1, 10),
+		Insert(1, 12),
+		InsertRange(3, 100, 104),
+		DeleteKey(1),
+		Insert(1, 13),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Rows != 5 || ack.Version == 0 {
+		t.Fatalf("Apply = %+v", ack)
+	}
+	if got := ordinalsOf(ctx, t, client, 1); !reflect.DeepEqual(got, []uint64{13}) {
+		t.Fatalf("key 1 = %v; the delete must apply before the insert that follows it", got)
+	}
+	if got := ordinalsOf(ctx, t, client, 3); !reflect.DeepEqual(got, []uint64{100, 101, 102, 103, 104}) {
+		t.Fatalf("key 3 = %v", got)
+	}
+
+	// A transaction across two Stage calls.
+	txn, err := client.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := client.Stage(ctx, txn, []Mutation{Insert(8, 80), Insert(8, 81)}); err != nil || rows != 2 {
+		t.Fatalf("Stage = %d, %v", rows, err)
+	}
+	if rows, err := client.Stage(ctx, txn, []Mutation{InsertRange(8, 90, 92)}); err != nil || rows != 1 {
+		t.Fatalf("Stage = %d, %v", rows, err)
+	}
+	if got := ordinalsOf(ctx, t, client, 8); len(got) != 0 {
+		t.Fatalf("key 8 = %v before commit; staged work must be invisible", got)
+	}
+
+	version, err := client.CommitWrite(ctx, txn)
+	if err != nil || version == 0 {
+		t.Fatalf("CommitWrite = %d, %v", version, err)
+	}
+	if got := ordinalsOf(ctx, t, client, 8); !reflect.DeepEqual(got, []uint64{80, 81, 90, 91, 92}) {
+		t.Fatalf("key 8 = %v; everything staged appears at one version", got)
+	}
+	// Retry while the outcome is still resident returns the same version.
+	if again, err := client.CommitWrite(ctx, txn); err != nil || again != version {
+		t.Fatalf("commit retry = %d, %v; want %d", again, err, version)
+	}
+
+	// Abort discards, and aborting an unknown transaction still succeeds.
+	aborted, err := client.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Stage(ctx, aborted, []Mutation{Insert(9, 90)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AbortWrite(ctx, aborted); err != nil {
+		t.Fatal(err)
+	}
+	if got := ordinalsOf(ctx, t, client, 9); len(got) != 0 {
+		t.Fatalf("key 9 = %v after abort", got)
+	}
+	if err := client.AbortWrite(ctx, aborted); err != nil {
+		t.Fatalf("aborting an unknown transaction must succeed: %v", err)
+	}
+
+	// A malformed mutation costs nothing, because this client validates the
+	// whole slice before opening a stream: no rows are sent, so the
+	// transaction is untouched and still usable.
+	//
+	// That is the difference between a client-side refusal and a server-side
+	// one. A failure the client cannot see coming -- the row bound, a dropped
+	// connection -- leaves earlier batches of the same call staged, and the
+	// server then poisons the transaction so they cannot be published. Stage's
+	// documentation says to treat any error as fatal for that reason; the
+	// poison itself is asserted in yesno-flight's own tests, where a stream
+	// can be driven past this client's validation.
+	clean, err := client.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Stage(ctx, clean, []Mutation{Insert(4, 40), {Key: 5, Lo: 9, Hi: 4, Op: OpRemoveRange}}); err == nil {
+		t.Fatal("an inverted range must be refused")
+	}
+	if _, err := client.Stage(ctx, clean, []Mutation{Insert(4, 41)}); err != nil {
+		t.Fatalf("a locally refused Stage must not disturb the transaction: %v", err)
+	}
+	if _, err := client.CommitWrite(ctx, clean); err != nil {
+		t.Fatal(err)
+	}
+	if got := ordinalsOf(ctx, t, client, 4); !reflect.DeepEqual(got, []uint64{41}) {
+		t.Fatalf("key 4 = %v; the refused call sent nothing, including its valid row", got)
+	}
+}
+
+func ordinalsOf(ctx context.Context, t *testing.T, client *Client, key uint64) []uint64 {
+	t.Helper()
+	stream, err := client.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Release()
+	got, err := stream.CollectOrdinals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}

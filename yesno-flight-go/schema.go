@@ -79,12 +79,24 @@ func DeleteKey(key uint64) Mutation {
 	return Mutation{Key: key, Op: OpDeleteKey}
 }
 
-// Validate checks the ordinal ceiling and the range order.
+// Validate checks everything the server checks, so a malformed mutation fails
+// here rather than after a round trip and a partially staged transaction.
 func (m Mutation) Validate() error {
 	switch m.Op {
 	case OpDeleteKey:
+		// A whole-key delete names no range, and the server refuses one that
+		// carries bounds rather than ignoring them.
+		if m.Lo != 0 || m.Hi != 0 {
+			return fmt.Errorf("delete of key %d carries bounds %d..=%d; it names no range", m.Key, m.Lo, m.Hi)
+		}
 		return nil
-	case OpInsert, OpRemove, OpInsertRange, OpRemoveRange:
+	case OpInsert, OpRemove:
+		// A point operation is a range whose bounds are equal. Sending one
+		// with hi != lo is a transposed argument, not a range.
+		if m.Lo != m.Hi {
+			return fmt.Errorf("point operation on key %d has lo %d and hi %d; set hi == lo, or use the range operation", m.Key, m.Lo, m.Hi)
+		}
+	case OpInsertRange, OpRemoveRange:
 	default:
 		return fmt.Errorf("unknown mutation op %d", m.Op)
 	}

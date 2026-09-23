@@ -417,15 +417,22 @@ async fn a_point_operation_carrying_a_range_is_refused() {
 // 2026-09-23 ). Both passed review and passed every test in this file at the
 // time, which is why they are written as behaviour rather than as notes.
 
-/// A staging call the server **rejected** must leave nothing behind.
+/// A staging call the server **rejected** must leave nothing committable.
 ///
 /// `a_point_operation_carrying_a_range_is_refused` above asserts the refusal
 /// and stops there, and that gap was the bug: rows were applied as they were
 /// validated, so an invalid row left every *earlier* row of the same batch in
-/// the resident batch. `commit_write` re-validates nothing, so the caller
-/// could publish work the server had told it was refused.
+/// the resident batch, and `commit_write` re-validates nothing.
 ///
-/// The row-bound refusal shares this path and is now ordered the same way --
+/// Two things fix it and only one of them is observable here. Decoding is now
+/// separated from application, so a single record batch applies entirely or
+/// not at all; and a failed staging call poisons the transaction, so the
+/// question "what did that batch leave behind" can no longer be asked through
+/// the public API at all. The second subsumes the first, which is why this
+/// asserts the refusal rather than an empty commit -- the contract a client
+/// sees is that a rejected stage cannot be committed, only aborted.
+///
+/// The row-bound refusal shares this path and is ordered the same way --
 /// checked before anything is staged -- but is not asserted separately here,
 /// because `MAX_TRANSACTION_ROWS` is sixteen million and a fixture that cannot
 /// reach it would assert nothing.
@@ -456,11 +463,15 @@ async fn a_rejected_batch_stages_none_of_its_rows() {
         .await;
     assert!(refused.is_err(), "an inverted range must be refused");
 
-    let version = client.commit_write(txn).await.unwrap();
+    assert!(
+        client.commit_write(txn).await.is_err(),
+        "a transaction whose staging call was refused must not commit"
+    );
+    client.abort_write(txn).await.unwrap();
     assert_eq!(
-        members_at(&mut client, 50, version).await,
+        members(&mut client, 50).await,
         Vec::<u64>::new(),
-        "a refused batch must contribute nothing, even to a later commit"
+        "a refused batch must contribute nothing"
     );
 }
 
@@ -528,4 +539,60 @@ async fn a_handle_from_a_previous_service_is_not_reissued() {
 /// `WriteTxn` is a newtype; this keeps the call sites above readable.
 fn txn_of(txn: WriteTxn) -> WriteTxn {
     txn
+}
+
+/// A `stage` call that fails in a **later** record batch poisons the
+/// transaction.
+///
+/// `a_rejected_batch_stages_none_of_its_rows` puts both rows in one batch and
+/// therefore cannot tell two different contracts apart, which a follow-up
+/// audit pointed out. A `stage` call is split into batches of 8192 rows, and
+/// each is applied before the next arrives, so a failure in the second batch
+/// leaves the first one staged and there is no way to withdraw it -- the core
+/// `WriteBatch` has no rollback.
+///
+/// So the transaction fails closed: commit is refused and abort is the only
+/// way out. This is what makes "a rejected stage" safe without asking every
+/// client to remember to abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_in_a_later_batch_poisons_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _stop) = serve(open(dir.path())).await;
+    let mut client = YesnoClient::connect(url).await.unwrap();
+
+    let txn = client.begin_write().await.unwrap();
+
+    // 8192 is the client's batch size, so this is two record batches in one
+    // call, with the invalid row in the second.
+    let mut mutations: Vec<Mutation> = (0..8192u64)
+        .map(|o| Mutation::Insert {
+            key: 80,
+            ordinal: o,
+        })
+        .collect();
+    mutations.push(Mutation::RemoveRange {
+        key: 80,
+        lo: 9,
+        hi: 4,
+    });
+
+    let refused = client.stage(txn, mutations).await;
+    assert!(refused.is_err(), "the inverted range must be refused");
+
+    // The first batch is staged and cannot be withdrawn, so the transaction is
+    // no longer committable. Without the poison it would commit 8192 rows the
+    // caller was told had failed.
+    let err = client
+        .commit_write(txn)
+        .await
+        .expect_err("a poisoned transaction must not commit");
+    let message = err.to_string();
+    assert!(
+        message.contains("Abort it"),
+        "the refusal has to say what to do about it: {message}"
+    );
+
+    // Abort is the way out, and it leaves nothing behind.
+    client.abort_write(txn).await.unwrap();
+    assert_eq!(members(&mut client, 80).await, Vec::<u64>::new());
 }

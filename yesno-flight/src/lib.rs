@@ -614,6 +614,25 @@ struct PendingWrite {
     batch: yesno_core::WriteBatch,
     rows: u64,
     deadline: std::time::Instant,
+    /// Why this transaction may no longer be committed, if it may not.
+    ///
+    /// **A staging call is atomic per record batch, not per call**, and that
+    /// distinction is not one a caller can act on. The clients split a `stage`
+    /// into batches of [`BATCH_ROWS`], and each batch is decoded, bound-checked
+    /// and applied before the next arrives -- so a failure in a later batch,
+    /// whether validation, the row bound, a decode error or the transport
+    /// dropping mid-stream, leaves the earlier batches of that same call
+    /// already staged. They cannot be withdrawn: the core `WriteBatch` has no
+    /// rollback, and buffering a whole call before applying it would mean
+    /// holding up to [`MAX_TRANSACTION_ROWS`] rows twice.
+    ///
+    /// So the transaction fails closed instead. Any staging call that does not
+    /// complete cleanly poisons it, `commit_write` refuses a poisoned
+    /// transaction, and `abort_write` is the only way out. The alternative --
+    /// documenting that a client *should* abort -- puts the correctness of
+    /// every caller in a comment, and the same audit that found this also
+    /// found a caller could already commit work the server had refused.
+    poisoned: Option<String>,
     /// A `do_put` stream is currently appending to this transaction.
     ///
     /// **Concurrent staging is refused rather than interleaved.** Operations on
@@ -635,6 +654,21 @@ struct PendingWrite {
 struct StagingGuard {
     writes: Arc<std::sync::Mutex<WriteTransactions>>,
     id: u64,
+    /// Set once the stream has been consumed without error.
+    ///
+    /// Everything else -- a validation failure, the row bound, a decode error,
+    /// the client vanishing mid-stream -- leaves this false and poisons the
+    /// transaction on drop. Putting it here rather than at each error site is
+    /// deliberate: an error path added later is poisoned by default, and the
+    /// transport failures have no error site to annotate.
+    clean: bool,
+}
+
+#[cfg(feature = "server")]
+impl StagingGuard {
+    fn finished(&mut self) {
+        self.clean = true;
+    }
 }
 
 #[cfg(feature = "server")]
@@ -643,6 +677,13 @@ impl Drop for StagingGuard {
         if let Ok(mut w) = self.writes.lock() {
             if let Some(tx) = w.open.get_mut(&self.id) {
                 tx.staging = false;
+                if !self.clean && tx.poisoned.is_none() {
+                    tx.poisoned = Some(
+                        "a staging call failed part-way through; rows from its earlier \
+                         record batches are staged and cannot be withdrawn"
+                            .into(),
+                    );
+                }
             }
         }
     }
@@ -749,6 +790,7 @@ impl YesnoFlightService {
         Ok(StagingGuard {
             writes: Arc::clone(&self.writes),
             id,
+            clean: false,
         })
     }
 
@@ -1237,7 +1279,7 @@ impl FlightService for YesnoFlightService {
         };
 
         // Claimed for the whole stream, released by the guard however it ends.
-        let _staging = match mode {
+        let mut _staging = match mode {
             PutMode::Txn(id) => Some(self.claim_staging(id)?),
             _ => None,
         };
@@ -1348,6 +1390,13 @@ impl FlightService for YesnoFlightService {
             batch_count += 1;
         }
 
+        // The stream was consumed without error, so this call staged all of
+        // itself or none of it. Anything that returned early above leaves the
+        // guard unclean and poisons the transaction on drop.
+        if let Some(g) = _staging.as_mut() {
+            g.finished();
+        }
+
         // `Apply`'s single commit: every row in the stream becomes visible at
         // one version, which is the whole difference from `Insert`.
         if let Some(wb) = pending {
@@ -1447,6 +1496,7 @@ impl FlightService for YesnoFlightService {
                     PendingWrite {
                         batch: self.db.batch(),
                         rows: 0,
+                        poisoned: None,
                         deadline: now + self.write_ttl,
                         staging: false,
                     },
@@ -1489,6 +1539,12 @@ impl FlightService for YesnoFlightService {
                              aborted, or expired"
                         ))
                     })?;
+                    if let Some(why) = &tx.poisoned {
+                        return Err(Status::failed_precondition(format!(
+                            "write transaction {id} cannot be committed: {why}. Abort it \
+                             and stage the work again."
+                        )));
+                    }
                     if tx.staging {
                         return Err(Status::failed_precondition(format!(
                             "write transaction {id} still has a do_put stream in flight"
