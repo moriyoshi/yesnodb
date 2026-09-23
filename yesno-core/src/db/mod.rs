@@ -3129,6 +3129,14 @@ enum Op {
     InsertRange(u64, u64, u64),
     RemoveRange(u64, u64, u64),
     PutChunk(u64, Prefix48, crate::Container),
+    /// `key, prefix, clear, set` -- apply `( old \ clear ) union set` to one
+    /// chunk. Either mask may be `None`, meaning empty.
+    PatchChunk(
+        u64,
+        Prefix48,
+        Option<crate::Container>,
+        Option<crate::Container>,
+    ),
     DeleteKey(u64),
 }
 
@@ -3397,6 +3405,18 @@ impl Op {
                 }
                 (RecType::ChunkImage, body)
             }
+            Op::PatchChunk(k, prefix, clear, set) => {
+                let empty = crate::Container::new_array();
+                (
+                    RecType::ChunkPatch,
+                    record::encode_chunk_patch(
+                        *k,
+                        *prefix,
+                        clear.as_ref().unwrap_or(&empty),
+                        set.as_ref().unwrap_or(&empty),
+                    ),
+                )
+            }
         }
     }
 
@@ -3408,6 +3428,7 @@ impl Op {
             | Op::InsertRange(k, _, _)
             | Op::RemoveRange(k, _, _)
             | Op::PutChunk(k, _, _)
+            | Op::PatchChunk(k, _, _, _)
             | Op::DeleteKey(k) => *k,
         }
     }
@@ -3537,6 +3558,73 @@ impl WriteBatch {
         for (prefix, c) in set.chunks() {
             self.push_op(Op::PutChunk(key, prefix, c.clone()));
         }
+        self
+    }
+
+    /// Patch one chunk in place: `new = ( old \ clear ) union set`.
+    ///
+    /// The incremental operation `store_set` is not. `store_set` replaces a
+    /// whole key, so calling it per tile deletes the tiles before it; `insert`
+    /// costs one operation per bit, which for a dense 512-bit row is 255 of
+    /// them. This takes both masks as containers and touches one chunk, so a
+    /// caller holding packed words commits them as words.
+    ///
+    /// `set` wins where the masks overlap, because `clear` is applied first.
+    /// Either mask may be empty; two empty masks are a no-op. A patch that
+    /// empties the chunk tombstones it rather than storing an empty container.
+    ///
+    /// Composes in insertion order with every other operation on the same key,
+    /// including `DeleteKey`, ranges, and a later patch of the same prefix.
+    /// That ordering is structural rather than a property of this method: the
+    /// commit sorts by `( key, arrival index )`.
+    ///
+    /// # Why this exists rather than a public `PutChunk`
+    ///
+    /// [`Self::store_set`]'s `Op::PutChunk` *replaces* the chunk live and logs
+    /// a `RecType::ChunkImage`, which *unions* on replay. They agree only
+    /// because `store_set` emits a `DeleteKey` ahead of them, so both are
+    /// acting on an emptied key. Exposing `PutChunk` for incremental use would
+    /// commit one state and recover another, silently, and only after a crash.
+    ///
+    /// This operation has one apply routine, `Memtable::patch_chunk`, called by
+    /// the commit path and by WAL replay. There is no second implementation to
+    /// keep in step.
+    ///
+    /// Both masks are validated against invariant I8 before the batch can
+    /// commit: a chunk at the maximum prefix cannot carry the reserved maximum
+    /// ordinal.
+    pub fn patch_chunk(
+        &mut self,
+        key: u64,
+        prefix: Prefix48,
+        clear: &crate::Container,
+        set: &crate::Container,
+    ) -> &mut Self {
+        if prefix >= 1u64 << (64 - crate::CHUNK_BITS) {
+            self.err
+                .get_or_insert(CodecError::Invariant("chunk prefix exceeds 48 bits"));
+            return self;
+        }
+        // I8: `u64::MAX` is not an ordinal, so the top slot of the top chunk is
+        // not addressable. Checked here because this is the boundary at which
+        // such a bit would become durable.
+        if prefix == (1u64 << (64 - crate::CHUNK_BITS)) - 1
+            && (set.contains(u16::MAX) || clear.contains(u16::MAX))
+        {
+            self.err.get_or_insert(CodecError::Invariant(
+                "the maximum ordinal is reserved and cannot be patched",
+            ));
+            return self;
+        }
+        if clear.is_empty() && set.is_empty() {
+            return self;
+        }
+        self.push_op(Op::PatchChunk(
+            key,
+            prefix,
+            (!clear.is_empty()).then(|| clear.clone()),
+            (!set.is_empty()).then(|| set.clone()),
+        ));
         self
     }
 
@@ -3886,6 +3974,15 @@ impl WriteBatch {
                     // of the index**, measured at 95.7-99.5% of this path's
                     // exclusive hold and rising with chunks per key.
                     Planned::Whole(Op::DeleteKey(k)) => del_keys.push(*k),
+                    // A patch is `( old \ clear ) union set`, so unlike a
+                    // replace it reads the chunk it lands on and wants that
+                    // chunk prefetched.
+                    Planned::Whole(Op::PatchChunk(key, prefix, _, _)) => {
+                        if want.len() >= PREFETCH_MAX {
+                            break 'units;
+                        }
+                        want.push(ChunkKey::new(*key, *prefix));
+                    }
                     // Any other whole-chunk op replaces outright; no base needed.
                     Planned::Whole(_) => {}
                 }
@@ -4020,6 +4117,23 @@ impl WriteBatch {
                     Op::PutChunk(k, p, c) => {
                         local += c.len() as u64;
                         mem.put_chunk(*k, *p, c.clone(), version);
+                    }
+                    Op::PatchChunk(k, p, clear, set) => {
+                        // The same routine replay calls, so the committed state
+                        // and the recovered state cannot differ. The base comes
+                        // from the prefetched map when it is there and from the
+                        // shard otherwise, exactly as the value path resolves
+                        // it.
+                        let changed =
+                            mem.patch_chunk(*k, *p, clear.as_ref(), set.as_ref(), version, || {
+                                match pre.and_then(|m| m.get(&ChunkKey::new(*k, *p))) {
+                                    Some(v) => v.clone(),
+                                    None => shard.disk_chunk(*k, *p),
+                                }
+                            });
+                        if changed {
+                            local += 1;
+                        }
                     }
                     Op::DeleteKey(k) => {
                         // On-disk chunks need tombstones of their own; without

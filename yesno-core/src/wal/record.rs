@@ -111,6 +111,15 @@ pub enum RecType {
     CheckpointBegin = 8,
     CheckpointEnd = 9,
     EpochFence = 10,
+    /// A chunk-local `( old \ clear ) union set`, carrying both masks as
+    /// container payloads rather than expanded ordinals.
+    ///
+    /// **Its replay applies the same transform its live path applies**, which
+    /// is the difference from [`RecType::ChunkImage`]: that one replaces live
+    /// and unions on replay, and the two agree only because its sole producer
+    /// emits a delete first. One routine, `Memtable::patch_chunk`, serves both
+    /// paths here, so they cannot drift.
+    ChunkPatch = 11,
 }
 
 impl RecType {
@@ -127,6 +136,7 @@ impl RecType {
             8 => RecType::CheckpointBegin,
             9 => RecType::CheckpointEnd,
             10 => RecType::EpochFence,
+            11 => RecType::ChunkPatch,
             _ => return None,
         })
     }
@@ -500,6 +510,110 @@ pub fn decode_chunk_delta(body: &[u8]) -> Result<(u64, u64, Vec<u16>, Vec<u16>)>
         .collect();
     let (add, rem) = vals.split_at(n_add);
     Ok((key, prefix, add.to_vec(), rem.to_vec()))
+}
+
+/// Body of a [`RecType::ChunkPatch`]: `key`, `prefix`, then the two masks.
+///
+/// Each mask is `kind( 1 ) | cardinality( 4 ) | length( 4 ) | payload`, where
+/// the payload is exactly what `container::codec::encode` produces. Reusing
+/// that encoding is deliberate: a container image record was rejected for
+/// `PutChunk` on the grounds that it would be "a second encoding path to keep
+/// in step with `codec`", and this is not one -- it *is* `codec`, whose
+/// decoder is already a fuzz target that must return `Err` rather than panic
+/// for any input.
+///
+/// An empty mask is encoded with cardinality zero and no payload, because
+/// `codec` has no representation for an empty container and an empty clear or
+/// set is a legitimate no-op half.
+pub fn encode_chunk_patch(
+    key: u64,
+    prefix: u64,
+    clear: &crate::Container,
+    set: &crate::Container,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    b.extend_from_slice(&key.to_le_bytes());
+    b.extend_from_slice(&prefix.to_le_bytes());
+    for mask in [clear, set] {
+        if mask.is_empty() {
+            b.push(0u8);
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        }
+        let payload = crate::container::codec::encode(mask);
+        b.push(mask.kind() as u8);
+        b.extend_from_slice(&mask.len().to_le_bytes());
+        b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        b.extend_from_slice(&payload);
+    }
+    b
+}
+
+/// Decode a [`RecType::ChunkPatch`] body.
+///
+/// Every length is checked against what remains before it is used, so a
+/// truncated or hostile record is an `Err` rather than a panic or an
+/// out-of-bounds read.
+pub fn decode_chunk_patch(
+    body: &[u8],
+) -> Result<(u64, u64, Option<crate::Container>, Option<crate::Container>)> {
+    if body.len() < 16 {
+        return Err(CodecError::Truncated {
+            expected: 16,
+            found: body.len(),
+        });
+    }
+    let key = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let prefix = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    if prefix >= 1u64 << (64 - crate::CHUNK_BITS) {
+        return Err(CodecError::Invariant("ChunkPatch prefix exceeds 48 bits"));
+    }
+    let mut at = 16usize;
+    let mut masks: [Option<crate::Container>; 2] = [None, None];
+    for slot in masks.iter_mut() {
+        if body.len() < at + 9 {
+            return Err(CodecError::Truncated {
+                expected: at + 9,
+                found: body.len(),
+            });
+        }
+        let kind = body[at];
+        let card = u32::from_le_bytes(body[at + 1..at + 5].try_into().unwrap());
+        let len = u32::from_le_bytes(body[at + 5..at + 9].try_into().unwrap()) as usize;
+        at += 9;
+        if card == 0 {
+            if len != 0 {
+                return Err(CodecError::Invariant(
+                    "ChunkPatch mask is empty but carries a payload",
+                ));
+            }
+            continue;
+        }
+        if body.len() < at + len {
+            return Err(CodecError::Truncated {
+                expected: at + len,
+                found: body.len(),
+            });
+        }
+        let kind = match kind {
+            0 => crate::ContainerKind::Array,
+            1 => crate::ContainerKind::Bitmap,
+            2 => crate::ContainerKind::Run,
+            _ => return Err(CodecError::Invariant("ChunkPatch mask has unknown kind")),
+        };
+        *slot = Some(crate::container::codec::decode(
+            kind,
+            &body[at..at + len],
+            card,
+        )?);
+        at += len;
+    }
+    if at != body.len() {
+        return Err(CodecError::Invariant("ChunkPatch body has trailing bytes"));
+    }
+    let [clear, set] = masks;
+    Ok((key, prefix, clear, set))
 }
 
 #[cfg(test)]

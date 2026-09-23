@@ -317,6 +317,64 @@ impl Memtable {
         self.put(ck, version, v);
     }
 
+    /// Apply `new = ( old \ clear ) union set` to one chunk.
+    ///
+    /// **This is the single routine both the live commit path and WAL replay
+    /// call**, and that is the whole design of `RecType::ChunkPatch`. Its
+    /// predecessor, `Op::PutChunk`, replaces here and *unions* on replay; the
+    /// two agree only because `store_set` emits a `DeleteKey` first, which is a
+    /// latent divergence held shut by one caller's discipline. There is no
+    /// second implementation to keep in step here, so there is nothing to
+    /// drift.
+    ///
+    /// The base is resolved exactly as [`Memtable::insert`] resolves it: the
+    /// latest memtable value if the chunk is known, an empty container if what
+    /// it knows is a tombstone -- a tombstone is a real answer and must not
+    /// resurrect what is on disk -- and otherwise the persisted chunk.
+    ///
+    /// Set wins on overlap, which follows from applying `clear` first. An empty
+    /// result publishes `None`, so a patch that clears a chunk tombstones it
+    /// rather than leaving an empty container behind.
+    ///
+    /// Returns whether the chunk's contents actually changed, so a commit's
+    /// reported change count stays a count of real changes rather than of
+    /// operations offered.
+    pub fn patch_chunk(
+        &mut self,
+        key: u64,
+        prefix: Prefix48,
+        clear: Option<&Container>,
+        set: Option<&Container>,
+        version: Version,
+        base: impl FnOnce() -> Option<Container>,
+    ) -> bool {
+        let ck = ChunkKey::new(key, prefix);
+        let old = match self.chunks.get(&ck) {
+            Some(_) => self.latest(ck).cloned(),
+            None => base(),
+        };
+        let after_clear = match (&old, clear) {
+            (Some(o), Some(c)) => crate::ops::and_not(o, c),
+            (Some(o), None) => Some(o.clone()),
+            (None, _) => None,
+        };
+        let new = match (after_clear, set) {
+            (Some(a), Some(s)) => crate::ops::or(&a, s),
+            (Some(a), None) => Some(a),
+            (None, Some(s)) => Some(s.clone()),
+            (None, None) => None,
+        };
+        let changed = match (&old, &new) {
+            (None, None) => false,
+            (Some(o), Some(n)) => o != n,
+            _ => true,
+        };
+        if changed {
+            self.put(ck, version, new);
+        }
+        changed
+    }
+
     /// Delete every chunk of `key` that the memtable knows about, and tombstone
     /// the ones named in `on_disk`.
     pub fn delete_key(

@@ -50,6 +50,7 @@ Documents arrive here two ways:
 | [Compression Models and Space Economics](./compression-models-and-space-economics.md) | Entropy bounds, run-aware models, corpus histograms, and total storage economics. |
 | [Measurement and Investigation Methodology](./measurement-and-investigation-methodology.md) | Experimental controls, evaluation frames, repeated sweeps, benchmark provenance, instrument canaries, and durable evidence. |
 | [Context Eligibility Product Direction](./context-eligibility-product-direction.md) | Candidate filtering, governed shares, identity namespaces, disclosure controls, versioned receipts, and the BYOC-first product boundary. |
+| [Chunk-Local Patch Writes](./chunk-local-patch-writes.md) | The `patch_chunk` operation and its WAL record, the live/replay agreement it is designed around, and the durable ingest measurement that justified it. |
 
 ## Preserved Source
 

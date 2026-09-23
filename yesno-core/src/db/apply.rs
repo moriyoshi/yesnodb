@@ -27,7 +27,11 @@ use crate::wal::record::{self, RecType, Record};
 pub(super) fn is_redo_material(r: &Record) -> bool {
     matches!(
         r.rtype,
-        RecType::SetRange | RecType::ChunkDelta | RecType::ChunkDelete | RecType::ChunkImage
+        RecType::SetRange
+            | RecType::ChunkDelta
+            | RecType::ChunkDelete
+            | RecType::ChunkImage
+            | RecType::ChunkPatch
     )
 }
 
@@ -76,6 +80,16 @@ pub(super) fn apply_record(sh: &Shard, mem: &mut Memtable, rec: &Record) -> Resu
                 .map(|st| st.lock().unwrap().key_prefixes(key).unwrap_or_default())
                 .unwrap_or_default();
             mem.delete_key(key, at, on_disk);
+        }
+        RecType::ChunkPatch => {
+            // **The same routine the live path calls.** `ChunkImage` above is
+            // the cautionary case: it replaces live and unions here, and the
+            // two agree only because its one producer emits a delete first.
+            // There is no second implementation here to keep in step.
+            let (key, prefix, clear, set) = record::decode_chunk_patch(&rec.body)?;
+            mem.patch_chunk(key, prefix, clear.as_ref(), set.as_ref(), at, || {
+                sh.disk_chunk(key, prefix)
+            });
         }
         RecType::ChunkImage => {
             // key, then the chunk's ordinals in full.

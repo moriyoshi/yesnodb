@@ -3992,3 +3992,83 @@ had already passed four gates. All three of its findings were *partial* failures
 guarantee that held sometimes -- which is the class that tests written by the
 implementer are worst at catching, because the implementer tests the path they
 were thinking about.
+
+---
+## 2026-09-24 -- `patch_chunk`, and the trap it was built around
+
+Upstream prescription from haiiie: an ordered transactional chunk-local
+clear/set patch with a dedicated WAL record whose live and replay semantics
+agree. The contract analysis is in `LTM/chunk-local-patch-writes.md`; this is
+the working record.
+
+### The trap, first, because it is the whole design
+
+`Op::PutChunk` **replaces** the chunk live and its `RecType::ChunkImage`
+**unions** on replay. They agree only because the one producer, `store_set`,
+emits a `DeleteKey` ahead of them, so both act on an emptied key. `apply.rs`
+already carried a comment saying so and warning against adding a producer that
+omits the delete -- which is exactly what an incremental chunk write would be.
+
+So the defence here is structural rather than disciplinary: **one apply
+routine, `Memtable::patch_chunk`, called by the commit path and by WAL
+replay.** There is no second implementation to keep in step, so there is
+nothing to drift. Everything else about this operation follows from that
+choice.
+
+The record carries both masks through `container::codec` rather than expanded
+ordinals. That answers the objection recorded against an image record for
+`PutChunk` -- "a second encoding path to keep in step with `codec`" -- because
+it *is* `codec`, whose decoder is already a fuzz target required to return
+`Err` rather than panic for any input.
+
+### Two integration points the compiler did not find
+
+A patch reads the chunk it lands on, unlike a replace, so it has to join the
+**prefetch** set; nothing would have failed without that, it would just have
+gone to disk under the shard write lock. And `Planned::Whole`'s live arm ends
+in `unreachable!`, so a missing arm there is a **runtime panic, not a compile
+error**. The build was green in both states.
+
+### The sabotage check was the point of the exercise
+
+Thirteen tests, all green, is not evidence for a feature whose failure mode is
+invisible until a crash. Sabotaging replay to union -- precisely the
+`ChunkImage` mistake -- fails **7 of 13**, including the point-writer oracle.
+That number is the reason to believe the gate, and it is the check this feature
+most needed, because every durable case reopens *without* checkpointing so the
+answer comes from replay.
+
+### Measured
+
+96,903-row COCO fixture, 24,772,541 set bits, 32 shards. Against the point
+writer at 1024-row tiles: build **5.18x** faster ( 0.489 s vs 2.534 s ), WAL
+**7.84x** smaller ( 6.30 MB vs 49.41 MB ), peak RSS **3.33x** smaller, and
+WAL-only reopen **7.91x** faster ( 0.555 s vs 4.388 s ). It beats the point
+writer on build *while taking 95 commits to its 4*.
+
+**The recovery figure is the one that matters**, and it is where the
+whole-key image arm failed: that arm builds in 0.120 s and reopens in 4.451 s,
+because a fast live commit that logs ordinals is not a fast recovery. Carrying
+container payloads makes the durable cost match the live cost. Its WAL is
+31.5x larger than the patch path's.
+
+The tile sweep produced a finding rather than a preference: **build time is
+commit-bound at about 5.7 ms per commit** -- the fsync -- while WAL size is
+flat across 128 to 16384 rows, a 3.4% spread, because the bytes are payloads
+and not framing. Tile size therefore trades atomicity granularity against
+fsync count and costs almost nothing in bytes. Below 128 rows a tile cannot
+fill a forward chunk and pays a commit for a partial one.
+
+Query p99 under a concurrent writer is 0.7 us against the point writer's
+0.4 us, with the same ~150 us tail maximum. Reported as the higher number
+rather than rounded away: it tracks commit *rate* ( 161/s against 1.6/s )
+rather than any per-query cost.
+
+### Not measured, and it is not a detail
+
+The end-to-end comparison through haiiie's ordered writer and service at
+matched encoder thread counts. These are direct-`Db` figures with no
+attributes, no metadata and no service, and must not be substituted for that
+result. The consumer owns it. haiiie was not modified.
+
+All four gates pass.
