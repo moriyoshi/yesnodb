@@ -612,6 +612,22 @@ pub fn decode_chunk_patch(
     if at != body.len() {
         return Err(CodecError::Invariant("ChunkPatch body has trailing bytes"));
     }
+    // I8 at the decode boundary, not only at the API boundary.
+    //
+    // `WriteBatch::patch_chunk` refuses the reserved maximum ordinal, but
+    // **nothing that reaches this function came through it**: crash recovery
+    // and replica apply decode records straight off the log, which is exactly
+    // where a corrupt or hostile record arrives. An audit found the top slot of
+    // the top chunk accepted here while the API rejected it.
+    if prefix == (1u64 << (64 - crate::CHUNK_BITS)) - 1 {
+        for mask in masks.iter().flatten() {
+            if mask.contains(u16::MAX) {
+                return Err(CodecError::Invariant(
+                    "ChunkPatch names the reserved maximum ordinal",
+                ));
+            }
+        }
+    }
     let [clear, set] = masks;
     Ok((key, prefix, clear, set))
 }

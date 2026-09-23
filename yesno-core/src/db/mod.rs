@@ -4124,16 +4124,17 @@ impl WriteBatch {
                         // from the prefetched map when it is there and from the
                         // shard otherwise, exactly as the value path resolves
                         // it.
-                        let changed =
+                        // `changed` is a count of ordinals, because that is the
+                        // unit `Committed.changed` is documented in. Adding one
+                        // per chunk here reported 1 for a patch that flipped a
+                        // hundred ordinals.
+                        local +=
                             mem.patch_chunk(*k, *p, clear.as_ref(), set.as_ref(), version, || {
                                 match pre.and_then(|m| m.get(&ChunkKey::new(*k, *p))) {
                                     Some(v) => v.clone(),
                                     None => shard.disk_chunk(*k, *p),
                                 }
                             });
-                        if changed {
-                            local += 1;
-                        }
                     }
                     Op::DeleteKey(k) => {
                         // On-disk chunks need tombstones of their own; without

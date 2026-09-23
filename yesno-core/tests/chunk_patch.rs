@@ -357,3 +357,82 @@ fn a_patch_composes_with_store_set_in_arrival_order() {
     }
     assert_eq!(replayed(&dir, 1), vec![50, 51, 60]);
 }
+
+// The two cases below come from an external audit of the committed operation
+// ( haiiie, 2026-09-24 ), which reproduced both with a scratch probe.
+
+/// `Committed.changed` counts **ordinals**, not chunks.
+///
+/// It is documented as "ordinals that actually changed state", and the commit
+/// path added one per changed chunk, so a patch flipping a hundred ordinals
+/// reported one. The audit's reproduction was `patch_added=100
+/// committed_changed=1`.
+#[test]
+fn a_patch_reports_the_ordinals_it_changed_not_the_chunks() {
+    let dir = tmpdir("changed-count");
+    let _c = CleanDir(dir.clone());
+    let db = Db::open_with(&dir, opts()).unwrap();
+
+    // 100 fresh ordinals in one chunk.
+    let mut b = db.batch();
+    b.patch_chunk(1, 0, &Container::new_array(), &mask(0..100u16));
+    assert_eq!(b.commit().unwrap().changed, 100);
+
+    // Re-applying the same set changes nothing.
+    let mut b = db.batch();
+    b.patch_chunk(1, 0, &Container::new_array(), &mask(0..100u16));
+    assert_eq!(b.commit().unwrap().changed, 0);
+
+    // A clear of 40 that are present, plus a set of 10 that are not: 50
+    // memberships flip. Overlap must not be double counted -- bit 95 is in
+    // both masks and ends up present, which it already was.
+    let mut b = db.batch();
+    b.patch_chunk(
+        1,
+        0,
+        &mask(60..100u16),
+        &mask((95..105u16).collect::<Vec<_>>()),
+    );
+    assert_eq!(
+        b.commit().unwrap().changed,
+        40,
+        "35 cleared ( 60..95 ) plus 5 newly set ( 100..105 ); 95..100 were \
+         cleared and set again in one patch and so did not change"
+    );
+
+    // Emptying the chunk counts everything that was in it.
+    let before = db.snapshot().unwrap().cardinality(1).unwrap();
+    let mut b = db.batch();
+    b.patch_chunk(1, 0, &mask(0..=u16::MAX), &Container::new_array());
+    assert_eq!(b.commit().unwrap().changed, before);
+}
+
+/// The reserved maximum ordinal is refused at **decode**, not only at the API.
+///
+/// `WriteBatch::patch_chunk` rejects it, but nothing reaching the decoder came
+/// through that API: crash recovery and replica apply read records straight
+/// off the log, which is where a corrupt or hostile record actually arrives.
+#[test]
+fn a_record_naming_the_reserved_ordinal_is_refused_at_decode() {
+    use yesno_core::wal::record::{decode_chunk_patch, encode_chunk_patch};
+
+    let top = (1u64 << 48) - 1;
+
+    // The top slot of the top chunk is `u64::MAX`, which is not an ordinal.
+    let body = encode_chunk_patch(1, top, &Container::new_array(), &mask([u16::MAX]));
+    assert!(
+        decode_chunk_patch(&body).is_err(),
+        "replay must refuse the reserved maximum ordinal"
+    );
+
+    // The same bit in the clear mask, which the API also rejects.
+    let body = encode_chunk_patch(1, top, &mask([u16::MAX]), &Container::new_array());
+    assert!(decode_chunk_patch(&body).is_err());
+
+    // One slot below, and the same bit in any lower chunk, stay legal: this is
+    // a boundary, not a refusal of the whole chunk or of the value.
+    let body = encode_chunk_patch(1, top, &Container::new_array(), &mask([u16::MAX - 1]));
+    assert!(decode_chunk_patch(&body).is_ok());
+    let body = encode_chunk_patch(1, top - 1, &Container::new_array(), &mask([u16::MAX]));
+    assert!(decode_chunk_patch(&body).is_ok());
+}

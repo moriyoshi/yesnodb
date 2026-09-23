@@ -336,9 +336,14 @@ impl Memtable {
     /// result publishes `None`, so a patch that clears a chunk tombstones it
     /// rather than leaving an empty container behind.
     ///
-    /// Returns whether the chunk's contents actually changed, so a commit's
-    /// reported change count stays a count of real changes rather than of
-    /// operations offered.
+    /// Returns **how many ordinals changed state**, which is the unit
+    /// `Committed.changed` is documented in.
+    ///
+    /// It returned a `bool` until 2026-09-24, and the commit path added one per
+    /// changed *chunk*. A patch that flipped a hundred ordinals therefore
+    /// reported one, silently redefining a field whose whole contract is
+    /// "ordinals that actually changed state". An audit caught it with
+    /// `patch_added=100 committed_changed=1`.
     pub fn patch_chunk(
         &mut self,
         key: u64,
@@ -347,7 +352,7 @@ impl Memtable {
         set: Option<&Container>,
         version: Version,
         base: impl FnOnce() -> Option<Container>,
-    ) -> bool {
+    ) -> u64 {
         let ck = ChunkKey::new(key, prefix);
         let old = match self.chunks.get(&ck) {
             Some(_) => self.latest(ck).cloned(),
@@ -364,12 +369,16 @@ impl Memtable {
             (None, Some(s)) => Some(s.clone()),
             (None, None) => None,
         };
+        // The symmetric difference is the count of ordinals whose membership
+        // flipped, which is exactly what the field means. Counting the chunk
+        // instead is off by however dense the patch was.
         let changed = match (&old, &new) {
-            (None, None) => false,
-            (Some(o), Some(n)) => o != n,
-            _ => true,
+            (None, None) => 0,
+            (Some(o), None) => o.len() as u64,
+            (None, Some(n)) => n.len() as u64,
+            (Some(o), Some(n)) => crate::ops::card::xor_cardinality(o, n) as u64,
         };
-        if changed {
+        if changed > 0 {
             self.put(ck, version, new);
         }
         changed
