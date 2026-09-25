@@ -96,6 +96,78 @@ pub const MAX_NODES: usize = 4096;
 /// who really did ask for a large expansion.
 pub const MAX_VIEW_SETS: u32 = 4096;
 
+/// Widest value a [`Sort::Big`] node may denote, in bits.
+///
+/// **The fourth bound, and it exists for the reason the other three do.**
+/// [`MAX_DEPTH`] and [`MAX_NODES`] bound the *tree*; [`MAX_VIEW_SETS`] bounds a
+/// descriptor field the evaluator loops over. This one bounds a quantity none of
+/// them can see: **how wide a value is**. A natural-number node is a `u64` and
+/// costs the same whatever it holds, so node count alone bounds it. An
+/// arbitrary-precision node does not have that property, and
+/// a read's declared width is a `u32` -- so a twelve-byte payload can
+/// otherwise ask for half a gigabyte of value.
+///
+/// 1 Mibit is 128 KiB per value. Decoding refuses anything whose *static* width
+/// bound exceeds it ( see [`BigExpr::width_bound`] ), so the check happens
+/// before evaluation rather than during it, exactly as `ViewSpec::check` does.
+/// At most [`MAX_DEPTH`] values are live at once in a recursive evaluation, so
+/// the live bound is 4 MiB.
+///
+/// **Do not raise this to admit an operand that a caller found too narrow**
+/// without re-deriving the product above. Multiplication adds widths, so the
+/// bound is what keeps a chain of them from being an amplification vector
+/// rather than a query.
+pub const MAX_VALUE_BITS: u64 = 1 << 20;
+
+/// Widest **whole result** a [`Sort::VecBig`] query may denote, in bits.
+///
+/// **The fifth bound, and it exists because the product of two bounded things
+/// is not bounded by either.** [`MAX_VIEW_SETS`] caps a vector at 4096
+/// constituents and [`MAX_VALUE_BITS`] caps each element at 2^20 bits; neither
+/// says anything about 4096 elements *of* 2^20 bits, which is 512 MiB of
+/// answer from a twenty-byte payload. That is exactly the shape of
+/// `cap-view-constituent-count`: a quantity the evaluator loops over that
+/// appears in no existing bound.
+///
+/// 2^24 is 2 MiB of result. It admits 4096 constituents at 4096 bits each, or
+/// sixteen at full width -- generous for a histogram of stored integers and far
+/// below what would hurt a server. Checked at decode against
+/// `arity * element width`, before anything is evaluated.
+pub const MAX_RESULT_BITS: u64 = 1 << 24;
+
+/// Work a query may ask for, in limb operations.
+///
+/// **The sixth bound, and the first that is not about size.** Width and result
+/// bounds cap how much *answer* an expression describes; neither caps how long
+/// producing it takes. Modular exponentiation is where those separate: its
+/// result is only as wide as the modulus, while its cost is roughly
+/// `2 * e_bits * M( m_limbs )` -- so a payload naming a 1 Mibit modulus and a
+/// 1 Mibit exponent describes a value that fits comfortably and a computation
+/// that does not finish.
+///
+/// **This is an admission bound, not a cost model, and the distinction is
+/// recorded rather than assumed.** This tree measured a word-operation model
+/// over-predict real time by two to three times on the reporter's own buffers,
+/// and concluded that the family of models is wrong for the quantity. A static
+/// count cannot rank plans. It can refuse the absurd, which is all this does:
+/// every rule below is a deliberate **upper** bound ( schoolbook `n^2` for a
+/// multiply, never Karatsuba's measured exponent ), so the estimate errs toward
+/// refusing work that would in fact have been affordable.
+///
+/// 2^28 is calibrated against modular exponentiation, the operation that forced
+/// it: a 2048-bit modulus with a full-width exponent is about 4.2e6 limb
+/// operations, 4096-bit about 3.4e7, and 8192-bit about 2.7e8 -- so the bound
+/// admits the sizes a caller plausibly means and refuses the ones that would
+/// pin a core. It is checked over the **whole tree**, because a single
+/// full-width multiply already costs about as much as the exponentiation the
+/// bound was written for.
+pub const MAX_WORK: u64 = 1 << 28;
+
+/// Limbs a value of `bits` bits occupies.
+const fn limbs_of(bits: u64) -> u64 {
+    bits.div_ceil(64)
+}
+
 const TAG_EMPTY: u8 = 0;
 const TAG_KEY: u8 = 1;
 const TAG_RANGE: u8 = 2;
@@ -125,6 +197,22 @@ const TAG_INT_LIT: u8 = 20;
 const TAG_INT_AT: u8 = 21;
 const TAG_INT_LIST: u8 = 22;
 const TAG_CONTAINS: u8 = 23;
+const TAG_BIG_LIT: u8 = 24;
+const TAG_BIG_WIDEN: u8 = 25;
+const TAG_BIG_READ: u8 = 26;
+const TAG_BIG_READ_SIGNED: u8 = 27;
+const TAG_BIG_NEG: u8 = 28;
+const TAG_BIG_ADD: u8 = 29;
+const TAG_BIG_SUB: u8 = 30;
+const TAG_BIG_MUL: u8 = 31;
+const TAG_BIG_DIV: u8 = 32;
+const TAG_BIG_REM: u8 = 33;
+const TAG_BIG_TRUNCATE: u8 = 34;
+const TAG_BIG_SATURATE: u8 = 35;
+const TAG_BIG_LIST: u8 = 36;
+const TAG_MAP_BIG: u8 = 37;
+const TAG_BIG_FOLD: u8 = 38;
+const TAG_BIG_POW_MOD: u8 = 39;
 
 const VIEW_INTERLEAVED: u8 = 0;
 const VIEW_BLOCKED: u8 = 1;
@@ -249,6 +337,11 @@ fn sort_of_tag(tag: u8) -> Option<Sort> {
         TAG_MAP_INT | TAG_INT_LIST => Sort::VecInt,
         TAG_CARDINALITY | TAG_RANK | TAG_INT_LIT | TAG_INT_AT => Sort::Int,
         TAG_CONTAINS => Sort::Bool,
+        TAG_BIG_LIT | TAG_BIG_WIDEN | TAG_BIG_READ | TAG_BIG_READ_SIGNED | TAG_BIG_NEG
+        | TAG_BIG_ADD | TAG_BIG_SUB | TAG_BIG_MUL | TAG_BIG_DIV | TAG_BIG_REM
+        | TAG_BIG_TRUNCATE | TAG_BIG_SATURATE => Sort::Big,
+        TAG_BIG_LIST | TAG_MAP_BIG => Sort::VecBig,
+        TAG_BIG_FOLD | TAG_BIG_POW_MOD => Sort::Big,
         _ => return None,
     })
 }
@@ -291,6 +384,20 @@ pub enum Sort {
     VecInt,
     /// A single truth value. Only a `map` body, never a query result.
     Bool,
+    /// A single arbitrary-precision integer.
+    ///
+    /// Distinct from [`Sort::Int`] rather than a widening of it. `Int` is a
+    /// count or a position -- a `u64`, whose cost is bounded by node count
+    /// alone. This sort's cost depends on how wide its values are, which is why
+    /// it is the only sort with [`MAX_VALUE_BITS`] over it.
+    Big,
+    /// One arbitrary-precision integer per constituent.
+    ///
+    /// **There is no unsigned counterpart, deliberately.** Sign is a property
+    /// of the *reading* -- `Read` yields a magnitude, `ReadSigned` a two's
+    /// complement of the same bits -- so a `Vec[BigUint]` would be a sort whose
+    /// only content is a promise the element's own node already makes.
+    VecBig,
 }
 
 impl std::fmt::Display for Sort {
@@ -301,6 +408,8 @@ impl std::fmt::Display for Sort {
             Sort::Int => write!(f, "integer"),
             Sort::VecInt => write!(f, "vector of integers"),
             Sort::Bool => write!(f, "boolean"),
+            Sort::Big => write!(f, "big integer"),
+            Sort::VecBig => write!(f, "vector of big integers"),
         }
     }
 }
@@ -428,6 +537,392 @@ pub enum IntExpr {
     At(Box<VecIntExpr>, u32),
 }
 
+/// An arbitrary-precision signed literal, in canonical form.
+///
+/// **Sign and magnitude, not two's complement, because the wire has no width.**
+/// Two's complement needs a width to be negative *in*, and a literal carries
+/// none -- width is the reader's argument and nothing else's. Storage is a
+/// different question: an integer read out of a set is read under a width, and
+/// that reading is where two's complement belongs.
+///
+/// **Canonical, and non-canonical encodings are refused rather than
+/// normalized.** The magnitude is little-endian with no trailing zero byte, and
+/// a negative zero cannot be built. One value therefore has exactly one
+/// encoding, which is what makes a cross-implementation byte vector meaningful:
+/// two clients that disagree about padding would otherwise both be "right".
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BigLit {
+    negative: bool,
+    /// Little-endian magnitude, no trailing zero byte. Empty is zero.
+    magnitude: Vec<u8>,
+}
+
+impl BigLit {
+    /// Zero.
+    pub fn zero() -> BigLit {
+        BigLit {
+            negative: false,
+            magnitude: Vec::new(),
+        }
+    }
+
+    /// Build from a little-endian magnitude and a sign.
+    ///
+    /// Trailing zero bytes are **rejected**, not trimmed, and so is a negative
+    /// zero. A caller that has just computed a magnitude should strip it rather
+    /// than rely on this to do so, because the same bytes must encode the same
+    /// way in every client.
+    pub fn from_le_bytes(
+        negative: bool,
+        magnitude: impl Into<Vec<u8>>,
+    ) -> Result<BigLit, ExprError> {
+        let magnitude = magnitude.into();
+        if magnitude.last() == Some(&0) {
+            return Err(ExprError::NonCanonicalBigLit);
+        }
+        if negative && magnitude.is_empty() {
+            return Err(ExprError::NonCanonicalBigLit);
+        }
+        if (magnitude.len() as u64).saturating_mul(8) > MAX_VALUE_BITS {
+            return Err(ExprError::ValueTooWide);
+        }
+        Ok(BigLit {
+            negative,
+            magnitude,
+        })
+    }
+
+    /// A signed `i64`, in canonical form.
+    pub fn from_i64(v: i64) -> BigLit {
+        let negative = v < 0;
+        let mut magnitude = v.unsigned_abs().to_le_bytes().to_vec();
+        while magnitude.last() == Some(&0) {
+            magnitude.pop();
+        }
+        BigLit {
+            negative,
+            magnitude,
+        }
+    }
+
+    /// Is this value negative? A zero never is.
+    pub fn is_negative(&self) -> bool {
+        self.negative
+    }
+
+    /// The little-endian magnitude, with no trailing zero byte.
+    pub fn magnitude_le(&self) -> &[u8] {
+        &self.magnitude
+    }
+
+    /// Bits in the magnitude. Zero has none.
+    pub fn bit_len(&self) -> u64 {
+        match self.magnitude.last() {
+            None => 0,
+            Some(top) => {
+                let below = (self.magnitude.len() as u64 - 1) * 8;
+                below + (8 - u64::from(top.leading_zeros()))
+            }
+        }
+    }
+}
+
+/// A single arbitrary-precision integer.
+///
+/// The sort exists because `bignum` can read one out of a set and the language
+/// previously had no way to name it. Nothing here performs arithmetic yet: the
+/// nodes are a literal, a widening from a natural number, and a read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BigExpr {
+    /// A literal.
+    Lit(BigLit),
+    /// A natural-number expression as an arbitrary-precision one.
+    ///
+    /// The inclusion of the counts into the integers, and the only way the two
+    /// numeric sorts meet. It is explicit rather than implicit so that a
+    /// position requiring one sort never silently accepts the other.
+    Widen(Box<IntExpr>),
+    /// A set read as a **magnitude**, keeping its low `width_bits` bits.
+    ///
+    /// A set *is* an integer -- ordinal `j` carries the `2^j` term -- so this
+    /// is a change of view and not a lookup. Never negative: every bit carries
+    /// its own power of two and none carries a sign. Reading narrower than the
+    /// value occupies is exactly `x mod 2^width_bits`.
+    ///
+    /// The width is the only bound on what this costs, which is why it is
+    /// required rather than optional: see [`MAX_VALUE_BITS`].
+    Read(Box<SetExpr>, u32),
+    /// A set read in **two's complement** over `width_bits`.
+    ///
+    /// The top bit of the width is the sign, so the same stored set denotes a
+    /// different number than [`BigExpr::Read`] gives for it.
+    ///
+    /// **A separate node rather than a flag on `Read`, deliberately.** Signed
+    /// and unsigned readings of one bit pattern are different values, and a
+    /// reader that sometimes means one and sometimes the other has no error
+    /// path -- it returns a well-formed wrong answer. That is the rule
+    /// `bignum`'s own documentation states for Montgomery form, applied to the
+    /// same hazard.
+    ReadSigned(Box<SetExpr>, u32),
+    /// The additive inverse.
+    Neg(Box<BigExpr>),
+    /// Sum.
+    Add(Box<BigExpr>, Box<BigExpr>),
+    /// Difference. **Total**, which is the operation the signed sort exists for.
+    Sub(Box<BigExpr>, Box<BigExpr>),
+    /// Product. **The node that makes the width budget necessary**: it adds the
+    /// operands' widths, so a chain of them is the amplification
+    /// [`MAX_VALUE_BITS`] refuses.
+    Mul(Box<BigExpr>, Box<BigExpr>),
+    /// Quotient, truncating toward zero. A zero divisor is an evaluation error.
+    Div(Box<BigExpr>, Box<BigExpr>),
+    /// Remainder, carrying the sign of the dividend.
+    Rem(Box<BigExpr>, Box<BigExpr>),
+    /// Keep the low `bits` bits of the magnitude: the wrap.
+    Truncate(Box<BigExpr>, u32),
+    /// Clamp into what a `bits`-wide two's-complement field holds: the ceiling.
+    ///
+    /// Separate from [`BigExpr::Truncate`] because they are different rules,
+    /// not different spellings -- one wraps and one clamps, and they coincide
+    /// only when the residue is already the ceiling.
+    Saturate(Box<BigExpr>, u32),
+    /// Reduce a vector of big integers to one, with an associative operator.
+    ///
+    /// The transpose of [`VecBigExpr::Map`]: a map keeps one value per
+    /// constituent, a fold collapses them. The two are the marginals of the
+    /// same matrix and do not determine each other.
+    Fold(Box<VecBigExpr>, BigFoldOp),
+    /// `base^exp mod modulus`, by Barrett reduction.
+    ///
+    /// **The node [`MAX_WORK`] exists for.** Its result is only as wide as the
+    /// modulus, so the width bound sees nothing alarming in it; its cost is
+    /// `2 * e_bits * M( m_limbs )`, which the width bound cannot see at all.
+    ///
+    /// A zero modulus has no Barrett form, and a **negative exponent** has no
+    /// value without a modular inverse -- which `bignum` deliberately lacks,
+    /// because an extended GCD needs signed intermediates. Both are evaluation
+    /// errors rather than silent answers. A negative base reduces into its
+    /// residue class first, so the result is always in `[ 0, modulus )`.
+    PowMod(Box<BigExpr>, Box<BigExpr>, Box<BigExpr>),
+}
+
+impl BigExpr {
+    /// Every key this expression names.
+    pub fn keys(&self, out: &mut Vec<u64>) {
+        match self {
+            BigExpr::Lit(_) => {}
+            BigExpr::Widen(a) => a.keys(out),
+            BigExpr::Read(a, _) | BigExpr::ReadSigned(a, _) => a.keys(out),
+            BigExpr::Neg(a) | BigExpr::Truncate(a, _) | BigExpr::Saturate(a, _) => a.keys(out),
+            BigExpr::Fold(v, _) => v.keys(out),
+            BigExpr::PowMod(b, e, m) => {
+                b.keys(out);
+                e.keys(out);
+                m.keys(out);
+            }
+            BigExpr::Add(a, b)
+            | BigExpr::Sub(a, b)
+            | BigExpr::Mul(a, b)
+            | BigExpr::Div(a, b)
+            | BigExpr::Rem(a, b) => {
+                a.keys(out);
+                b.keys(out);
+            }
+        }
+    }
+
+    /// An upper bound, in bits, on the value this expression can denote.
+    ///
+    /// **Static, which is the property the whole sort rests on.** Every source
+    /// of width is known without evaluating anything: a literal carries its own
+    /// length, a widening is a `u64`, and a read is told its width by a
+    /// descriptor. So the decoder can refuse an over-wide expression before it
+    /// runs, the way an over-large view descriptor is refused.
+    ///
+    /// When arithmetic lands this function is where its rules go -- `add` is
+    /// `max( a, b ) + 1`, `mul` is `a + b` -- and it stays one upward pass.
+    pub fn width_bound(&self) -> u64 {
+        match self {
+            BigExpr::Lit(v) => v.bit_len(),
+            BigExpr::Widen(_) => 64,
+            // The most negative two's-complement value at width `w` is
+            // `-2^(w-1)`, whose magnitude needs exactly `w` bits. So both
+            // readings are bounded by the declared width.
+            BigExpr::Read(_, width) | BigExpr::ReadSigned(_, width) => *width as u64,
+            // A sign costs no bits in a sign-and-magnitude value.
+            BigExpr::Neg(a) => a.width_bound(),
+            // Opposite signs cannot exceed the wider operand; same signs carry
+            // at most one bit past it. One rule bounds both.
+            BigExpr::Add(a, b) | BigExpr::Sub(a, b) => {
+                a.width_bound().max(b.width_bound()).saturating_add(1)
+            }
+            BigExpr::Mul(a, b) => a.width_bound().saturating_add(b.width_bound()),
+            // A quotient is no wider than its dividend, a remainder no wider
+            // than the smaller of the two.
+            BigExpr::Div(a, _) => a.width_bound(),
+            BigExpr::Rem(a, b) => a.width_bound().min(b.width_bound()),
+            BigExpr::Truncate(a, bits) | BigExpr::Saturate(a, bits) => {
+                a.width_bound().min(*bits as u64)
+            }
+            // **The arities matter here and nowhere else in this function.**
+            // A sum of `n` values below `2^w` is below `2^( w + bits( n ) )`,
+            // so addition costs a handful of bits; a *product* of them reaches
+            // `n * w`, which is the same unbounded product `MAX_RESULT_BITS`
+            // exists for -- except that here it lands in a single value, so it
+            // is `MAX_VALUE_BITS` that has to hold it.
+            // A residue is bounded by its modulus, and by nothing the base or
+            // the exponent do.
+            BigExpr::PowMod(_, _, m) => m.width_bound(),
+            BigExpr::Fold(v, op) => {
+                let arity = u64::from(v.arity());
+                let widest = v.element_bound();
+                match op {
+                    BigFoldOp::Add => widest.saturating_add(64 - arity.leading_zeros() as u64),
+                    BigFoldOp::Mul => widest.saturating_mul(arity),
+                    BigFoldOp::Min | BigFoldOp::Max => widest,
+                }
+            }
+        }
+    }
+
+    /// An upper bound on the limb operations evaluating this costs.
+    ///
+    /// **Deliberately loose, and loose in one direction.** Every rule is an
+    /// upper bound -- schoolbook `n^2` for a multiply rather than Karatsuba's
+    /// measured exponent -- so the estimate refuses work that would in fact
+    /// have been affordable and never admits work that would not. That is the
+    /// right way round for an admission bound; it is the wrong way round for a
+    /// cost model, which is why this is not one. See [`MAX_WORK`].
+    pub fn work_bound(&self) -> u64 {
+        let limbs = |e: &BigExpr| limbs_of(e.width_bound());
+        match self {
+            // A literal arrives in the payload; nothing is computed.
+            BigExpr::Lit(_) => 0,
+            BigExpr::Widen(_) => 1,
+            // A read gathers its own limbs out of the set.
+            BigExpr::Read(_, width) | BigExpr::ReadSigned(_, width) => limbs_of(u64::from(*width)),
+            BigExpr::Neg(a) => a.work_bound().saturating_add(limbs(a)),
+            BigExpr::Add(a, b) | BigExpr::Sub(a, b) => a
+                .work_bound()
+                .saturating_add(b.work_bound())
+                .saturating_add(limbs(a).max(limbs(b))),
+            BigExpr::Mul(a, b) | BigExpr::Div(a, b) | BigExpr::Rem(a, b) => a
+                .work_bound()
+                .saturating_add(b.work_bound())
+                .saturating_add(limbs(a).saturating_mul(limbs(b))),
+            BigExpr::Truncate(a, _) | BigExpr::Saturate(a, _) => {
+                a.work_bound().saturating_add(limbs(a))
+            }
+            BigExpr::Fold(v, op) => {
+                let arity = u64::from(v.arity());
+                let element = limbs_of(v.element_bound());
+                let reduce = match op {
+                    // One pass, one operation per element.
+                    BigFoldOp::Add | BigFoldOp::Min | BigFoldOp::Max => {
+                        arity.saturating_mul(element)
+                    }
+                    // The accumulator grows as it goes, so the last multiply
+                    // is against the whole product. Bounded by its square.
+                    BigFoldOp::Mul => {
+                        let whole = arity.saturating_mul(element);
+                        whole.saturating_mul(whole)
+                    }
+                };
+                v.work_bound().saturating_add(reduce)
+            }
+            // One squaring per exponent bit and one multiply per set bit, each
+            // Barrett-reduced. The reduction is two multiplies, so the whole
+            // step is bounded by four `m_limbs^2` -- rounded to two per bit
+            // here and doubled by the `2 *`, which is the same number said the
+            // way the module header says it.
+            BigExpr::PowMod(b, e, m) => {
+                let m_limbs = limbs(m);
+                let step = m_limbs.saturating_mul(m_limbs).saturating_mul(4);
+                b.work_bound()
+                    .saturating_add(e.work_bound())
+                    .saturating_add(m.work_bound())
+                    .saturating_add(e.width_bound().saturating_mul(step))
+            }
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            BigExpr::Lit(v) => {
+                out.push(TAG_BIG_LIT);
+                out.push(u8::from(v.negative));
+                let len = u32::try_from(v.magnitude.len()).expect("bounded by MAX_VALUE_BITS");
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&v.magnitude);
+            }
+            BigExpr::Widen(a) => {
+                out.push(TAG_BIG_WIDEN);
+                a.write(out);
+            }
+            BigExpr::Read(a, width) => {
+                out.push(TAG_BIG_READ);
+                out.extend_from_slice(&width.to_le_bytes());
+                a.write(out);
+            }
+            BigExpr::ReadSigned(a, width) => {
+                out.push(TAG_BIG_READ_SIGNED);
+                out.extend_from_slice(&width.to_le_bytes());
+                a.write(out);
+            }
+            BigExpr::Neg(a) => {
+                out.push(TAG_BIG_NEG);
+                a.write(out);
+            }
+            BigExpr::Add(a, b) => {
+                out.push(TAG_BIG_ADD);
+                a.write(out);
+                b.write(out);
+            }
+            BigExpr::Sub(a, b) => {
+                out.push(TAG_BIG_SUB);
+                a.write(out);
+                b.write(out);
+            }
+            BigExpr::Mul(a, b) => {
+                out.push(TAG_BIG_MUL);
+                a.write(out);
+                b.write(out);
+            }
+            BigExpr::Div(a, b) => {
+                out.push(TAG_BIG_DIV);
+                a.write(out);
+                b.write(out);
+            }
+            BigExpr::Rem(a, b) => {
+                out.push(TAG_BIG_REM);
+                a.write(out);
+                b.write(out);
+            }
+            BigExpr::Truncate(a, bits) => {
+                out.push(TAG_BIG_TRUNCATE);
+                out.extend_from_slice(&bits.to_le_bytes());
+                a.write(out);
+            }
+            BigExpr::Saturate(a, bits) => {
+                out.push(TAG_BIG_SATURATE);
+                out.extend_from_slice(&bits.to_le_bytes());
+                a.write(out);
+            }
+            BigExpr::Fold(v, op) => {
+                out.push(TAG_BIG_FOLD);
+                out.push(op.byte());
+                v.write(out);
+            }
+            BigExpr::PowMod(b, e, m) => {
+                out.push(TAG_BIG_POW_MOD);
+                b.write(out);
+                e.write(out);
+                m.write(out);
+            }
+        }
+    }
+}
+
 /// A single truth value. Only ever a `map` body -- never a query result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoolExpr {
@@ -453,6 +948,134 @@ pub enum VecIntExpr {
     /// two is confusing the two marginals of the same matrix, which do not
     /// determine each other.
     Map(Box<VecSetExpr>, Box<IntExpr>),
+}
+
+/// How [`BigExpr::Fold`] combines a vector's elements.
+///
+/// **Four, and the reason is different from [`FoldOp`]'s three.** That enum is
+/// closed at three because on packed bits the only additive monoids available
+/// are `|` and `^`. Here the carrier is the integers, where `+` and `*` are the
+/// two ring operations and `min` / `max` are the lattice ones. All four are
+/// associative and commutative, so a fold over them does not depend on the
+/// order the constituents happen to be visited in -- which is the property that
+/// makes folding a vector meaningful at all.
+///
+/// None of them needs an identity, because a vector is never empty: an empty
+/// one is [`ExprError::EmptyVector`] at decode. That is what admits `min` and
+/// `max`, which have no identity in an unbounded domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BigFoldOp {
+    /// Sum.
+    Add,
+    /// Product. **The one whose width grows with the arity** -- see
+    /// [`BigExpr::width_bound`].
+    Mul,
+    /// Least element.
+    Min,
+    /// Greatest element.
+    Max,
+}
+
+impl BigFoldOp {
+    fn byte(self) -> u8 {
+        match self {
+            BigFoldOp::Add => 0,
+            BigFoldOp::Mul => 1,
+            BigFoldOp::Min => 2,
+            BigFoldOp::Max => 3,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<BigFoldOp> {
+        Some(match b {
+            0 => BigFoldOp::Add,
+            1 => BigFoldOp::Mul,
+            2 => BigFoldOp::Min,
+            3 => BigFoldOp::Max,
+            _ => return None,
+        })
+    }
+}
+
+/// One arbitrary-precision integer per constituent.
+///
+/// The `Big` analogue of [`VecIntExpr`], and the shape a facet histogram takes
+/// when the quantity per cohort is a stored integer rather than a count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VecBigExpr {
+    /// A literal vector.
+    List(Vec<BigExpr>),
+    /// A big-integer query applied to every element of a vector of sets.
+    ///
+    /// A **map, not a fold**, on the same terms as [`VecIntExpr::Map`].
+    Map(Box<VecSetExpr>, Box<BigExpr>),
+}
+
+impl VecBigExpr {
+    /// How many elements this vector has.
+    pub fn arity(&self) -> u32 {
+        match self {
+            VecBigExpr::List(xs) => xs.len() as u32,
+            VecBigExpr::Map(v, _) => v.arity(),
+        }
+    }
+
+    /// An upper bound, in bits, on any one element.
+    pub fn element_bound(&self) -> u64 {
+        match self {
+            VecBigExpr::List(xs) => xs.iter().map(BigExpr::width_bound).max().unwrap_or(0),
+            VecBigExpr::Map(_, body) => body.width_bound(),
+        }
+    }
+
+    /// An upper bound on the limb operations evaluating this vector costs.
+    pub fn work_bound(&self) -> u64 {
+        match self {
+            VecBigExpr::List(xs) => xs
+                .iter()
+                .map(BigExpr::work_bound)
+                .fold(0u64, u64::saturating_add),
+            // The body runs once per constituent.
+            VecBigExpr::Map(_, body) => u64::from(self.arity()).saturating_mul(body.work_bound()),
+        }
+    }
+
+    /// An upper bound, in bits, on the **whole** result.
+    ///
+    /// `arity * element width`, which is the quantity neither
+    /// [`MAX_VIEW_SETS`] nor [`MAX_VALUE_BITS`] bounds: each caps one factor
+    /// and the product is free. See [`MAX_RESULT_BITS`].
+    pub fn result_bound(&self) -> u64 {
+        u64::from(self.arity()).saturating_mul(self.element_bound())
+    }
+
+    /// Every key this vector reads.
+    pub fn keys(&self, out: &mut Vec<u64>) {
+        match self {
+            VecBigExpr::List(xs) => xs.iter().for_each(|x| x.keys(out)),
+            VecBigExpr::Map(v, body) => {
+                v.keys(out);
+                body.keys(out);
+            }
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        match self {
+            VecBigExpr::List(xs) => {
+                out.push(TAG_BIG_LIST);
+                out.extend_from_slice(&(xs.len() as u16).to_le_bytes());
+                for x in xs {
+                    x.write(out);
+                }
+            }
+            VecBigExpr::Map(v, body) => {
+                out.push(TAG_MAP_BIG);
+                v.write(out);
+                body.write(out);
+            }
+        }
+    }
 }
 
 impl VecIntExpr {
@@ -643,6 +1266,22 @@ pub enum ExprError {
     /// A fold operator byte that is none of the three. See [`FoldOp`].
     UnknownFoldOp(u8),
     TrailingBytes,
+    /// A big-integer literal with a trailing zero byte, or a negative zero.
+    ///
+    /// Refused rather than normalized, for the reason
+    /// [`ExprError::NonCanonicalLiteral`] is: one value must have exactly one
+    /// encoding, or a cross-implementation byte vector states nothing.
+    NonCanonicalBigLit,
+    /// A value whose static width bound exceeds [`MAX_VALUE_BITS`].
+    ValueTooWide,
+    /// A read of zero bits, which denotes nothing.
+    ZeroWidthRead,
+    /// A literal's sign byte that is neither 0 nor 1.
+    UnknownSignByte(u8),
+    /// A vector whose whole result could exceed [`MAX_RESULT_BITS`].
+    ResultTooLarge,
+    /// An expression whose estimated work could exceed [`MAX_WORK`].
+    TooMuchWork,
 }
 
 impl std::fmt::Display for ExprError {
@@ -685,6 +1324,20 @@ impl std::fmt::Display for ExprError {
             ExprError::UnknownViewLayout(v) => write!(f, "unknown view layout {v}"),
             ExprError::UnknownFoldOp(v) => write!(f, "unknown fold operator {v}"),
             ExprError::TrailingBytes => write!(f, "trailing bytes after expression"),
+            ExprError::NonCanonicalBigLit => {
+                write!(f, "big-integer literal is not canonical")
+            }
+            ExprError::ValueTooWide => {
+                write!(f, "value is wider than {MAX_VALUE_BITS} bits")
+            }
+            ExprError::ZeroWidthRead => write!(f, "a big-integer read has zero width"),
+            ExprError::UnknownSignByte(v) => write!(f, "unknown sign byte {v}"),
+            ExprError::ResultTooLarge => {
+                write!(f, "result is larger than {MAX_RESULT_BITS} bits")
+            }
+            ExprError::TooMuchWork => {
+                write!(f, "query asks for more than {MAX_WORK} limb operations")
+            }
         }
     }
 }
@@ -948,14 +1601,33 @@ pub enum AnyExpr {
     Set(SetExpr),
     /// One integer per constituent.
     VecInt(VecIntExpr),
+    /// A single arbitrary-precision integer.
+    Big(BigExpr),
+    /// One arbitrary-precision integer per constituent.
+    VecBig(VecBigExpr),
 }
 
 impl AnyExpr {
+    /// Every key this query names, in the order it names them.
+    ///
+    /// Sort-agnostic so a coordinator can route on the primary posting list
+    /// without first deciding what shape the answer has.
+    pub fn keys(&self, out: &mut Vec<u64>) {
+        match self {
+            AnyExpr::Set(e) => e.keys(out),
+            AnyExpr::VecInt(e) => e.keys(out),
+            AnyExpr::Big(e) => e.keys(out),
+            AnyExpr::VecBig(e) => e.keys(out),
+        }
+    }
+
     /// The sort this query denotes.
     pub fn sort(&self) -> Sort {
         match self {
             AnyExpr::Set(_) => Sort::Set,
             AnyExpr::VecInt(_) => Sort::VecInt,
+            AnyExpr::Big(_) => Sort::Big,
+            AnyExpr::VecBig(_) => Sort::VecBig,
         }
     }
 
@@ -971,6 +1643,8 @@ impl AnyExpr {
         match self {
             AnyExpr::Set(e) => e.write(&mut out),
             AnyExpr::VecInt(e) => e.write(&mut out),
+            AnyExpr::Big(e) => e.write(&mut out),
+            AnyExpr::VecBig(e) => e.write(&mut out),
         }
         debug_assert_ne!(
             out.len(),
@@ -985,8 +1659,14 @@ impl AnyExpr {
         let mut cur = Self::open(bytes)?;
         // The leading tag decides the sort, and the two decoders reject each
         // other's tags, so this dispatch cannot silently pick the wrong one.
-        let out = match cur.b.first() {
-            Some(&TAG_INT_LIST) | Some(&TAG_MAP_INT) => AnyExpr::VecInt(cur.vec_int_expr(0)?),
+        // Through `sort_of_tag`, for the reason that table exists: a per-sort
+        // list here is a second enumeration of the same fact, and the first
+        // time the two disagreed a tag was reported as unknown in one position
+        // and a sort mismatch in another.
+        let out = match cur.b.first().copied().and_then(sort_of_tag) {
+            Some(Sort::VecInt) => AnyExpr::VecInt(cur.vec_int_expr(0)?),
+            Some(Sort::Big) => AnyExpr::Big(cur.big_expr(0)?),
+            Some(Sort::VecBig) => AnyExpr::VecBig(cur.big_vector(0)?),
             _ => AnyExpr::Set(cur.expr(0)?),
         };
         if cur.at != cur.b.len() {
@@ -1021,19 +1701,27 @@ impl AnyExpr {
 /// return an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryRequest {
-    pub expression: SetExpr,
+    /// The query, **at whichever sort it denotes**.
+    ///
+    /// This was a `SetExpr` until 2026-09-25, which meant the multi-sorted
+    /// language had no way to reach a server at all: a facet histogram parsed,
+    /// evaluated in process, and could not be asked for over Flight. Widening
+    /// it is what gives `Vec[Int]` and `Big` a transport, and it costs nothing
+    /// on the wire -- the leading tag already determines the sort, so a payload
+    /// that used to decode as a set still does.
+    pub expression: AnyExpr,
     pub version: Option<u64>,
 }
 
 impl QueryRequest {
-    pub fn current(expression: SetExpr) -> Self {
+    pub fn current(expression: AnyExpr) -> Self {
         Self {
             expression,
             version: None,
         }
     }
 
-    pub fn at(expression: SetExpr, version: u64) -> Self {
+    pub fn at(expression: AnyExpr, version: u64) -> Self {
         Self {
             expression,
             version: Some(version),
@@ -1078,7 +1766,7 @@ impl QueryRequest {
             return Err(ExprError::TrailingBytes);
         }
         Ok(Self {
-            expression: SetExpr::decode(&bytes[QUERY_HEADER_LEN..])?,
+            expression: AnyExpr::decode(&bytes[QUERY_HEADER_LEN..])?,
             version: pinned.then_some(raw_version),
         })
     }
@@ -1306,6 +1994,148 @@ impl Cursor<'_> {
             }
             other => return Err(misplaced(Sort::Int, other)),
         })
+    }
+
+    /// A read's width, checked before it can be used to size anything.
+    fn read_width(&mut self) -> Result<u32, ExprError> {
+        let width = self.u32()?;
+        if width == 0 {
+            return Err(ExprError::ZeroWidthRead);
+        }
+        if u64::from(width) > MAX_VALUE_BITS {
+            return Err(ExprError::ValueTooWide);
+        }
+        Ok(width)
+    }
+
+    fn big_lit(&mut self) -> Result<BigLit, ExprError> {
+        let sign = *self.take(1)?.first().expect("took exactly 1");
+        let negative = match sign {
+            0 => false,
+            1 => true,
+            other => return Err(ExprError::UnknownSignByte(other)),
+        };
+        let len = self.u32()? as usize;
+        // Checked before `take` so an over-wide length is refused as the
+        // amplification it is, rather than as a truncated payload.
+        if (len as u64).saturating_mul(8) > MAX_VALUE_BITS {
+            return Err(ExprError::ValueTooWide);
+        }
+        let bytes = self.take(len)?.to_vec();
+        BigLit::from_le_bytes(negative, bytes)
+    }
+
+    fn big_vector(&mut self, depth: usize) -> Result<VecBigExpr, ExprError> {
+        if depth > MAX_DEPTH {
+            return Err(ExprError::TooDeep);
+        }
+        self.nodes += 1;
+        if self.nodes > MAX_NODES {
+            return Err(ExprError::TooManyNodes);
+        }
+        let tag = *self.take(1)?.first().expect("took exactly 1");
+        let out = match tag {
+            TAG_BIG_LIST => {
+                let n = self.u16()? as usize;
+                if n == 0 {
+                    return Err(ExprError::EmptyVector);
+                }
+                if self.nodes + n > MAX_NODES {
+                    return Err(ExprError::TooManyNodes);
+                }
+                let mut xs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    xs.push(self.big_expr(depth + 1)?);
+                }
+                VecBigExpr::List(xs)
+            }
+            TAG_MAP_BIG => {
+                let v = self.vec_expr(depth + 1)?;
+                let body = self.body(depth + 1, Cursor::big_expr)?;
+                VecBigExpr::Map(Box::new(v), Box::new(body))
+            }
+            other => return Err(misplaced(Sort::VecBig, other)),
+        };
+        // The product bound, checked here because this is the only node that
+        // has both factors: the arity and the element width.
+        if out.result_bound() > MAX_RESULT_BITS {
+            return Err(ExprError::ResultTooLarge);
+        }
+        if out.work_bound() > MAX_WORK {
+            return Err(ExprError::TooMuchWork);
+        }
+        Ok(out)
+    }
+
+    fn big_expr(&mut self, depth: usize) -> Result<BigExpr, ExprError> {
+        if depth > MAX_DEPTH {
+            return Err(ExprError::TooDeep);
+        }
+        self.nodes += 1;
+        if self.nodes > MAX_NODES {
+            return Err(ExprError::TooManyNodes);
+        }
+        let tag = *self.take(1)?.first().expect("took exactly 1");
+        let out = match tag {
+            TAG_BIG_LIT => BigExpr::Lit(self.big_lit()?),
+            TAG_BIG_WIDEN => BigExpr::Widen(Box::new(self.int_expr(depth + 1)?)),
+            TAG_BIG_READ => {
+                let width = self.read_width()?;
+                BigExpr::Read(Box::new(self.expr(depth + 1)?), width)
+            }
+            TAG_BIG_READ_SIGNED => {
+                let width = self.read_width()?;
+                BigExpr::ReadSigned(Box::new(self.expr(depth + 1)?), width)
+            }
+            TAG_BIG_NEG => BigExpr::Neg(Box::new(self.big_expr(depth + 1)?)),
+            TAG_BIG_ADD | TAG_BIG_SUB | TAG_BIG_MUL | TAG_BIG_DIV | TAG_BIG_REM => {
+                let a = Box::new(self.big_expr(depth + 1)?);
+                let b = Box::new(self.big_expr(depth + 1)?);
+                match tag {
+                    TAG_BIG_ADD => BigExpr::Add(a, b),
+                    TAG_BIG_SUB => BigExpr::Sub(a, b),
+                    TAG_BIG_MUL => BigExpr::Mul(a, b),
+                    TAG_BIG_DIV => BigExpr::Div(a, b),
+                    _ => BigExpr::Rem(a, b),
+                }
+            }
+            TAG_BIG_TRUNCATE | TAG_BIG_SATURATE => {
+                // A zero width is meaningful here, unlike on a read: wrapping
+                // or clamping into an empty field is zero, which is a value.
+                let bits = self.u32()?;
+                if u64::from(bits) > MAX_VALUE_BITS {
+                    return Err(ExprError::ValueTooWide);
+                }
+                let a = Box::new(self.big_expr(depth + 1)?);
+                if tag == TAG_BIG_TRUNCATE {
+                    BigExpr::Truncate(a, bits)
+                } else {
+                    BigExpr::Saturate(a, bits)
+                }
+            }
+            TAG_BIG_FOLD => {
+                let raw = *self.take(1)?.first().expect("took exactly 1");
+                let op = BigFoldOp::from_byte(raw).ok_or(ExprError::UnknownFoldOp(raw))?;
+                BigExpr::Fold(Box::new(self.big_vector(depth + 1)?), op)
+            }
+            TAG_BIG_POW_MOD => {
+                let b = Box::new(self.big_expr(depth + 1)?);
+                let e = Box::new(self.big_expr(depth + 1)?);
+                let m = Box::new(self.big_expr(depth + 1)?);
+                BigExpr::PowMod(b, e, m)
+            }
+            other => return Err(misplaced(Sort::Big, other)),
+        };
+        // Both bounds on every node rather than only at the root: a
+        // sub-expression can be neither wider nor more expensive than the whole
+        // is allowed to be.
+        if out.width_bound() > MAX_VALUE_BITS {
+            return Err(ExprError::ValueTooWide);
+        }
+        if out.work_bound() > MAX_WORK {
+            return Err(ExprError::TooMuchWork);
+        }
+        Ok(out)
     }
 
     fn bool_expr(&mut self, depth: usize) -> Result<BoolExpr, ExprError> {
@@ -1581,6 +2411,22 @@ mod tests {
             TAG_INT_AT,
             TAG_INT_LIST,
             TAG_CONTAINS,
+            TAG_BIG_LIT,
+            TAG_BIG_WIDEN,
+            TAG_BIG_READ,
+            TAG_BIG_READ_SIGNED,
+            TAG_BIG_NEG,
+            TAG_BIG_ADD,
+            TAG_BIG_SUB,
+            TAG_BIG_MUL,
+            TAG_BIG_DIV,
+            TAG_BIG_REM,
+            TAG_BIG_TRUNCATE,
+            TAG_BIG_SATURATE,
+            TAG_BIG_LIST,
+            TAG_MAP_BIG,
+            TAG_BIG_FOLD,
+            TAG_BIG_POW_MOD,
         ];
         // Contiguous from zero, so "defined" is decidable by comparison.
         let mut sorted = defined;
@@ -1648,6 +2494,102 @@ mod tests {
         );
         assert_eq!(e.encode().len(), 34);
         assert_eq!(SetExpr::decode(&e.encode()), Ok(e));
+    }
+
+    /// The same fixed-vector discipline for the `Big` sort, and it carries
+    /// more weight here than for sets: this payload exercises a signed literal
+    /// ( sign byte, length prefix, canonical magnitude ), a width-carrying
+    /// read, and two nesting levels. Mirrored verbatim in the Python, Go and
+    /// Java clients' own tests.
+    #[test]
+    fn the_big_cross_implementation_wire_vector_is_stable() {
+        let e = AnyExpr::Big(BigExpr::Saturate(
+            Box::new(BigExpr::Mul(
+                Box::new(BigExpr::Read(Box::new(SetExpr::Key(4)), 128)),
+                Box::new(BigExpr::Lit(BigLit::from_i64(-3))),
+            )),
+            32,
+        ));
+        let hex: String = e.encode().iter().map(|b| format!("{b:02x}")).collect();
+        // header(6) SATURATE bits(4) MUL READ width(4) KEY key(8) LIT sign len(4) mag
+        assert_eq!(
+            hex,
+            "59534e58010023200000001f1a8000000001040000000000000018010100000003"
+        );
+        assert_eq!(e.encode().len(), 33);
+        assert_eq!(AnyExpr::decode(&e.encode()), Ok(e));
+    }
+
+    /// **The bound that exists because two bounded factors have an unbounded
+    /// product.** `MAX_VIEW_SETS` caps the arity and `MAX_VALUE_BITS` caps each
+    /// element; neither sees 4096 elements *of* 2^20 bits, which is half a
+    /// gigabyte of answer from a payload of a few dozen bytes.
+    #[test]
+    fn a_wide_vector_of_wide_values_is_refused_before_it_runs() {
+        let widest = BigExpr::Read(Box::new(SetExpr::Hole), MAX_VALUE_BITS as u32);
+        let e = AnyExpr::VecBig(VecBigExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(1)),
+                ViewSpec::interleaved(MAX_VIEW_SETS),
+            )),
+            Box::new(widest),
+        ));
+        let payload = e.encode();
+        assert!(
+            payload.len() < 64,
+            "payload was {} bytes, so it is not an amplification",
+            payload.len()
+        );
+        assert_eq!(AnyExpr::decode(&payload), Err(ExprError::ResultTooLarge));
+    }
+
+    /// And the same shape inside the bound is accepted, so the refusal above is
+    /// the bound working rather than the sort being rejected.
+    #[test]
+    fn a_vector_of_values_within_the_result_bound_is_accepted() {
+        let e = AnyExpr::VecBig(VecBigExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(1)),
+                ViewSpec::interleaved(64),
+            )),
+            Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 1024)),
+        ));
+        assert!(e.encode().len() < 64);
+        assert_eq!(AnyExpr::decode(&e.encode()), Ok(e));
+    }
+
+    #[test]
+    fn a_vector_of_big_integers_round_trips() {
+        for e in [
+            AnyExpr::VecBig(VecBigExpr::List(vec![
+                BigExpr::Lit(BigLit::from_i64(1)),
+                BigExpr::Lit(BigLit::from_i64(-2)),
+            ])),
+            AnyExpr::VecBig(VecBigExpr::Map(
+                Box::new(VecSetExpr::View(
+                    Box::new(SetExpr::Key(9)),
+                    ViewSpec::interleaved(3),
+                )),
+                Box::new(BigExpr::ReadSigned(Box::new(SetExpr::Hole), 64)),
+            )),
+        ] {
+            assert_eq!(AnyExpr::decode(&e.encode()), Ok(e.clone()));
+            assert_eq!(e.sort(), Sort::VecBig);
+        }
+    }
+
+    /// `powmod` pinned across implementations too, because it is the node
+    /// whose operand order a reader cannot infer from the bytes.
+    #[test]
+    fn the_pow_mod_wire_vector_is_stable() {
+        let lit = |v: i64| Box::new(BigExpr::Lit(BigLit::from_i64(v)));
+        let e = AnyExpr::Big(BigExpr::PowMod(lit(2), lit(10), lit(1000)));
+        let hex: String = e.encode().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "59534e58010027180001000000021800010000000a180002000000e803"
+        );
+        assert_eq!(AnyExpr::decode(&e.encode()), Ok(e));
     }
 
     #[test]
@@ -2074,7 +3016,7 @@ mod tests {
     }
     #[test]
     fn query_requests_round_trip_current_and_pinned_versions() {
-        let expression = sample();
+        let expression = AnyExpr::Set(sample());
         for request in [
             QueryRequest::current(expression.clone()),
             QueryRequest::at(expression.clone(), 42),
@@ -2087,9 +3029,41 @@ mod tests {
         }
     }
 
+    /// **The gap widening the carrier closed.** A `Vec[Int]` or `Big` query
+    /// had no way to reach a server at all: the request carried a `SetExpr`, so
+    /// the facet histogram the sorted language exists for parsed, evaluated in
+    /// process, and could not be asked for over the wire.
+    #[test]
+    fn a_request_survives_the_carrier_at_every_returnable_sort() {
+        let facet = AnyExpr::VecInt(VecIntExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(9)),
+                ViewSpec::interleaved(3),
+            )),
+            Box::new(IntExpr::Cardinality(Box::new(SetExpr::Hole))),
+        ));
+        let value = AnyExpr::Big(BigExpr::Mul(
+            Box::new(BigExpr::Read(Box::new(SetExpr::Key(4)), 128)),
+            Box::new(BigExpr::Lit(BigLit::from_i64(-3))),
+        ));
+        for e in [AnyExpr::Set(sample()), facet, value] {
+            let sort = e.sort();
+            for request in [
+                QueryRequest::current(e.clone()),
+                QueryRequest::at(e.clone(), 7),
+            ] {
+                let bytes = request.encode();
+                assert!(QueryRequest::looks_like_request(&bytes));
+                let back = QueryRequest::decode(&bytes).expect("round trip");
+                assert_eq!(back, request);
+                assert_eq!(back.expression.sort(), sort);
+            }
+        }
+    }
+
     #[test]
     fn malformed_query_requests_are_rejected() {
-        let full = QueryRequest::at(sample(), 7).encode();
+        let full = QueryRequest::at(AnyExpr::Set(sample()), 7).encode();
         for n in 0..full.len() {
             assert!(QueryRequest::decode(&full[..n]).is_err(), "prefix {n}");
         }
@@ -2098,7 +3072,7 @@ mod tests {
         unknown_flags[5] = 0x80;
         assert!(QueryRequest::decode(&unknown_flags).is_err());
 
-        let mut unflagged_version = QueryRequest::current(sample()).encode();
+        let mut unflagged_version = QueryRequest::current(AnyExpr::Set(sample())).encode();
         unflagged_version[6] = 1;
         assert_eq!(
             QueryRequest::decode(&unflagged_version),
@@ -2110,5 +3084,161 @@ mod tests {
     fn a_bare_key_cannot_look_like_a_query_request() {
         let colliding = u64::from_le_bytes(*b"YSNQ\0\0\0\0");
         assert!(!QueryRequest::looks_like_request(&colliding.to_le_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod big_tests {
+    use super::*;
+
+    fn round_trip(e: AnyExpr) {
+        assert_eq!(AnyExpr::decode(&e.encode()).unwrap(), e);
+    }
+
+    #[test]
+    fn literals_round_trip_at_both_signs() {
+        for v in [0i64, 1, -1, i64::MAX, i64::MIN + 1, 255, 256, -256] {
+            round_trip(AnyExpr::Big(BigExpr::Lit(BigLit::from_i64(v))));
+        }
+    }
+
+    #[test]
+    fn a_read_round_trips_with_its_descriptor() {
+        round_trip(AnyExpr::Big(BigExpr::Read(Box::new(SetExpr::Key(42)), 100)));
+        round_trip(AnyExpr::Big(BigExpr::ReadSigned(
+            Box::new(SetExpr::Key(42)),
+            100,
+        )));
+    }
+
+    #[test]
+    fn a_widening_round_trips() {
+        round_trip(AnyExpr::Big(BigExpr::Widen(Box::new(
+            IntExpr::Cardinality(Box::new(SetExpr::Key(9))),
+        ))));
+    }
+
+    /// One value, one encoding. A trailing zero byte is a second spelling of the
+    /// same number, so it is refused rather than trimmed -- otherwise two
+    /// clients could both be "right" and the pinned byte vector would state
+    /// nothing.
+    #[test]
+    fn a_trailing_zero_byte_is_refused_rather_than_trimmed() {
+        assert_eq!(
+            BigLit::from_le_bytes(false, vec![1, 0]),
+            Err(ExprError::NonCanonicalBigLit)
+        );
+        // And on the wire, where a hostile client writes it directly.
+        let mut bytes = AnyExpr::Big(BigExpr::Lit(BigLit::from_i64(1))).encode();
+        let len_at = bytes.len() - 5;
+        bytes[len_at..len_at + 4].copy_from_slice(&2u32.to_le_bytes());
+        bytes.push(0);
+        assert_eq!(AnyExpr::decode(&bytes), Err(ExprError::NonCanonicalBigLit));
+    }
+
+    #[test]
+    fn a_negative_zero_cannot_be_built() {
+        assert_eq!(
+            BigLit::from_le_bytes(true, Vec::new()),
+            Err(ExprError::NonCanonicalBigLit)
+        );
+        assert!(!BigLit::from_i64(0).is_negative());
+    }
+
+    #[test]
+    fn bit_len_counts_the_magnitude() {
+        assert_eq!(BigLit::zero().bit_len(), 0);
+        assert_eq!(BigLit::from_i64(1).bit_len(), 1);
+        assert_eq!(BigLit::from_i64(255).bit_len(), 8);
+        assert_eq!(BigLit::from_i64(256).bit_len(), 9);
+        assert_eq!(BigLit::from_i64(-256).bit_len(), 9);
+        assert_eq!(BigLit::from_i64(i64::MAX).bit_len(), 63);
+    }
+
+    /// The bound that makes this sort safe to accept from the network.
+    ///
+    /// `width_bits` is a `u32`, so a twelve-byte descriptor can ask for half a
+    /// gigabyte of value. The refusal is at decode, before anything evaluates.
+    #[test]
+    fn an_over_wide_descriptor_is_refused_at_decode() {
+        // Built by hand, because the encoder would not produce it.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.push(RESERVED);
+        bytes.push(TAG_BIG_READ);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(TAG_KEY);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(AnyExpr::decode(&bytes), Err(ExprError::ValueTooWide));
+    }
+
+    /// A read of nothing denotes nothing, so it is refused rather than
+    /// answered with zero -- which is also what a genuine zero reads as.
+    #[test]
+    fn a_zero_width_read_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.push(RESERVED);
+        bytes.push(TAG_BIG_READ);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(TAG_KEY);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(AnyExpr::decode(&bytes), Err(ExprError::ZeroWidthRead));
+    }
+
+    /// An over-long literal is refused as the amplification it is, and the
+    /// length is checked *before* the bytes are taken, so the refusal does not
+    /// depend on the payload actually carrying them.
+    #[test]
+    fn an_over_long_literal_length_is_refused_before_its_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.push(RESERVED);
+        bytes.push(TAG_BIG_LIT);
+        bytes.push(0);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(AnyExpr::decode(&bytes), Err(ExprError::ValueTooWide));
+    }
+
+    #[test]
+    fn a_big_tag_where_a_set_belongs_is_a_sort_mismatch() {
+        assert_eq!(sort_of_tag(TAG_BIG_LIT), Some(Sort::Big));
+        assert_eq!(
+            misplaced(Sort::Set, TAG_BIG_LIT),
+            ExprError::SortMismatch {
+                expected: Sort::Set,
+                tag: TAG_BIG_LIT,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_sign_byte_is_refused() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(VERSION);
+        bytes.push(RESERVED);
+        bytes.push(TAG_BIG_LIT);
+        bytes.push(2);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(AnyExpr::decode(&bytes), Err(ExprError::UnknownSignByte(2)));
+    }
+
+    /// The decode contract: any input is an `Err` or a value, never a panic.
+    #[test]
+    fn truncations_of_a_big_expression_never_panic() {
+        let full = AnyExpr::Big(BigExpr::Read(Box::new(SetExpr::Key(42)), 128)).encode();
+        for n in 0..full.len() {
+            let _ = AnyExpr::decode(&full[..n]);
+        }
+        for b in 0u8..=255 {
+            let mut m = full.clone();
+            let at = m.len() / 2;
+            m[at] = b;
+            let _ = AnyExpr::decode(&m);
+        }
     }
 }

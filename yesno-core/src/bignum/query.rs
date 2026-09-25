@@ -62,7 +62,7 @@ impl BigUint {
     /// The value as a `u64`, or `None` if it does not fit.
     ///
     /// `None` rather than a truncation, for the same reason
-    /// [`IntLayout::ordinal_at`](super::IntLayout::ordinal_at) returns `None` at
+    /// [`Layout::ordinal_at`](crate::matrix::Layout::ordinal_at) returns `None` at
     /// the ceiling: a value that does not fit is not a value that fits with some
     /// bits removed.
     #[inline]

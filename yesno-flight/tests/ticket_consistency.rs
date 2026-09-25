@@ -202,7 +202,7 @@ async fn a_view_ticket_keeps_the_pre_write_logical_set() {
     assert_eq!(info.total_records, want.len() as i64);
     let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.to_vec();
     let ticket = Ticket::decode(&raw).unwrap();
-    assert_eq!(ticket.expr, Some(expr));
+    assert_eq!(ticket.expr, Some(yesno_flight::AnyExpr::Set(expr)));
 
     let extra_logical = 144;
     db.insert(9, extra_logical * 3 + 1).unwrap();

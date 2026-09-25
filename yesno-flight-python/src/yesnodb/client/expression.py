@@ -8,10 +8,11 @@ limits because descriptors received from a network are untrusted bytes.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from itertools import pairwise
-from typing import ClassVar
+from typing import ClassVar, overload
 
 from .errors import ExpressionError
 
@@ -57,6 +58,50 @@ _TAG_INT_LIT = 20
 _TAG_INT_AT = 21
 _TAG_INT_LIST = 22
 _TAG_CONTAINS = 23
+_TAG_BIG_LIT = 24
+_TAG_BIG_WIDEN = 25
+_TAG_BIG_READ = 26
+_TAG_BIG_READ_SIGNED = 27
+_TAG_BIG_NEG = 28
+_TAG_BIG_ADD = 29
+_TAG_BIG_SUB = 30
+_TAG_BIG_MUL = 31
+_TAG_BIG_DIV = 32
+_TAG_BIG_REM = 33
+_TAG_BIG_TRUNCATE = 34
+_TAG_BIG_SATURATE = 35
+_TAG_BIG_LIST = 36
+_TAG_MAP_BIG = 37
+_TAG_BIG_FOLD = 38
+_TAG_BIG_POW_MOD = 39
+
+# The widest value a big-integer node may denote. Mirrors `MAX_VALUE_BITS` in
+# the Rust crate: multiplication adds the operands' widths, so without this a
+# small payload describes a value no server should try to build.
+MAX_VALUE_BITS = 1 << 20
+
+# The widest whole result a vector of big integers may denote.
+#
+# The product of two bounded factors is not bounded by either: 4096
+# constituents of 2**20 bits each is half a gigabyte of answer from a payload
+# of a few dozen bytes. Mirrors MAX_RESULT_BITS in the Rust crate.
+MAX_RESULT_BITS = 1 << 24
+
+# Work a query may ask for, in limb operations.
+#
+# The first bound that is not about size. Modular exponentiation returns a value
+# no wider than its modulus, so the width bound finds nothing wrong with a
+# payload naming a computation that would not finish. Mirrors MAX_WORK in the
+# Rust crate.
+#
+# An admission bound, not a cost model: every rule is a deliberate *upper*
+# bound, which is right for refusing the absurd and wrong for ranking plans.
+MAX_WORK = 1 << 28
+
+
+def _limbs(bits: int) -> int:
+    return -(-bits // 64)
+
 
 # One table, consulted by every decoder's fallback. Enumerating other sorts'
 # tags inside each arm is how a tag ends up reported as unknown in one position
@@ -66,6 +111,8 @@ SORT_VEC_SET = "vector of sets"
 SORT_INT = "integer"
 SORT_VEC_INT = "vector of integers"
 SORT_BOOL = "boolean"
+SORT_BIG = "big integer"
+SORT_VEC_BIG = "vector of big integers"
 
 _TAG_SORTS = {
     _TAG_EMPTY: SORT_SET,
@@ -92,6 +139,22 @@ _TAG_SORTS = {
     _TAG_INT_AT: SORT_INT,
     _TAG_INT_LIST: SORT_VEC_INT,
     _TAG_CONTAINS: SORT_BOOL,
+    _TAG_BIG_LIT: SORT_BIG,
+    _TAG_BIG_WIDEN: SORT_BIG,
+    _TAG_BIG_READ: SORT_BIG,
+    _TAG_BIG_READ_SIGNED: SORT_BIG,
+    _TAG_BIG_NEG: SORT_BIG,
+    _TAG_BIG_ADD: SORT_BIG,
+    _TAG_BIG_SUB: SORT_BIG,
+    _TAG_BIG_MUL: SORT_BIG,
+    _TAG_BIG_DIV: SORT_BIG,
+    _TAG_BIG_REM: SORT_BIG,
+    _TAG_BIG_TRUNCATE: SORT_BIG,
+    _TAG_BIG_SATURATE: SORT_BIG,
+    _TAG_BIG_LIST: SORT_VEC_BIG,
+    _TAG_MAP_BIG: SORT_VEC_BIG,
+    _TAG_BIG_FOLD: SORT_BIG,
+    _TAG_BIG_POW_MOD: SORT_BIG,
 }
 
 
@@ -124,6 +187,23 @@ class ViewLayout(IntEnum):
 
     INTERLEAVED = 0
     BLOCKED = 1
+
+
+class BigFoldOp(IntEnum):
+    """How :class:`BigFold` combines a vector's elements.
+
+    Four, where the set fold has three: the carrier is the integers, where
+    ``+`` and ``*`` are the ring operations and ``min`` / ``max`` the lattice
+    ones. All four are associative and commutative, so the answer does not
+    depend on the order constituents are visited in. None needs an identity,
+    because a vector is never empty -- which is what admits ``min`` and ``max``
+    in an unbounded domain.
+    """
+
+    ADD = 0
+    MUL = 1
+    MIN = 2
+    MAX = 3
 
 
 class FoldOp(IntEnum):
@@ -627,6 +707,691 @@ class VecIntExpr:
         return tuple(out)
 
 
+class BigExpr:
+    """A single arbitrary-precision signed integer.
+
+    Distinct from :class:`IntExpr` rather than a widening of it. An ``IntExpr``
+    is a count or a position -- a ``u64``, whose cost is bounded by node count
+    alone. This sort's cost depends on how wide its values are, which is why it
+    is the only sort with a width bound over it.
+    """
+
+    __slots__ = ()
+
+    def _encode_node(self, out: bytearray) -> None:
+        raise NotImplementedError
+
+    def _append_keys(self, out: list[int]) -> None:
+        raise NotImplementedError
+
+    def width_bound(self) -> int:
+        """An upper bound, in bits, on the value this expression can denote.
+
+        Static: every source of width is known without evaluating anything, so
+        an over-wide expression is refused before it is sent rather than after
+        a server has tried to build it.
+        """
+
+        raise NotImplementedError
+
+    def work_bound(self) -> int:
+        """An upper bound on the limb operations evaluating this costs.
+
+        Deliberately loose, and loose in one direction: schoolbook rather than
+        Karatsuba, so it refuses work that would have been affordable and never
+        admits work that would not.
+        """
+
+        raise NotImplementedError
+
+    def keys(self) -> tuple[int, ...]:
+        """Every key this expression reads, in first-appearance order."""
+
+        out: list[int] = []
+        self._append_keys(out)
+        return tuple(out)
+
+
+def _big(value: object) -> BigExpr:
+    if not isinstance(value, BigExpr):
+        raise TypeError(f"expected a big-integer expression, not {type(value).__name__}")
+    if value.width_bound() > MAX_VALUE_BITS:
+        raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+    if value.work_bound() > MAX_WORK:
+        raise ExpressionError(f"query asks for more than {MAX_WORK} limb operations")
+    return value
+
+
+def _bounded(node: BigExpr) -> None:
+    """Refuse a node whose own result could exceed the width budget.
+
+    Checking the operands is not enough, and that is the whole point of the
+    bound: multiplication *adds* widths, so two operands that each fit can
+    combine into one that does not. The Rust decoder makes the same check per
+    node rather than at the root, for the same reason.
+    """
+
+    if node.width_bound() > MAX_VALUE_BITS:
+        raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+    if node.work_bound() > MAX_WORK:
+        raise ExpressionError(f"query asks for more than {MAX_WORK} limb operations")
+
+
+def _width(value: object, *, name: str) -> int:
+    width = _u32(value, name=name)
+    if width == 0:
+        raise ExpressionError("a big-integer read has zero width")
+    if width > MAX_VALUE_BITS:
+        raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+    return width
+
+
+@dataclass(frozen=True, slots=True)
+class BigLit(BigExpr):
+    """A literal, as an ordinary Python ``int`` of any magnitude.
+
+    Encoded sign-and-magnitude rather than two's complement, because a literal
+    has no width to be negative in -- width is a reader's argument. The
+    magnitude is little-endian and canonical: no trailing zero byte, and a
+    negative zero cannot occur.
+    """
+
+    value: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, int) or isinstance(self.value, bool):
+            raise TypeError(f"expected an int, not {type(self.value).__name__}")
+        if self.value.bit_length() > MAX_VALUE_BITS:
+            raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_LIT)
+        magnitude = abs(self.value)
+        body = magnitude.to_bytes((magnitude.bit_length() + 7) // 8, "little")
+        out.append(1 if self.value < 0 else 0)
+        out.extend(struct.pack("<I", len(body)))
+        out.extend(body)
+
+    def _append_keys(self, out: list[int]) -> None:
+        return None
+
+    def width_bound(self) -> int:
+        return self.value.bit_length()
+
+    def work_bound(self) -> int:
+        return 0
+
+
+@dataclass(frozen=True, slots=True)
+class Widen(BigExpr):
+    """A count as an arbitrary-precision integer: the inclusion of N into Z."""
+
+    input: IntExpr
+
+    def __post_init__(self) -> None:
+        _integer(self.input)
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_WIDEN)
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return 64
+
+    def work_bound(self) -> int:
+        return 1
+
+
+@dataclass(frozen=True, slots=True)
+class ReadUint(BigExpr):
+    """A set read as a magnitude, keeping its low ``width_bits`` bits.
+
+    A set *is* an integer -- ordinal ``j`` carries the ``2**j`` term -- so this
+    is a change of view, not a lookup. Reading narrower than the value occupies
+    is exactly ``x % 2**width_bits``.
+    """
+
+    input: SetExpr
+    width_bits: int
+
+    def __post_init__(self) -> None:
+        _expression(self.input)
+        _width(self.width_bits, name="width_bits")
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_READ)
+        out.extend(struct.pack("<I", self.width_bits))
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return self.width_bits
+
+    def work_bound(self) -> int:
+        return _limbs(self.width_bits)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadInt(BigExpr):
+    """A set read in two's complement over ``width_bits``.
+
+    The top bit of the width is the sign, so the same stored set denotes a
+    different number than :class:`ReadUint` gives for it. A separate node
+    rather than a flag: nothing in the bits says which reading was meant, so an
+    operation that sometimes did one and sometimes the other would have no
+    error path, only a well-formed wrong answer.
+    """
+
+    input: SetExpr
+    width_bits: int
+
+    def __post_init__(self) -> None:
+        _expression(self.input)
+        _width(self.width_bits, name="width_bits")
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_READ_SIGNED)
+        out.extend(struct.pack("<I", self.width_bits))
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return self.width_bits
+
+    def work_bound(self) -> int:
+        return _limbs(self.width_bits)
+
+
+@dataclass(frozen=True, slots=True)
+class Neg(BigExpr):
+    """The additive inverse."""
+
+    input: BigExpr
+
+    def __post_init__(self) -> None:
+        _big(self.input)
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_NEG)
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return self.input.width_bound()
+
+    def work_bound(self) -> int:
+        return self.input.work_bound() + _limbs(self.input.width_bound())
+
+
+class _Binary(BigExpr):
+    """Shared shape for the five binary arithmetic nodes."""
+
+    __slots__ = ()
+    _tag: ClassVar[int]
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(self._tag)
+        self.left._encode_node(out)  # type: ignore[attr-defined]
+        self.right._encode_node(out)  # type: ignore[attr-defined]
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.left._append_keys(out)  # type: ignore[attr-defined]
+        self.right._append_keys(out)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True, slots=True)
+class Add(_Binary):
+    """Sum."""
+
+    left: BigExpr
+    right: BigExpr
+    _tag: ClassVar[int] = _TAG_BIG_ADD
+
+    def __post_init__(self) -> None:
+        _big(self.left)
+        _big(self.right)
+        _bounded(self)
+
+    def width_bound(self) -> int:
+        return max(self.left.width_bound(), self.right.width_bound()) + 1
+
+    def work_bound(self) -> int:
+        return (
+            self.left.work_bound()
+            + self.right.work_bound()
+            + max(_limbs(self.left.width_bound()), _limbs(self.right.width_bound()))
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Sub(_Binary):
+    """Difference. Total, which is the operation the signed sort exists for."""
+
+    left: BigExpr
+    right: BigExpr
+    _tag: ClassVar[int] = _TAG_BIG_SUB
+
+    def __post_init__(self) -> None:
+        _big(self.left)
+        _big(self.right)
+        _bounded(self)
+
+    def width_bound(self) -> int:
+        return max(self.left.width_bound(), self.right.width_bound()) + 1
+
+    def work_bound(self) -> int:
+        return (
+            self.left.work_bound()
+            + self.right.work_bound()
+            + max(_limbs(self.left.width_bound()), _limbs(self.right.width_bound()))
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Mul(_Binary):
+    """Product.
+
+    The node that makes the width bound necessary: it adds the operands'
+    widths, so a few nested products over wide reads describe a value no server
+    should try to build.
+    """
+
+    left: BigExpr
+    right: BigExpr
+    _tag: ClassVar[int] = _TAG_BIG_MUL
+
+    def __post_init__(self) -> None:
+        _big(self.left)
+        _big(self.right)
+        _bounded(self)
+
+    def width_bound(self) -> int:
+        return self.left.width_bound() + self.right.width_bound()
+
+    def work_bound(self) -> int:
+        return (
+            self.left.work_bound()
+            + self.right.work_bound()
+            + _limbs(self.left.width_bound()) * _limbs(self.right.width_bound())
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Div(_Binary):
+    """Quotient, truncating toward zero. A zero divisor is a server error."""
+
+    left: BigExpr
+    right: BigExpr
+    _tag: ClassVar[int] = _TAG_BIG_DIV
+
+    def __post_init__(self) -> None:
+        _big(self.left)
+        _big(self.right)
+
+    def width_bound(self) -> int:
+        return self.left.width_bound()
+
+    def work_bound(self) -> int:
+        return (
+            self.left.work_bound()
+            + self.right.work_bound()
+            + _limbs(self.left.width_bound()) * _limbs(self.right.width_bound())
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Rem(_Binary):
+    """Remainder, carrying the sign of the dividend."""
+
+    left: BigExpr
+    right: BigExpr
+    _tag: ClassVar[int] = _TAG_BIG_REM
+
+    def __post_init__(self) -> None:
+        _big(self.left)
+        _big(self.right)
+
+    def width_bound(self) -> int:
+        return min(self.left.width_bound(), self.right.width_bound())
+
+    def work_bound(self) -> int:
+        return (
+            self.left.work_bound()
+            + self.right.work_bound()
+            + _limbs(self.left.width_bound()) * _limbs(self.right.width_bound())
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Truncate(BigExpr):
+    """Wrap into a ``bits``-wide two's-complement field."""
+
+    input: BigExpr
+    bits: int
+
+    def __post_init__(self) -> None:
+        _big(self.input)
+        bits = _u32(self.bits, name="bits")
+        if bits > MAX_VALUE_BITS:
+            raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_TRUNCATE)
+        out.extend(struct.pack("<I", self.bits))
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return min(self.input.width_bound(), self.bits)
+
+    def work_bound(self) -> int:
+        return self.input.work_bound() + _limbs(self.input.width_bound())
+
+
+@dataclass(frozen=True, slots=True)
+class Saturate(BigExpr):
+    """Clamp into the same field :class:`Truncate` wraps into.
+
+    One field, two overflow rules. They coincide only where nothing overflowed.
+    """
+
+    input: BigExpr
+    bits: int
+
+    def __post_init__(self) -> None:
+        _big(self.input)
+        bits = _u32(self.bits, name="bits")
+        if bits > MAX_VALUE_BITS:
+            raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_SATURATE)
+        out.extend(struct.pack("<I", self.bits))
+        self.input._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.input._append_keys(out)
+
+    def width_bound(self) -> int:
+        return min(self.input.width_bound(), self.bits)
+
+    def work_bound(self) -> int:
+        return self.input.work_bound() + _limbs(self.input.width_bound())
+
+
+class VecBigExpr:
+    """One arbitrary-precision integer per constituent.
+
+    There is no unsigned counterpart, deliberately: sign is a property of the
+    *reading* -- :class:`ReadUint` yields a magnitude, :class:`ReadInt` a two's
+    complement of the same bits -- so a vector of unsigned values would be a
+    sort whose only content is a promise the element's own node already makes.
+    """
+
+    __slots__ = ()
+
+    @property
+    def arity(self) -> int:
+        raise NotImplementedError
+
+    def element_bound(self) -> int:
+        """An upper bound, in bits, on any one element."""
+
+        raise NotImplementedError
+
+    def result_bound(self) -> int:
+        """An upper bound, in bits, on the *whole* result.
+
+        ``arity * element width``, which is the quantity neither the
+        constituent cap nor the per-value width bound covers: each caps one
+        factor and the product is free.
+        """
+
+        return self.arity * self.element_bound()
+
+    def work_bound(self) -> int:
+        """An upper bound on the limb operations this vector costs."""
+
+        raise NotImplementedError
+
+    def _encode_node(self, out: bytearray) -> None:
+        raise NotImplementedError
+
+    def _append_keys(self, out: list[int]) -> None:
+        raise NotImplementedError
+
+    def keys(self) -> tuple[int, ...]:
+        """Every key this vector reads, in first-appearance order."""
+
+        out: list[int] = []
+        self._append_keys(out)
+        return tuple(out)
+
+
+def _vec_big(value: object) -> VecBigExpr:
+    if not isinstance(value, VecBigExpr):
+        raise TypeError(f"expected a vector of big integers, not {type(value).__name__}")
+    if value.result_bound() > MAX_RESULT_BITS:
+        raise ExpressionError(f"result is larger than {MAX_RESULT_BITS} bits")
+    if value.work_bound() > MAX_WORK:
+        raise ExpressionError(f"query asks for more than {MAX_WORK} limb operations")
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BigList(VecBigExpr):
+    """A literal vector of big integers."""
+
+    elements: tuple[BigExpr, ...]
+
+    def __init__(self, *elements: BigExpr) -> None:
+        if not elements:
+            raise ExpressionError("vector has no elements")
+        for element in elements:
+            _big(element)
+        object.__setattr__(self, "elements", tuple(elements))
+        _vec_big(self)
+
+    @property
+    def arity(self) -> int:
+        return len(self.elements)
+
+    def element_bound(self) -> int:
+        return max((e.width_bound() for e in self.elements), default=0)
+
+    def work_bound(self) -> int:
+        return sum(e.work_bound() for e in self.elements)
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_LIST)
+        out.extend(struct.pack("<H", len(self.elements)))
+        for element in self.elements:
+            element._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        for element in self.elements:
+            element._append_keys(out)
+
+
+@dataclass(frozen=True, slots=True)
+class MapBig(VecBigExpr):
+    """A big-integer query applied to every element of a vector of sets.
+
+    A map, not a fold, on the same terms as :class:`MapInt`.
+    """
+
+    vector: VecSetExpr
+    body: BigExpr
+
+    def __post_init__(self) -> None:
+        _vector(self.vector)
+        _big(self.body)
+        _vec_big(self)
+
+    @property
+    def arity(self) -> int:
+        return self.vector.arity
+
+    def element_bound(self) -> int:
+        return self.body.width_bound()
+
+    def work_bound(self) -> int:
+        # The body runs once per constituent.
+        return self.arity * self.body.work_bound()
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_MAP_BIG)
+        self.vector._encode_node(out)
+        self.body._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.vector._append_keys(out)
+        self.body._append_keys(out)
+
+
+@dataclass(frozen=True, slots=True)
+class BigFold(BigExpr):
+    """Reduce a vector of big integers to one.
+
+    The transpose of :class:`MapBig`: a map keeps one value per constituent, a
+    fold collapses them. The two are the marginals of the same matrix and do
+    not determine each other.
+    """
+
+    vector: VecBigExpr
+    op: BigFoldOp
+
+    def __post_init__(self) -> None:
+        _vec_big(self.vector)
+        if not isinstance(self.op, BigFoldOp):
+            raise TypeError(f"expected a BigFoldOp, not {type(self.op).__name__}")
+        _bounded(self)
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_FOLD)
+        out.append(int(self.op))
+        self.vector._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.vector._append_keys(out)
+
+    def width_bound(self) -> int:
+        """Only ``MUL`` grows with the arity.
+
+        A sum of ``n`` values below ``2**w`` is below ``2**(w + bits(n))``, so
+        addition costs a handful of bits. A product reaches ``n * w`` -- the
+        same unbounded product the result bound exists for, except that here it
+        lands in a single value.
+        """
+
+        arity = self.vector.arity
+        widest = self.vector.element_bound()
+        if self.op is BigFoldOp.ADD:
+            return widest + arity.bit_length()
+        if self.op is BigFoldOp.MUL:
+            return widest * arity
+        return widest
+
+    def work_bound(self) -> int:
+        arity = self.vector.arity
+        element = _limbs(self.vector.element_bound())
+        if self.op is BigFoldOp.MUL:
+            # The accumulator grows as it goes, so the last multiply is against
+            # the whole product.
+            whole = arity * element
+            reduce = whole * whole
+        else:
+            reduce = arity * element
+        return self.vector.work_bound() + reduce
+
+
+@dataclass(frozen=True, slots=True)
+class PowMod(BigExpr):
+    """``base ** exp mod modulus``, by Barrett reduction.
+
+    The node the work bound exists for: the result is only as wide as the
+    modulus, so nothing about its *size* is alarming, while its cost grows with
+    the exponent's bit count times the square of the modulus's.
+
+    A zero modulus has no residues and a negative exponent is a modular
+    inverse, which the engine does not compute; both are server-side errors
+    rather than answers. A negative base enters its residue class first, so the
+    answer is always in ``[0, modulus)``.
+    """
+
+    base: BigExpr
+    exp: BigExpr
+    modulus: BigExpr
+
+    def __post_init__(self) -> None:
+        _big(self.base)
+        _big(self.exp)
+        _big(self.modulus)
+        _bounded(self)
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_POW_MOD)
+        self.base._encode_node(out)
+        self.exp._encode_node(out)
+        self.modulus._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.base._append_keys(out)
+        self.exp._append_keys(out)
+        self.modulus._append_keys(out)
+
+    def width_bound(self) -> int:
+        # A residue is bounded by its modulus and by nothing else.
+        return self.modulus.width_bound()
+
+    def work_bound(self) -> int:
+        m_limbs = _limbs(self.modulus.width_bound())
+        # One squaring per exponent bit and one multiply per set bit, each
+        # Barrett-reduced; the reduction is two multiplies.
+        step = 4 * m_limbs * m_limbs
+        return (
+            self.base.work_bound()
+            + self.exp.work_bound()
+            + self.modulus.work_bound()
+            + self.exp.width_bound() * step
+        )
+
+
+@overload
+def big(value: int) -> BigLit: ...
+
+
+@overload
+def big(value: Sequence[int | BigExpr]) -> BigList: ...
+
+
+def big(value: int | Sequence[int | BigExpr]) -> BigLit | BigList:
+    """A big-integer literal, or a literal vector of them.
+
+    Mirrors the query language exactly: ``big(1)`` is a single value and
+    ``big([1, 2, 3])`` is a vector of three. The same spelling carries the sort
+    in both, which is the point -- a bare list is a vector of *sets*
+    everywhere, so a vector of big integers says so where it is written.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, Sequence)):
+        raise TypeError(f"expected an int or a sequence, not {type(value).__name__}")
+    if isinstance(value, int):
+        return BigLit(value)
+    return BigList(*(e if isinstance(e, BigExpr) else BigLit(e) for e in value))
+
+
 def _integer(value: object) -> IntExpr:
     if not isinstance(value, IntExpr):
         raise TypeError(f"expected an integer expression, not {type(value).__name__}")
@@ -904,22 +1669,33 @@ class AnyExpr:
     always reaches a query result through a fold, a pack, or an index.
     """
 
-    expression: SetExpr | VecIntExpr
+    expression: SetExpr | VecIntExpr | BigExpr | VecBigExpr
 
     def __post_init__(self) -> None:
-        if not isinstance(self.expression, (SetExpr, VecIntExpr)):
-            raise TypeError("a query must be a set or a vector of integers")
+        if not isinstance(self.expression, (SetExpr, VecIntExpr, BigExpr, VecBigExpr)):
+            raise TypeError("a query must be a set, a vector of integers, or a big integer")
+        if isinstance(self.expression, BigExpr):
+            _big(self.expression)
+        if isinstance(self.expression, VecBigExpr):
+            _vec_big(self.expression)
 
     @property
     def sort(self) -> str:
-        return SORT_SET if isinstance(self.expression, SetExpr) else SORT_VEC_INT
+        if isinstance(self.expression, SetExpr):
+            return SORT_SET
+        if isinstance(self.expression, BigExpr):
+            return SORT_BIG
+        if isinstance(self.expression, VecBigExpr):
+            return SORT_VEC_BIG
+        return SORT_VEC_INT
 
     def encode(self) -> bytes:
         """Encode with the ``YSNX`` header, exactly as :meth:`SetExpr.encode` does."""
 
         if isinstance(self.expression, SetExpr):
             return self.expression.encode()
-        _check_shape(self.expression)
+        if isinstance(self.expression, VecIntExpr):
+            _check_shape(self.expression)
         out = bytearray(_HEADER)
         self.expression._encode_node(out)
         return bytes(out)
@@ -938,9 +1714,17 @@ class AnyExpr:
         cursor = _Cursor(raw[len(_HEADER) :])
         # The leading tag decides the sort, and the decoders reject each
         # other's tags, so this dispatch cannot silently pick the wrong one.
+        # Through the one sort table, for the reason it exists: a per-sort list
+        # here is a second enumeration of the same fact waiting to disagree.
         leading = cursor.payload[0] if cursor.payload else None
-        if leading in (_TAG_INT_LIST, _TAG_MAP_INT):
-            expression: SetExpr | VecIntExpr = cursor.int_vector(0)
+        leading_sort = _TAG_SORTS.get(leading) if leading is not None else None
+        expression: SetExpr | VecIntExpr | BigExpr | VecBigExpr
+        if leading_sort == SORT_VEC_INT:
+            expression = cursor.int_vector(0)
+        elif leading_sort == SORT_BIG:
+            expression = cursor.big(0)
+        elif leading_sort == SORT_VEC_BIG:
+            expression = cursor.big_vector(0)
         else:
             expression = cursor.expression(0)
         if cursor.offset != len(cursor.payload):
@@ -950,22 +1734,32 @@ class AnyExpr:
 
 @dataclass(frozen=True, slots=True)
 class QueryRequest:
-    """An expression and an optional exact database version to evaluate."""
+    """An expression and an optional exact database version to evaluate.
 
-    expression: SetExpr
+    The expression is at **whichever sort it denotes**. It was a set alone
+    until the carrier was widened, which meant the multi-sorted language had no
+    way to reach a server: a facet histogram could be built and never sent.
+    """
+
+    expression: SetExpr | VecIntExpr | BigExpr | VecBigExpr
     version: int | None = None
 
     def __post_init__(self) -> None:
-        _expression(self.expression)
+        if not isinstance(self.expression, (SetExpr, VecIntExpr, BigExpr, VecBigExpr)):
+            raise TypeError("a query must be a set, a vector of integers, or a big integer")
+        if isinstance(self.expression, BigExpr):
+            _big(self.expression)
+        if isinstance(self.expression, VecBigExpr):
+            _vec_big(self.expression)
         if self.version is not None:
             _u64(self.version, name="version")
 
     @classmethod
-    def current(cls, expression: SetExpr) -> QueryRequest:
+    def current(cls, expression: SetExpr | VecIntExpr | BigExpr | VecBigExpr) -> QueryRequest:
         return cls(expression)
 
     @classmethod
-    def at(cls, expression: SetExpr, version: int) -> QueryRequest:
+    def at(cls, expression: SetExpr | VecIntExpr | BigExpr, version: int) -> QueryRequest:
         return cls(expression, version)
 
     def encode(self) -> bytes:
@@ -976,7 +1770,9 @@ class QueryRequest:
         return (
             QUERY_MAGIC
             + struct.pack("<BBQ", QUERY_VERSION, _QUERY_FLAG_PINNED if pinned else 0, version)
-            + self.expression.encode()
+            # Through `AnyExpr`, which is the one encoder that knows every
+            # sort: only `SetExpr` carries an `encode` of its own.
+            + AnyExpr(self.expression).encode()
         )
 
     @classmethod
@@ -994,7 +1790,7 @@ class QueryRequest:
         pinned = flags & _QUERY_FLAG_PINNED != 0
         if not pinned and version != 0:
             raise ExpressionError("an unpinned query request has a non-zero version")
-        expression = SetExpr.decode(raw[_QUERY_HEADER_LEN:])
+        expression = AnyExpr.decode(raw[_QUERY_HEADER_LEN:]).expression
         return cls(expression, version if pinned else None)
 
     @staticmethod
@@ -1233,6 +2029,95 @@ class _Cursor:
             ordinal = self.unpack("<Q")[0]
             return Contains(self.expression(depth + 1), ordinal)
         raise _misplaced(SORT_BOOL, tag)
+
+    def big(self, depth: int) -> BigExpr:
+        if depth > MAX_DEPTH:
+            raise ExpressionError(f"expression nested deeper than {MAX_DEPTH}")
+        self.nodes += 1
+        if self.nodes > MAX_NODES:
+            raise ExpressionError(f"expression has more than {MAX_NODES} nodes")
+        (tag,) = self.unpack("<B")
+
+        if tag == _TAG_BIG_LIT:
+            (sign,) = self.unpack("<B")
+            if sign not in (0, 1):
+                raise ExpressionError(f"unknown sign byte {sign}")
+            (length,) = self.unpack("<I")
+            # Checked before the bytes are taken, so an over-wide length is
+            # refused as the amplification it is rather than as a truncation.
+            if length * 8 > MAX_VALUE_BITS:
+                raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+            body = self.take(length)
+            if body and body[-1] == 0:
+                raise ExpressionError("big-integer literal is not canonical")
+            magnitude = int.from_bytes(body, "little")
+            if sign == 1 and magnitude == 0:
+                raise ExpressionError("big-integer literal is not canonical")
+            return BigLit(-magnitude if sign else magnitude)
+        if tag == _TAG_BIG_WIDEN:
+            return Widen(self.int_expression(depth + 1))
+        if tag in (_TAG_BIG_READ, _TAG_BIG_READ_SIGNED):
+            (width,) = self.unpack("<I")
+            if width == 0:
+                raise ExpressionError("a big-integer read has zero width")
+            if width > MAX_VALUE_BITS:
+                raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+            operand = self.expression(depth + 1)
+            return ReadUint(operand, width) if tag == _TAG_BIG_READ else ReadInt(operand, width)
+        if tag == _TAG_BIG_NEG:
+            return Neg(self.big(depth + 1))
+        if tag == _TAG_BIG_POW_MOD:
+            base = self.big(depth + 1)
+            exp = self.big(depth + 1)
+            return PowMod(base, exp, self.big(depth + 1))
+        if tag == _TAG_BIG_FOLD:
+            (raw,) = self.unpack("<B")
+            try:
+                op = BigFoldOp(raw)
+            except ValueError as error:
+                raise ExpressionError(f"unknown fold operator {raw}") from error
+            return BigFold(self.big_vector(depth + 1), op)
+        binary = {
+            _TAG_BIG_ADD: Add,
+            _TAG_BIG_SUB: Sub,
+            _TAG_BIG_MUL: Mul,
+            _TAG_BIG_DIV: Div,
+            _TAG_BIG_REM: Rem,
+        }.get(tag)
+        if binary is not None:
+            left = self.big(depth + 1)
+            right = self.big(depth + 1)
+            return binary(left, right)
+        if tag in (_TAG_BIG_TRUNCATE, _TAG_BIG_SATURATE):
+            # A zero width is meaningful here, unlike on a read: wrapping or
+            # clamping into an empty field is zero, which is a value.
+            (bits,) = self.unpack("<I")
+            if bits > MAX_VALUE_BITS:
+                raise ExpressionError(f"value is wider than {MAX_VALUE_BITS} bits")
+            narrowed = self.big(depth + 1)
+            return (
+                Truncate(narrowed, bits) if tag == _TAG_BIG_TRUNCATE else Saturate(narrowed, bits)
+            )
+        raise _misplaced(SORT_BIG, tag)
+
+    def big_vector(self, depth: int) -> VecBigExpr:
+        if depth > MAX_DEPTH:
+            raise ExpressionError(f"expression nested deeper than {MAX_DEPTH}")
+        self.nodes += 1
+        if self.nodes > MAX_NODES:
+            raise ExpressionError(f"expression has more than {MAX_NODES} nodes")
+        (tag,) = self.unpack("<B")
+        if tag == _TAG_BIG_LIST:
+            (count,) = self.unpack("<H")
+            if count == 0:
+                raise ExpressionError("vector has no elements")
+            if self.nodes + count > MAX_NODES:
+                raise ExpressionError(f"expression has more than {MAX_NODES} nodes")
+            return BigList(*(self.big(depth + 1) for _ in range(count)))
+        if tag == _TAG_MAP_BIG:
+            vector = self.vector(depth + 1)
+            return MapBig(vector, self.body(depth + 1, _Cursor.big))
+        raise _misplaced(SORT_VEC_BIG, tag)
 
     def int_vector(self, depth: int) -> VecIntExpr:
         if depth > MAX_DEPTH:

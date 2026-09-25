@@ -30,9 +30,10 @@
 //! form — stronger than value equality, because it also pins normalization, and
 //! weaker than byte identity, because no format is being agreed on.
 
+use num_bigint::BigInt as SRef;
 use num_bigint::BigUint as Ref;
 use proptest::prelude::*;
-use yesno_core::bignum::{Barrett, BigUint, IntLayout, IntSink, KARATSUBA_MIN};
+use yesno_core::bignum::{Barrett, BigInt, BigUint, KARATSUBA_MIN};
 use yesno_core::OrdSet;
 
 fn to_ref(x: &BigUint) -> Ref {
@@ -229,48 +230,53 @@ proptest! {
     }
 
     /// The whole `OrdSet` boundary, oracle-checked at both ends.
+    ///
+    /// One set is one integer, so the boundary is a pair of maps that must
+    /// compose to the identity in both directions.
     #[test]
-    fn a_series_round_trips_through_the_ordset_boundary(
-        values in prop::collection::vec(big(), 1..6),
-        stride_pad in 0u64..3,
+    fn a_value_round_trips_through_the_ordset_boundary(v in big()) {
+        let set = OrdSet::from_int(&v).expect("bit length is far below the ceiling");
+        let got = set.read_int(u64::MAX);
+        prop_assert_eq!(&got, &v);
+        prop_assert_eq!(to_ref(&got), to_ref(&v));
+        // And back again: the set is recovered from the value it denotes.
+        prop_assert_eq!(OrdSet::from_int(&got).expect("same value"), set);
+    }
+
+    /// Reading fewer bits than are there is exactly `v mod 2^w`, which is the
+    /// only thing a width argument does.
+    #[test]
+    fn a_narrow_read_is_the_value_modulo_two_to_the_width(
+        v in big(),
+        w in 0u64..1_024,
     ) {
-        let width = values.iter().map(|v| v.bit_len()).max().unwrap_or(0).max(1);
-        prop_assume!(width <= 20_000);
-        let width = width as u32;
-        let layout = IntLayout { width_bits: width, stride: width as u64 + stride_pad };
-        let mut sink = IntSink::new(layout);
-        for (k, v) in values.iter().enumerate() {
-            sink.place(k as u64, v).expect("width was taken from the widest value");
-        }
-        let set = sink.build();
-        for (k, v) in values.iter().enumerate() {
-            let got = set.read_int(k as u64, &layout).expect("addressable");
-            prop_assert_eq!(&got, v);
-            prop_assert_eq!(to_ref(&got), to_ref(v));
-        }
-        // `int_count` reaches the highest **set ordinal**, so a zero *above*
-        // every non-zero value is invisible — absence and zero write the same
-        // thing, which is nothing. A zero *below* one is still counted. Asserting
-        // `>= values.len()` is therefore wrong, and this is the exact property
-        // instead.
-        let last_nonzero = values.iter().rposition(|v| !v.is_zero());
-        prop_assert_eq!(
-            set.int_count(&layout),
-            last_nonzero.map_or(0, |i| i as u64 + 1)
-        );
+        let set = OrdSet::from_int(&v).expect("bit length is far below the ceiling");
+        let got = set.read_int(w);
+        prop_assert_eq!(&got, &v.truncate(w));
+        prop_assert_eq!(to_ref(&got), to_ref(&v) % (Ref::from(1u32) << w as u32));
     }
 }
 
-/// The seam. `width_bits < 65536` does not imply chunk containment, and a
-/// generator that never places a straddling integer leaves the gather's hardest
-/// path untested while every property above still passes.
+/// The seam, restated for a model that no longer has a stride -- and the
+/// systematic **width** sweep the randomized properties under-cover.
 ///
-/// Copied in spirit from `matrix/read.rs`'s `saw_straddle` flag: the assertion at
-/// the end is what makes the coverage a fact rather than a hope.
+/// Those properties derive their values from whole-limb generators, so their
+/// bit lengths cluster near multiples of 64. The top-limb mask in `truncate`
+/// and the partial-limb handling in the read are exactly the code that is
+/// trivial at a multiple of 64 and interesting three bits either side, which is
+/// why the widths here are enumerated rather than sampled.
+///
+/// An integer used to be able to start at any bit offset, so a *limb* could
+/// cross the 65 536-bit chunk boundary and the gather had a shift-and-carry
+/// path for it. With the base pinned to zero that cannot happen -- 65 536 bits
+/// is exactly 1 024 limbs, so a chunk boundary is always a limb boundary. What
+/// remains worth covering is a value **spanning** several chunks, and the
+/// assertion at the end is what makes that coverage a fact rather than a hope.
 #[test]
-fn the_boundary_round_trip_actually_covers_a_straddling_integer() {
-    let mut seen_straddle = 0usize;
-    let mut seen_contained = 0usize;
+fn the_boundary_round_trip_actually_covers_a_multi_chunk_value() {
+    let mut seen_multi_chunk = 0usize;
+    let mut seen_single_chunk = 0usize;
+    let mut seen_partial_limb = 0usize;
     let mut st = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = || {
         st = st
@@ -279,42 +285,57 @@ fn the_boundary_round_trip_actually_covers_a_straddling_integer() {
         st
     };
 
-    // 10 000 bits: integer 6 spans 60 000..70 000 and crosses 65 536, and
-    // `dense(100)` puts integer 655's *first limb* across the same boundary.
-    for &width in &[10_000u32, 100, 65_536, 64] {
-        let layout = IntLayout::dense(width);
-        for k in 0..8u64 {
-            let limbs = (width as usize).div_ceil(64);
-            let v =
-                BigUint::from_limbs_le((0..limbs).map(|_| next()).collect()).truncate(width as u64);
-            let mut sink = IntSink::new(layout);
-            sink.place(k, &v).expect("in range");
-            let set = sink.build();
-            let got = set.read_int(k, &layout).expect("addressable");
-            assert_eq!(got, v, "width {width}, index {k}");
-            assert_eq!(to_ref(&got), to_ref(&v));
-            match layout.straddles(k) {
-                Some(true) => seen_straddle += 1,
-                Some(false) => seen_contained += 1,
-                None => {}
+    // The boundaries the module's own comments call out: a limb, a chunk, and
+    // one either side of each.
+    let mut widths: Vec<u64> = (1..=200).collect();
+    widths.extend([255, 256, 257, 511, 512, 513, 1023, 1024, 1025]);
+    widths.extend([65_535, 65_536, 65_537, 131_071, 131_072, 200_000]);
+
+    for &w in &widths {
+        if w % 64 != 0 {
+            seen_partial_limb += 1;
+        }
+        let v = BigUint::from_limbs_le((0..(w as usize).div_ceil(64)).map(|_| next()).collect())
+            .truncate(w);
+        let set = OrdSet::from_int(&v).expect("in range");
+
+        let got = set.read_int(u64::MAX);
+        assert_eq!(got, v, "round trip: w={w}");
+        assert_eq!(to_ref(&got), to_ref(&v), "oracle: w={w}");
+
+        if v.bit_len() > 65_536 {
+            seen_multi_chunk += 1;
+        } else if v.bit_len() > 0 {
+            seen_single_chunk += 1;
+        }
+
+        // Reading narrower is exactly `v mod 2^narrow`, including at widths
+        // that are not multiples of 64.
+        for nw in [1u64, 63, 64, 65, 65_536, w.div_ceil(2)] {
+            if nw > w {
+                continue;
             }
+            assert_eq!(set.read_int(nw), v.truncate(nw), "narrow: w={w} nw={nw}");
         }
     }
+
+    // Anti-vacuity, in the shape `matrix/seek.rs` uses: without these the sweep
+    // could pass having exercised neither of the two things it exists for.
+    assert!(seen_multi_chunk > 0, "no value spanned more than one chunk");
+    assert!(seen_single_chunk > 0, "no value stayed inside one chunk");
     assert!(
-        seen_straddle > 0,
-        "no placement straddled a chunk boundary, so the seam went untested"
+        seen_partial_limb > 100,
+        "only {seen_partial_limb} widths had a partial top limb"
     );
-    assert!(seen_contained > 0, "no placement was chunk-contained");
 }
 
 /// An unwritten index reads as zero, and the oracle agrees that is what an empty
 /// span means. Absence is not `None` — see `bignum::read`'s header.
 #[test]
 fn an_empty_set_reads_as_zero_everywhere_addressable() {
-    let layout = IntLayout::dense(256);
     let set = OrdSet::new();
-    for k in [0u64, 1, 7, 1_000] {
-        let got = set.read_int(k, &layout).expect("addressable");
+    for w in [0u64, 1, 7, 256, u64::MAX] {
+        let got = set.read_int(w);
         assert!(got.is_zero());
         assert_eq!(to_ref(&got), Ref::from(0u32));
     }
@@ -382,88 +403,162 @@ fn the_generators_reach_every_shape_the_kernels_branch_on() {
     );
 }
 
-/// A systematic sweep over **widths**, which the randomized properties above
-/// under-cover.
-///
-/// `a_series_round_trips_through_the_ordset_boundary` derives its width from
-/// the generated values' bit lengths, and those come from whole-limb generators —
-/// so its widths cluster near multiples of 64. The top-limb mask in `truncate`
-/// and the partial-limb handling in the gather are exactly the code that is
-/// trivial at a multiple of 64 and interesting three bits either side, so that
-/// clustering leaves the interesting case to chance.
-///
-/// This walks every width in a dense low band plus the chunk boundaries, against
-/// four strides and several indices, and checks both the round trip and the
-/// narrow-read reduction. Deterministic, so a failure names one triple.
-#[test]
-fn every_width_round_trips_and_reduces_at_a_narrower_one() {
-    let mut st = 0xa5a5_5a5a_c3c3_3c3cu64;
-    let mut next = || {
-        st = st
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        st
-    };
+// ---------------------------------------------------------------------------
+// Signed arithmetic
+// ---------------------------------------------------------------------------
 
-    let mut widths: Vec<u32> = (1..=200).collect();
-    // The boundaries the module's own comments call out: a limb, a chunk, and
-    // one either side of each.
-    widths.extend([255, 256, 257, 511, 512, 513, 1023, 1024, 1025]);
-    widths.extend([65_535, 65_536, 65_537]);
+fn to_sref(x: &BigInt) -> SRef {
+    let m = SRef::from(to_ref(x.magnitude()));
+    if x.is_negative() {
+        -m
+    } else {
+        m
+    }
+}
 
-    let mut saw_straddle = 0usize;
-    let mut saw_partial_limb = 0usize;
+/// Every signed value must satisfy its own canonical form, whatever the oracle
+/// says about the number: a normalized magnitude and no negative zero.
+fn assert_signed_canonical(x: &BigInt) {
+    assert!(x.is_canonical(), "non-canonical signed value: {x:?}");
+}
 
-    for &w in &widths {
-        for pad in [0u64, 1, 7, 64] {
-            let layout = IntLayout {
-                width_bits: w,
-                stride: w as u64 + pad,
-            };
-            assert!(layout.check().is_ok(), "w={w} pad={pad}");
-            if w % 64 != 0 {
-                saw_partial_limb += 1;
-            }
-            for k in [0u64, 1, 6, 7, 655] {
-                let v = BigUint::from_limbs_le(
-                    (0..(w as usize).div_ceil(64)).map(|_| next()).collect(),
-                )
-                .truncate(w as u64);
+prop_compose! {
+    /// Boundary-biased like `big()`, then signed. A uniform sign is right here
+    /// -- the interesting structure is in the magnitude, and the sign's own
+    /// boundary ( zero, which cannot be negative ) is reached by `big()`
+    /// producing zero.
+    fn signed()(m in big(), negative in any::<bool>()) -> BigInt {
+        BigInt::from_magnitude(negative, m)
+    }
+}
 
-                let mut sink = IntSink::new(layout);
-                sink.place(k, &v).expect("value was truncated to the width");
-                let set = sink.build();
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
-                let got = set.read_int(k, &layout).expect("addressable");
-                assert_eq!(got, v, "round trip: w={w} pad={pad} k={k}");
-                assert_eq!(to_ref(&got), to_ref(&v), "oracle: w={w} pad={pad} k={k}");
-
-                if layout.straddles(k) == Some(true) {
-                    saw_straddle += 1;
-                }
-
-                // Reading narrower is exactly `v mod 2^narrow`, including at
-                // widths that are not multiples of 64.
-                for nw in [1u32, 63, 64, 65, w.div_ceil(2)] {
-                    if nw > w {
-                        continue;
-                    }
-                    let narrow = IntLayout {
-                        width_bits: nw,
-                        stride: layout.stride,
-                    };
-                    let g = set.read_int(k, &narrow).expect("addressable");
-                    assert_eq!(g, v.truncate(nw as u64), "narrow: w={w} nw={nw} k={k}");
-                }
-            }
+    #[test]
+    fn signed_add_sub_mul_match_the_oracle(a in signed(), b in signed()) {
+        for (got, want) in [
+            (a.add(&b), to_sref(&a) + to_sref(&b)),
+            (a.sub(&b), to_sref(&a) - to_sref(&b)),
+            (a.mul(&b), to_sref(&a) * to_sref(&b)),
+        ] {
+            assert_signed_canonical(&got);
+            prop_assert_eq!(to_sref(&got), want);
         }
     }
 
-    // Anti-vacuity, in the shape `matrix/seek.rs` uses: without these the
-    // sweep could pass having exercised neither of the two things it exists for.
-    assert!(saw_straddle > 0, "no placement straddled a chunk boundary");
-    assert!(
-        saw_partial_limb > 100,
-        "only {saw_partial_limb} widths had a partial top limb"
-    );
+    /// `num-bigint`'s `/` and `%` truncate toward zero, which is the convention
+    /// this type chose -- so the oracle checks the convention and not just the
+    /// magnitudes.
+    #[test]
+    fn signed_division_matches_the_oracle_including_its_signs(a in signed(), b in signed()) {
+        prop_assume!(!b.is_zero());
+        let (q, r) = a.divrem(&b).expect("non-zero divisor");
+        assert_signed_canonical(&q);
+        assert_signed_canonical(&r);
+        prop_assert_eq!(to_sref(&q), to_sref(&a).clone() / to_sref(&b));
+        prop_assert_eq!(to_sref(&r), to_sref(&a) % to_sref(&b));
+        // And the identity, independently of the oracle.
+        prop_assert_eq!(to_sref(&q.mul(&b).add(&r)), to_sref(&a));
+    }
+
+    #[test]
+    fn the_euclidean_remainder_is_non_negative_and_reconstructs(a in signed(), b in signed()) {
+        prop_assume!(!b.is_zero());
+        let (q, r) = a.div_euclid_rem(&b).expect("non-zero divisor");
+        assert_signed_canonical(&q);
+        assert_signed_canonical(&r);
+        prop_assert!(!r.is_negative());
+        prop_assert!(r.abs() < b.abs());
+        prop_assert_eq!(to_sref(&q.mul(&b).add(&r)), to_sref(&a));
+    }
+
+    /// Ordering is the operation a sign-and-magnitude representation most
+    /// easily gets wrong, because the magnitudes reverse below zero.
+    #[test]
+    fn signed_ordering_matches_the_oracle(a in signed(), b in signed()) {
+        prop_assert_eq!(a.cmp(&b), to_sref(&a).cmp(&to_sref(&b)));
+    }
+
+    /// A conservative extension: on non-negative operands the signed operations
+    /// are the unsigned ones, limb for limb.
+    #[test]
+    fn signed_operations_reduce_to_the_unsigned_ones(a in big(), b in big()) {
+        let (sa, sb) = (BigInt::from_uint(a.clone()), BigInt::from_uint(b.clone()));
+        let (ssum, usum) = (sa.add(&sb), a.add(&b));
+        prop_assert_eq!(ssum.magnitude().limbs(), usum.limbs());
+        let (sprod, uprod) = (sa.mul(&sb), a.mul(&b));
+        prop_assert_eq!(sprod.magnitude().limbs(), uprod.limbs());
+        if !b.is_zero() {
+            let (uq, ur) = a.divrem(&b).expect("non-zero");
+            let (sq, sr) = sa.divrem(&sb).expect("non-zero");
+            prop_assert_eq!(sq.magnitude().limbs(), uq.limbs());
+            prop_assert_eq!(sr.magnitude().limbs(), ur.limbs());
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Saturation against the oracle, at both signs, plus the two properties
+    /// the module claims for it: it nests, and it lands inside the field.
+    #[test]
+    fn saturation_clamps_to_the_field_and_nests(a in signed(), w1 in 0u64..300, w2 in 0u64..300) {
+        let got = a.saturate(w1);
+        assert_signed_canonical(&got);
+
+        // Against the oracle: clamp into the two's-complement range for w1.
+        let want = if w1 == 0 {
+            SRef::from(0)
+        } else {
+            let ceiling = SRef::from(1) << (w1 - 1) as u32;
+            let max = ceiling.clone() - SRef::from(1);
+            let min = -ceiling;
+            to_sref(&a).clamp(min, max)
+        };
+        prop_assert_eq!(to_sref(&got), want);
+
+        // Nests: applying twice is applying at the narrower width.
+        prop_assert_eq!(a.saturate(w1).saturate(w2), a.saturate(w1.min(w2)));
+    }
+
+    /// The unsigned clamp, same two claims.
+    #[test]
+    fn unsigned_saturation_clamps_and_nests(a in big(), w1 in 0u64..300, w2 in 0u64..300) {
+        let got = a.saturate(w1);
+        assert_canonical(&got);
+        let ceiling = (Ref::from(1u32) << w1 as u32) - Ref::from(1u32);
+        prop_assert_eq!(to_ref(&got), to_ref(&a).min(ceiling));
+        prop_assert_eq!(a.saturate(w1).saturate(w2), a.saturate(w1.min(w2)));
+    }
+
+    /// Truncation and saturation are different rules, and **naming when they
+    /// differ is harder than it looks** -- two drafts of this property were
+    /// wrong before this one. They agree whenever nothing is clamped, and also
+    /// whenever the low `w` bits happen to be all ones, because the wrap and
+    /// the ceiling land on the same number. So the checkable statement is what
+    /// each rule *is*, not when they disagree.
+    #[test]
+    fn saturation_is_the_ceiling_where_truncation_is_the_wrap(
+        a in big(),
+        w in 0u64..300,
+    ) {
+        let (t, s) = (a.truncate(w), a.saturate(w));
+        assert_canonical(&t);
+        assert_canonical(&s);
+
+        // Truncation is the residue; saturation is the minimum with the ceiling.
+        let ceiling = (Ref::from(1u32) << w as u32) - Ref::from(1u32);
+        prop_assert_eq!(to_ref(&t), to_ref(&a) % (Ref::from(1u32) << w as u32));
+        prop_assert_eq!(to_ref(&s), to_ref(&a).min(ceiling.clone()));
+
+        // Neither ever leaves the field, which is the whole point of both.
+        prop_assert!(t.bit_len() <= w);
+        prop_assert!(s.bit_len() <= w);
+
+        // And they coincide exactly when the residue is already the ceiling --
+        // which includes, but is not limited to, the un-clamped case.
+        prop_assert_eq!(t == s, to_ref(&t) == ceiling || a.bit_len() <= w);
+    }
 }

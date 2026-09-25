@@ -33,6 +33,39 @@ pub fn pairs_schema() -> SchemaRef {
     ]))
 }
 
+/// `{ value: UInt64 }` — one integer per constituent, in constituent order.
+///
+/// The answer shape for a `Vec[Int]` query: a facet histogram is row `i` for
+/// constituent `i`, and the sort's own contract is that the vector is **exactly
+/// the arity long**, so the row index is the constituent index and needs no
+/// column of its own.
+///
+/// **Emitted as a single batch**, which is what makes that true: a chunked
+/// result would make the row index batch-local and the correspondence would be
+/// silently wrong. Arity is capped at `MAX_VIEW_SETS`, so one batch always
+/// suffices.
+pub fn vec_int_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+/// `{ negative: Boolean, magnitude: Binary }` — one arbitrary-precision integer.
+///
+/// Sign and magnitude rather than two's complement, because the wire value has
+/// no width to be negative in -- width is a reader's argument, and by the time a
+/// result is being returned the reading has already happened. The magnitude is
+/// **little-endian and canonical**: no trailing zero byte, and a negative zero
+/// cannot occur. Exactly one row.
+pub fn big_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("negative", DataType::Boolean, false),
+        Field::new("magnitude", DataType::Binary, false),
+    ]))
+}
+
 /// `{ matched: Boolean }` — a selection mask over one chunk.
 ///
 /// `base_ordinal` rides in the field metadata so a consumer can align the mask

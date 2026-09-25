@@ -16,7 +16,7 @@
 /// This was the whole ticket, and its doc read "Fixed, so a short or long one
 /// is rejected outright." That is no longer true and the sentence is replaced
 /// rather than corrected beside: a ticket is now the header followed by an
-/// **optional** encoded [`crate::SetExpr`], so a longer one is a pushed-down
+/// **optional** encoded [`crate::AnyExpr`], so a longer one is a pushed-down
 /// filter rather than corruption. A bare 40-byte ticket still decodes exactly as
 /// before, which is what keeps existing clients working.
 ///
@@ -39,7 +39,7 @@ pub struct Ticket {
     /// `key` above is still meaningful when this is `Some`: it names the
     /// primary posting list, so a coordinator can route without decoding the
     /// expression. The expression is the authority on *what to return*.
-    pub expr: Option<crate::SetExpr>,
+    pub expr: Option<crate::AnyExpr>,
 }
 
 impl Ticket {
@@ -55,7 +55,7 @@ impl Ticket {
     }
 
     /// A ticket carrying a pushed-down filter.
-    pub fn with_expr(version: u64, key: u64, expr: crate::SetExpr) -> Self {
+    pub fn with_expr(version: u64, key: u64, expr: crate::AnyExpr) -> Self {
         Ticket {
             expr: Some(expr),
             ..Ticket::whole_key(version, key)
@@ -90,7 +90,7 @@ impl Ticket {
         // asked for, silently. An unparseable expression must reject the ticket.
         let expr = match &b[TICKET_HEADER_LEN..] {
             [] => None,
-            rest => Some(crate::SetExpr::decode(rest).ok()?),
+            rest => Some(crate::AnyExpr::decode(rest).ok()?),
         };
         let t = Ticket {
             version: g(0),
@@ -135,7 +135,10 @@ mod tests {
     /// have rejected.
     #[test]
     fn a_ticket_can_carry_an_expression() {
-        let e = crate::SetExpr::And(vec![crate::SetExpr::Key(42), crate::SetExpr::Range(0, 10)]);
+        let e = crate::AnyExpr::Set(crate::SetExpr::And(vec![
+            crate::SetExpr::Key(42),
+            crate::SetExpr::Range(0, 10),
+        ]));
         let t = Ticket::with_expr(3, 42, e.clone());
         let bytes = t.encode();
         assert!(bytes.len() > TICKET_HEADER_LEN);

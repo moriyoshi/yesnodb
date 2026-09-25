@@ -170,7 +170,11 @@ async fn a_view_query_round_trips_with_an_exact_logical_count() {
     let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.to_vec();
     let ticket = Ticket::decode(&raw).expect("server view ticket must decode");
     assert_eq!(ticket.key, 9, "the physical key remains the routing key");
-    assert_eq!(ticket.expr, Some(expr), "the ticket must carry the view");
+    assert_eq!(
+        ticket.expr,
+        Some(yesno_flight::AnyExpr::Set(expr)),
+        "the ticket must carry the view"
+    );
 
     let stream = client
         .do_get(arrow_flight::Ticket::new(raw))

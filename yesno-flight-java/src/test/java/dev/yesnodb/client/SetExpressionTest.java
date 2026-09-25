@@ -198,4 +198,170 @@ class SetExpressionTest {
             FoldOp.OR);
     assertEquals(sequential, SetExpression.decode(sequential.encode()));
   }
+
+  /**
+   * Mirrors {@code the_big_cross_implementation_wire_vector_is_stable} in the Rust crate, and its
+   * Python and Go counterparts.
+   *
+   * <p>Five implementations of one format drift silently otherwise: each can round-trip against
+   * itself while disagreeing with the others, and only a shared constant catches that.
+   */
+  @Test
+  void bigWireVectorMatchesTheRustCrate() {
+    BigExpression e =
+        new BigExpression.Saturate(
+            new BigExpression.Multiply(
+                new BigExpression.ReadUint(SetExpression.key(4), 128),
+                new BigExpression.Literal(BigInteger.valueOf(-3))),
+            32);
+    byte[] encoded = SetExpressionCodec.encodeBig(e);
+    assertEquals(
+        "59534e58010023200000001f1a8000000001040000000000000018010100000003",
+        HexFormat.of().formatHex(encoded));
+    assertEquals(e, SetExpressionCodec.decodeBig(encoded));
+  }
+
+  @Test
+  void bigNodesRoundTrip() {
+    BigExpression[] cases = {
+      new BigExpression.Literal(BigInteger.ZERO),
+      new BigExpression.Literal(BigInteger.ONE),
+      new BigExpression.Literal(BigInteger.valueOf(-1)),
+      new BigExpression.Literal(BigInteger.ONE.shiftLeft(200)),
+      new BigExpression.Literal(BigInteger.ONE.shiftLeft(200).negate()),
+      new BigExpression.Widen(IntExpression.cardinality(SetExpression.key(7))),
+      new BigExpression.ReadUint(SetExpression.key(4), 128),
+      new BigExpression.ReadInt(SetExpression.key(4), 8),
+      new BigExpression.Negate(new BigExpression.Literal(BigInteger.valueOf(5))),
+      new BigExpression.Add(
+          new BigExpression.Literal(BigInteger.ONE),
+          new BigExpression.Literal(BigInteger.TWO)),
+      new BigExpression.Truncate(new BigExpression.Literal(BigInteger.valueOf(300)), 8),
+      new BigExpression.Saturate(new BigExpression.Literal(BigInteger.valueOf(300)), 8),
+    };
+    for (BigExpression e : cases) {
+      assertEquals(e, SetExpressionCodec.decodeBig(SetExpressionCodec.encodeBig(e)));
+    }
+  }
+
+  /** {@code map} builds a vector of big integers and {@code fold} collapses one. */
+  @Test
+  void bigVectorIsBuiltByMapAndCollapsedByFold() {
+    VecBigExpression vector =
+        new VecBigExpression.MapBig(
+            VecSetExpression.view(SetExpression.key(9), ViewSpec.interleaved(3)),
+            new BigExpression.ReadUint(SetExpression.hole(), 128));
+    assertEquals(
+        vector, SetExpressionCodec.decodeBigVector(SetExpressionCodec.encodeBigVector(vector)));
+
+    for (BigFoldOp op : BigFoldOp.values()) {
+      BigExpression fold = new BigExpression.Fold(vector, op);
+      assertEquals(fold, SetExpressionCodec.decodeBig(SetExpressionCodec.encodeBig(fold)));
+    }
+
+    // Only a product fold grows with the arity: a sum costs a handful of bits.
+    assertEquals(128 + 2, new BigExpression.Fold(vector, BigFoldOp.ADD).widthBound());
+    assertEquals(128 * 3, new BigExpression.Fold(vector, BigFoldOp.MUL).widthBound());
+    assertEquals(128, new BigExpression.Fold(vector, BigFoldOp.MIN).widthBound());
+  }
+
+  /** One value, one encoding, or a shared byte vector states nothing. */
+  @Test
+  void aNegativeZeroIsUnrepresentableAndATrailingZeroByteIsRefused() {
+    byte[] zero = SetExpressionCodec.encodeBig(new BigExpression.Literal(BigInteger.ZERO));
+    assertEquals("59534e580100180000000000", HexFormat.of().formatHex(zero));
+
+    byte[] negativeZero = zero.clone();
+    negativeZero[7] = 1;
+    assertThrows(
+        IllegalArgumentException.class, () -> SetExpressionCodec.decodeBig(negativeZero));
+  }
+
+  /**
+   * Two bounded factors have an unbounded product: the constituent cap and the per-value width
+   * bound each cap one and say nothing about their product.
+   */
+  @Test
+  void theResultBoundRefusesAWideVectorOfWideValues() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new VecBigExpression.MapBig(
+                VecSetExpression.view(SetExpression.key(1), ViewSpec.interleaved(4096)),
+                new BigExpression.ReadUint(
+                    SetExpression.hole(), (int) BigExpression.MAX_VALUE_BITS)));
+  }
+
+  @Test
+  void aZeroWidthReadIsRefused() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new BigExpression.ReadUint(SetExpression.key(1), 0));
+  }
+
+  /**
+   * Mirrors {@code the_pow_mod_wire_vector_is_stable} in the Rust crate: operand order is the one
+   * thing a reader cannot infer from the bytes.
+   */
+  @Test
+  void powModWireVectorMatchesTheRustCrate() {
+    BigExpression e =
+        new BigExpression.PowMod(
+            new BigExpression.Literal(BigInteger.TWO),
+            new BigExpression.Literal(BigInteger.TEN),
+            new BigExpression.Literal(BigInteger.valueOf(1000)));
+    byte[] encoded = SetExpressionCodec.encodeBig(e);
+    assertEquals(
+        "59534e58010027180001000000021800010000000a180002000000e803",
+        HexFormat.of().formatHex(encoded));
+    assertEquals(e, SetExpressionCodec.decodeBig(encoded));
+  }
+
+  /**
+   * The amplification the work bound exists for, and the one the width bound structurally cannot
+   * see: a residue is only as wide as its modulus.
+   */
+  @Test
+  void aCostlyExponentiationIsRefusedWhereItsWidthIsUnremarkable() {
+    BigExpression wide =
+        new BigExpression.ReadUint(SetExpression.key(1), (int) BigExpression.MAX_VALUE_BITS);
+    BigExpression e =
+        new BigExpression.PowMod(
+            new BigExpression.Literal(BigInteger.TWO), wide, wide);
+
+    assertEquals(BigExpression.MAX_VALUE_BITS, e.widthBound());
+    assertTrue(e.workBound() > BigExpression.MAX_WORK);
+
+    byte[] encoded = SetExpressionCodec.encodeBig(e);
+    assertThrows(IllegalArgumentException.class, () -> SetExpressionCodec.decodeBig(encoded));
+  }
+
+  /** The sizes a caller plausibly means are admitted, so the bound is calibrated. */
+  @Test
+  void rsaScaleExponentiationIsAdmitted() {
+    for (int bits : new int[] {2048, 4096}) {
+      BigExpression operand = new BigExpression.ReadUint(SetExpression.key(1), bits);
+      BigExpression e =
+          new BigExpression.PowMod(
+              new BigExpression.Literal(BigInteger.TWO), operand, operand);
+      assertTrue(e.workBound() <= BigExpression.MAX_WORK);
+      assertEquals(e, SetExpressionCodec.decodeBig(SetExpressionCodec.encodeBig(e)));
+    }
+  }
+
+  /**
+   * {@code BigExpression.of} and {@code VecBigExpression.of} are the Java spelling of the query
+   * language's {@code big( .. )} and {@code big( [ .. ] )}. A record cannot be overloaded on
+   * shape, so the vector half takes its own home.
+   */
+  @Test
+  void bigFactoriesMirrorTheQueryLanguage() {
+    assertEquals(new BigExpression.Literal(BigInteger.valueOf(7)), BigExpression.of(7));
+
+    VecBigExpression vector = VecBigExpression.of(1, 2, 3);
+    assertEquals(3, vector.arity());
+
+    BigExpression folded = new BigExpression.Fold(vector, BigFoldOp.ADD);
+    assertEquals(folded, SetExpressionCodec.decodeBig(SetExpressionCodec.encodeBig(folded)));
+  }
 }

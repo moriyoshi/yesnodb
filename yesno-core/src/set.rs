@@ -249,7 +249,7 @@ impl OrdSet {
     /// an array, `rank` is a `partition_point`, so the count is two searches and
     /// the probe makes three. Either way it is bounded at ~1.5x of a count that
     /// is already single-digit nanoseconds, and it is the price of the 0.02x row
-    /// above and of [`OrdSet::int_is_zero`], whose spans are narrow and whose
+    /// above and of the narrow-span predicates, whose spans are narrow and whose
     /// sets are not.
     ///
     /// Do not repair it by counting first when the range touches one chunk:

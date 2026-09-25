@@ -26,7 +26,7 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::mutations_schema;
 use crate::{
-    pairs_schema, QueryRequest, ServerStats, SetExpr, Ticket, ACTION_ABORT_WRITE,
+    pairs_schema, AnyExpr, QueryRequest, ServerStats, SetExpr, Ticket, ACTION_ABORT_WRITE,
     ACTION_BEGIN_WRITE, ACTION_CLEAR, ACTION_COMMIT_WRITE, ACTION_CONTAINS, ACTION_INSERT_ONE,
     ACTION_REMOVE_ONE, BATCH_ROWS, OP_DELETE_KEY, OP_INSERT, OP_INSERT_RANGE, OP_REMOVE,
     OP_REMOVE_RANGE, PUT_APPLY, PUT_INSERT, PUT_REMOVE, PUT_TXN_PREFIX,
@@ -371,7 +371,7 @@ where
         expression: &SetExpr,
         version: u64,
     ) -> Result<QueryInfo> {
-        self.prepare_command(&QueryRequest::at(expression.clone(), version).encode())
+        self.prepare_command(&QueryRequest::at(AnyExpr::Set(expression.clone()), version).encode())
             .await
     }
 

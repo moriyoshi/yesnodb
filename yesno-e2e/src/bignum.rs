@@ -1,7 +1,8 @@
 //! `bn_*`: arbitrary-precision integers, and the `OrdSet` boundary they live at.
 //!
-//! An `OrdSet` under an `IntLayout` is a series of unsigned big integers. These
-//! verbs read one out, operate on it, and put it back — the shape
+//! An `OrdSet` **is** an unsigned big integer: ordinal `j` carries the `2^j`
+//! term. These verbs move one across that boundary, operate on it, and put it
+//! back — the shape
 //! `yesno_core::bignum` is built around, so a scenario exercises the real
 //! boundary rather than a convenience wrapper.
 //!
@@ -40,7 +41,7 @@
 //! `bn_` prefix is what makes it a non-issue.
 
 use monty_types::{MontyException, MontyObject};
-use yesno_core::bignum::{IntLayout, IntSink};
+use yesno_core::OrdSet;
 
 use crate::convert::{bignum_obj, int_obj, tuple, value_err, Args};
 use crate::world::World;
@@ -60,24 +61,9 @@ pub const OWNS: &[&str] = &[
     "bn_limb_len",
     "bn_hex",
     // the OrdSet boundary
-    "bn_series_build",
-    "bn_series_get",
-    "bn_series_count",
+    "bn_to_set",
+    "bn_of_set",
 ];
-
-/// The layout every series verb interprets its index under.
-///
-/// Spelled from two explicit arguments rather than carried on a handle, so a
-/// scenario that reads at a different width than it wrote says so on the line
-/// that does it — which is the `x mod 2^width` identity `read_int` exists to
-/// expose.
-fn layout_of(verb: &str, width: u64, stride: u64) -> Result<IntLayout, MontyException> {
-    let width_bits = u32::try_from(width)
-        .map_err(|_| value_err(format!("{verb}(): width_bits must fit a u32")))?;
-    let l = IntLayout { width_bits, stride };
-    l.check().map_err(|e| value_err(format!("{verb}(): {e}")))?;
-    Ok(l)
-}
 
 impl World {
     pub(crate) fn call_bignum(
@@ -148,33 +134,22 @@ impl World {
 
             // --- the OrdSet boundary ---
             // Returns an ordinary set handle, so the database verbs carry it.
-            "bn_series_build" => {
-                a.exact(3)?;
-                let layout = layout_of(verb, a.u64(1)?, a.u64(2)?)?;
-                let values = a.bignum_list(0)?;
-                let mut sink = IntSink::new(layout);
-                for (k, v) in values.iter().enumerate() {
-                    sink.place(k as u64, v)
-                        .map_err(|e| value_err(format!("{verb}(): index {k}: {e}")))?;
-                }
-                Ok(self.push_set(sink.build()))
+            // One value in, one set out. Returns an ordinary set handle, so
+            // the database verbs carry it.
+            "bn_to_set" => {
+                a.exact(1)?;
+                let set = OrdSet::from_int(&a.bignum(0)?)
+                    .map_err(|e| value_err(format!("{verb}(): {e}")))?;
+                Ok(self.push_set(set))
             }
-            "bn_series_get" => {
-                a.exact(4)?;
+            // The width is explicit on the line that reads, rather than carried
+            // on the handle, so a scenario reading at a narrower width than it
+            // wrote says so where it does it -- which is the `x mod 2^width`
+            // identity this boundary exists to expose.
+            "bn_of_set" => {
+                a.exact(2)?;
                 let set = self.set(a.handle(0)?, verb)?.clone();
-                let layout = layout_of(verb, a.u64(2)?, a.u64(3)?)?;
-                Ok(match set.read_int(a.u64(1)?, &layout) {
-                    Some(v) => bignum_obj(&v),
-                    // Not addressable at all, which is a statement about the
-                    // layout rather than an empty answer.
-                    None => MontyObject::None,
-                })
-            }
-            "bn_series_count" => {
-                a.exact(3)?;
-                let set = self.set(a.handle(0)?, verb)?.clone();
-                let layout = layout_of(verb, a.u64(1)?, a.u64(2)?)?;
-                Ok(int_obj(set.int_count(&layout)))
+                Ok(bignum_obj(&set.read_int(a.u64(1)?)))
             }
             _ => Err(value_err(format!("{verb}() is not a bignum verb"))),
         }

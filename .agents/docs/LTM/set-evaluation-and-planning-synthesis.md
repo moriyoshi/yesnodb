@@ -23,7 +23,7 @@ Set evaluation spans representation-specific eager kernels, conforming lazy stre
 - Planner soundness comes from algebra and one-sided facts, termination from the source-pinned weighted measure, and profitability from empirical costs. These are not interchangeable proofs.
 - `Concat` requires strict prefix order. Arbitrary ordinal cuts can leave two pieces in one chunk and require scratch-container reassembly.
 - Matrix, integer, and view layouts are caller-owned affine lenses over ordinary sets. They add no storage catalog or fourth container kind.
-- `BigUint` is normalized little-endian limbs while `IntLayout` owns width. Karatsuba is measured; Toom-3 and Burnikel-Ziegler were declined until real operands exceed roughly 256 and 512 limbs.
+- `BigUint` is normalized little-endian limbs; a set *is* an integer and width is a reader's argument ( `IntLayout` was removed 2026-09-25 ). Karatsuba is measured; Toom-3 and Burnikel-Ziegler were declined until real operands exceed roughly 256 and 512 limbs.
 - View folds are not restrictions. `Any`, `All`, and `Parity` are exact for union, intersection, and symmetric difference respectively; inverse-image expansion preserves the whole Boolean signature.
 - Flight view transforms deliberately materialize at an eager boundary and re-enter the Boolean tree as set leaves. Lazy view expression nodes require a workload plus planner bounds, statistics, streaming cardinality, and a renewed termination audit.
 

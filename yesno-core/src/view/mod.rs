@@ -4,8 +4,7 @@
 //! constituent has its own **logical** ordinals; the view maps
 //! `( constituent, logical ordinal )` to a physical ordinal, and back. Nothing
 //! is stored — a `View` is a descriptor the caller constructs, exactly as
-//! [`Layout`](crate::matrix::Layout) and [`IntLayout`](crate::bignum::IntLayout)
-//! are.
+//! [`Layout`](crate::matrix::Layout) is.
 //!
 //! # A view is an `n × W` boolean matrix whose rows are the sets
 //!

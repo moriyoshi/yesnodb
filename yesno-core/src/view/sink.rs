@@ -92,7 +92,7 @@ impl ViewSink {
     /// **Placing the same `set` twice unions the two**, because the underlying
     /// set has no notion of clearing a bit a later placement leaves unset. That
     /// follows [`MatrixSink::place`](crate::matrix::MatrixSink::place) rather
-    /// than [`IntSink::place`](crate::bignum::IntSink::place): OR-ing two
+    /// than an integer write would be: OR-ing two
     /// *sets* is a meaningful operation and is exactly what a caller building a
     /// constituent from parts would want, whereas OR-ing two integers is not
     /// addition and had to be refused. A caller meaning to replace builds a

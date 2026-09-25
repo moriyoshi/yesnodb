@@ -124,7 +124,7 @@ impl BigUint {
     ///
     /// The comparison happens before any limb is written, so a declined
     /// subtraction leaves the value exactly as it was — the same contract
-    /// [`IntSink::place`](super::IntSink::place) has for a rejected placement.
+    /// a width-checking writer would have for a rejected placement.
     pub fn sub_assign(&mut self, rhs: &BigUint) -> bool {
         debug_assert!(self.is_normalized() && rhs.is_normalized());
         if &*self < rhs {
@@ -164,7 +164,7 @@ impl BigUint {
     ///
     /// Allocates proportionally to `n`, not to `self`: shifting by a billion
     /// bits produces a billion-bit number, and nothing here caps that. The
-    /// [`IntSink`](super::IntSink) boundary is where a width is enforced.
+    /// reader is where a width is chosen, and nothing else enforces one.
     ///
     /// # Panics
     ///
@@ -228,30 +228,39 @@ impl BigUint {
     /// site rather than configured anywhere:
     ///
     /// ```
-    /// use yesno_core::bignum::{BigUint, IntLayout, IntSink};
+    /// use yesno_core::{bignum::BigUint, OrdSet};
     ///
-    /// let layout = IntLayout::dense(8);
     /// let wide = BigUint::from_u64(0x1_23);
-    /// let mut sink = IntSink::new(layout);
     ///
-    /// // A value that does not fit is refused, never clamped.
-    /// assert!(sink.place(0, &wide).is_err());
-    /// // Opting into the cyclic reading is one call, and it names the width.
-    /// sink.place(0, &wide.truncate(layout.width_bits as u64)).unwrap();
-    /// assert_eq!(sink.build().read_int(0, &layout).unwrap(), BigUint::from_u64(0x23));
+    /// // Storing keeps every bit: a set is as wide as its highest member, so
+    /// // nothing is declared and nothing can fail to fit.
+    /// let set = OrdSet::from_int(&wide).unwrap();
+    /// assert_eq!(set.read_int(u64::MAX), wide);
+    ///
+    /// // Opting into the cyclic reading is one call, and it names the width --
+    /// // whether it is spelled on the write or on the read.
+    /// assert_eq!(set.read_int(8), BigUint::from_u64(0x23));
+    /// assert_eq!(wide.truncate(8), BigUint::from_u64(0x23));
     /// ```
     ///
-    /// # Why this and not a saturating form
+    /// # Truncation and saturation are different questions, and both are here
     ///
-    /// [`OrdSet::read_int`](crate::OrdSet::read_int) at a narrower `width_bits`
-    /// yields `x mod 2^width_bits`, and not by choice: reading `W` ordinals out
-    /// of the store cannot see the bits above them, so the reduction is what the
-    /// bit layout *is*. Truncation is the only write rule that agrees with it.
+    /// [`OrdSet::read_int`](crate::OrdSet::read_int) at a narrower width yields
+    /// `x mod 2^width`, and not by choice: reading `W` ordinals out of the store
+    /// cannot see the bits above them, so the reduction is what the bit layout
+    /// *is*. **Truncation is what a read does**, and this is the write-side
+    /// spelling of it.
     ///
-    /// It is **not** true that saturation fails to compose — `sat_W'` after
-    /// `sat_W` is `sat_W'`, just as truncation nests — and saturating addition is
-    /// associative. Those arguments were checked and are false; the reader is the
-    /// whole case. See the module header.
+    /// [`BigUint::saturate`] is not a competing write rule. It used to be
+    /// refused on the grounds that "the reader cannot saturate", which was the
+    /// right answer while storage had a declared width and a write had to agree
+    /// with a read at that width. **Storage has no width any more** — a set is
+    /// as wide as its highest member — so there is no write rule left to
+    /// disagree with, and clamping a value to what a `W`-bit field can hold is a
+    /// question about the *value*, asked by the caller who has such a field.
+    /// The two compose in the one way that matters and it is tested:
+    /// `x.saturate( W )` is below `2^W`, so reading it back at `W` returns it
+    /// unchanged.
     pub fn truncate(&self, bits: u64) -> BigUint {
         let mut out = self.clone();
         out.truncate_assign(bits);
@@ -259,6 +268,31 @@ impl BigUint {
     }
 
     /// `self = self mod 2^bits`. The kernel [`BigUint::truncate`] wraps.
+    /// Clamp to the largest value `bits` bits can hold: `min( self, 2^bits - 1 )`.
+    ///
+    /// # Why there is no `add_sat` / `mul_sat` family
+    ///
+    /// Because there would be nothing in one. The arithmetic here is **exact** —
+    /// a sum or product cannot overflow, the limb vector grows — so the true
+    /// result always exists and `a.add( &b ).saturate( w )` *is* saturating
+    /// addition, not an approximation of it. A machine-word type needs a fused
+    /// operation because the exact result is unrepresentable; this one does not,
+    /// and a family of them would be a second spelling of one composition.
+    ///
+    /// Saturation nests exactly as truncation does: `sat_w'` after `sat_w` is
+    /// `sat_min( w, w' )`.
+    pub fn saturate(&self, bits: u64) -> BigUint {
+        if self.bit_len() <= bits {
+            return self.clone();
+        }
+        // `bit_len > bits` implies `bits` is below the value's own length, so
+        // the ceiling is representable and the subtraction cannot underflow.
+        BigUint::one()
+            .shl(bits)
+            .sub(&BigUint::one())
+            .expect("2^bits >= 1 for every bits")
+    }
+
     pub fn truncate_assign(&mut self, bits: u64) {
         debug_assert!(self.is_normalized());
         // The guard is on `bit_len`, not on the limb count. A value of 96

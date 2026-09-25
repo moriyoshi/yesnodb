@@ -40,6 +40,32 @@ final class SetExpressionCodec {
     return new Decoder(encoded).decodeIntVector();
   }
 
+  static byte[] encodeBig(BigExpression expression) {
+    ByteArrayOutputStream output = new ByteArrayOutputStream(32);
+    output.writeBytes(MAGIC);
+    output.write(VERSION);
+    output.write(0);
+    writeBig(expression, output);
+    return output.toByteArray();
+  }
+
+  static BigExpression decodeBig(byte[] encoded) {
+    return new Decoder(encoded).decodeBig();
+  }
+
+  static byte[] encodeBigVector(VecBigExpression vector) {
+    ByteArrayOutputStream output = new ByteArrayOutputStream(32);
+    output.writeBytes(MAGIC);
+    output.write(VERSION);
+    output.write(0);
+    writeBigVector(vector, output);
+    return output.toByteArray();
+  }
+
+  static VecBigExpression decodeBigVector(byte[] encoded) {
+    return new Decoder(encoded).decodeBigVector();
+  }
+
   /**
    * The sort a tag belongs to, or {@code null} if no version defines it.
    *
@@ -53,6 +79,8 @@ final class SetExpressionCodec {
       case 16, 22 -> "vector of integers";
       case 18, 19, 20, 21 -> "integer";
       case 23 -> "boolean";
+      case 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 38, 39 -> "big integer";
+      case 36, 37 -> "vector of big integers";
       default -> null;
     };
   }
@@ -157,6 +185,101 @@ final class SetExpressionCodec {
       writeInt(output, at.index());
     } else {
       throw new IllegalArgumentException("unknown integer implementation: " + expression);
+    }
+  }
+
+  private static void writeBig(BigExpression expression, ByteArrayOutputStream output) {
+    if (expression instanceof BigExpression.Literal literal) {
+      output.write(24);
+      // Sign and canonical little-endian magnitude: no trailing zero byte, and
+      // a negative zero cannot occur, so one value has exactly one encoding.
+      java.math.BigInteger magnitude = literal.value().abs();
+      byte[] body = littleEndianMagnitude(magnitude);
+      output.write(literal.value().signum() < 0 ? 1 : 0);
+      writeInt(output, body.length);
+      output.writeBytes(body);
+    } else if (expression instanceof BigExpression.Widen widen) {
+      output.write(25);
+      writeIntExpr(widen.input(), output);
+    } else if (expression instanceof BigExpression.ReadUint read) {
+      output.write(26);
+      writeInt(output, read.widthBits());
+      writeExpression(read.input(), output);
+    } else if (expression instanceof BigExpression.ReadInt read) {
+      output.write(27);
+      writeInt(output, read.widthBits());
+      writeExpression(read.input(), output);
+    } else if (expression instanceof BigExpression.Negate negate) {
+      output.write(28);
+      writeBig(negate.input(), output);
+    } else if (expression instanceof BigExpression.Add add) {
+      writeBigPair(29, add.left(), add.right(), output);
+    } else if (expression instanceof BigExpression.Subtract sub) {
+      writeBigPair(30, sub.left(), sub.right(), output);
+    } else if (expression instanceof BigExpression.Multiply mul) {
+      writeBigPair(31, mul.left(), mul.right(), output);
+    } else if (expression instanceof BigExpression.Divide div) {
+      writeBigPair(32, div.left(), div.right(), output);
+    } else if (expression instanceof BigExpression.Remainder rem) {
+      writeBigPair(33, rem.left(), rem.right(), output);
+    } else if (expression instanceof BigExpression.Truncate truncate) {
+      output.write(34);
+      writeInt(output, truncate.bits());
+      writeBig(truncate.input(), output);
+    } else if (expression instanceof BigExpression.Saturate saturate) {
+      output.write(35);
+      writeInt(output, saturate.bits());
+      writeBig(saturate.input(), output);
+    } else if (expression instanceof BigExpression.Fold fold) {
+      output.write(38);
+      output.write(fold.op().wire());
+      writeBigVector(fold.vector(), output);
+    } else if (expression instanceof BigExpression.PowMod pow) {
+      output.write(39);
+      writeBig(pow.base(), output);
+      writeBig(pow.exp(), output);
+      writeBig(pow.modulus(), output);
+    } else {
+      throw new IllegalArgumentException("unknown big-integer implementation: " + expression);
+    }
+  }
+
+  private static void writeBigPair(
+      int tag, BigExpression left, BigExpression right, ByteArrayOutputStream output) {
+    output.write(tag);
+    writeBig(left, output);
+    writeBig(right, output);
+  }
+
+  /** A magnitude as little-endian bytes with no trailing zero. */
+  private static byte[] littleEndianMagnitude(java.math.BigInteger magnitude) {
+    if (magnitude.signum() == 0) {
+      return new byte[0];
+    }
+    byte[] be = magnitude.toByteArray();
+    int start = 0;
+    while (start < be.length - 1 && be[start] == 0) {
+      start++;
+    }
+    int length = be.length - start;
+    byte[] le = new byte[length];
+    for (int i = 0; i < length; i++) {
+      le[i] = be[be.length - 1 - i];
+    }
+    return le;
+  }
+
+  private static void writeBigVector(VecBigExpression vector, ByteArrayOutputStream output) {
+    if (vector instanceof VecBigExpression.Listing list) {
+      output.write(36);
+      writeShort(output, list.elements().size());
+      list.elements().forEach(element -> writeBig(element, output));
+    } else if (vector instanceof VecBigExpression.MapBig map) {
+      output.write(37);
+      writeVector(map.vector(), output);
+      writeBig(map.body(), output);
+    } else {
+      throw new IllegalArgumentException("unknown big-vector implementation: " + vector);
     }
   }
 
@@ -428,6 +551,15 @@ final class SetExpressionCodec {
       }
     }
 
+    private BigExpression readBigBody(int depth) {
+      enterBody();
+      try {
+        return readBig(depth);
+      } finally {
+        inMap = false;
+      }
+    }
+
     private SetExpression readSetBody(int depth) {
       enterBody();
       try {
@@ -480,6 +612,167 @@ final class SetExpressionCodec {
         }
         default -> throw misplaced("integer", tag);
       };
+    }
+
+    private BigExpression readBig(int depth) {
+      countNode(depth);
+      int tag = readUnsignedByte();
+      BigExpression out =
+          switch (tag) {
+            case 24 -> {
+              int sign = readUnsignedByte();
+              if (sign > 1) {
+                throw malformed("unknown sign byte " + sign);
+              }
+              long length = readUnsignedInt();
+              // Checked before the bytes are taken, so an over-wide length is
+              // refused as the amplification it is rather than as a truncation.
+              if (length * 8 > BigExpression.MAX_VALUE_BITS) {
+                throw malformed(
+                    "value is wider than " + BigExpression.MAX_VALUE_BITS + " bits");
+              }
+              require((int) length);
+              byte[] body = new byte[(int) length];
+              input.get(body);
+              if (body.length > 0 && body[body.length - 1] == 0) {
+                throw malformed("big-integer literal is not canonical");
+              }
+              if (sign == 1 && body.length == 0) {
+                throw malformed("big-integer literal is not canonical");
+              }
+              java.math.BigInteger magnitude = bigEndianOf(body);
+              yield new BigExpression.Literal(sign == 1 ? magnitude.negate() : magnitude);
+            }
+            case 25 -> new BigExpression.Widen(readInt(depth + 1));
+            case 26 -> {
+              int width = readWidth();
+              yield new BigExpression.ReadUint(readExpression(depth + 1), width);
+            }
+            case 27 -> {
+              int width = readWidth();
+              yield new BigExpression.ReadInt(readExpression(depth + 1), width);
+            }
+            case 28 -> new BigExpression.Negate(readBig(depth + 1));
+            case 29 -> new BigExpression.Add(readBig(depth + 1), readBig(depth + 1));
+            case 30 -> new BigExpression.Subtract(readBig(depth + 1), readBig(depth + 1));
+            case 31 -> new BigExpression.Multiply(readBig(depth + 1), readBig(depth + 1));
+            case 32 -> new BigExpression.Divide(readBig(depth + 1), readBig(depth + 1));
+            case 33 -> new BigExpression.Remainder(readBig(depth + 1), readBig(depth + 1));
+            case 34 -> {
+              int bits = readBits();
+              yield new BigExpression.Truncate(readBig(depth + 1), bits);
+            }
+            case 35 -> {
+              int bits = readBits();
+              yield new BigExpression.Saturate(readBig(depth + 1), bits);
+            }
+            case 39 ->
+                new BigExpression.PowMod(
+                    readBig(depth + 1), readBig(depth + 1), readBig(depth + 1));
+            case 38 -> {
+              byte raw = (byte) readUnsignedByte();
+              BigFoldOp op = BigFoldOp.fromWire(raw);
+              if (op == null) {
+                throw malformed("unknown fold operator " + raw);
+              }
+              yield new BigExpression.Fold(readBigVector(depth + 1), op);
+            }
+            default -> throw misplaced("big integer", tag);
+          };
+      // Per node rather than only at the root: a sub-expression cannot be
+      // wider than the whole is allowed to be.
+      if (out.widthBound() > BigExpression.MAX_VALUE_BITS) {
+        throw malformed("value is wider than " + BigExpression.MAX_VALUE_BITS + " bits");
+      }
+      if (out.workBound() > BigExpression.MAX_WORK) {
+        throw malformed(
+            "query asks for more than " + BigExpression.MAX_WORK + " limb operations");
+      }
+      return out;
+    }
+
+    private int readWidth() {
+      long width = readUnsignedInt();
+      if (width == 0) {
+        throw malformed("a big-integer read has zero width");
+      }
+      if (width > BigExpression.MAX_VALUE_BITS) {
+        throw malformed("value is wider than " + BigExpression.MAX_VALUE_BITS + " bits");
+      }
+      return (int) width;
+    }
+
+    /** A zero width is meaningful for the narrowing nodes, unlike on a read. */
+    private int readBits() {
+      long bits = readUnsignedInt();
+      if (bits > BigExpression.MAX_VALUE_BITS) {
+        throw malformed("value is wider than " + BigExpression.MAX_VALUE_BITS + " bits");
+      }
+      return (int) bits;
+    }
+
+    private static java.math.BigInteger bigEndianOf(byte[] littleEndian) {
+      byte[] be = new byte[littleEndian.length + 1];
+      for (int i = 0; i < littleEndian.length; i++) {
+        be[be.length - 1 - i] = littleEndian[i];
+      }
+      return new java.math.BigInteger(be);
+    }
+
+    private VecBigExpression readBigVector(int depth) {
+      countNode(depth);
+      int tag = readUnsignedByte();
+      VecBigExpression out =
+          switch (tag) {
+            case 36 -> {
+              int count = readUnsignedShort();
+              if (count == 0) {
+                throw malformed("vector has no elements");
+              }
+              if (nodes + count > SetExpression.MAX_NODES) {
+                throw malformed(
+                    "expression has more than " + SetExpression.MAX_NODES + " nodes");
+              }
+              List<BigExpression> elements = new ArrayList<>(count);
+              for (int index = 0; index < count; index++) {
+                elements.add(readBig(depth + 1));
+              }
+              yield new VecBigExpression.Listing(elements);
+            }
+            case 37 -> {
+              VecSetExpression vector = readVector(depth + 1);
+              yield new VecBigExpression.MapBig(vector, readBigBody(depth + 1));
+            }
+            default -> throw misplaced("vector of big integers", tag);
+          };
+      // The product bound, checked where both factors are in hand.
+      if (out.resultBound() > VecBigExpression.MAX_RESULT_BITS) {
+        throw malformed(
+            "result is larger than " + VecBigExpression.MAX_RESULT_BITS + " bits");
+      }
+      if (out.workBound() > BigExpression.MAX_WORK) {
+        throw malformed(
+            "query asks for more than " + BigExpression.MAX_WORK + " limb operations");
+      }
+      return out;
+    }
+
+    private BigExpression decodeBig() {
+      readHeader();
+      BigExpression value = readBig(0);
+      if (input.hasRemaining()) {
+        throw malformed("trailing bytes after expression");
+      }
+      return value;
+    }
+
+    private VecBigExpression decodeBigVector() {
+      readHeader();
+      VecBigExpression vector = readBigVector(0);
+      if (input.hasRemaining()) {
+        throw malformed("trailing bytes after expression");
+      }
+      return vector;
     }
 
     private VecIntExpression readIntVector(int depth) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -60,7 +61,51 @@ const (
 	tagIntAt
 	tagIntList
 	tagContains
+	// The big-integer sort. Its cost depends on how wide its values are, which
+	// is why it is the only sort with MaxValueBits over it.
+	tagBigLit
+	tagBigWiden
+	tagBigRead
+	tagBigReadSigned
+	tagBigNeg
+	tagBigAdd
+	tagBigSub
+	tagBigMul
+	tagBigDiv
+	tagBigRem
+	tagBigTruncate
+	tagBigSaturate
+	tagBigList
+	tagMapBig
+	tagBigFold
+	tagBigPowMod
 )
+
+// MaxValueBits is the widest value a big-integer node may denote.
+//
+// Mirrors MAX_VALUE_BITS in the Rust crate. Multiplication adds the operands'
+// widths, so without this a small payload describes a value no server should
+// try to build.
+const MaxValueBits = 1 << 20
+
+// MaxResultBits is the widest whole result a vector of big integers may denote.
+//
+// The product of two bounded factors is not bounded by either: 4096
+// constituents of 2^20 bits each is half a gigabyte of answer from a payload of
+// a few dozen bytes. Mirrors MAX_RESULT_BITS in the Rust crate.
+const MaxResultBits = 1 << 24
+
+// MaxWork is the work a query may ask for, in limb operations.
+//
+// The first bound that is not about size. Modular exponentiation returns a
+// value no wider than its modulus, so the width bound finds nothing wrong with
+// a payload naming a computation that would not finish.
+//
+// An admission bound, not a cost model: every rule is a deliberate upper bound,
+// which is right for refusing the absurd and wrong for ranking plans.
+const MaxWork = 1 << 28
+
+func limbsOf(bits uint64) uint64 { return (bits + 63) / 64 }
 
 // Sort names, used in sort-mismatch errors.
 const (
@@ -69,6 +114,8 @@ const (
 	sortInt    = "integer"
 	sortVecInt = "vector of integers"
 	sortBool   = "boolean"
+	sortBig    = "big integer"
+	sortVecBig = "vector of big integers"
 )
 
 // sortOfTag is one table consulted by every decoder's fallback.
@@ -88,6 +135,12 @@ func sortOfTag(tag byte) (string, bool) {
 		return sortInt, true
 	case tagContains:
 		return sortBool, true
+	case tagBigLit, tagBigWiden, tagBigRead, tagBigReadSigned, tagBigNeg,
+		tagBigAdd, tagBigSub, tagBigMul, tagBigDiv, tagBigRem,
+		tagBigTruncate, tagBigSaturate, tagBigFold, tagBigPowMod:
+		return sortBig, true
+	case tagBigList, tagMapBig:
+		return sortVecBig, true
 	}
 	return "", false
 }
@@ -374,6 +427,390 @@ type IntAtExpr struct {
 
 func (IntAtExpr) yesnoIntExpr() {}
 
+// BigExpr is a single arbitrary-precision signed integer.
+//
+// Distinct from IntExpr rather than a widening of it: an IntExpr is a count or
+// a position, a uint64 whose cost is bounded by node count alone.
+type BigExpr interface {
+	yesnoBigExpr()
+	// WidthBound is an upper bound, in bits, on the value this expression can
+	// denote. Static, so an over-wide expression is refused before it is sent.
+	WidthBound() uint64
+	// WorkBound is an upper bound on the limb operations evaluating this costs.
+	WorkBound() uint64
+}
+
+// BigLitExpr is a literal, sign and canonical little-endian magnitude.
+//
+// Sign and magnitude rather than two's complement, because a literal has no
+// width to be negative in. Negative reports the sign; a zero is never negative,
+// and Magnitude never carries a trailing zero byte, so one value has exactly
+// one encoding.
+type BigLitExpr struct {
+	Negative  bool
+	Magnitude []byte
+}
+
+func (BigLitExpr) yesnoBigExpr() {}
+
+// WidthBound reports the magnitude's bit length.
+func (l BigLitExpr) WidthBound() uint64 {
+	for i := len(l.Magnitude) - 1; i >= 0; i-- {
+		if b := l.Magnitude[i]; b != 0 {
+			return uint64(i)*8 + uint64(8-bits.LeadingZeros8(b))
+		}
+	}
+	return 0
+}
+
+// WorkBound reports zero: a literal arrives in the payload.
+func (BigLitExpr) WorkBound() uint64 { return 0 }
+
+// BigLitFromInt64 builds a canonical literal from a signed machine integer.
+func BigLitFromInt64(v int64) BigLitExpr {
+	magnitude := uint64(v)
+	negative := v < 0
+	if negative {
+		magnitude = uint64(-v)
+	}
+	var body []byte
+	for magnitude != 0 {
+		body = append(body, byte(magnitude))
+		magnitude >>= 8
+	}
+	return BigLitExpr{Negative: negative && len(body) > 0, Magnitude: body}
+}
+
+// Big builds a big-integer literal from a signed machine integer.
+//
+// The scalar half of the query language's big( .. ). Go has no overloading, so
+// the vector half is BigVec rather than the same name.
+func Big(v int64) BigLitExpr { return BigLitFromInt64(v) }
+
+// BigVec builds a literal vector of big integers from plain numbers.
+//
+// The query language spells this big( [ 1, 2, 3 ] ), and the marker is not
+// decoration: a bracketed list is a vector of *sets* everywhere, so a vector of
+// big integers has to say so where it is written.
+func BigVec(values ...int64) BigListExpr {
+	elements := make([]BigExpr, 0, len(values))
+	for _, v := range values {
+		elements = append(elements, BigLitFromInt64(v))
+	}
+	return BigListExpr{Elements: elements}
+}
+
+// BigWidenExpr is a count as an arbitrary-precision integer.
+type BigWidenExpr struct{ Input IntExpr }
+
+func (BigWidenExpr) yesnoBigExpr()      {}
+func (BigWidenExpr) WidthBound() uint64 { return 64 }
+func (BigWidenExpr) WorkBound() uint64  { return 1 }
+
+// BigReadExpr is a set read as a magnitude, keeping its low WidthBits bits.
+//
+// A set is an integer: ordinal j carries the 2^j term. Reading narrower than
+// the value occupies is exactly x mod 2^WidthBits.
+type BigReadExpr struct {
+	Input     Expr
+	WidthBits uint32
+}
+
+func (BigReadExpr) yesnoBigExpr()        {}
+func (r BigReadExpr) WidthBound() uint64 { return uint64(r.WidthBits) }
+
+// WorkBound reports the limbs the gather fills.
+func (r BigReadExpr) WorkBound() uint64 { return limbsOf(uint64(r.WidthBits)) }
+
+// BigReadSignedExpr is a set read in two's complement over WidthBits.
+//
+// A separate node rather than a flag on BigReadExpr: the same bits denote two
+// different numbers and nothing in them says which was meant, so an operation
+// that sometimes did one and sometimes the other would have no error path.
+type BigReadSignedExpr struct {
+	Input     Expr
+	WidthBits uint32
+}
+
+func (BigReadSignedExpr) yesnoBigExpr()        {}
+func (r BigReadSignedExpr) WidthBound() uint64 { return uint64(r.WidthBits) }
+
+// WorkBound reports the limbs the gather fills.
+func (r BigReadSignedExpr) WorkBound() uint64 { return limbsOf(uint64(r.WidthBits)) }
+
+// BigNegExpr is the additive inverse.
+type BigNegExpr struct{ Input BigExpr }
+
+func (BigNegExpr) yesnoBigExpr()        {}
+func (n BigNegExpr) WidthBound() uint64 { return n.Input.WidthBound() }
+func (n BigNegExpr) WorkBound() uint64 {
+	return n.Input.WorkBound() + limbsOf(n.Input.WidthBound())
+}
+
+// BigAddExpr is a sum.
+type BigAddExpr struct{ Left, Right BigExpr }
+
+func (BigAddExpr) yesnoBigExpr() {}
+
+// WidthBound reports one bit past the wider operand: opposite signs cannot
+// exceed it and same signs carry at most one bit.
+func (a BigAddExpr) WidthBound() uint64 { return maxWidth(a.Left, a.Right) + 1 }
+
+// WorkBound reports one pass over the wider operand.
+func (a BigAddExpr) WorkBound() uint64 { return additiveWork(a.Left, a.Right) }
+
+// BigSubExpr is a difference. Total, which is what the signed sort exists for.
+type BigSubExpr struct{ Left, Right BigExpr }
+
+func (BigSubExpr) yesnoBigExpr()        {}
+func (b BigSubExpr) WidthBound() uint64 { return maxWidth(b.Left, b.Right) + 1 }
+
+// WorkBound reports one pass over the wider operand.
+func (b BigSubExpr) WorkBound() uint64 { return additiveWork(b.Left, b.Right) }
+
+// BigMulExpr is a product.
+//
+// The node that makes the width bound necessary: it adds the operands' widths.
+type BigMulExpr struct{ Left, Right BigExpr }
+
+func (BigMulExpr) yesnoBigExpr() {}
+func (m BigMulExpr) WidthBound() uint64 {
+	return m.Left.WidthBound() + m.Right.WidthBound()
+}
+
+// WorkBound uses schoolbook, never Karatsuba's measured exponent: an upper
+// bound refuses work that would have been affordable and never the reverse.
+func (m BigMulExpr) WorkBound() uint64 { return productWork(m.Left, m.Right) }
+
+// BigDivExpr is a quotient, truncating toward zero.
+type BigDivExpr struct{ Left, Right BigExpr }
+
+func (BigDivExpr) yesnoBigExpr()        {}
+func (d BigDivExpr) WidthBound() uint64 { return d.Left.WidthBound() }
+func (d BigDivExpr) WorkBound() uint64  { return productWork(d.Left, d.Right) }
+
+// BigRemExpr is a remainder, carrying the sign of the dividend.
+type BigRemExpr struct{ Left, Right BigExpr }
+
+func (BigRemExpr) yesnoBigExpr()       {}
+func (r BigRemExpr) WorkBound() uint64 { return productWork(r.Left, r.Right) }
+
+func (r BigRemExpr) WidthBound() uint64 {
+	if l := r.Left.WidthBound(); l < r.Right.WidthBound() {
+		return l
+	}
+	return r.Right.WidthBound()
+}
+
+// BigTruncateExpr wraps into a Bits-wide two's-complement field.
+type BigTruncateExpr struct {
+	Input BigExpr
+	Bits  uint32
+}
+
+func (BigTruncateExpr) yesnoBigExpr() {}
+func (t BigTruncateExpr) WidthBound() uint64 {
+	return minWidth(t.Input.WidthBound(), uint64(t.Bits))
+}
+
+func (t BigTruncateExpr) WorkBound() uint64 {
+	return t.Input.WorkBound() + limbsOf(t.Input.WidthBound())
+}
+
+// BigSaturateExpr clamps into the same field BigTruncateExpr wraps into.
+//
+// One field, two overflow rules; they coincide only where nothing overflowed.
+type BigSaturateExpr struct {
+	Input BigExpr
+	Bits  uint32
+}
+
+func (BigSaturateExpr) yesnoBigExpr() {}
+func (s BigSaturateExpr) WidthBound() uint64 {
+	return minWidth(s.Input.WidthBound(), uint64(s.Bits))
+}
+
+func (s BigSaturateExpr) WorkBound() uint64 {
+	return s.Input.WorkBound() + limbsOf(s.Input.WidthBound())
+}
+
+// BigFoldOp is how BigFoldExpr combines a vector's elements.
+//
+// Four, where the set fold has three: the carrier is the integers, where + and
+// * are the ring operations and min / max the lattice ones. All four are
+// associative and commutative, so the answer does not depend on the order
+// constituents are visited in. None needs an identity, because a vector is
+// never empty.
+type BigFoldOp byte
+
+// The four big-integer fold operators.
+const (
+	BigFoldAdd BigFoldOp = 0
+	BigFoldMul BigFoldOp = 1
+	BigFoldMin BigFoldOp = 2
+	BigFoldMax BigFoldOp = 3
+)
+
+// VecBigExpr is one arbitrary-precision integer per constituent.
+//
+// There is no unsigned counterpart, deliberately: sign is a property of the
+// reading, so a vector of unsigned values would be a sort whose only content is
+// a promise the element's own node already makes.
+type VecBigExpr interface {
+	yesnoVecBigExpr()
+	Arity() uint32
+	// ElementBound is an upper bound, in bits, on any one element.
+	ElementBound() uint64
+	// WorkBound is an upper bound on the limb operations this vector costs.
+	WorkBound() uint64
+}
+
+// ResultBound is arity times the element width: the quantity neither the
+// constituent cap nor the per-value width bound covers.
+func ResultBound(v VecBigExpr) uint64 {
+	return uint64(v.Arity()) * v.ElementBound()
+}
+
+// BigListExpr is a literal vector of big integers.
+type BigListExpr struct{ Elements []BigExpr }
+
+func (BigListExpr) yesnoVecBigExpr() {}
+
+// Arity reports the literal element count.
+func (l BigListExpr) Arity() uint32 { return uint32(len(l.Elements)) }
+
+// WorkBound sums the elements' work.
+func (l BigListExpr) WorkBound() uint64 {
+	var total uint64
+	for _, e := range l.Elements {
+		total += e.WorkBound()
+	}
+	return total
+}
+
+// ElementBound reports the widest element.
+func (l BigListExpr) ElementBound() uint64 {
+	var widest uint64
+	for _, e := range l.Elements {
+		if w := e.WidthBound(); w > widest {
+			widest = w
+		}
+	}
+	return widest
+}
+
+// MapBigExpr applies a big-integer query to every element of a set vector.
+type MapBigExpr struct {
+	Vector VecExpr
+	Body   BigExpr
+}
+
+func (MapBigExpr) yesnoVecBigExpr() {}
+
+// Arity reports the underlying vector's arity.
+func (m MapBigExpr) Arity() uint32 { return m.Vector.Arity() }
+
+// ElementBound reports the body's width.
+func (m MapBigExpr) ElementBound() uint64 { return m.Body.WidthBound() }
+
+// WorkBound: the body runs once per constituent.
+func (m MapBigExpr) WorkBound() uint64 { return uint64(m.Arity()) * m.Body.WorkBound() }
+
+// BigPowModExpr is base^exp mod modulus, by Barrett reduction.
+//
+// The node the work bound exists for: its result is only as wide as the
+// modulus, so the width bound finds nothing wrong with it, while its cost grows
+// with the exponent's bit count times the square of the modulus's.
+//
+// A zero modulus has no residues and a negative exponent is a modular inverse,
+// which the engine does not compute; both are server-side errors. A negative
+// base enters its residue class first, so the answer is in [0, modulus).
+type BigPowModExpr struct {
+	Base    BigExpr
+	Exp     BigExpr
+	Modulus BigExpr
+}
+
+func (BigPowModExpr) yesnoBigExpr() {}
+
+// WidthBound reports the modulus's width: a residue is bounded by nothing else.
+func (p BigPowModExpr) WidthBound() uint64 { return p.Modulus.WidthBound() }
+
+// WorkBound reports one squaring per exponent bit and one multiply per set bit,
+// each Barrett-reduced, where the reduction is two multiplies.
+func (p BigPowModExpr) WorkBound() uint64 {
+	mLimbs := limbsOf(p.Modulus.WidthBound())
+	step := 4 * mLimbs * mLimbs
+	return p.Base.WorkBound() + p.Exp.WorkBound() + p.Modulus.WorkBound() +
+		p.Exp.WidthBound()*step
+}
+
+// BigFoldExpr reduces a vector of big integers to one.
+//
+// The transpose of MapBigExpr: a map keeps one value per constituent, a fold
+// collapses them.
+type BigFoldExpr struct {
+	Vector VecBigExpr
+	Op     BigFoldOp
+}
+
+func (BigFoldExpr) yesnoBigExpr() {}
+
+// WidthBound reports the fold's width. Only Mul grows with the arity: a sum of
+// n values below 2^w is below 2^(w+bits(n)), while a product reaches n*w.
+// WorkBound reports one pass per element, except for a product, whose
+// accumulator grows as it goes so the last multiply is against the whole.
+func (f BigFoldExpr) WorkBound() uint64 {
+	arity := uint64(f.Vector.Arity())
+	element := limbsOf(f.Vector.ElementBound())
+	reduce := arity * element
+	if f.Op == BigFoldMul {
+		reduce = reduce * reduce
+	}
+	return f.Vector.WorkBound() + reduce
+}
+
+func (f BigFoldExpr) WidthBound() uint64 {
+	arity := uint64(f.Vector.Arity())
+	widest := f.Vector.ElementBound()
+	switch f.Op {
+	case BigFoldAdd:
+		return widest + uint64(bits.Len64(arity))
+	case BigFoldMul:
+		return widest * arity
+	default:
+		return widest
+	}
+}
+
+func additiveWork(a, b BigExpr) uint64 {
+	la, lb := limbsOf(a.WidthBound()), limbsOf(b.WidthBound())
+	if lb > la {
+		la = lb
+	}
+	return a.WorkBound() + b.WorkBound() + la
+}
+
+func productWork(a, b BigExpr) uint64 {
+	return a.WorkBound() + b.WorkBound() +
+		limbsOf(a.WidthBound())*limbsOf(b.WidthBound())
+}
+
+func maxWidth(a, b BigExpr) uint64 {
+	if x, y := a.WidthBound(), b.WidthBound(); x > y {
+		return x
+	} else {
+		return y
+	}
+}
+
+func minWidth(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ContainsExpr is whether a set holds one ordinal.
 type ContainsExpr struct {
 	Input   Expr
@@ -562,6 +999,204 @@ func EncodeIntVector(vector VecIntExpr) ([]byte, error) {
 		return nil, errors.New("expression encoding is ambiguous with a bare key")
 	}
 	return out, nil
+}
+
+// EncodeBig encodes one complete YSNX command at the big-integer sort.
+func EncodeBig(expression BigExpr) ([]byte, error) {
+	if err := validateBig(expression); err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 32)
+	out = append(out, expressionMagic[:]...)
+	out = append(out, expressionVersion, 0)
+	out = appendBig(out, expression)
+	if len(out) == 8 {
+		return nil, errors.New("expression encoding is ambiguous with a bare key")
+	}
+	return out, nil
+}
+
+// DecodeBig decodes one complete YSNX command at the big-integer sort.
+func DecodeBig(payload []byte) (BigExpr, error) {
+	if len(payload) < expressionHeader {
+		return nil, errors.New("expression ended in its header")
+	}
+	if string(payload[:4]) != string(expressionMagic[:]) {
+		return nil, errors.New("not a yesnodb expression")
+	}
+	if payload[4] != expressionVersion || payload[5] != 0 {
+		return nil, fmt.Errorf("unsupported expression version %d", payload[4])
+	}
+	c := &expressionCursor{payload: payload[expressionHeader:]}
+	value, err := c.bigExpression(0)
+	if err != nil {
+		return nil, err
+	}
+	if c.offset != len(c.payload) {
+		return nil, errors.New("trailing bytes after expression")
+	}
+	return value, nil
+}
+
+// EncodeBigVector encodes one complete YSNX command at the big-vector sort.
+func EncodeBigVector(vector VecBigExpr) ([]byte, error) {
+	if err := validateBigVector(vector); err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 32)
+	out = append(out, expressionMagic[:]...)
+	out = append(out, expressionVersion, 0)
+	out = appendBigVector(out, vector)
+	if len(out) == 8 {
+		return nil, errors.New("expression encoding is ambiguous with a bare key")
+	}
+	return out, nil
+}
+
+// DecodeBigVector decodes one complete YSNX command at the big-vector sort.
+func DecodeBigVector(payload []byte) (VecBigExpr, error) {
+	if len(payload) < expressionHeader {
+		return nil, errors.New("expression ended in its header")
+	}
+	if string(payload[:4]) != string(expressionMagic[:]) {
+		return nil, errors.New("not a yesnodb expression")
+	}
+	if payload[4] != expressionVersion || payload[5] != 0 {
+		return nil, fmt.Errorf("unsupported expression version %d", payload[4])
+	}
+	c := &expressionCursor{payload: payload[expressionHeader:]}
+	vector, err := c.bigVector(0)
+	if err != nil {
+		return nil, err
+	}
+	if c.offset != len(c.payload) {
+		return nil, errors.New("trailing bytes after expression")
+	}
+	return vector, nil
+}
+
+func validateBigVector(root VecBigExpr) error {
+	if root == nil {
+		return errors.New("a vector of big integers is required")
+	}
+	if ResultBound(root) > MaxResultBits {
+		return fmt.Errorf("result is larger than %d bits", MaxResultBits)
+	}
+	if root.WorkBound() > MaxWork {
+		return fmt.Errorf("query asks for more than %d limb operations", MaxWork)
+	}
+	switch v := root.(type) {
+	case BigListExpr:
+		if len(v.Elements) == 0 {
+			return errors.New("vector has no elements")
+		}
+		for _, e := range v.Elements {
+			if err := validateBig(e); err != nil {
+				return err
+			}
+		}
+		return nil
+	case MapBigExpr:
+		if err := validateBig(v.Body); err != nil {
+			return err
+		}
+		// Through the existing set-vector walker: a one-element integer map
+		// over it is the cheapest way to reach it, and it carries the arity
+		// checks a nested index still needs.
+		return validateIntVector(MapIntExpr{Vector: v.Vector, Body: IntLitExpr{}})
+	default:
+		return fmt.Errorf("unsupported big-vector type %T", root)
+	}
+}
+
+// validateBig refuses a tree whose result could exceed the width budget.
+//
+// Checking the operands is not enough, and that is the point of the bound:
+// multiplication adds widths, so two operands that each fit can combine into
+// one that does not.
+func validateBig(root BigExpr) error {
+	if root == nil {
+		return errors.New("a big-integer expression is required")
+	}
+	var visit func(BigExpr, int) error
+	nodes := 0
+	visit = func(e BigExpr, depth int) error {
+		if depth > MaxExpressionDepth {
+			return fmt.Errorf("expression nested deeper than %d", MaxExpressionDepth)
+		}
+		nodes++
+		if nodes > MaxExpressionNodes {
+			return fmt.Errorf("expression has more than %d nodes", MaxExpressionNodes)
+		}
+		if e.WidthBound() > MaxValueBits {
+			return fmt.Errorf("value is wider than %d bits", MaxValueBits)
+		}
+		if e.WorkBound() > MaxWork {
+			return fmt.Errorf("query asks for more than %d limb operations", MaxWork)
+		}
+		switch n := e.(type) {
+		case BigLitExpr:
+			if len(n.Magnitude) > 0 && n.Magnitude[len(n.Magnitude)-1] == 0 {
+				return errors.New("big-integer literal is not canonical")
+			}
+			if n.Negative && len(n.Magnitude) == 0 {
+				return errors.New("big-integer literal is not canonical")
+			}
+			return nil
+		case BigWidenExpr:
+			// Through the existing integer walker rather than a second copy
+			// of it: a one-element literal vector is the cheapest way to
+			// reach it, and it carries the arity checks an `IntAtExpr`
+			// inside the body still needs.
+			return validateIntVector(IntListExpr{Elements: []IntExpr{n.Input}})
+		case BigReadExpr:
+			if n.WidthBits == 0 {
+				return errors.New("a big-integer read has zero width")
+			}
+			return validateExpression(n.Input)
+		case BigReadSignedExpr:
+			if n.WidthBits == 0 {
+				return errors.New("a big-integer read has zero width")
+			}
+			return validateExpression(n.Input)
+		case BigNegExpr:
+			return visit(n.Input, depth+1)
+		case BigAddExpr:
+			return visitPair(visit, n.Left, n.Right, depth)
+		case BigSubExpr:
+			return visitPair(visit, n.Left, n.Right, depth)
+		case BigMulExpr:
+			return visitPair(visit, n.Left, n.Right, depth)
+		case BigDivExpr:
+			return visitPair(visit, n.Left, n.Right, depth)
+		case BigRemExpr:
+			return visitPair(visit, n.Left, n.Right, depth)
+		case BigTruncateExpr:
+			return visit(n.Input, depth+1)
+		case BigSaturateExpr:
+			return visit(n.Input, depth+1)
+		case BigFoldExpr:
+			return validateBigVector(n.Vector)
+		case BigPowModExpr:
+			if err := visit(n.Base, depth+1); err != nil {
+				return err
+			}
+			if err := visit(n.Exp, depth+1); err != nil {
+				return err
+			}
+			return visit(n.Modulus, depth+1)
+		default:
+			return fmt.Errorf("unsupported big-integer type %T", e)
+		}
+	}
+	return visit(root, 0)
+}
+
+func visitPair(visit func(BigExpr, int) error, left, right BigExpr, depth int) error {
+	if err := visit(left, depth+1); err != nil {
+		return err
+	}
+	return visit(right, depth+1)
 }
 
 // DecodeIntVector decodes one complete YSNX command at the integer-vector sort.
@@ -918,6 +1553,83 @@ func appendInt(out []byte, expression IntExpr) []byte {
 	return out
 }
 
+func appendBig(out []byte, expression BigExpr) []byte {
+	switch e := expression.(type) {
+	case BigLitExpr:
+		out = append(out, tagBigLit)
+		if e.Negative {
+			out = append(out, 1)
+		} else {
+			out = append(out, 0)
+		}
+		out = binary.LittleEndian.AppendUint32(out, uint32(len(e.Magnitude)))
+		out = append(out, e.Magnitude...)
+	case BigWidenExpr:
+		out = append(out, tagBigWiden)
+		out = appendInt(out, e.Input)
+	case BigReadExpr:
+		out = append(out, tagBigRead)
+		out = binary.LittleEndian.AppendUint32(out, e.WidthBits)
+		out = appendExpression(out, e.Input)
+	case BigReadSignedExpr:
+		out = append(out, tagBigReadSigned)
+		out = binary.LittleEndian.AppendUint32(out, e.WidthBits)
+		out = appendExpression(out, e.Input)
+	case BigNegExpr:
+		out = append(out, tagBigNeg)
+		out = appendBig(out, e.Input)
+	case BigAddExpr:
+		out = appendBigBinary(out, tagBigAdd, e.Left, e.Right)
+	case BigSubExpr:
+		out = appendBigBinary(out, tagBigSub, e.Left, e.Right)
+	case BigMulExpr:
+		out = appendBigBinary(out, tagBigMul, e.Left, e.Right)
+	case BigDivExpr:
+		out = appendBigBinary(out, tagBigDiv, e.Left, e.Right)
+	case BigRemExpr:
+		out = appendBigBinary(out, tagBigRem, e.Left, e.Right)
+	case BigTruncateExpr:
+		out = append(out, tagBigTruncate)
+		out = binary.LittleEndian.AppendUint32(out, e.Bits)
+		out = appendBig(out, e.Input)
+	case BigSaturateExpr:
+		out = append(out, tagBigSaturate)
+		out = binary.LittleEndian.AppendUint32(out, e.Bits)
+		out = appendBig(out, e.Input)
+	case BigFoldExpr:
+		out = append(out, tagBigFold, byte(e.Op))
+		out = appendBigVector(out, e.Vector)
+	case BigPowModExpr:
+		out = append(out, tagBigPowMod)
+		out = appendBig(out, e.Base)
+		out = appendBig(out, e.Exp)
+		out = appendBig(out, e.Modulus)
+	}
+	return out
+}
+
+func appendBigVector(out []byte, vector VecBigExpr) []byte {
+	switch v := vector.(type) {
+	case BigListExpr:
+		out = append(out, tagBigList)
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(v.Elements)))
+		for _, element := range v.Elements {
+			out = appendBig(out, element)
+		}
+	case MapBigExpr:
+		out = append(out, tagMapBig)
+		out = appendVector(out, v.Vector)
+		out = appendBig(out, v.Body)
+	}
+	return out
+}
+
+func appendBigBinary(out []byte, tag byte, left, right BigExpr) []byte {
+	out = append(out, tag)
+	out = appendBig(out, left)
+	return appendBig(out, right)
+}
+
 func appendIntVector(out []byte, vector VecIntExpr) []byte {
 	switch v := vector.(type) {
 	case IntListExpr:
@@ -1232,6 +1944,252 @@ func (c *expressionCursor) boolExpression(depth int) (BoolExpr, error) {
 		return nil, err
 	}
 	return Contains(input, ordinal), nil
+}
+
+func (c *expressionCursor) uint32() (uint32, error) {
+	value, err := c.take(4)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(value), nil
+}
+
+// readWidth decodes a read's width and refuses one that denotes nothing or
+// that exceeds the value budget, before it can be used to size anything.
+func (c *expressionCursor) readWidth() (uint32, error) {
+	width, err := c.uint32()
+	if err != nil {
+		return 0, err
+	}
+	if width == 0 {
+		return 0, errors.New("a big-integer read has zero width")
+	}
+	if uint64(width) > MaxValueBits {
+		return 0, fmt.Errorf("value is wider than %d bits", MaxValueBits)
+	}
+	return width, nil
+}
+
+func (c *expressionCursor) bigExpression(depth int) (BigExpr, error) {
+	if depth > MaxExpressionDepth {
+		return nil, fmt.Errorf("expression nested deeper than %d", MaxExpressionDepth)
+	}
+	c.nodes++
+	if c.nodes > MaxExpressionNodes {
+		return nil, fmt.Errorf("expression has more than %d nodes", MaxExpressionNodes)
+	}
+	rawTag, err := c.take(1)
+	if err != nil {
+		return nil, err
+	}
+	tag := rawTag[0]
+
+	binaryNode := func(build func(BigExpr, BigExpr) BigExpr) (BigExpr, error) {
+		left, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		right, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		return build(left, right), nil
+	}
+
+	var out BigExpr
+	switch tag {
+	case tagBigLit:
+		rawSign, err := c.take(1)
+		if err != nil {
+			return nil, err
+		}
+		if rawSign[0] > 1 {
+			return nil, fmt.Errorf("unknown sign byte %d", rawSign[0])
+		}
+		length, err := c.uint32()
+		if err != nil {
+			return nil, err
+		}
+		// Checked before the bytes are taken, so an over-wide length is
+		// refused as the amplification it is rather than as a truncation.
+		if uint64(length)*8 > MaxValueBits {
+			return nil, fmt.Errorf("value is wider than %d bits", MaxValueBits)
+		}
+		body, err := c.take(int(length))
+		if err != nil {
+			return nil, err
+		}
+		if len(body) > 0 && body[len(body)-1] == 0 {
+			return nil, errors.New("big-integer literal is not canonical")
+		}
+		if rawSign[0] == 1 && len(body) == 0 {
+			return nil, errors.New("big-integer literal is not canonical")
+		}
+		// Zero is `nil`, not an empty slice. Go distinguishes the two and
+		// `reflect.DeepEqual` does too, so leaving both reachable would give
+		// one value two in-memory representations -- the same defect the wire
+		// format refuses a trailing zero byte to avoid.
+		var magnitude []byte
+		if len(body) > 0 {
+			magnitude = slices.Clone(body)
+		}
+		out = BigLitExpr{Negative: rawSign[0] == 1, Magnitude: magnitude}
+	case tagBigWiden:
+		inner, err := c.intExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		out = BigWidenExpr{Input: inner}
+	case tagBigRead, tagBigReadSigned:
+		width, err := c.readWidth()
+		if err != nil {
+			return nil, err
+		}
+		inner, err := c.expression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		if tag == tagBigRead {
+			out = BigReadExpr{Input: inner, WidthBits: width}
+		} else {
+			out = BigReadSignedExpr{Input: inner, WidthBits: width}
+		}
+	case tagBigNeg:
+		inner, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		out = BigNegExpr{Input: inner}
+	case tagBigAdd:
+		out, err = binaryNode(func(l, r BigExpr) BigExpr { return BigAddExpr{Left: l, Right: r} })
+	case tagBigSub:
+		out, err = binaryNode(func(l, r BigExpr) BigExpr { return BigSubExpr{Left: l, Right: r} })
+	case tagBigMul:
+		out, err = binaryNode(func(l, r BigExpr) BigExpr { return BigMulExpr{Left: l, Right: r} })
+	case tagBigDiv:
+		out, err = binaryNode(func(l, r BigExpr) BigExpr { return BigDivExpr{Left: l, Right: r} })
+	case tagBigRem:
+		out, err = binaryNode(func(l, r BigExpr) BigExpr { return BigRemExpr{Left: l, Right: r} })
+	case tagBigPowMod:
+		base, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		exp, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		modulus, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		out = BigPowModExpr{Base: base, Exp: exp, Modulus: modulus}
+	case tagBigFold:
+		rawOp, err := c.take(1)
+		if err != nil {
+			return nil, err
+		}
+		if rawOp[0] > byte(BigFoldMax) {
+			return nil, fmt.Errorf("unknown fold operator %d", rawOp[0])
+		}
+		vector, err := c.bigVector(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		out = BigFoldExpr{Vector: vector, Op: BigFoldOp(rawOp[0])}
+	case tagBigTruncate, tagBigSaturate:
+		// A zero width is meaningful here, unlike on a read: wrapping or
+		// clamping into an empty field is zero, which is a value.
+		bits, err := c.uint32()
+		if err != nil {
+			return nil, err
+		}
+		if uint64(bits) > MaxValueBits {
+			return nil, fmt.Errorf("value is wider than %d bits", MaxValueBits)
+		}
+		inner, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		if tag == tagBigTruncate {
+			out = BigTruncateExpr{Input: inner, Bits: bits}
+		} else {
+			out = BigSaturateExpr{Input: inner, Bits: bits}
+		}
+	default:
+		return nil, misplaced(sortBig, tag)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Both bounds per node rather than only at the root: a sub-expression can
+	// be neither wider nor more expensive than the whole is allowed to be.
+	if out.WidthBound() > MaxValueBits {
+		return nil, fmt.Errorf("value is wider than %d bits", MaxValueBits)
+	}
+	if out.WorkBound() > MaxWork {
+		return nil, fmt.Errorf("query asks for more than %d limb operations", MaxWork)
+	}
+	return out, nil
+}
+
+func (c *expressionCursor) bigVector(depth int) (VecBigExpr, error) {
+	if depth > MaxExpressionDepth {
+		return nil, fmt.Errorf("expression nested deeper than %d", MaxExpressionDepth)
+	}
+	c.nodes++
+	if c.nodes > MaxExpressionNodes {
+		return nil, fmt.Errorf("expression has more than %d nodes", MaxExpressionNodes)
+	}
+	rawTag, err := c.take(1)
+	if err != nil {
+		return nil, err
+	}
+	var out VecBigExpr
+	switch rawTag[0] {
+	case tagBigList:
+		raw, err := c.take(2)
+		if err != nil {
+			return nil, err
+		}
+		count := int(binary.LittleEndian.Uint16(raw))
+		if count == 0 {
+			return nil, errors.New("vector has no elements")
+		}
+		if c.nodes+count > MaxExpressionNodes {
+			return nil, fmt.Errorf("expression has more than %d nodes", MaxExpressionNodes)
+		}
+		elements := make([]BigExpr, 0, count)
+		for i := 0; i < count; i++ {
+			element, err := c.bigExpression(depth + 1)
+			if err != nil {
+				return nil, err
+			}
+			elements = append(elements, element)
+		}
+		out = BigListExpr{Elements: elements}
+	case tagMapBig:
+		vector, err := c.vector(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		bodyValue, err := body(c, depth+1, c.bigExpression)
+		if err != nil {
+			return nil, err
+		}
+		out = MapBigExpr{Vector: vector, Body: bodyValue}
+	default:
+		return nil, misplaced(sortVecBig, rawTag[0])
+	}
+	// The product bound, checked here because this is the only node with both
+	// factors: the arity and the element width.
+	if ResultBound(out) > MaxResultBits {
+		return nil, fmt.Errorf("result is larger than %d bits", MaxResultBits)
+	}
+	if out.WorkBound() > MaxWork {
+		return nil, fmt.Errorf("query asks for more than %d limb operations", MaxWork)
+	}
+	return out, nil
 }
 
 func (c *expressionCursor) intExpression(depth int) (IntExpr, error) {

@@ -4161,3 +4161,660 @@ cooperative path runs rather than where the real cost or the real input
 arrives.** The poison bug validated per record batch while clients send per
 call. The I8 check guarded `WriteBatch` while records arrive from the log.
 This one measured the operation it added and not the vector it widened.
+
+## 2026-09-24 -- `vec_int_batch` fuses one key and N filters, not N siblings
+
+A haiiie session ( `haiiie-67` ) handed over a design note proposing, among
+other things, a Flight wire opcode exposing `vec_int_batch`, on the stated
+grounds that it "shares one packed-key traversal across sibling integer
+intersection-cardinality vectors". It asked to be rejected cheaply if the
+shape was wrong. It is wrong, and the way it is wrong is worth recording
+because the note's own plan would have hidden it.
+
+**The precondition is narrower than the name suggests.**
+`vec_int_batch` calls `direct_key_intersection` on every vector, requires the
+shape `Map( View( Key( k ), spec ), Cardinality( body ) )`, and then bails the
+**entire batch** to N independent `vec_int` calls unless every vector names the
+same `k` and the same `ViewSpec`. The fused path's signature states the real
+contract: `count_key_intersections( key: u64, view: View, filters: &[&OrdSet],
+snap )` -- one key, a slice of filters. The sharing is across *filters over one
+key*, never across keys.
+
+**Why that mattered to the proposal.** haiiie's scan is 118 posting lanes, and
+its own notes scope every snapshot accessor to one key, so a lane is plausibly
+a distinct key. Had they prototyped against `vec_int_batch` in that shape, the
+guard would have fired on the second vector, the run would have measured the
+scalar fallback, and their sequencing step -- "if a local harness driving that
+evaluator cannot beat the embedded scan, no wire opcode will" -- would have
+returned a **false negative** attributed to pushdown rather than to a fusion
+that never engaged. A kill-switch measurement pointed at the fallback path
+kills the wrong thing.
+
+**Three asks wear one name.** Counts of one key's view constituents against a
+single filter are *already* one wire call ( `VecIntExpr` returns `Vec<u64>`,
+dispatched in `yesno-wire` at `TAG_INT_LIST` / `TAG_MAP_INT` ) and need nothing
+from us. N filters over one key and spec is the genuine gap the `//` comment at
+`yesno-flight/src/expr.rs:290` describes, and is a real exposure of a shipped
+evaluator. N distinct keys is a new engine capability wearing the costume of an
+exposure. Sent back asking which one their accumulator wants, since that is a
+read of their code rather than a measurement.
+
+**The generalizable bit.** A batch entrypoint that silently degrades to the
+scalar path is honest in its doc comment and dishonest in its name, and a
+consumer reading the name will design a benchmark that cannot detect the
+difference. The fallback is the right behaviour; what it costs is that
+"`vec_int_batch` was slow" and "`vec_int_batch` did not engage" produce the
+same number. Anything we eventually put on the wire over it should report
+whether the fusion took, not just the counts.
+
+Nothing built, nothing scheduled. Verification only: no code changed, so no
+gate run. Tree still stamped at f7f9daf for code; 8d2c39b is comments plus LTM
+and 9a64bf0 is this file.
+
+### Closing the 2026-09-24 exchange: case 3, and the axis error recurred
+
+The consumer verified both halves and came back with the answer plus a piece
+neither side had. `search.rs` opens lanes as one key per query dimension, so it
+is **case 3** -- N distinct keys, the `key != first_key` guard fires on the
+second vector, and the fallback measurement would have been taken. Case 1 does
+not apply and never did.
+
+**The mismatch is wider than batch width, which I had not seen.** Their
+`slice.rs` sums those lanes into one integer **per ordinal**. Our evaluator
+returns counts **per constituent of one key**. Those are different
+computations, so there is no batch width at which they converge and no wire
+opcode over `vec_int_batch` that would serve them. My "case 3 is a new engine
+capability, not an exposure" was right about the category and understated the
+distance.
+
+**And the crate had already settled this, on the opposite axis.** The
+`view_count` closing addendum in `TODO.md` ( 2026-09-19 ) separates the two
+marginals of the same `n x W` matrix by construction: packings `c_0 = {0}`,
+`c_1 = {1}` and `c_0 = {0, 1}`, `c_1 = {}` share a `view_count` of `[ 1, 1 ]`
+while their facet counts differ, so neither determines the other. The original
+prescription argued from a facet count and asked for `view_count`. This note
+reasoned from a per-ordinal accumulator and asked for a per-constituent
+evaluator. **Same confusion, opposite direction, four days later, in a
+different venue** -- a wire opcode rather than a lens method. A separation
+proved once did not prevent its own mirror image.
+
+That is the argument for having recorded the *construction* and not just the
+verdict. A verdict ( "`view_count` is declined" ) would not have caught this,
+because this was not `view_count`; the two-packing construction catches any
+proposal that assumes one marginal answers the other, whatever it is called.
+
+**How the drift happened, reported unprompted and worth keeping.** Their
+`slice.rs` module comment still asserts that the arithmetic "belongs upstream"
+and that "a prescription for it is filed there ... waiting on" a benchmark.
+True when written, false since 2026-09-19. Their gate fails on a dead citation
+slug but cannot check an English `//!` sentence claiming a document exists
+elsewhere. So a stale cross-repository claim in a rationale comment pointed a
+later session at a closed proposal as though it were open. They flagged it to
+their user and declined to edit production source on a peer's message, which is
+the right call.
+
+**The transferable form**: our own rule says a stale rationale comment is worse
+than none, and this is that rule with a longer blast radius -- **a `//!` block
+asserting the state of something in another repository cannot be verified by
+either repository's gate.** We have such claims too. The cheap discipline is to
+state the fact and its date rather than the other tree's posture: "measured
+1.26x at L = 8 ( 2026-09-14 )" stays true; "a prescription is filed upstream
+and waiting" has a shelf life nothing checks.
+
+**Net effect on this tree: none, and that is the outcome.** No code changed, no
+gate run needed. `bit-sliced-lens-proposed-by-a-consumer` stays closed and is
+now better supported -- the confirmation is appended to that entry rather than
+only here, because "a caller would reopen it" is the line a future session will
+actually read, and the only candidate has confirmed it is not one.
+
+**Correction to the entry above, same day.** It asserted "We have such claims
+too" of cross-repository posture comments, and then adopted a discipline
+against them. That assertion was not checked before it was written. Checked
+now: the cross-repository comments in `yesno-*/src/` state **dated facts with
+their boundary**, not the other tree's posture. `stream/dynamic.rs:124`
+is the model -- it dates the consumer's measurement to 2026-09-14, reproduces
+the table rather than citing a path ( noting the producing crate "lived in the
+scratch directory and is gone" ), separates the measured rows from the
+extrapolated ones, and then says a consumer-reported size "is a measurement
+taken at *their* boundary, so it needs the boundary stated before it can be
+compared with anything here."
+
+So the discipline was already the house pattern and now has a name and a
+failure mode attached. The nearest thing to a shelf-life claim is
+`stream/plan.rs:1027`, "`Expr` has no production consumer yet" -- about this
+workspace, checkable here, and a different and milder thing.
+
+Recorded because the original sentence was the same *kind* of move as the
+defect it was describing: an unverified claim about the state of a tree,
+written into a rationale comment's neighbouring document on the strength of it
+sounding right. Catching it required one grep.
+
+## 2026-09-24 -- A consumer's space probe found a comment describing a mechanism we never built
+
+A second `haiiie` session reported measured allocated-space growth ( `st_blocks`,
+correctly, since our shard files are sparse ): under scattered deletes their
+index ends at **3.07x** a fresh index of the same content, and their offline
+compaction *grew* allocation by 11.7 MB rather than reusing freed space. They
+asked one question -- is there any path by which allocated space comes back --
+and offered a hypothesis: slabs are reused only once they drain, and scattered
+deletes leave every slab partly live, so none ever drain.
+
+**Their hypothesis is right, and the answer to the question is no.** Verified in
+source rather than reasoned about:
+
+* `new_slab_for` recycles a whole `SlabState::Free` slab before extending the
+  file, and its own comment says this "returns its 2 MiB to the file rather than
+  growing the file" -- reuse **in place**, nothing returned to the filesystem.
+* A slab reaches `Free` only when its **last** slot is released ( `free_now`:
+  `emptied = slab.used_count == 0` ).
+* Slot scavenging out of partly-live slabs is deliberately excluded from the
+  write path -- "that is the compactor's job" -- to preserve the generational
+  locality the allocator exists for.
+
+So a delete pattern that leaves every slab partly live drains nothing, recycles
+nothing, and grows monotonically. Exactly what they measured.
+
+**And then the part that is ours alone.** Three comments say freed space is
+returned by punching holes: `store/segment.rs:30`, `store/alloc.rs:841`, and the
+doc comment on `i6_the_shard_file_never_shrinks`. **Nothing punches.** No
+`fallocate`, no `FALLOC_FL_PUNCH_HOLE`, and `yesno-core` has no `libc` / `nix` /
+`rustix` dependency at all -- the only raw file access is `FileExt` for
+`pwrite` / `pread`. The mechanism cannot be reached from this dependency set.
+Filed as `hole-punching-is-documented-but-not-implemented`.
+
+**The I6 test does not cover the sentence it opens with.** It asserts
+`metadata().len()` is non-decreasing. That is **apparent** size; for a sparse
+file it says nothing about allocated blocks. So it tests the true half ( never
+truncate -- SIGBUS under a live mapping, uncatchable ) and is silent on the
+false half. A doc comment stated the invariant the test does not check, directly
+above a test that checks a different one.
+
+**Note what found this, because it is the whole lesson.** Not a gate -- the
+claim survived every one we run, for as long as it has existed. Not a reader:
+I have read `alloc.rs` before and did not notice, because the sentence is
+plausible and sits beside a true one. It took **an outside consumer measuring
+bytes and asking whether the documented behaviour was the real one.** The three
+gates check what the code does against what other code expects; nothing checks
+prose against the syscall table.
+
+**This is the same failure mode as yesterday's, one day later and closer to
+home.** That one was a `//!` block asserting the state of another repository,
+and I wrote then that such a claim "cannot be verified by either repository's
+gate". This one asserts the existence of a mechanism **inside this tree** and is
+equally unverifiable by anything we run. I also wrote, correcting myself, that
+our cross-repository comments state dated facts and that the discipline "was
+already the house pattern here". That remains true of the cross-repository ones
+and is not a claim about the rest, which I had not checked -- and the first
+storage comment I checked afterwards was false.
+
+**The transferable form**: a rationale comment that names a *mechanism* is a
+testable claim wearing prose. "We punch holes" can be checked with one grep for
+the syscall; "space is returned" cannot be checked at all. Prefer the form that
+a grep can falsify, and when a comment and a test sit together, make the test
+cover the sentence.
+
+Nothing built, no code changed, no gate run -- documentation only. The repair is
+a maintainer's decision and both options are written out in the TODO entry.
+
+## 2026-09-25 -- Stage A of arbitrary-precision integers: the sort exists, the transport does not
+
+Implemented the language and engine half of stage A. `yesno-wire` gained
+`Sort::Big`, a `BigExpr` of `Lit` / `Widen` / `Read`, the descriptor `IntSpec`,
+the canonical literal `BigLit`, tags 24-26, four error variants, and
+`AnyExpr::Big`. `yesno-flight` gained `big()` and `BigValue`. 17 tests, all
+green, plus the workspace gate.
+
+**The bound is the load-bearing part, and it is checked per node rather than at
+the root.** `MAX_VALUE_BITS = 1 << 20` is the fourth bound in a format whose
+header advertises three, and it exists because the other three cannot see value
+*width*: `IntSpec::width_bits` is a `u32`, so a twelve-byte descriptor can ask
+for half a gigabyte. `BigExpr::width_bound` is one upward pass over statically
+known widths -- a literal carries its length, a widening is 64, a read is told
+by its descriptor -- and `big_expr` refuses above the bound **before** anything
+evaluates. Checking only the root would let a sub-expression be wider than the
+whole is allowed to be. The literal decoder checks the length prefix *before*
+`take`, so an over-wide length is refused as the amplification it is rather
+than reported as a truncated payload.
+
+**The existing tag-table test caught the new tags, which is the second time
+that discipline has paid.** `every_defined_tag_has_exactly_one_sort` asserts the
+defined tags are contiguous from zero and that nothing above them is claimed, so
+adding three tags failed it immediately and the fix was to extend its table.
+That test exists because tag 22 was once reported as unknown in one position and
+a sort mismatch in another.
+
+**Two semantic choices worth recording.** Sign is **sign-and-magnitude, not
+two's complement**, because a literal has no width to be negative in -- width is
+a property of `IntSpec` and of nothing else, and two's complement belongs to the
+*reading* of stored bits rather than to a literal. And a negative zero is
+unrepresentable: `BigLit::from_le_bytes` refuses it, `BigValue::new` normalizes
+a negative zero away, and a trailing zero byte is refused rather than trimmed,
+so one value has exactly one encoding. That last one matters specifically
+because the cross-implementation byte vector is only meaningful if two clients
+cannot both be "right" about padding.
+
+**`BigValue` is a flight-local type and says so.** `yesno_core::bignum` is
+unsigned by a deliberate decision, so a signed *value* has no core type yet.
+Stage A needs no arithmetic, so it carries sign beside a `BigUint` rather than
+inventing `BigInt` early. Signed arithmetic still wants a core type, and that is
+stage B.
+
+**What this does NOT do, stated plainly because the tests could mislead.** A
+`Big` expression **cannot reach the server**. A Flight ticket carries a
+`SetExpr` and is decoded by `SetExpr::decode`, which correctly refuses a
+`TAG_BIG_*` leading tag as a sort mismatch. So there is no transport and no
+result encoding: the end-to-end tests drive the evaluator in-process, which is
+real coverage of the lens-to-language path and is **not** coverage of a network
+round trip. The CLI rejects a big query with a message rather than mishandling
+it. The plan predicted this gap -- "a big result needs a result encoding, not
+just an expression" -- and it is the next piece, not an oversight.
+
+**Verification.** `cargo clippy --workspace --all-targets --all-features
+-D warnings` exit 0, `cargo fmt --check` clean, `cargo test -p yesno-core` all
+green, `cargo test -p yesno-wire -p yesno-flight` all green. **Not run**:
+`gate.sh`, `gate-pg.sh`, `gate-search.sh` and the Python, Go and Java client
+gates, which `QUALITY_GATE.md` requires for a `yesno-wire` change and which need
+Docker. `yesno-pg` was checked by inspection rather than built -- it names
+`SetExpr` only, never `AnyExpr`, `ExprError` or `Sort`, so the three enums that
+gained variants are not matched there -- but inspection is not a Bazel build,
+and the last wire change found three non-exhaustive matches that no cargo
+command could see.
+
+### Same day, two corrections to the entry above
+
+**The stride went, and the evidence was one-sided.** `IntSpec` carried a
+`width_bits` and a `stride`, mirroring `IntLayout`. It now carries a width
+alone, and the series is dense. The question was asked before the byte was
+spent, and the count answers it: every `IntLayout` this workspace constructs
+outside the arithmetic oracle's own `pad in [ 0, 1, 7, 64 ]` sweep is
+`dense`, `word_aligned` appears only inside assertions about its own `.stride`,
+and **`IntLayout::chunk_aligned` -- the padded spelling the module offers
+against straddling, which is the hazard its header names -- has no caller
+anywhere.** So the wire would have carried eight bytes of public format for a
+capability with no consumer on either side of it. That is the surface this tree
+removes elsewhere, and the cheapest version of removing it is not adding it.
+
+`IntLayout` keeps its stride. The wire being **narrower** than the engine is
+correct rather than a compromise: core stays general and oracle-tested across
+pads, and the format promises only what something asks for. If a padded series
+ever gets a caller the descriptor gains a layout byte exactly as `ViewSpec` has
+one -- dense with nothing after it, padded followed by a stride -- which is an
+*additive* encoding. Adding a byte later is possible; removing eight from a
+shipped descriptor is not, which is why the direction of the mistake matters
+more than its size.
+
+**Signedness was half-built, and the entry above did not say so.** It recorded
+the sign-and-magnitude literal decision and left the reader to notice that
+`Read` was hardcoded non-negative -- the fact appeared only inside a test
+assertion ( "a read is never negative" ). Nothing could *produce* a negative
+value except a literal, so the sort's domain was Z in name and N in practice.
+
+Now closed by `BigExpr::ReadSigned`, tag 27: the same stored bits read in two's
+complement over the declared width. **A separate node rather than a flag on
+`Read`**, for the reason `bignum`'s own documentation gives for Montgomery form
+-- two readings of one bit pattern are different values, and a reader that
+sometimes means one and sometimes the other has no error path, only a
+well-formed wrong answer. The arithmetic is `2^width - raw` when the top
+addressable bit is set, computed from the existing unsigned ops, so **no core
+change was needed**: `BigUint::sub` returns an `Option` because unsigned
+subtraction is partial, and the impossible branch is named rather than
+unwrapped.
+
+Three tests pin it, including the one-bit case where the width *is* the whole
+content of the sign ( 0 and -1 ), and one asserting the two readings stay
+distinct across an encode/decode round trip.
+
+**What remains unsigned-only is arithmetic, which is stage B and does need a
+core signed type.** Reads and literals now span Z; nothing computes.
+
+**Verification after both corrections**: clippy `--workspace --all-targets
+--all-features -D warnings` exit 0, `cargo fmt --check` clean, 115 tests green
+across `yesno-wire` and `yesno-flight`. `yesno-core` was not re-run and did not
+need to be -- nothing under `yesno-core/src` was touched this session. The
+Docker gates remain un-run, as above.
+
+## 2026-09-25 -- One set is one integer: `IntLayout` and `IntSink` removed
+
+`bignum/` described a **series**: an `IntLayout { width_bits, stride }` put bit
+`j` of integer `k` at `k*stride + j`, and `IntSink` placed into it by index.
+Both are gone. A set **is** an integer, width is a bare argument, and several
+integers are several keys.
+
+**The evidence was that nothing used the generality.** Every layout the
+workspace constructed was `dense`; `word_aligned`'s only callers were
+assertions about its own arithmetic; `chunk_aligned` -- the spelling the module
+header offered against the hazard it called *the* hazard -- had **no caller at
+all**; and the padded reading was exercised only by an oracle sweep that existed
+to exercise it. A capability whose sole consumer is its own test is the
+`stats.rs` pattern.
+
+**Three things fell out, and the third paid for the change.**
+
+* **Width is an argument, not a type.** It appears only where a choice is made,
+  and `read_int` became **total** -- absence and zero are the same thing in a
+  set, so there is no unaddressable index left to report.
+* **`IntSink` became a map.** `OrdSet::from_int` is `push_line( 0, limbs )`: no
+  index to advance, no strictly-increasing rule, no ceiling check beyond the
+  ordinal universe. It is a `Result` only because a value with a bit at
+  `u64::MAX` is unrepresentable ( I8 ), which is also why it is not a `From`.
+* **The straddling hazard is gone rather than centralized.** An integer, or a
+  single limb, could cross a chunk boundary **only because an arbitrary stride
+  put its base at a non-multiple of 64** -- the worked example was
+  `dense( 100 )`'s integer 655 starting at bit 65 500. With the base always
+  zero and 65 536 bits being exactly 1 024 limbs, a chunk covers whole limbs
+  from a limb boundary. I had told the user the opposite earlier in the session
+  and corrected it before writing any code.
+
+**What that bought, on the user's prompt to check container representations.**
+Reading is now **per container rather than per ordinal**: a bitmap is a block
+transfer into the limb window, arrays and runs set what they hold. The first
+draft was a flat `iter()` loop, which was correct and would have quietly lost
+the block transfer the old `pack::try_gather` had. Three tests hold it --
+`every_container_representation_reads_the_same` asserts *which* representation
+each construction landed on rather than assuming ( the run case needed an
+explicit `optimize`, and the assertion caught that ), and
+`a_narrow_read_of_a_bitmap_masks_the_bits_above_the_width` covers the one place
+a block transfer can lose `x mod 2^width` by carrying bits above it.
+
+**Several integers in one ordinal space is now a `view/` question.** A caller
+packs them as constituents and selects one before reading it, which composes the
+two lenses instead of duplicating addressing in both;
+`a_constituent_of_an_interleaved_view_reads_as_its_own_value` is that
+composition, and it passed first try.
+
+**`pack/` lost its second consumer and stays anyway.** ARCHITECTURE's
+justification for the module -- "`matrix/` and `bignum/` are both built on it"
+-- is no longer true and has been rewritten rather than left to rot. The merge
+was still right: it is why the surviving walk has one implementation rather than
+two that drifted. A module with one consumer is wrong when the abstraction was
+*invented* for one, which this was not.
+
+**The wire followed.** `IntSpec` is gone; `BigExpr::Read` / `ReadSigned` carry a
+bare `u32` width and no index, and `MAX_VALUE_BITS` is checked on it at decode.
+The tags are one day old and unshipped, so this cost nothing.
+
+**Two guards did their job and are worth naming.** `check-layout.py` failed on
+the `sink.rs` -> `write.rs` rename, in both directions, exactly as advertised.
+And the `truncate` **doctest** failed after `clippy --workspace --all-targets`
+and the unit tests were all green -- `--all-targets` does not reach doctests, so
+a public example can go stale while every gate above it passes.
+
+**Verification.** `cargo fmt --check` clean; `clippy --workspace --all-targets
+--all-features -D warnings` exit 0; `cargo test -p yesno-core` **1 166 passed,
+0 failed** ( doctests included ); `yesno-wire` and `yesno-flight` 114 passed;
+`bignum.py` and `bignum_series.py` both pass under `yesno-e2e`; **all eleven
+`scripts/check-*.py` green**. **Not run**: `gate.sh`, `gate-pg.sh`,
+`gate-search.sh` and the Python, Go and Java client gates, which
+`QUALITY_GATE.md` requires for a `yesno-core` and `yesno-wire` change and which
+need Docker.
+
+## 2026-09-25 -- Signed arithmetic, saturation, and stage B of the expression language
+
+Three pieces, in the order they were asked for.
+
+**`BigInt` is a separate type, never a flag on `BigUint`.** Sign and magnitude,
+zero never negative, `is_canonical` as the debug-time guard in the shape
+`is_normalized` already had. The separation is this module's own Montgomery rule
+applied to signs: an operation that sometimes receives a signed operand and
+sometimes not has no error path, only a well-formed wrong answer. Every unsigned
+identity keeps holding underneath.
+
+**Division truncates toward zero, and the reason is not convention.** For
+non-negative operands `BigInt::divrem` **is** `BigUint::divrem` -- same
+quotient, same remainder -- so the signed operation is a *conservative
+extension* of the shipped one and the existing oracle carries it; a
+disagreement on non-negative operands is a wrapper bug rather than a difference
+of convention. `div_euclid_rem` derives the non-negative-remainder form once.
+ARCHITECTURE recorded this choice as open ( "truncating versus Euclidean" ) and
+it is now settled with the alternative derivable rather than absent.
+
+**Saturation reverses a recorded rejection, and the premise is what changed.**
+It was refused because "the reader cannot saturate" -- correct while storage had
+a declared width that a write had to agree with. Storage has no width since this
+morning, so there is no competing write rule left; clamping is a question about
+a *value*, asked by a caller who has a `W`-bit field. The composition is the
+part that had to be proved rather than asserted, and
+`a_saturated_value_survives_a_round_trip_at_its_own_width` proves it: a value
+clamped to `W` is recovered exactly by a read at `W`, through both the unsigned
+and the two's-complement reader.
+
+**There is no `add_sat` family, and that is a finding rather than a
+deferral.** The arithmetic is *exact* -- a sum or product cannot overflow -- so
+`a.add( &b ).saturate( w )` **is** saturating addition rather than an
+approximation of it. A machine-word type needs the fused operation because the
+exact result is unrepresentable; this one does not, and a family would be a
+second spelling of one composition.
+
+### Two mistakes the tests caught, both mine
+
+**A property that was wrong twice before it was right.** "Truncation and
+saturation differ precisely when the value overflows" is false at `w = 0` ( both
+are zero ) and false again whenever the low `w` bits are all ones ( the wrap and
+the ceiling land on the same number ). Proptest produced both counterexamples
+within seconds. The surviving property states what each rule **is** -- one is
+the residue, one is the minimum with the ceiling -- and derives the coincidence,
+which is the form that could not have been wrong in the same way.
+
+**`Truncate` and `Saturate` were targeting different fields**, which is exactly
+the hazard the rest of this module is organized against. `Truncate` wrapped the
+*magnitude* ( so `truncate( 255, 8 )` was `255`, which no 8-bit signed field
+holds ) while `Saturate` clamped into the signed range. A caller choosing an
+overflow rule would silently have been choosing a different range too. Fixed by
+giving `BigInt` its own `truncate`, a two's-complement wrap into **the same**
+field, with machine `i8` as the reference in the test.
+
+### Stage B
+
+`Neg` / `Add` / `Sub` / `Mul` / `Div` / `Rem` / `Truncate` / `Saturate` on the
+wire, tags 28-35, evaluated through `BigInt`. `AnyExpr::decode` now dispatches
+through `sort_of_tag` instead of re-listing each sort's tags, which is the table
+that exists because a tag was once reported as unknown in one position and a
+sort mismatch in another -- a per-sort list at the top level was a second
+enumeration of the same fact waiting to disagree.
+
+**The amplification vector is a `Read`, not a `Mul` over literals, and the
+first version of that test asserted the wrong thing.** The wire has no sharing,
+so `Mul( a, a )` writes `a` twice: literal width grows with the payload and
+amplifies nothing. A `Read` is six bytes that *declare* a width, so
+`Mul( Read( k, 2^20 ), Read( k, 2^20 ) )` is a fifteen-byte payload describing
+a two-megabit value. That is what `MAX_VALUE_BITS` refuses at decode, and the
+paired test one bit under the bound shows the refusal is the bound working
+rather than the shape being rejected.
+
+**Verification.** `cargo fmt --check` clean; `clippy --workspace --all-targets
+--all-features -D warnings` exit 0; **1 322 tests green** across `yesno-core`,
+`yesno-wire` and `yesno-flight` ( core alone 1 187, up from 1 166 ); all eleven
+`scripts/check-*.py` green. **Not run**: `gate.sh`, `gate-pg.sh`,
+`gate-search.sh` and the Python, Go and Java client gates, which need Docker and
+which `QUALITY_GATE.md` requires for a change touching `yesno-core` and
+`yesno-wire`.
+
+## 2026-09-25 -- The multi-sorted language gets a transport, and it had never had one
+
+`QueryRequest.expression` and `Ticket.expr` both carried a `SetExpr`. So
+**`Vec[Int]` could not reach a server either**, and had not been able to since
+the sort was built: the facet histogram -- the acceptance case the typed
+language was created for, recorded as working end to end -- parsed in the CLI,
+evaluated in process, and was then rejected by `parse_expression` with "this
+query denotes one integer per constituent, not a set". Nothing failed. There was
+simply no path, and no test could notice because every test called the evaluator
+directly.
+
+That is the shape worth keeping: **an acceptance case can be genuinely passing
+and genuinely unreachable at the same time**, when the thing that carries it is
+never exercised. `Big` inherited the gap rather than introducing it, and the
+fix is shared.
+
+**What changed.** `QueryRequest.expression` and `Ticket.expr` are now `AnyExpr`.
+The widening costs nothing on the wire -- the leading tag already determines the
+sort, so a payload that used to decode as a set still does -- and it was free to
+make because nothing has shipped publicly. `AnyExpr` gained `keys`, so a
+coordinator routes on the primary posting list without first deciding what shape
+the answer has. Two result schemas joined the three that existed:
+`vec_int_schema` ( one `UInt64` per constituent, **one batch**, so the row index
+*is* the constituent index ) and `big_schema` ( `negative: Boolean`,
+`magnitude: Binary`, canonical little-endian, exactly one row ).
+
+**`total_records` is per sort, and that is not cosmetic.** A set answers rows of
+ordinals, a vector answers one row per constituent, a scalar answers one.
+Counting a vector with `cardinality` would have told a coordinator sizing an
+endpoint the wrong shape.
+
+### The bug that says why this needed a socket test
+
+`schema_for` was written as the single place an answer's shape is decided, with
+a comment saying so -- and it was consulted in **two** of the **three** places
+that decide it. The third is `FlightDataEncoderBuilder::with_schema`, which
+stamped `ordinals_schema()` on every stream regardless of the batches inside.
+
+The symptom was perfect: `get_flight_info` classified the query correctly
+( `total_records` came back as 1, and that assertion passed ), `do_get` built a
+correct two-column batch, and the client received a one-row batch whose schema
+said `ordinal: UInt64`. Every in-process test of the evaluator passed. Only a
+real `get_flight_info` -> `do_get` over a socket showed it, and it showed as a
+downcast failure three lines after an assertion that had just succeeded.
+
+**A comment claiming a function is the single source of truth is not evidence
+that it is.** This one was written the same hour it was falsified, by me, in
+the same file. The count is now spelled out in the doc -- all three sites named
+-- because "one place" was the part that read as true and wasn't.
+
+**Verification.** `cargo fmt --check` clean; `clippy --workspace --all-targets
+--all-features -D warnings` exit 0; all eleven `scripts/check-*.py` green; the
+two new end-to-end transport tests pass against a live server. **Not run**:
+`gate.sh`, `gate-pg.sh`, `gate-search.sh` and the client gates, which need
+Docker -- and `yesno-pg` constructs `QueryRequest`, so `gate-pg.sh` is now
+load-bearing for this change rather than precautionary.
+
+## 2026-09-25 -- Client parity, a vector sort, folding, and four checks that live outside the loop
+
+The `Big` work reached the clients, gained a vector sort and a fold, and then
+met the real gates. **Both gates are green** -- `gate.sh` after one failure,
+`gate-pg.sh` first time, with `yesno-pg` compiled against PostgreSQL 17 and 18
+and 2 of 2 `pg_regress` targets passing. That last one closes the risk this
+change carried from the start: `yesno-pg` is Bazel-only, no cargo command sees
+it, and `QueryRequest` was widened out from under it.
+
+**`Vec[Big]` is one sort, not two.** The request was for `Vec<BigInt>` *and*
+`Vec<BigUint>`; there is only one, because sign is a property of the **reading**
+-- `Read` yields a magnitude, `ReadSigned` a two's complement of the same bits.
+A `Vec[BigUint]` would be a sort whose only content is a promise the element's
+own node already makes.
+
+**It needed a bound neither existing one supplies.** `MAX_VIEW_SETS` caps the
+arity at 4096 and `MAX_VALUE_BITS` caps each element at 2^20 bits; **neither
+bounds their product**, and 4096 elements of 2^20 bits is half a gigabyte of
+answer from a twenty-byte payload. `MAX_RESULT_BITS = 2^24` is the fifth bound
+and it is the `cap-view-constituent-count` shape exactly: a quantity the
+evaluator loops over that appears in no existing bound.
+
+**Folding, and the width rule is the interesting part.** `add` / `mul` / `min` /
+`max`, four where the set fold has three, because the carrier is the integers
+rather than packed bits. None needs an identity since a vector is never empty,
+which is what admits `min` and `max` at all. **Only `mul` grows with the
+arity**: a sum of `n` values below `2^w` is below `2^( w + bits( n ) )`, while a
+product reaches `n * w` -- the same unbounded product, except that a fold lands
+it in a *single* value, so `MAX_VALUE_BITS` has to hold it rather than
+`MAX_RESULT_BITS`.
+
+**The width is optional exactly where the shape derives one**: inside a map over
+a **blocked** view, whose stride *is* the constituent's logical universe.
+Interleaved derives nothing and a bare set has no statically known extent, so
+there it stays required. **Resolved at parse time, not on the wire** -- the
+encoding still carries an explicit width, so one query keeps one encoding. A
+"derive it" marker in the format would have been a second spelling of the same
+request.
+
+**All five implementations agree byte for byte.** The pinned vector
+`59534e58010023200000001f1a8000000001040000000000000018010100000003` is now
+fixed in the Rust, Python, Go and Java suites, and the fold widths ( 130 for a
+sum, 384 for a product over three 128-bit constituents ) were computed
+independently by each. A JDK 21 inside `yesno-e2e:local` made the Java half
+verifiable on this host rather than written blind.
+
+### Four checks that live outside the loop, in one session
+
+Each of these was invisible to `cargo clippy --workspace --all-targets
+--all-features` plus `cargo test`, which is the triple `CLAUDE.md` names and the
+one I ran all day:
+
+* **Doctests.** `--all-targets` does not reach them. A public example on
+  `BigUint::truncate` went stale while every unit test passed.
+* **The Flight stream encoder.** `schema_for` was written as the single place an
+  answer's shape is decided and wired into **two** of the **three** places that
+  decide it; `FlightDataEncoderBuilder::with_schema` stamped `ordinals_schema`
+  on every stream regardless. Only a real socket round trip showed it.
+* **Rustdoc intra-doc links.** `gate.sh` runs a `doc links resolve` step nothing
+  else does. Eight links to deleted types -- `IntSpec`, `IntSink`,
+  `IntLayout::ordinal_at`, `OrdSet::int_is_zero` -- survived every local check
+  and failed the gate.
+* **Feature-gated dead code.** `schema_for`'s callers are behind
+  `#[cfg( feature = "server" )]` and it was not, so it is dead in a build
+  without that feature -- which **`--all-features` structurally cannot see,
+  because it turns the feature on.** Bazel builds without it and warned. The
+  complement check is `--no-default-features`, and it is not in the documented
+  triple.
+
+**The generalizable form**: `--all-features` and `--all-targets` sound
+exhaustive and are each blind in a specific direction -- one cannot see a
+feature being *off*, the other cannot see doctests or docs. A tool that reports
+success over the union of its own coverage says nothing about the complement,
+and `gate.sh` exists because that gap has a record here.
+
+**And I read the wrong exit code.** The first `gate.sh` run failed, its wrapper
+echoed 0, and I reported it as passing before reading the log whose first line
+said `gate.sh exit: 1`. Corrected in the next message. Read the gate's own
+output, not a wrapper's status.
+
+## 2026-09-25 -- Stage C: modular exponentiation, and the first bound that is not about size
+
+`PowMod( base, exp, modulus )` on the wire, tag 39, evaluated through `Barrett`.
+Three semantics decided rather than left to fall out: a **zero modulus** has no
+Barrett form; a **negative exponent** is a modular inverse, which `bignum`
+deliberately lacks because an extended GCD needs signed intermediates; and a
+**negative base** enters its residue class first, so the answer is always in
+`[ 0, m )` and never carries a sign out. All three are errors or reductions
+rather than plausible-looking wrong answers, and `m == 1` reducing `base^0` to
+zero -- the classic wrong `1` -- is pinned by its own test because the module
+header names it.
+
+**`MAX_WORK = 2^28` is the sixth bound and the first that is not about size.**
+Width and result bounds cap how much *answer* an expression describes.
+`PowMod` is where cost and size separate: its result is only as wide as the
+modulus, so `width_bound` finds nothing wrong with a payload naming a 1 Mibit
+modulus and a 1 Mibit exponent -- a value that fits comfortably and a
+computation that does not finish. The test that says so asserts **both**: that
+the width is unremarkable and within `MAX_VALUE_BITS`, and that the work is
+not.
+
+**It covers the whole tree, not just exponentiation**, because a single
+full-width multiply already costs about what the exponentiation the bound was
+written for does. A budget watching only `PowMod` would refuse one and admit
+the other at the same price.
+
+**Calibrated against the operation that forced it**, on a schoolbook `n^2`
+multiply: a 2048-bit modulus with a full-width exponent is ~4.2e6 limb
+operations, 4096-bit ~3.4e7, 8192-bit ~2.7e8. So the bound admits RSA-scale
+work and refuses what would pin a core, and `rsa_scale_exponentiation_is_admitted`
+keeps that calibration honest -- without it the bound could tighten silently
+until it refused everything and the amplification test would still pass.
+
+**Recorded as an admission bound, not a cost model, and the distinction is
+load-bearing.** This tree measured a word-operation model over-predict real
+time by two to three times on the reporter's own buffers and concluded the
+family of models is wrong for the quantity. So every rule here is a deliberate
+**upper** bound -- schoolbook rather than Karatsuba's measured exponent -- which
+is the right direction for refusing the absurd and the wrong direction for
+ranking plans. A static count cannot do the second and this does not try.
+
+**Verification.** `cargo fmt --check` clean; `clippy --workspace --all-targets
+--all-features -D warnings` exit 0; **291 tests** green across `yesno-wire`,
+`yesno-flight` and `yesno-server`; `docs/` self-contained. And the two checks
+that caught things earlier today were run deliberately rather than assumed:
+`cargo build --no-default-features` ( the feature-gated dead code
+`--all-features` structurally cannot see ) and `RUSTDOCFLAGS="-D warnings"
+cargo doc` ( the intra-doc links ). Both clean.
+
+**Outstanding**: `PowMod` is not in the Python, Go or Java clients yet -- the
+other twelve big-integer nodes are. The gates were green *before* this stage,
+so both need re-running.

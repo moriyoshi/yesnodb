@@ -290,3 +290,274 @@ func TestTheHoleIsScopedToAMapBody(t *testing.T) {
 		t.Fatal("round trip mismatch for a sequential map")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The big-integer sort
+// ---------------------------------------------------------------------------
+
+// Mirrors `the_big_cross_implementation_wire_vector_is_stable` in the Rust
+// crate and its Python counterpart. Five implementations of one format drift
+// silently otherwise: each can round-trip against itself while disagreeing
+// with the others.
+func TestBigWireVectorMatchesTheRustCrate(t *testing.T) {
+	e := BigSaturateExpr{
+		Input: BigMulExpr{
+			Left:  BigReadExpr{Input: KeyExpr{Key: 4}, WidthBits: 128},
+			Right: BigLitFromInt64(-3),
+		},
+		Bits: 32,
+	}
+	encoded, err := EncodeBig(e)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	const want = "59534e58010023200000001f1a8000000001040000000000000018010100000003"
+	if got := hex.EncodeToString(encoded); got != want {
+		t.Fatalf("wire vector drifted:\n got %s\nwant %s", got, want)
+	}
+	back, err := DecodeBig(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(back, e) {
+		t.Fatalf("round trip: got %#v", back)
+	}
+}
+
+func TestBigNodesRoundTrip(t *testing.T) {
+	cases := []BigExpr{
+		BigLitFromInt64(0),
+		BigLitFromInt64(1),
+		BigLitFromInt64(-1),
+		BigLitFromInt64(1 << 40),
+		BigLitFromInt64(-(1 << 40)),
+		BigWidenExpr{Input: CardinalityExpr{Input: KeyExpr{Key: 7}}},
+		BigReadExpr{Input: KeyExpr{Key: 4}, WidthBits: 128},
+		BigReadSignedExpr{Input: KeyExpr{Key: 4}, WidthBits: 8},
+		BigNegExpr{Input: BigLitFromInt64(5)},
+		BigAddExpr{Left: BigLitFromInt64(1), Right: BigLitFromInt64(2)},
+		BigSubExpr{Left: BigLitFromInt64(1), Right: BigLitFromInt64(2)},
+		BigMulExpr{Left: BigLitFromInt64(3), Right: BigLitFromInt64(4)},
+		BigDivExpr{Left: BigLitFromInt64(7), Right: BigLitFromInt64(2)},
+		BigRemExpr{Left: BigLitFromInt64(7), Right: BigLitFromInt64(2)},
+		BigTruncateExpr{Input: BigLitFromInt64(300), Bits: 8},
+		BigSaturateExpr{Input: BigLitFromInt64(300), Bits: 8},
+	}
+	for _, e := range cases {
+		encoded, err := EncodeBig(e)
+		if err != nil {
+			t.Fatalf("encode %#v: %v", e, err)
+		}
+		back, err := DecodeBig(encoded)
+		if err != nil {
+			t.Fatalf("decode %#v: %v", e, err)
+		}
+		if !reflect.DeepEqual(back, e) {
+			t.Fatalf("round trip %#v -> %#v", e, back)
+		}
+	}
+}
+
+// The amplification the width budget exists to refuse. A read is six bytes
+// that declare a width, so a product of two maximal reads is a tiny payload
+// describing a value no server should try to build.
+func TestBigWidthBudgetRefusesAnAmplification(t *testing.T) {
+	wide := BigReadExpr{Input: KeyExpr{Key: 1}, WidthBits: MaxValueBits}
+	if _, err := EncodeBig(BigMulExpr{Left: wide, Right: wide}); err == nil {
+		t.Fatal("a product of two maximal reads must be refused")
+	}
+	// One bit under the bound is accepted, so the refusal above is the bound
+	// working rather than the shape being rejected.
+	half := BigReadExpr{Input: KeyExpr{Key: 1}, WidthBits: MaxValueBits / 2}
+	if _, err := EncodeBig(BigMulExpr{Left: half, Right: half}); err != nil {
+		t.Fatalf("a product just inside the bound must be accepted: %v", err)
+	}
+}
+
+// One value, one encoding, or a shared byte vector states nothing.
+func TestBigLiteralCanonicalityIsEnforced(t *testing.T) {
+	if _, err := EncodeBig(BigLitExpr{Magnitude: []byte{1, 0}}); err == nil {
+		t.Fatal("a trailing zero byte must be refused rather than trimmed")
+	}
+	if _, err := EncodeBig(BigLitExpr{Negative: true}); err == nil {
+		t.Fatal("a negative zero must be unrepresentable")
+	}
+	if BigLitFromInt64(0).Negative {
+		t.Fatal("zero is never negative")
+	}
+}
+
+func TestBigZeroWidthReadIsRefused(t *testing.T) {
+	if _, err := EncodeBig(BigReadExpr{Input: KeyExpr{Key: 1}}); err == nil {
+		t.Fatal("a read of zero bits denotes nothing and must be refused")
+	}
+}
+
+func TestABigTagWhereASetBelongsIsASortMismatch(t *testing.T) {
+	encoded, err := EncodeBig(BigLitFromInt64(1))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := DecodeExpression(encoded); err == nil {
+		t.Fatal("a big-integer payload must not decode as a set")
+	}
+}
+
+func TestBigVectorIsBuiltByMapAndCollapsedByFold(t *testing.T) {
+	vector := MapBigExpr{
+		Vector: ViewExpr{Input: KeyExpr{Key: 9}, View: ViewSpec{Sets: 3, Layout: ViewInterleaved}},
+		Body:   BigReadExpr{Input: HoleExpr{}, WidthBits: 128},
+	}
+	encoded, err := EncodeBigVector(vector)
+	if err != nil {
+		t.Fatalf("encode vector: %v", err)
+	}
+	back, err := DecodeBigVector(encoded)
+	if err != nil {
+		t.Fatalf("decode vector: %v", err)
+	}
+	if !reflect.DeepEqual(back, vector) {
+		t.Fatalf("vector round trip: %#v", back)
+	}
+
+	for _, op := range []BigFoldOp{BigFoldAdd, BigFoldMul, BigFoldMin, BigFoldMax} {
+		f := BigFoldExpr{Vector: vector, Op: op}
+		enc, err := EncodeBig(f)
+		if err != nil {
+			t.Fatalf("encode fold %d: %v", op, err)
+		}
+		got, err := DecodeBig(enc)
+		if err != nil {
+			t.Fatalf("decode fold %d: %v", op, err)
+		}
+		if !reflect.DeepEqual(got, f) {
+			t.Fatalf("fold round trip %d: %#v", op, got)
+		}
+	}
+}
+
+// Only a product fold grows with the arity: a sum costs a handful of bits.
+func TestOnlyAProductFoldGrowsWithTheArity(t *testing.T) {
+	vector := MapBigExpr{
+		Vector: ViewExpr{Input: KeyExpr{Key: 9}, View: ViewSpec{Sets: 3, Layout: ViewInterleaved}},
+		Body:   BigReadExpr{Input: HoleExpr{}, WidthBits: 128},
+	}
+	for _, c := range []struct {
+		op   BigFoldOp
+		want uint64
+	}{
+		{BigFoldAdd, 128 + 2},
+		{BigFoldMul, 128 * 3},
+		{BigFoldMin, 128},
+		{BigFoldMax, 128},
+	} {
+		if got := (BigFoldExpr{Vector: vector, Op: c.op}).WidthBound(); got != c.want {
+			t.Fatalf("op %d: got %d, want %d", c.op, got, c.want)
+		}
+	}
+}
+
+// Two bounded factors have an unbounded product: the constituent cap and the
+// per-value width bound each cap one and say nothing about their product.
+func TestBigVectorResultBoundRefusesAWideVectorOfWideValues(t *testing.T) {
+	wide := MapBigExpr{
+		Vector: ViewExpr{Input: KeyExpr{Key: 1}, View: ViewSpec{Sets: 4096, Layout: ViewInterleaved}},
+		Body:   BigReadExpr{Input: HoleExpr{}, WidthBits: MaxValueBits},
+	}
+	if _, err := EncodeBigVector(wide); err == nil {
+		t.Fatal("a wide vector of wide values must be refused")
+	}
+	ok := MapBigExpr{
+		Vector: ViewExpr{Input: KeyExpr{Key: 1}, View: ViewSpec{Sets: 64, Layout: ViewInterleaved}},
+		Body:   BigReadExpr{Input: HoleExpr{}, WidthBits: 1024},
+	}
+	if _, err := EncodeBigVector(ok); err != nil {
+		t.Fatalf("a vector inside the bound must be accepted: %v", err)
+	}
+}
+
+// Mirrors `the_pow_mod_wire_vector_is_stable` in the Rust crate: the operand
+// order is the one thing a reader cannot infer from the bytes.
+func TestPowModWireVectorMatchesTheRustCrate(t *testing.T) {
+	e := BigPowModExpr{
+		Base:    BigLitFromInt64(2),
+		Exp:     BigLitFromInt64(10),
+		Modulus: BigLitFromInt64(1000),
+	}
+	encoded, err := EncodeBig(e)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	const want = "59534e58010027180001000000021800010000000a180002000000e803"
+	if got := hex.EncodeToString(encoded); got != want {
+		t.Fatalf("wire vector drifted:\n got %s\nwant %s", got, want)
+	}
+	back, err := DecodeBig(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(back, e) {
+		t.Fatalf("round trip: %#v", back)
+	}
+}
+
+// The amplification the work bound exists for, and the one the width bound
+// structurally cannot see: a residue is only as wide as its modulus.
+func TestACostlyExponentiationIsRefusedWhereItsWidthIsUnremarkable(t *testing.T) {
+	wide := func(bits uint32) BigExpr {
+		return BigReadExpr{Input: KeyExpr{Key: 1}, WidthBits: bits}
+	}
+	e := BigPowModExpr{Base: BigLitFromInt64(2), Exp: wide(1 << 20), Modulus: wide(1 << 20)}
+
+	if e.WidthBound() != 1<<20 || e.WidthBound() > MaxValueBits {
+		t.Fatalf("the width should be unremarkable, got %d", e.WidthBound())
+	}
+	if e.WorkBound() <= MaxWork {
+		t.Fatalf("the work should exceed the budget, got %d", e.WorkBound())
+	}
+	if _, err := EncodeBig(e); err == nil {
+		t.Fatal("a costly exponentiation must be refused")
+	}
+}
+
+// And the sizes a caller plausibly means are admitted, so the bound is
+// calibrated rather than merely restrictive.
+func TestRsaScaleExponentiationIsAdmitted(t *testing.T) {
+	for _, bits := range []uint32{2048, 4096} {
+		operand := BigReadExpr{Input: KeyExpr{Key: 1}, WidthBits: bits}
+		e := BigPowModExpr{Base: BigLitFromInt64(2), Exp: operand, Modulus: operand}
+		if e.WorkBound() > MaxWork {
+			t.Fatalf("%d-bit modulus cost %d exceeds the budget", bits, e.WorkBound())
+		}
+		if _, err := EncodeBig(e); err != nil {
+			t.Fatalf("%d-bit modulus must be admitted: %v", bits, err)
+		}
+	}
+}
+
+// Big and BigVec are the Go spelling of the query language's big( .. ) and
+// big( [ .. ] ). Go cannot overload, so the vector half takes its own name.
+func TestBigAndBigVecMirrorTheQueryLanguage(t *testing.T) {
+	if got := Big(7); !reflect.DeepEqual(got, BigLitFromInt64(7)) {
+		t.Fatalf("Big(7) = %#v", got)
+	}
+	want := BigListExpr{Elements: []BigExpr{
+		BigLitFromInt64(1), BigLitFromInt64(2), BigLitFromInt64(3),
+	}}
+	if got := BigVec(1, 2, 3); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BigVec(1,2,3) = %#v", got)
+	}
+
+	folded := BigFoldExpr{Vector: BigVec(1, 2, 3), Op: BigFoldAdd}
+	encoded, err := EncodeBig(folded)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	back, err := DecodeBig(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(back, folded) {
+		t.Fatalf("round trip: %#v", back)
+	}
+}

@@ -265,7 +265,6 @@ impl Packing {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn a_dense_packing_is_the_identity_on_the_ordinal_space() {
         let p = Packing::dense(4, 8);
@@ -274,17 +273,6 @@ mod tests {
         // Object 3, line 2, bit 5 is ordinal 3*32 + 2*8 + 5.
         assert_eq!(p.ordinal_at(3, 2, 5), Some(96 + 16 + 5));
     }
-
-    #[test]
-    fn one_line_reproduces_the_integer_shape() {
-        let p = Packing::dense(1, 100);
-        assert_eq!(p.span_bits(), 100);
-        assert_eq!(p.object_stride, 100);
-        assert_eq!(p.line_words(), 2);
-        // Bit j of object k is at k*100 + j, which is exactly IntLayout's rule.
-        assert_eq!(p.ordinal_at(7, 0, 3), Some(703));
-    }
-
     #[test]
     fn padding_above_the_last_line_is_not_counted_in_the_span() {
         let p = Packing::word_aligned(3, 100);
@@ -293,9 +281,6 @@ mod tests {
         assert_eq!(p.span_bits(), 256 + 100);
         assert_eq!(p.object_stride, 384);
     }
-
-    /// The seam. `span_bits() < 65536` does not imply chunk containment, and
-    /// this is the index that proves it.
     #[test]
     fn a_small_object_can_still_straddle_a_chunk_boundary() {
         let p = Packing::dense(1, 10_000);
@@ -305,7 +290,6 @@ mod tests {
         assert_eq!(p.straddles(0), Some(false));
         assert_eq!(p.straddles(5), Some(false));
     }
-
     #[test]
     fn a_chunk_aligned_packing_never_straddles() {
         let p = Packing::chunk_aligned(4, 100).unwrap();
@@ -317,7 +301,6 @@ mod tests {
         assert!(Packing::chunk_aligned(2, 65_536).is_none());
         assert!(Packing::chunk_aligned(1, 65_536).is_some());
     }
-
     #[test]
     fn check_rejects_overlap_and_zero_but_allows_a_generous_stride() {
         assert!(Packing::dense(4, 8).check().is_ok());
@@ -343,7 +326,6 @@ mod tests {
         .check()
         .is_ok());
     }
-
     #[test]
     fn an_object_reaching_past_the_ordinal_ceiling_is_not_addressable() {
         let p = Packing::dense(1, 64);
@@ -354,117 +336,6 @@ mod tests {
         assert!(p.last_of(last - 1).is_some());
         assert_eq!(p.straddles(last), None);
     }
-
-    /// **The property that says the shared type is real rather than a forced
-    /// factoring**, and it could not be written while the two lenses each owned
-    /// a copy of the walk.
-    ///
-    /// A one-line packing is an integer to `bignum` and a single-row matrix to
-    /// `matrix`. Those are two independent public entry points reading the same
-    /// ordinals under the same addressing, so they must agree bit for bit — a
-    /// `BitMatrix`'s row words and a `BigUint`'s limbs are the same canonical
-    /// form at `lines == 1`.
-    ///
-    /// The indices are chosen to include **straddling** ones. Restricting
-    /// them to chunk-contained objects would leave the seam untested while every
-    /// assertion here still passed.
-    #[test]
-    fn a_one_line_packing_reads_the_same_as_a_single_row_matrix() {
-        use crate::bignum::IntLayout;
-        use crate::matrix::Layout;
-        use crate::OrdSet;
-
-        let mut checked = 0u32;
-        let mut nonzero = 0u32;
-        let mut straddling = 0u32;
-        for width in [1u32, 7, 64, 100, 128, 1000, 10_000] {
-            for stride in [width as u64, width as u64 + 3, 65_536] {
-                if stride < width as u64 {
-                    continue;
-                }
-                let int = IntLayout {
-                    width_bits: width,
-                    stride,
-                };
-                let mat = Layout {
-                    line_stride: width,
-                    matrix_stride: stride,
-                    ..Layout::dense(1, width)
-                };
-                assert_eq!(int.packing(), mat.packing(), "w={width} s={stride}");
-
-                // Boundary-biased source: values around every chunk edge the
-                // strides can reach, plus a sparse spread.
-                let s = OrdSet::from_iter_unsorted(
-                    (0..400u64)
-                        .map(|i| i * 977)
-                        .chain([0, 1, 65_535, 65_536, 65_537, 131_071, 131_072]),
-                );
-
-                for k in [0u64, 1, 5, 6, 7, 13, 655, 1000] {
-                    let (Some(v), Some(m)) = (s.read_int(k, &int), s.read_matrix(k, &mat)) else {
-                        continue;
-                    };
-                    assert_eq!(m.rows(), 1);
-                    for b in 0..width {
-                        assert_eq!(
-                            v.bit(b as u64),
-                            m.get(0, b),
-                            "w={width} s={stride} k={k} bit={b}"
-                        );
-                    }
-                    checked += 1;
-                    nonzero += u32::from(m.count_ones() > 0);
-                    straddling += u32::from(int.straddles(k) == Some(true));
-                }
-            }
-        }
-        // Without these the whole test passes on pairs of zeros.
-        assert!(checked > 50, "only {checked} comparisons");
-        assert!(nonzero > 20, "only {nonzero} of {checked} had any bits");
-        assert!(straddling > 5, "only {straddling} straddling objects");
-    }
-
-    /// The two lenses' own `check`s and this one must agree on what is legal, or
-    /// a layout a lens accepts could reach a kernel that rejects it.
-    #[test]
-    fn each_lens_check_agrees_with_the_packing_check() {
-        use crate::bignum::IntLayout;
-        use crate::matrix::Layout;
-
-        for width in [0u32, 1, 8, 64] {
-            for stride in [0u64, 1, 8, 64, 128] {
-                let l = IntLayout {
-                    width_bits: width,
-                    stride,
-                };
-                assert_eq!(
-                    l.check().is_ok(),
-                    l.packing().check().is_ok(),
-                    "IntLayout w={width} s={stride}"
-                );
-            }
-        }
-        for rows in [0u32, 1, 4] {
-            for cols in [0u32, 1, 7] {
-                for line_stride in [0u32, 1, 7, 16] {
-                    for matrix_stride in [0u64, 16, 1 << 12] {
-                        let l = Layout {
-                            line_stride,
-                            matrix_stride,
-                            ..Layout::dense(rows, cols)
-                        };
-                        assert_eq!(
-                            l.check().is_ok(),
-                            l.packing().check().is_ok(),
-                            "Layout {l:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn count_below_reports_addressable_positions_not_non_empty_ones() {
         let p = Packing::dense(1, 64);

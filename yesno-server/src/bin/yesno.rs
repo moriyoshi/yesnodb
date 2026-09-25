@@ -15,7 +15,7 @@
 
 use std::process::ExitCode;
 
-use arrow_array::{Array, UInt64Array};
+use arrow_array::{Array, BinaryArray, BooleanArray, UInt64Array};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, Empty, FlightDescriptor};
 use clap::{Parser, Subcommand};
@@ -258,7 +258,7 @@ async fn connect(cli: &Cli) -> Result<Client, Fail> {
 fn descriptor(key: u64) -> FlightDescriptor {
     FlightDescriptor::new_cmd(key.to_le_bytes().to_vec())
 }
-fn expression_descriptor(expr: &yesno_flight::SetExpr) -> FlightDescriptor {
+fn expression_descriptor(expr: &yesno_flight::AnyExpr) -> FlightDescriptor {
     FlightDescriptor::new_cmd(expr.encode())
 }
 /// The same expression bound to one database version.
@@ -267,7 +267,7 @@ fn expression_descriptor(expr: &yesno_flight::SetExpr) -> FlightDescriptor {
 /// `SetExpr` has no version slot, and `QueryRequest` is the form that carries
 /// both. The server distinguishes them by magic, so sending the wrong one asks a
 /// different question rather than failing.
-fn expression_descriptor_at(expr: &yesno_flight::SetExpr, version: u64) -> FlightDescriptor {
+fn expression_descriptor_at(expr: &yesno_flight::AnyExpr, version: u64) -> FlightDescriptor {
     FlightDescriptor::new_cmd(yesno_flight::QueryRequest::at(expr.clone(), version).encode())
 }
 
@@ -288,6 +288,18 @@ impl std::error::Error for QueryParseError {}
 struct QueryParser<'a> {
     input: &'a str,
     at: usize,
+    /// The width a bare `uint( e )` / `int( e )` takes inside the current map
+    /// body, when the enclosing view makes one derivable.
+    ///
+    /// **Only a blocked view supplies it.** A blocked constituent's logical
+    /// universe is exactly `x < stride`, so the stride *is* the width. An
+    /// interleaved constituent's logical ordinals are unbounded, so there is
+    /// nothing to derive and the width stays required.
+    ///
+    /// Resolved here rather than on the wire: the encoding keeps carrying an
+    /// explicit width, so one query still has one encoding. A "derive it"
+    /// marker in the format would be a second spelling of the same request.
+    derived_width: Option<u32>,
 }
 
 impl QueryParser<'_> {
@@ -466,9 +478,36 @@ impl QueryParser<'_> {
     }
 
     /// A whole query: a set, or one integer per constituent.
+    /// The keywords that can only begin a `Big`, so one token of lookahead
+    /// decides the sort -- the same trick `map` uses, and for the same reason:
+    /// the sorts reject each other's nodes, so guessing wrong is an error
+    /// rather than a reinterpretation.
+    const BIG_HEADS: [&'static str; 13] = [
+        "big", "widen", "uint", "int", "neg", "add", "sub", "mul", "div", "rem", "truncate",
+        "saturate", "powmod",
+    ];
+
     fn query(&mut self) -> Result<yesno_flight::AnyExpr, QueryParseError> {
         self.skip_ws();
         let save = self.at;
+        if let Ok(id) = self.ident() {
+            let id = id.to_ascii_lowercase();
+            self.at = save;
+            if Self::BIG_HEADS.iter().any(|h| *h == id) {
+                return self.big_expr().map(yesno_flight::AnyExpr::Big);
+            }
+            // `fold` names both sorts' folds, so one token cannot decide it:
+            // the *vector* does. Tried speculatively and rewound on failure,
+            // the same shape `map` uses just below -- and the set fold must
+            // keep working unchanged, which is the half this can get wrong.
+            if id == "fold" {
+                if let Ok(e) = self.big_expr() {
+                    return Ok(yesno_flight::AnyExpr::Big(e));
+                }
+                self.at = save;
+            }
+        }
+        self.at = save;
         // Only `map` with an integer body denotes the vector sort, and that is
         // decidable from the text, so try it before falling back to a set.
         if let Ok(id) = self.ident() {
@@ -476,12 +515,31 @@ impl QueryParser<'_> {
                 let probe = self.at;
                 if self.expect(b'(').is_ok() {
                     if let Ok(v) = self.vec_expr() {
-                        if self.expect(b',').is_ok() && self.peek_body_sort()? == BodySort::Int {
-                            let body = self.int_expr()?;
-                            self.expect(b')')?;
-                            return Ok(yesno_flight::AnyExpr::VecInt(
-                                yesno_flight::VecIntExpr::Map(Box::new(v), Box::new(body)),
-                            ));
+                        if self.expect(b',').is_ok() {
+                            let saved = self.derived_width;
+                            self.derived_width = Self::width_of(&v);
+                            let sort = self.peek_body_sort();
+                            match sort? {
+                                BodySort::Int => {
+                                    let body = self.int_expr();
+                                    self.derived_width = saved;
+                                    let body = body?;
+                                    self.expect(b')')?;
+                                    return Ok(yesno_flight::AnyExpr::VecInt(
+                                        yesno_flight::VecIntExpr::Map(Box::new(v), Box::new(body)),
+                                    ));
+                                }
+                                BodySort::Big => {
+                                    let body = self.big_expr();
+                                    self.derived_width = saved;
+                                    let body = body?;
+                                    self.expect(b')')?;
+                                    return Ok(yesno_flight::AnyExpr::VecBig(
+                                        yesno_flight::VecBigExpr::Map(Box::new(v), Box::new(body)),
+                                    ));
+                                }
+                                _ => self.derived_width = saved,
+                            }
                         }
                     }
                 }
@@ -613,6 +671,10 @@ impl QueryParser<'_> {
                     "map with an integer body denotes a vector of integers, \
                      which is not a set; it can only be a whole query",
                 )),
+                BodySort::Big => Err(self.error(
+                    "map with a big-integer body denotes a vector of big \
+                     integers, which is not a set; it can only be a whole query",
+                )),
                 BodySort::Set => {
                     let body = self.expr()?;
                     self.expect(b')')?;
@@ -634,6 +696,7 @@ impl QueryParser<'_> {
                 BodySort::Int
             }
             Ok(id) if id.eq_ignore_ascii_case("contains") => BodySort::Bool,
+            Ok(id) if Self::BIG_HEADS.iter().any(|h| id.eq_ignore_ascii_case(h)) => BodySort::Big,
             _ => BodySort::Set,
         };
         self.at = save;
@@ -666,6 +729,226 @@ impl QueryParser<'_> {
             return Ok(yesno_flight::IntExpr::Rank(Box::new(a), x));
         }
         Err(self.error(format!("'{ident}' is not an integer")))
+    }
+
+    /// A signed literal: an optional `-` then digits.
+    fn signed_literal(&mut self) -> Result<yesno_flight::BigLit, QueryParseError> {
+        self.skip_ws();
+        let negative = self.input.as_bytes().get(self.at) == Some(&b'-');
+        if negative {
+            self.at += 1;
+        }
+        let magnitude = self.number()?;
+        let mut bytes = magnitude.to_le_bytes().to_vec();
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        yesno_flight::BigLit::from_le_bytes(negative, bytes).map_err(|e| self.error(format!("{e}")))
+    }
+
+    fn big_expr(&mut self) -> Result<yesno_flight::BigExpr, QueryParseError> {
+        use yesno_flight::BigExpr;
+        self.skip_ws();
+        // A bare number is a literal wherever a big integer is *required*, and
+        // only there. The position has already fixed the sort, so there is
+        // nothing to infer and nothing to get wrong -- unlike at the top level,
+        // where a bare number is a key and must stay one.
+        if self
+            .input
+            .as_bytes()
+            .get(self.at)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'-')
+        {
+            return self.signed_literal().map(BigExpr::Lit);
+        }
+        let ident = self.ident()?.to_ascii_lowercase();
+
+        // `op( a, b )` for the five binary arithmetic nodes.
+        let binary = |p: &mut Self| -> Result<(Box<BigExpr>, Box<BigExpr>), QueryParseError> {
+            p.expect(b'(')?;
+            let a = Box::new(p.big_expr()?);
+            p.expect(b',')?;
+            let b = Box::new(p.big_expr()?);
+            p.expect(b')')?;
+            Ok((a, b))
+        };
+        // `op( a, WIDTH )` for the two field-narrowing nodes.
+        let narrowing = |p: &mut Self| -> Result<(Box<BigExpr>, u32), QueryParseError> {
+            p.expect(b'(')?;
+            let a = Box::new(p.big_expr()?);
+            p.expect(b',')?;
+            let w = p.number()?;
+            p.expect(b')')?;
+            let w = u32::try_from(w).map_err(|_| p.error("width must fit a u32"))?;
+            Ok((a, w))
+        };
+
+        match ident.as_str() {
+            // `big( n )` is a scalar literal; `big( [ .. ] )` is a vector and
+            // belongs to `vec_big_expr`, which is the only caller that can
+            // return one. Refusing it here rather than mis-parsing it is what
+            // makes the error name the real problem.
+            "big" => {
+                self.expect(b'(')?;
+                self.skip_ws();
+                if self.input.as_bytes().get(self.at) == Some(&b'[') {
+                    return Err(self.error(
+                        "big( [ .. ] ) is a vector of big integers, which is not a \
+                         single value; it can only be folded",
+                    ));
+                }
+                let v = self.signed_literal()?;
+                self.expect(b')')?;
+                Ok(BigExpr::Lit(v))
+            }
+            "widen" => {
+                self.expect(b'(')?;
+                let a = self.int_expr()?;
+                self.expect(b')')?;
+                Ok(BigExpr::Widen(Box::new(a)))
+            }
+            // `uint` reads a magnitude, `int` reads two's complement -- the
+            // convention every other language uses, where the unsigned form
+            // takes the prefix. Two spellings because they are two different
+            // numbers from the same bits, and nothing in the bits says which
+            // was meant.
+            "uint" | "int" => {
+                self.expect(b'(')?;
+                let a = Box::new(self.expr()?);
+                // Optional exactly where it is derivable: inside a map over a
+                // blocked view, whose stride *is* the constituent's universe.
+                // Required everywhere else, because a set with a distant
+                // highest member is cheap to store and expensive to render,
+                // and the width is the only bound on that.
+                let w = if self.expect(b',').is_ok() {
+                    let w = self.number()?;
+                    u32::try_from(w).map_err(|_| self.error("width must fit a u32"))?
+                } else {
+                    self.derived_width.ok_or_else(|| {
+                        self.error(
+                            "a width is required here; it is derivable only \
+                             inside a map over a blocked view, whose stride is \
+                             the constituent's own universe",
+                        )
+                    })?
+                };
+                self.expect(b')')?;
+                Ok(if ident == "uint" {
+                    BigExpr::Read(a, w)
+                } else {
+                    BigExpr::ReadSigned(a, w)
+                })
+            }
+            "neg" => {
+                self.expect(b'(')?;
+                let a = Box::new(self.big_expr()?);
+                self.expect(b')')?;
+                Ok(BigExpr::Neg(a))
+            }
+            "add" => binary(self).map(|(a, b)| BigExpr::Add(a, b)),
+            "sub" => binary(self).map(|(a, b)| BigExpr::Sub(a, b)),
+            "mul" => binary(self).map(|(a, b)| BigExpr::Mul(a, b)),
+            "div" => binary(self).map(|(a, b)| BigExpr::Div(a, b)),
+            "rem" => binary(self).map(|(a, b)| BigExpr::Rem(a, b)),
+            "powmod" => {
+                self.expect(b'(')?;
+                let b = Box::new(self.big_expr()?);
+                self.expect(b',')?;
+                let e = Box::new(self.big_expr()?);
+                self.expect(b',')?;
+                let m = Box::new(self.big_expr()?);
+                self.expect(b')')?;
+                Ok(BigExpr::PowMod(b, e, m))
+            }
+            "truncate" => narrowing(self).map(|(a, w)| BigExpr::Truncate(a, w)),
+            "saturate" => narrowing(self).map(|(a, w)| BigExpr::Saturate(a, w)),
+            // Reached only through `query`'s speculative attempt, because
+            // `fold` names both sorts' folds and the vector decides which:
+            // a big vector folds with `add` / `mul` / `min` / `max`, a set
+            // vector with `or` / `and` / `xor`.
+            "fold" => {
+                self.expect(b'(')?;
+                let v = self.vec_big_expr()?;
+                self.expect(b',')?;
+                let op = self.big_fold_op()?;
+                self.expect(b')')?;
+                Ok(BigExpr::Fold(Box::new(v), op))
+            }
+            other => Err(self.error(format!("'{other}' is not a big integer"))),
+        }
+    }
+
+    /// The width a blocked view's constituent addresses, if the vector is one.
+    fn width_of(v: &yesno_flight::VecSetExpr) -> Option<u32> {
+        match v {
+            yesno_flight::VecSetExpr::View(_, spec) => match spec.layout {
+                yesno_flight::ViewLayout::Blocked { stride } => u32::try_from(stride).ok(),
+                yesno_flight::ViewLayout::Interleaved => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn big_fold_op(&mut self) -> Result<yesno_flight::BigFoldOp, QueryParseError> {
+        use yesno_flight::BigFoldOp;
+        let id = self.ident()?.to_ascii_lowercase();
+        match id.as_str() {
+            "add" => Ok(BigFoldOp::Add),
+            "mul" => Ok(BigFoldOp::Mul),
+            "min" => Ok(BigFoldOp::Min),
+            "max" => Ok(BigFoldOp::Max),
+            other => Err(self.error(format!(
+                "'{other}' is not a big-integer fold operator; \
+                 expected add, mul, min or max"
+            ))),
+        }
+    }
+
+    /// A vector of big integers.
+    ///
+    /// **A bare `[ .. ]` is never one.** A bracketed list is a vector of
+    /// *sets* everywhere in this language, and letting the same text mean two
+    /// things decided by an operator several tokens later is the reading
+    /// hazard this spelling exists to remove: `big( [ 1, 2, 3 ] )` says which
+    /// sort it is where the vector is written.
+    fn vec_big_expr(&mut self) -> Result<yesno_flight::VecBigExpr, QueryParseError> {
+        use yesno_flight::VecBigExpr;
+        self.skip_ws();
+        let save = self.at;
+        let id = self.ident()?.to_ascii_lowercase();
+        if id == "big" {
+            self.expect(b'(')?;
+            self.skip_ws();
+            self.expect(b'[')?;
+            let mut elements = Vec::new();
+            loop {
+                elements.push(self.big_expr()?);
+                self.skip_ws();
+                if self.expect(b',').is_err() {
+                    break;
+                }
+            }
+            self.expect(b']')?;
+            self.expect(b')')?;
+            if elements.is_empty() {
+                return Err(self.error("vector has no elements"));
+            }
+            return Ok(VecBigExpr::List(elements));
+        }
+        if id != "map" {
+            self.at = save;
+            return Err(self.error(format!("'{id}' is not a vector of big integers")));
+        }
+        self.expect(b'(')?;
+        let v = self.vec_expr()?;
+        self.expect(b',')?;
+        let saved = self.derived_width;
+        self.derived_width = Self::width_of(&v);
+        let body = self.big_expr();
+        self.derived_width = saved;
+        let body = body?;
+        self.expect(b')')?;
+        Ok(VecBigExpr::Map(Box::new(v), Box::new(body)))
     }
 
     fn bool_expr(&mut self) -> Result<yesno_flight::BoolExpr, QueryParseError> {
@@ -753,16 +1036,7 @@ enum BodySort {
     Set,
     Int,
     Bool,
-}
-
-fn parse_expression(input: &str) -> Result<yesno_flight::SetExpr, QueryParseError> {
-    match parse_query(input)? {
-        yesno_flight::AnyExpr::Set(e) => Ok(e),
-        yesno_flight::AnyExpr::VecInt(_) => Err(QueryParseError {
-            at: 0,
-            message: "this query denotes one integer per constituent, not a set".into(),
-        }),
-    }
+    Big,
 }
 
 /// Parse a whole query at whichever sort it denotes.
@@ -771,7 +1045,11 @@ fn parse_expression(input: &str) -> Result<yesno_flight::SetExpr, QueryParseErro
 /// constituent -- a facet histogram -- and that is the other shape a server can
 /// return.
 fn parse_query(input: &str) -> Result<yesno_flight::AnyExpr, QueryParseError> {
-    let mut parser = QueryParser { input, at: 0 };
+    let mut parser = QueryParser {
+        input,
+        at: 0,
+        derived_width: None,
+    };
     let expr = parser.query()?;
     parser.skip_ws();
     if parser.at != input.len() {
@@ -786,6 +1064,22 @@ async fn print_rows(
     subject: &str,
     limit: Option<usize>,
 ) -> Result<(), Fail> {
+    print_answer(c, descriptor, subject, limit, yesno_flight::Sort::Set).await
+}
+
+/// Render an answer at whichever sort it denotes.
+///
+/// The sort comes from the **client's own parse**, not from inspecting the
+/// batch: the client wrote the query, so it already knows the shape, and
+/// deciding again from the columns would be a second answer to a settled
+/// question that could disagree with the first.
+async fn print_answer(
+    c: &mut Client,
+    descriptor: FlightDescriptor,
+    subject: &str,
+    limit: Option<usize>,
+    sort: yesno_flight::Sort,
+) -> Result<(), Fail> {
     let info = c.get_flight_info(descriptor).await?.into_inner();
     let ep = info
         .endpoint
@@ -793,8 +1087,14 @@ async fn print_rows(
         .ok_or("the server returned no endpoint")?;
     let ticket = ep.ticket.clone().ok_or("the endpoint carries no ticket")?;
     if let Some(t) = yesno_flight::Ticket::decode(&ticket.ticket) {
+        let unit = match sort {
+            yesno_flight::Sort::VecInt => "counts",
+            yesno_flight::Sort::Big => "value",
+            yesno_flight::Sort::VecBig => "values",
+            _ => "ordinals",
+        };
         eprintln!(
-            "# {subject}: {} ordinals at version {}",
+            "# {subject}: {} {unit} at version {}",
             info.total_records, t.version
         );
     }
@@ -808,16 +1108,60 @@ async fn print_rows(
     let mut shown = 0usize;
     while let Some(b) = stream.next().await {
         let b = b?;
-        let col = b
-            .column_by_name("ordinal")
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .ok_or("the server sent no ordinal column")?;
-        for i in 0..col.len() {
-            if limit.is_some_and(|n| shown >= n) {
-                return Ok(());
+        match sort {
+            // One integer per constituent, printed as `index value` so a
+            // reader does not have to count lines to know which cohort a
+            // number belongs to.
+            yesno_flight::Sort::VecInt => {
+                let col = b
+                    .column_by_name("value")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or("the server sent no value column")?;
+                for i in 0..col.len() {
+                    if limit.is_some_and(|n| shown >= n) {
+                        return Ok(());
+                    }
+                    println!("{shown}\t{}", col.value(i));
+                    shown += 1;
+                }
             }
-            println!("{}", col.value(i));
-            shown += 1;
+            // Hexadecimal, with a `0x` so it cannot be misread as decimal.
+            // `bignum` deliberately has no base-10 rendering yet -- it needs
+            // repeated division and belongs with the divider -- and inventing
+            // one here would put a second, slower copy outside the crate that
+            // owns the decision.
+            yesno_flight::Sort::Big | yesno_flight::Sort::VecBig => {
+                let sign = b
+                    .column_by_name("negative")
+                    .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+                    .ok_or("the server sent no sign column")?;
+                let magnitude = b
+                    .column_by_name("magnitude")
+                    .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+                    .ok_or("the server sent no magnitude column")?;
+                for i in 0..magnitude.len() {
+                    let v = yesno_core::bignum::BigUint::from_le_bytes(magnitude.value(i));
+                    let text = v.to_hex_string();
+                    if sign.value(i) {
+                        println!("-0x{text}");
+                    } else {
+                        println!("0x{text}");
+                    }
+                }
+            }
+            _ => {
+                let col = b
+                    .column_by_name("ordinal")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or("the server sent no ordinal column")?;
+                for i in 0..col.len() {
+                    if limit.is_some_and(|n| shown >= n) {
+                        return Ok(());
+                    }
+                    println!("{}", col.value(i));
+                    shown += 1;
+                }
+            }
         }
     }
     Ok(())
@@ -903,7 +1247,7 @@ async fn run(cli: Cli) -> Result<(), Fail> {
             count_only,
             at_version,
         } => {
-            let expr = parse_expression(&expression)?;
+            let expr = parse_query(&expression)?;
             let descriptor = match at_version {
                 Some(version) => expression_descriptor_at(&expr, version),
                 None => expression_descriptor(&expr),
@@ -912,7 +1256,14 @@ async fn run(cli: Cli) -> Result<(), Fail> {
                 let info = c.get_flight_info(descriptor).await?.into_inner();
                 println!("{}", info.total_records);
             } else {
-                print_rows(&mut c, descriptor, &format!("query {expression}"), limit).await?;
+                print_answer(
+                    &mut c,
+                    descriptor,
+                    &format!("query {expression}"),
+                    limit,
+                    expr.sort(),
+                )
+                .await?;
             }
         }
 
@@ -1060,6 +1411,19 @@ fn format_stats(stats: &yesno_flight::ServerStats) -> String {
 
 #[cfg(test)]
 mod query_parser_tests {
+    /// The set grammar, unwrapped. `parse_query` is the only parser now that a
+    /// query can denote any sort; this keeps the set assertions readable
+    /// without a second entry point in the binary that nothing ships.
+    fn parse_expression(input: &str) -> Result<yesno_flight::SetExpr, QueryParseError> {
+        match parse_query(input)? {
+            yesno_flight::AnyExpr::Set(e) => Ok(e),
+            other => Err(QueryParseError {
+                at: 0,
+                message: format!("this query denotes a {}, not a set", other.sort()),
+            }),
+        }
+    }
+
     use super::*;
     use yesno_flight::SetExpr;
 
@@ -1300,11 +1664,286 @@ mod query_parser_tests {
     /// asks a different question ( "read at the newest visible version" ) and
     /// answers it successfully, which is the failure a type cannot catch and a
     /// round-trip can.
+    /// The `Big` sort, parsed at every node. One token of lookahead decides
+    /// the sort, so each of these must reach `AnyExpr::Big` rather than being
+    /// tried as a set and failing.
+    #[test]
+    fn big_integer_queries_parse_at_every_node() {
+        use yesno_flight::{AnyExpr, BigExpr, BigLit, IntExpr, SetExpr};
+
+        let b = |t: &str| match parse_query(t) {
+            Ok(AnyExpr::Big(e)) => e,
+            other => panic!("{t} parsed as {other:?}"),
+        };
+
+        assert_eq!(b("big(42)"), BigExpr::Lit(BigLit::from_i64(42)));
+        assert_eq!(b("big(-42)"), BigExpr::Lit(BigLit::from_i64(-42)));
+        assert_eq!(b("big(0)"), BigExpr::Lit(BigLit::from_i64(0)));
+        assert_eq!(
+            b("widen(cardinality(7))"),
+            BigExpr::Widen(Box::new(IntExpr::Cardinality(Box::new(SetExpr::Key(7)))))
+        );
+        assert_eq!(
+            b("uint(key(4), 128)"),
+            BigExpr::Read(Box::new(SetExpr::Key(4)), 128)
+        );
+        assert_eq!(
+            b("int(key(4), 8)"),
+            BigExpr::ReadSigned(Box::new(SetExpr::Key(4)), 8)
+        );
+        assert_eq!(
+            b("neg(big(1))"),
+            BigExpr::Neg(Box::new(BigExpr::Lit(BigLit::from_i64(1))))
+        );
+        for (text, build) in [
+            ("add", BigExpr::Add as fn(_, _) -> BigExpr),
+            ("sub", BigExpr::Sub),
+            ("mul", BigExpr::Mul),
+            ("div", BigExpr::Div),
+            ("rem", BigExpr::Rem),
+        ] {
+            assert_eq!(
+                b(&format!("{text}(big(6), big(3))")),
+                build(
+                    Box::new(BigExpr::Lit(BigLit::from_i64(6))),
+                    Box::new(BigExpr::Lit(BigLit::from_i64(3)))
+                )
+            );
+        }
+        assert_eq!(
+            b("truncate(big(300), 8)"),
+            BigExpr::Truncate(Box::new(BigExpr::Lit(BigLit::from_i64(300))), 8)
+        );
+        assert_eq!(
+            b("saturate(big(300), 8)"),
+            BigExpr::Saturate(Box::new(BigExpr::Lit(BigLit::from_i64(300))), 8)
+        );
+        // Nested, so the recursion is exercised rather than only the heads.
+        assert_eq!(
+            b("saturate(mul(uint(key(1), 64), big(-3)), 32)"),
+            BigExpr::Saturate(
+                Box::new(BigExpr::Mul(
+                    Box::new(BigExpr::Read(Box::new(SetExpr::Key(1)), 64)),
+                    Box::new(BigExpr::Lit(BigLit::from_i64(-3)))
+                )),
+                32
+            )
+        );
+    }
+
+    /// `map` builds a vector of big integers, and `fold` collapses one.
+    ///
+    /// `fold` is overloaded on the vector's sort, so the set form must keep
+    /// working unchanged -- which is the half a lookahead can get wrong.
+    #[test]
+    fn a_vector_of_big_integers_is_built_by_map_and_collapsed_by_fold() {
+        use yesno_flight::{
+            AnyExpr, BigExpr, BigFoldOp, SetExpr, VecBigExpr, VecSetExpr, ViewSpec,
+        };
+
+        let want_vector = VecBigExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(9)),
+                ViewSpec::interleaved(3),
+            )),
+            Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 128)),
+        );
+
+        // `map` alone denotes the vector sort.
+        assert_eq!(
+            parse_query("map(view(9, interleaved(3)), uint(_, 128))").unwrap(),
+            AnyExpr::VecBig(want_vector.clone())
+        );
+
+        // `fold` collapses it to one value, at each operator.
+        for (text, op) in [
+            ("add", BigFoldOp::Add),
+            ("mul", BigFoldOp::Mul),
+            ("min", BigFoldOp::Min),
+            ("max", BigFoldOp::Max),
+        ] {
+            assert_eq!(
+                parse_query(&format!(
+                    "fold(map(view(9, interleaved(3)), uint(_, 128)), {text})"
+                ))
+                .unwrap(),
+                AnyExpr::Big(BigExpr::Fold(Box::new(want_vector.clone()), op))
+            );
+        }
+
+        // A literal vector folds too.
+        assert_eq!(
+            parse_query("fold(big([1, 2]), add)").unwrap(),
+            AnyExpr::Big(BigExpr::Fold(
+                Box::new(VecBigExpr::List(vec![
+                    BigExpr::Lit(yesno_flight::BigLit::from_i64(1)),
+                    BigExpr::Lit(yesno_flight::BigLit::from_i64(2)),
+                ])),
+                BigFoldOp::Add
+            ))
+        );
+
+        // And the set fold is untouched by the overload.
+        assert!(matches!(
+            parse_query("fold(map(view(9, interleaved(3)), and(_, 7)), or)"),
+            Ok(AnyExpr::Set(_))
+        ));
+    }
+
+    /// A bare number is a big literal where a big integer is required, and a
+    /// key where a set is.
+    ///
+    /// The position fixes the sort before the number is read, so there is
+    /// nothing to infer. The half worth testing is that the *set* reading is
+    /// untouched: `42` at the top level is still `key( 42 )`, not the integer
+    /// forty-two.
+    #[test]
+    fn a_bare_number_is_a_literal_only_where_a_big_integer_is_required() {
+        use yesno_flight::{AnyExpr, BigExpr, BigFoldOp, BigLit, SetExpr, VecBigExpr};
+
+        let lit = |v: i64| Box::new(BigExpr::Lit(BigLit::from_i64(v)));
+
+        // Spelled out and inferred agree, so this is sugar rather than a
+        // different query.
+        for (short, long) in [
+            ("add(1, 2)", "add(big(1), big(2))"),
+            ("powmod(2, 10, 1000)", "powmod(big(2), big(10), big(1000))"),
+            ("neg(-5)", "neg(big(-5))"),
+            ("truncate(300, 8)", "truncate(big(300), 8)"),
+            (
+                "fold(big([1, 2, 3]), add)",
+                "fold(big([big(1), big(2), big(3)]), add)",
+            ),
+        ] {
+            assert_eq!(
+                parse_query(short).unwrap(),
+                parse_query(long).unwrap(),
+                "{short}"
+            );
+        }
+
+        assert_eq!(
+            parse_query("fold(big([1, 2, 3]), add)").unwrap(),
+            AnyExpr::Big(BigExpr::Fold(
+                Box::new(VecBigExpr::List(vec![*lit(1), *lit(2), *lit(3)])),
+                BigFoldOp::Add
+            ))
+        );
+        assert_eq!(
+            parse_query("add(1, -2)").unwrap(),
+            AnyExpr::Big(BigExpr::Add(lit(1), lit(-2)))
+        );
+
+        // And the set reading is untouched: a bare number is still a key, and
+        // a set-valued position still reads one.
+        assert_eq!(parse_query("42").unwrap(), AnyExpr::Set(SetExpr::Key(42)));
+        assert_eq!(
+            parse_query("and(1, 2)").unwrap(),
+            AnyExpr::Set(SetExpr::And(vec![SetExpr::Key(1), SetExpr::Key(2)]))
+        );
+        // `uint`'s operand is a set, so its bare number is a key there too.
+        assert_eq!(
+            parse_query("uint(4, 128)").unwrap(),
+            AnyExpr::Big(BigExpr::Read(Box::new(SetExpr::Key(4)), 128))
+        );
+    }
+
+    /// **A bracketed list is a vector of sets, everywhere, with no exception.**
+    ///
+    /// This is the wart `big( [ .. ] )` exists to remove. Without it,
+    /// `fold( [ 1, 2, 3 ], or )` and `fold( [ 1, 2, 3 ], add )` were the union
+    /// of three posting lists and the number six -- the same vector text,
+    /// decided by the last token. Now the sort is announced where the vector
+    /// is written, and a bare list has exactly one meaning.
+    #[test]
+    fn a_bracketed_list_is_always_a_vector_of_sets() {
+        use yesno_flight::AnyExpr;
+
+        // The set fold still reads a list of keys.
+        assert!(matches!(
+            parse_query("fold([1, 2, 3], or)"),
+            Ok(AnyExpr::Set(_))
+        ));
+        // A bare list can no longer become a big vector, whatever follows it.
+        assert!(parse_query("fold([1, 2, 3], add)").is_err());
+        // The marked form is the only big one.
+        assert!(matches!(
+            parse_query("fold(big([1, 2, 3]), add)"),
+            Ok(AnyExpr::Big(_))
+        ));
+        // A vector where a single value belongs names the real problem rather
+        // than mis-parsing into something that looks plausible.
+        let e = parse_query("add(big([1, 2]), big(3))").unwrap_err();
+        assert!(
+            e.message.contains("vector of big integers"),
+            "unhelpful error: {}",
+            e.message
+        );
+    }
+
+    /// The width is optional exactly where the shape supplies one.
+    ///
+    /// A blocked constituent's logical universe is `x < stride`, so the stride
+    /// *is* the width. An interleaved one has no bound, and a bare set has no
+    /// statically known extent -- in both the width stays required, because it
+    /// is the only cap on what a read can cost.
+    #[test]
+    fn a_width_is_optional_only_where_the_view_derives_one() {
+        use yesno_flight::{AnyExpr, BigExpr, SetExpr, VecBigExpr, VecSetExpr, ViewSpec};
+
+        let blocked = "map(view(9, blocked(3, 128)), uint(_))";
+        assert_eq!(
+            parse_query(blocked).unwrap(),
+            AnyExpr::VecBig(VecBigExpr::Map(
+                Box::new(VecSetExpr::View(
+                    Box::new(SetExpr::Key(9)),
+                    ViewSpec::blocked(3, 128),
+                )),
+                Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 128)),
+            ))
+        );
+        // Spelling it out gives the same tree, so the derivation is a
+        // convenience rather than a different query.
+        assert_eq!(
+            parse_query("map(view(9, blocked(3, 128)), uint(_, 128))").unwrap(),
+            parse_query(blocked).unwrap()
+        );
+
+        // Interleaved derives nothing: a constituent's ordinals are unbounded.
+        assert!(parse_query("map(view(9, interleaved(3)), uint(_))").is_err());
+        // Nor does a bare set outside any map.
+        assert!(parse_query("uint(key(4))").is_err());
+        // And the explicit form still works in both.
+        assert!(parse_query("map(view(9, interleaved(3)), uint(_, 64))").is_ok());
+        assert!(parse_query("uint(key(4), 64)").is_ok());
+    }
+
+    /// The lookahead must not swallow set queries. `and`/`or`/`not` are set
+    /// operators and none of them is a big-integer head, but the check is
+    /// cheap and the failure would be silent misrouting.
+    #[test]
+    fn the_big_lookahead_does_not_capture_set_queries() {
+        use yesno_flight::AnyExpr;
+        for t in [
+            "42",
+            "key(7)",
+            "and(1, 2)",
+            "or(1,2)",
+            "not(1)",
+            "and-not(1,2)",
+        ] {
+            assert!(
+                matches!(parse_query(t), Ok(AnyExpr::Set(_))),
+                "{t} must still be a set"
+            );
+        }
+    }
+
     #[test]
     fn a_versioned_query_descriptor_round_trips_its_version() {
         use yesno_flight::{QueryRequest, SetExpr};
 
-        let expr = SetExpr::Key(42);
+        let expr = yesno_flight::AnyExpr::Set(SetExpr::Key(42));
         let bound = expression_descriptor_at(&expr, 7);
         assert!(
             QueryRequest::looks_like_request(&bound.cmd),

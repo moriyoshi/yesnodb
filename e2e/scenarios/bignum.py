@@ -97,33 +97,28 @@ assert bn_pow_mod(WIDE, 5, 1) == 0
 assert bn_pow_mod(2, 3, 0) is None
 
 # --- the OrdSet boundary, without a database ---------------------------------
+# A set IS an integer: ordinal j carries the 2**j term. So this boundary is a
+# pair of maps that must compose to the identity, not a layout to interpret.
 WIDTH = 1700
-STRIDE = 1700
-series = [WIDE, 0, SMALL, ALL_ONES % (1 << WIDTH)]
-s = bn_series_build(series, WIDTH, STRIDE)
-for k, v in enumerate(series):
-    assert bn_series_get(s, k, WIDTH, STRIDE) == v, k
-
-# A zero *below* a non-zero value is still counted; the count reaches the
-# highest set ordinal.
-assert bn_series_count(s, WIDTH, STRIDE) == len(series)
+for v in [WIDE, 0, SMALL, ALL_ONES % (1 << WIDTH)]:
+    assert bn_of_set(bn_to_set(v), WIDTH) == v
 
 # Reading at a narrower width is exactly `x mod 2**width`. It falls out of the
-# least-significant-bit-first ordering, and it is the identity that makes
-# truncation the only write rule agreeing with the reader.
+# least-significant-bit-first ordering, and with every value starting at ordinal
+# zero it is the only thing the width argument does.
+s = bn_to_set(WIDE)
 for narrow in [1, 63, 64, 65, 300]:
-    assert bn_series_get(s, 0, narrow, STRIDE) == WIDE % (1 << narrow), narrow
+    assert bn_of_set(s, narrow) == WIDE % (1 << narrow), narrow
 
-# An index nothing was written to reads as zero, not as an error. Absence and
-# zero are the same thing in a set.
-assert bn_series_get(s, 99, WIDTH, STRIDE) == 0
+# The empty set is zero. Absence and zero are the same thing in a set, which is
+# why reading is total and has no "not addressable" answer to give.
+assert bn_of_set(bn_to_set(0), WIDTH) == 0
 
-# The seam: at stride 10000, integer 6 spans bits 60000..70000 and crosses the
-# 65536-bit chunk boundary. A reader that stopped at the first chunk passes every
-# assertion above and fails this one.
-STRADDLE_W = 10000
-straddle = [0, 0, 0, 0, 0, 0, (1 << STRADDLE_W) - 1]
-t = bn_series_build(straddle, STRADDLE_W, STRADDLE_W)
-assert bn_series_get(t, 6, STRADDLE_W, STRADDLE_W) == (1 << STRADDLE_W) - 1
-assert bn_series_get(t, 5, STRADDLE_W, STRADDLE_W) == 0
-assert bn_series_get(t, 7, STRADDLE_W, STRADDLE_W) == 0
+# A value spanning several chunks. A chunk is 65536 bits and a limb is 64, so a
+# chunk boundary is always a limb boundary -- but a reader that stopped at the
+# first chunk would pass every assertion above and fail this one.
+SPAN = 200_000
+spanning = (1 << SPAN) | (1 << 65_536) | (1 << 65_535) | 1
+t = bn_to_set(spanning)
+assert bn_of_set(t, SPAN + 1) == spanning
+assert bn_of_set(t, 65_536) == (1 << 65_535) | 1

@@ -157,29 +157,29 @@ fn pow_mod_widths(c: &mut Criterion) {
 /// **These two rows do not differ only in position, and reading them as a
 /// straddling penalty is wrong.** At `width = 10 000` and half fill, `k = 0`
 /// puts ~5 000 values in one chunk — above `ARRAY_MAX`, so a **bitmap**, which
-/// the arm serves with a bit-block transfer. `k = 6` splits them across two
-/// chunks of ~2 500 each — below `ARRAY_MAX`, so two **arrays**, which the arm
-/// walks per value. The 27.6x and the 1.25x are the bitmap and array arms, not
-/// contained and straddling, and the fixture cannot separate the two effects
-/// because the container kind is a consequence of the placement.
+/// the read walks per container.
 ///
-/// It inherited its framing from `matrix/`'s equivalent row, where the
-/// operand is one chunk either way and the comparison *is* positional. Do not
-/// quote a straddling cost from this bench.
+/// **What this can and cannot separate.** Every value now begins at ordinal
+/// zero, so there is no contained-versus-straddling comparison to make -- that
+/// distinction was a property of the stride and went with it. What remains is
+/// width, and the container kind is still a consequence of the density rather
+/// than something the fixture controls, so do not quote a per-chunk cost from
+/// these rows.
 fn ordset_boundary(c: &mut Criterion) {
-    use yesno_core::bignum::{IntLayout, IntSink};
+    use yesno_core::OrdSet;
 
     let mut g = c.benchmark_group("bignum/ordset_boundary");
     let mut st = 0x5555_aaaa_5555_aaaau64;
-    let width = 10_000u32;
-    let value = operand(&mut st, (width / 64) as usize);
-    for &(name, k) in &[("contained_0", 0u64), ("straddling_6", 6)] {
-        let layout = IntLayout::dense(width);
-        let mut sink = IntSink::new(layout);
-        sink.place(k, &value).expect("in range");
-        let set = sink.build();
+    // One inside a chunk, one spanning several, which is the only positional
+    // distinction left now that every value starts at ordinal zero.
+    for &(name, width) in &[("one_chunk", 10_000u64), ("many_chunks", 200_000)] {
+        let value = operand(&mut st, width.div_ceil(64) as usize);
+        let set = OrdSet::from_int(&value).expect("in range");
         g.bench_function(name, |bn| {
-            bn.iter(|| black_box(&set).read_int(black_box(k), &layout))
+            bn.iter(|| black_box(&set).read_int(black_box(u64::MAX)))
+        });
+        g.bench_function(format!("{name}/write"), |bn| {
+            bn.iter(|| OrdSet::from_int(black_box(&value)))
         });
     }
     g.finish();

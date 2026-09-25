@@ -9,12 +9,24 @@ from hypothesis import strategies as st
 
 from yesnodb.client import (
     MAX_NODES,
+    MAX_RESULT_BITS,
+    MAX_VALUE_BITS,
+    MAX_WORK,
+    SORT_BIG,
+    SORT_VEC_BIG,
+    Add,
     And,
     AndNot,
     AnyExpr,
     At,
+    BigExpr,
+    BigFold,
+    BigFoldOp,
+    BigList,
+    BigLit,
     Cardinality,
     Contains,
+    Div,
     Empty,
     Expand,
     ExpressionError,
@@ -25,16 +37,29 @@ from yesnodb.client import (
     List,
     Literal,
     Map,
+    MapBig,
     MapBool,
     MapInt,
+    Mul,
+    Neg,
     Or,
     Pack,
+    PowMod,
     QueryRequest,
     Range,
+    ReadInt,
+    ReadUint,
+    Rem,
+    Saturate,
     Select,
     SetExpr,
+    Sub,
+    Truncate,
     View,
+    ViewLayout,
     ViewSpec,
+    Widen,
+    big,
     complement,
     xor,
 )
@@ -244,3 +269,224 @@ def test_bool_bodies_and_select_denote_sets() -> None:
     # ``select`` is partial, so it yields a set rather than a sentinel.
     nth = Select(Key(7), 0)
     assert SetExpr.decode(nth.encode()) == nth
+
+
+# ---------------------------------------------------------------------------
+# The big-integer sort
+# ---------------------------------------------------------------------------
+
+
+def test_big_wire_vector_matches_the_rust_crate() -> None:
+    """Mirrors `the_big_cross_implementation_wire_vector_is_stable` in Rust.
+
+    Five implementations of one format drift silently otherwise: each can
+    round-trip against itself while disagreeing with the others.
+    """
+
+    e = Saturate(Mul(ReadUint(Key(4), 128), BigLit(-3)), 32)
+    assert (
+        AnyExpr(e).encode().hex()
+        == "59534e58010023200000001f1a8000000001040000000000000018010100000003"
+    )
+    assert AnyExpr.decode(AnyExpr(e).encode()).expression == e
+    assert AnyExpr(e).sort == SORT_BIG
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        BigLit(0),
+        BigLit(1),
+        BigLit(-1),
+        BigLit(2**200),
+        BigLit(-(2**200)),
+        Widen(Cardinality(Key(7))),
+        ReadUint(Key(4), 128),
+        ReadInt(Key(4), 8),
+        Neg(BigLit(5)),
+        Add(BigLit(1), BigLit(2)),
+        Sub(BigLit(1), BigLit(2)),
+        Mul(BigLit(3), BigLit(4)),
+        Div(BigLit(7), BigLit(2)),
+        Rem(BigLit(7), BigLit(2)),
+        Truncate(BigLit(300), 8),
+        Saturate(BigLit(300), 8),
+    ],
+)
+def test_big_nodes_round_trip(expression: BigExpr) -> None:
+    assert AnyExpr.decode(AnyExpr(expression).encode()).expression == expression
+
+
+def test_a_big_query_request_round_trips() -> None:
+    e = Mul(ReadUint(Key(1), 64), BigLit(-3))
+    for request in (QueryRequest.current(e), QueryRequest.at(e, 7)):
+        assert QueryRequest.decode(request.encode()) == request
+
+
+def test_a_negative_zero_is_unrepresentable() -> None:
+    """One value, one encoding, or a shared byte vector states nothing."""
+
+    assert not BigLit(0).value
+    encoded = AnyExpr(BigLit(0)).encode()
+    # sign byte 0, length 0: no trailing zero byte to disagree about.
+    assert encoded[-5:] == b"\x00\x00\x00\x00\x00"
+    # And a hand-built negative zero is refused on the way back in.
+    bad = bytearray(encoded)
+    bad[-5] = 1
+    with pytest.raises(ExpressionError):
+        AnyExpr.decode(bytes(bad))
+
+
+def test_a_trailing_zero_byte_is_refused_rather_than_trimmed() -> None:
+    encoded = bytearray(AnyExpr(BigLit(1)).encode())
+    encoded[-5:-1] = (2).to_bytes(4, "little")
+    encoded.append(0)
+    with pytest.raises(ExpressionError):
+        AnyExpr.decode(bytes(encoded))
+
+
+def test_the_width_budget_refuses_an_amplification() -> None:
+    """A read is six bytes that declare a width, so a product of two maximal
+    reads is a tiny payload describing a value no server should build."""
+
+    wide = ReadUint(Key(1), MAX_VALUE_BITS)
+    with pytest.raises(ExpressionError):
+        Mul(wide, wide)
+    # One bit under the bound is accepted, so the refusal is the bound working
+    # rather than the shape being rejected.
+    half = ReadUint(Key(1), MAX_VALUE_BITS // 2)
+    assert Mul(half, half).width_bound() == MAX_VALUE_BITS
+
+
+def test_a_zero_width_read_is_refused() -> None:
+    with pytest.raises(ExpressionError):
+        ReadUint(Key(1), 0)
+
+
+def test_a_big_tag_where_a_set_belongs_is_a_sort_mismatch() -> None:
+    payload = bytearray(AnyExpr(BigLit(1)).encode())
+    with pytest.raises(ExpressionError):
+        SetExpr.decode(bytes(payload))
+
+
+def _big_vector() -> MapBig:
+    return MapBig(
+        View(Key(9), ViewSpec(3, ViewLayout.INTERLEAVED, 0)),
+        ReadUint(Hole(), 128),
+    )
+
+
+def test_a_vector_of_big_integers_is_built_by_map_and_round_trips() -> None:
+    v = _big_vector()
+    assert AnyExpr(v).sort == SORT_VEC_BIG
+    assert AnyExpr.decode(AnyExpr(v).encode()).expression == v
+    assert AnyExpr.decode(AnyExpr(BigList(BigLit(1), BigLit(-2))).encode()).expression == BigList(
+        BigLit(1), BigLit(-2)
+    )
+
+
+@pytest.mark.parametrize("op", [BigFoldOp.ADD, BigFoldOp.MUL, BigFoldOp.MIN, BigFoldOp.MAX])
+def test_a_fold_collapses_a_big_vector_and_round_trips(op: BigFoldOp) -> None:
+    f = BigFold(BigList(BigLit(1), BigLit(2)), op)
+    assert AnyExpr(f).sort == SORT_BIG
+    assert AnyExpr.decode(AnyExpr(f).encode()).expression == f
+
+
+def test_only_a_product_fold_grows_with_the_arity() -> None:
+    """A sum costs a handful of bits; a product costs arity times the width."""
+
+    v = _big_vector()
+    assert BigFold(v, BigFoldOp.ADD).width_bound() == 128 + 2
+    assert BigFold(v, BigFoldOp.MUL).width_bound() == 128 * 3
+    assert BigFold(v, BigFoldOp.MIN).width_bound() == 128
+
+
+def test_the_result_bound_refuses_a_wide_vector_of_wide_values() -> None:
+    """Two bounded factors have an unbounded product.
+
+    The constituent cap and the per-value width bound each cap one factor and
+    say nothing about 4096 elements *of* a million bits.
+    """
+
+    # The vector itself is refused at construction, before anything can be
+    # asked of it -- which is earlier than `AnyExpr` and is the point.
+    with pytest.raises(ExpressionError):
+        MapBig(
+            View(Key(1), ViewSpec(4096, ViewLayout.INTERLEAVED, 0)),
+            ReadUint(Hole(), MAX_VALUE_BITS),
+        )
+    # The same shape inside the bound is accepted.
+    ok = MapBig(
+        View(Key(1), ViewSpec(64, ViewLayout.INTERLEAVED, 0)),
+        ReadUint(Hole(), 1024),
+    )
+    assert AnyExpr(ok).sort == SORT_VEC_BIG
+    assert ok.result_bound() == 64 * 1024 <= MAX_RESULT_BITS
+
+
+def test_a_product_fold_over_a_wide_vector_is_refused() -> None:
+    """The product lands in one value, so the per-value bound has to hold it."""
+
+    v = MapBig(
+        View(Key(1), ViewSpec(1024, ViewLayout.INTERLEAVED, 0)),
+        ReadUint(Hole(), 4096),
+    )
+    with pytest.raises(ExpressionError):
+        BigFold(v, BigFoldOp.MUL)
+    # Summing the same vector is nowhere near the bound.
+    assert BigFold(v, BigFoldOp.ADD).width_bound() == 4096 + 11
+
+
+def test_pow_mod_wire_vector_matches_the_rust_crate() -> None:
+    """Operand order is the one thing a reader cannot infer from the bytes."""
+
+    e = PowMod(BigLit(2), BigLit(10), BigLit(1000))
+    assert AnyExpr(e).encode().hex() == "59534e58010027180001000000021800010000000a180002000000e803"
+    assert AnyExpr.decode(AnyExpr(e).encode()).expression == e
+
+
+def test_a_costly_exponentiation_is_refused_where_its_width_is_unremarkable() -> None:
+    """The amplification the width bound structurally cannot see.
+
+    A residue is only as wide as its modulus, so nothing about the size of this
+    query is alarming; the cost is what is wrong with it.
+    """
+
+    wide = ReadUint(Key(1), MAX_VALUE_BITS)
+    with pytest.raises(ExpressionError):
+        PowMod(BigLit(2), wide, wide)
+
+
+def test_rsa_scale_exponentiation_is_admitted() -> None:
+    """So the bound is calibrated rather than merely restrictive."""
+
+    for bits in (2048, 4096):
+        operand = ReadUint(Key(1), bits)
+        e = PowMod(BigLit(2), operand, operand)
+        assert e.work_bound() <= MAX_WORK
+        assert AnyExpr.decode(AnyExpr(e).encode()).expression == e
+
+
+def test_big_mirrors_the_query_language_spelling() -> None:
+    """``big(1)`` is a value and ``big([1, 2, 3])`` is a vector.
+
+    The same spelling carries the sort in both, exactly as the query language
+    does -- a bare list is a vector of *sets* everywhere, so a vector of big
+    integers has to say so where it is written.
+    """
+
+    assert big(7) == BigLit(7)
+    assert big(-7) == BigLit(-7)
+    assert big([1, 2, 3]) == BigList(BigLit(1), BigLit(2), BigLit(3))
+    # Elements may already be expressions, so the factory composes.
+    assert big([1, ReadUint(Key(4), 64)]) == BigList(BigLit(1), ReadUint(Key(4), 64))
+
+    folded = BigFold(big([1, 2, 3]), BigFoldOp.ADD)
+    assert AnyExpr.decode(AnyExpr(folded).encode()).expression == folded
+
+
+def test_big_rejects_what_is_neither_a_value_nor_a_sequence() -> None:
+    with pytest.raises(TypeError):
+        big("3")  # type: ignore[call-overload]
+    with pytest.raises(TypeError):
+        big(True)  # type: ignore[arg-type]

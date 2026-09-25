@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "server")]
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{BinaryArray, BooleanArray, RecordBatch, UInt64Array};
 #[cfg(feature = "server")]
 use arrow_flight::encode::FlightDataEncoderBuilder;
 #[cfg(feature = "server")]
@@ -108,13 +108,13 @@ pub mod ticket;
 #[cfg(feature = "server")]
 enum Request2 {
     Key(u64),
-    Expr(SetExpr, Option<u64>),
+    Expr(AnyExpr, Option<u64>),
 }
 pub use client::{Ack, QueryInfo, QueryStream, YesnoClient};
 pub use ticket::Ticket;
 pub use yesno_wire::{
-    AnyExpr, BoolExpr, FoldOp, IntExpr, QueryRequest, SetExpr, VecIntExpr, VecSetExpr, ViewLayout,
-    ViewSpec,
+    AnyExpr, BigExpr, BigFoldOp, BigLit, BoolExpr, FoldOp, IntExpr, QueryRequest, SetExpr, Sort,
+    VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAX_WORK,
 };
 
 /// Space and reader counters returned by the `stats` Flight action.
@@ -158,6 +158,68 @@ pub fn ordinals_schema() -> SchemaRef {
         DataType::UInt64,
         false,
     )]))
+}
+
+/// S4: one integer per constituent, in constituent order.
+///
+/// Row `i` is constituent `i`, which holds because the sort's contract is that
+/// the vector is exactly the arity long **and** because the result is emitted
+/// as a single batch. A chunked result would make the row index batch-local.
+pub fn vec_int_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+/// S5: one arbitrary-precision integer, sign and canonical little-endian
+/// magnitude. Exactly one row.
+pub fn big_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("negative", DataType::Boolean, false),
+        Field::new("magnitude", DataType::Binary, false),
+    ]))
+}
+
+/// One row per value: sign and canonical little-endian magnitude.
+///
+/// Shared by the scalar and vector sorts, because a scalar answer *is* the
+/// one-row case. Writing it once is what keeps the two from disagreeing about
+/// column order or null-ness.
+#[cfg(feature = "server")]
+fn big_batch(values: &[yesno_core::bignum::BigInt]) -> RecordBatch {
+    let signs: Vec<bool> = values.iter().map(|v| v.is_negative()).collect();
+    let magnitudes: Vec<Vec<u8>> = values.iter().map(|v| v.magnitude().to_le_bytes()).collect();
+    let borrowed: Vec<&[u8]> = magnitudes.iter().map(|m| m.as_slice()).collect();
+    RecordBatch::try_new(
+        big_schema(),
+        vec![
+            Arc::new(BooleanArray::from(signs)),
+            Arc::new(BinaryArray::from(borrowed)),
+        ],
+    )
+    .expect("two columns of the declared types")
+}
+
+/// The answer shape a ticket implies.
+///
+/// One place, consulted by **all three** sites that decide an answer's shape:
+/// the `FlightInfo` `get_flight_info` advertises, the batches `do_get` builds,
+/// and the schema its encoder stamps on the stream. Those three disagreeing is
+/// what a client sees as a corrupt stream rather than an error -- and the
+/// encoder was the one missed when this function was first written, which is
+/// why the count is spelled out here.
+#[cfg(feature = "server")]
+fn schema_for(t: &Ticket) -> SchemaRef {
+    match &t.expr {
+        None | Some(AnyExpr::Set(_)) => ordinals_schema(),
+        Some(AnyExpr::VecInt(_)) => vec_int_schema(),
+        // The same two columns as a scalar, with one row per constituent. The
+        // shape is identical, so the schema is the same function; the sort is
+        // carried by the query, not by the columns.
+        Some(AnyExpr::Big(_)) | Some(AnyExpr::VecBig(_)) => big_schema(),
+    }
 }
 
 /// S2: `(key, ordinal)` pairs, the bulk-ingest and export shape.
@@ -899,7 +961,10 @@ impl YesnoFlightService {
             return Ok(Request2::Expr(q.expression, q.version));
         }
         if SetExpr::looks_like_expr(&d.cmd) {
-            let e = SetExpr::decode(&d.cmd)
+            // A bare expression payload, at whichever sort its leading tag
+            // says. `AnyExpr::decode` is the same parse `SetExpr::decode` was
+            // for a set, so this stays backward compatible by construction.
+            let e = AnyExpr::decode(&d.cmd)
                 .map_err(|e| Status::invalid_argument(format!("bad expression: {e}")))?;
             return Ok(Request2::Expr(e, None));
         }
@@ -1048,8 +1113,18 @@ impl FlightService for YesnoFlightService {
             // view selection likewise uses its dedicated count; folds and expands
             // are explicit eager transform boundaries in the current core API.
             Request2::Expr(e, _) => {
-                let total = expr::cardinality(&e, &snap)
-                    .map_err(|err| Status::internal(err.to_string()))?;
+                // `total_records` is per sort, because the sorts do not agree
+                // on what a record is: a set answers rows of ordinals, a vector
+                // answers one row per constituent, and a single integer answers
+                // one row. Counting a vector by `cardinality` would report the
+                // wrong shape to a coordinator sizing an endpoint.
+                let total = match &e {
+                    AnyExpr::Set(set) => expr::cardinality(set, &snap)
+                        .map_err(|err| Status::internal(err.to_string()))?,
+                    AnyExpr::VecInt(v) => u64::from(v.arity()),
+                    AnyExpr::Big(_) => 1,
+                    AnyExpr::VecBig(v) => u64::from(v.arity()),
+                };
                 let mut keys = Vec::new();
                 e.keys(&mut keys);
                 // `key` names the primary posting list so a coordinator can
@@ -1062,7 +1137,7 @@ impl FlightService for YesnoFlightService {
         tracing::Span::current().record("result.records", total);
 
         let info = FlightInfo::new()
-            .try_with_schema(&ordinals_schema())
+            .try_with_schema(&schema_for(&t))
             .map_err(|e| Status::internal(e.to_string()))?
             .with_descriptor(d)
             .with_endpoint(FlightEndpoint::new().with_ticket(FlightTicket::new(t.encode())))
@@ -1110,6 +1185,12 @@ impl FlightService for YesnoFlightService {
         let leased = self.leased(t.version);
         tracing::Span::current().record("query.version", t.version);
         tracing::Span::current().record("query.expression", t.expr.is_some());
+
+        // Taken before the ticket moves into the worker, and from the same
+        // function `get_flight_info` advertised with. The encoder below states
+        // the schema a third time, and a mismatch there is what a client sees
+        // as a corrupt stream rather than an error.
+        let stream_schema = schema_for(&t);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, Status>>(4);
         let worker_span = tracing::info_span!(
@@ -1163,9 +1244,59 @@ impl FlightService for YesnoFlightService {
                 // `t.key`. Falling back to the bare key here would return a
                 // **superset** — every row the client asked to exclude — and
                 // nothing downstream would notice.
+                // The two non-set sorts answer a whole result in one batch and
+                // return here; only a set streams. They are handled before the
+                // set path rather than inside it because a vector and a scalar
+                // have no ordinal stream to filter by prefix.
+                match &t.expr {
+                    Some(AnyExpr::VecInt(v)) => {
+                        match expr::vec_int(v, &snap) {
+                            Ok(values) => {
+                                let arr = UInt64Array::new(values.into(), None);
+                                let rb =
+                                    RecordBatch::try_new(vec_int_schema(), vec![Arc::new(arr)])
+                                        .expect("one column of the declared type");
+                                let _ = tx.blocking_send(Ok(rb));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Flight vector evaluation failed");
+                                let _ = tx.blocking_send(Err(engine_status(e)));
+                            }
+                        }
+                        return;
+                    }
+                    Some(AnyExpr::Big(b)) => {
+                        match expr::big(b, &snap).map(|v| vec![v]) {
+                            Ok(values) => {
+                                let _ = tx.blocking_send(Ok(big_batch(&values)));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Flight integer evaluation failed");
+                                let _ = tx.blocking_send(Err(engine_status(e)));
+                            }
+                        }
+                        return;
+                    }
+                    Some(AnyExpr::VecBig(v)) => {
+                        match expr::vec_big(v, &snap) {
+                            Ok(values) => {
+                                let _ = tx.blocking_send(Ok(big_batch(&values)));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Flight vector evaluation failed");
+                                let _ = tx.blocking_send(Err(engine_status(e)));
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let loaded = match &t.expr {
-                    None => snap.load(t.key),
-                    Some(e) => expr::lower(e, &snap).and_then(|lowered| lowered.collect_set()),
+                    Some(AnyExpr::Set(e)) => {
+                        expr::lower(e, &snap).and_then(|lowered| lowered.collect_set())
+                    }
+                    // A bare key, or a sort already answered above.
+                    _ => snap.load(t.key),
                 };
                 let set = match loaded {
                     Ok(s) => s,
@@ -1233,7 +1364,7 @@ impl FlightService for YesnoFlightService {
         let batches = tokio_stream::wrappers::ReceiverStream::new(rx)
             .map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)));
         let stream = FlightDataEncoderBuilder::new()
-            .with_schema(ordinals_schema())
+            .with_schema(stream_schema)
             .build(batches)
             .map_err(|e| match e {
                 arrow_flight::error::FlightError::Tonic(s) => *s,

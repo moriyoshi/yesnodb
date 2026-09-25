@@ -33,6 +33,7 @@
 
 use std::sync::Arc;
 
+use yesno_core::bignum::{Barrett, BigInt, BigUint};
 use yesno_core::view::{
     stream_interleaved_view_fold, stream_view_cardinalities, stream_view_ranks,
     IntersectionCountStrategy, Reduce, View, ViewIntersectionCounter, ViewSink,
@@ -41,8 +42,9 @@ use yesno_core::{
     ChunkStream, ChunkStreamExt, Container, Expr, KeyStream, OrdSet, Prefix48, Snapshot,
 };
 pub use yesno_wire::{
-    AnyExpr, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort, VecIntExpr, VecSetExpr,
-    ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES, MAX_VIEW_SETS, VERSION,
+    AnyExpr, BigExpr, BigFoldOp, BigLit, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort,
+    VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES,
+    MAX_RESULT_BITS, MAX_VALUE_BITS, MAX_VIEW_SETS, MAX_WORK, VERSION,
 };
 
 /// Exact cardinality for a wire expression.
@@ -366,6 +368,170 @@ fn eval_int(e: &IntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
         IntExpr::Rank(a, x) => lower_in(a, snap, hole)?.collect_set()?.rank(*x),
         IntExpr::At(v, i) => eval_vec_int_at(v, *i, snap, hole)?,
     })
+}
+
+/// Evaluate an arbitrary-precision expression.
+pub fn big(e: &BigExpr, snap: &Snapshot) -> yesno_core::Result<BigInt> {
+    eval_big(e, snap, None)
+}
+
+/// Evaluate one arbitrary-precision integer per constituent.
+///
+/// The `Big` analogue of [`vec_int`]. Each element is evaluated with the hole
+/// bound to that constituent, exactly as the integer vector does, so the two
+/// sorts agree about what a `map` means.
+pub fn vec_big(v: &VecBigExpr, snap: &Snapshot) -> yesno_core::Result<Vec<BigInt>> {
+    eval_vec_big(v, snap, None)
+}
+
+fn eval_vec_big(
+    v: &VecBigExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Vec<BigInt>> {
+    match v {
+        VecBigExpr::List(xs) => xs.iter().map(|x| eval_big(x, snap, hole)).collect(),
+        VecBigExpr::Map(vector, body) => {
+            let arity = vector.arity();
+            let mut out = Vec::with_capacity(arity as usize);
+            for i in 0..arity {
+                let part = lower_vec_at(vector, i, snap, hole)?.collect_set()?;
+                out.push(eval_big(body, snap, Some(&Arc::new(part)))?);
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn eval_big(e: &BigExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<BigInt> {
+    Ok(match e {
+        BigExpr::Lit(v) => {
+            BigInt::from_magnitude(v.is_negative(), BigUint::from_le_bytes(v.magnitude_le()))
+        }
+        // The inclusion of the counts into the integers. Never negative, which
+        // is the whole content of the widening.
+        BigExpr::Widen(a) => BigInt::from_uint(BigUint::from_u64(eval_int(a, snap, hole)?)),
+        BigExpr::Read(a, width) => BigInt::from_uint(read_raw(a, u64::from(*width), snap, hole)?),
+        BigExpr::ReadSigned(a, width) => {
+            let width = u64::from(*width);
+            let raw = read_raw(a, width, snap, hole)?;
+            // Two's complement: the top addressable bit is the sign, and a
+            // negative value's magnitude is `2^width - raw`. The subtraction
+            // cannot fail -- `read_int` yields a value below `2^width` -- but it
+            // is an `Option` because unsigned subtraction is partial, so the
+            // impossible case is named rather than unwrapped.
+            if raw.bit(width - 1) {
+                let magnitude = BigUint::one().shl(width).sub(&raw).ok_or(
+                    yesno_core::CodecError::Invariant(
+                        "a read value exceeded its own declared width",
+                    ),
+                )?;
+                BigInt::from_magnitude(true, magnitude)
+            } else {
+                BigInt::from_uint(raw)
+            }
+        }
+        BigExpr::Neg(a) => eval_big(a, snap, hole)?.neg(),
+        BigExpr::Add(a, b) => eval_big(a, snap, hole)?.add(&eval_big(b, snap, hole)?),
+        BigExpr::Sub(a, b) => eval_big(a, snap, hole)?.sub(&eval_big(b, snap, hole)?),
+        BigExpr::Mul(a, b) => eval_big(a, snap, hole)?.mul(&eval_big(b, snap, hole)?),
+        // A zero divisor has no answer in the domain, which the decoder cannot
+        // see: the divisor is a value, not a descriptor.
+        BigExpr::Div(a, b) => {
+            eval_big(a, snap, hole)?
+                .divrem(&eval_big(b, snap, hole)?)
+                .ok_or(DIVIDE_BY_ZERO)?
+                .0
+        }
+        BigExpr::Rem(a, b) => {
+            eval_big(a, snap, hole)?
+                .divrem(&eval_big(b, snap, hole)?)
+                .ok_or(DIVIDE_BY_ZERO)?
+                .1
+        }
+        // The wrap and the ceiling. Two rules, spelled apart, because they
+        // coincide only when the residue is already the ceiling.
+        BigExpr::Truncate(a, bits) => eval_big(a, snap, hole)?.truncate(u64::from(*bits)),
+        BigExpr::Saturate(a, bits) => eval_big(a, snap, hole)?.saturate(u64::from(*bits)),
+        BigExpr::PowMod(base, exp, modulus) => {
+            let modulus = eval_big(modulus, snap, hole)?;
+            let exp = eval_big(exp, snap, hole)?;
+            // A negative exponent is a modular inverse, and `bignum` has none:
+            // an extended GCD needs signed intermediates the magnitude type
+            // deliberately lacks. Named rather than answered wrongly.
+            if exp.is_negative() {
+                return Err(yesno_core::CodecError::Invariant(
+                    "a negative exponent needs a modular inverse, which this engine has not",
+                ));
+            }
+            let barrett = Barrett::new(modulus.magnitude())
+                .ok_or(yesno_core::CodecError::Invariant("modulus is zero"))?;
+            let base = eval_big(base, snap, hole)?;
+            // A negative base enters its residue class first, so the answer is
+            // always in `[ 0, modulus )` rather than carrying a sign out.
+            let reduced = barrett.reduce(base.magnitude());
+            let reduced = if base.is_negative() && !reduced.is_zero() {
+                modulus
+                    .magnitude()
+                    .sub(&reduced)
+                    .expect("a residue is below its modulus")
+            } else {
+                reduced
+            };
+            BigInt::from_uint(barrett.pow_mod(&reduced, exp.magnitude()))
+        }
+        BigExpr::Fold(v, op) => {
+            let values = eval_vec_big(v, snap, hole)?;
+            // A vector is never empty -- the decoder refuses one -- so the
+            // fold needs no identity, which is what admits `min` and `max` in
+            // a domain that has no least or greatest element.
+            let mut it = values.into_iter();
+            let first = it.next().ok_or(yesno_core::CodecError::Invariant(
+                "a fold over an empty vector has no value",
+            ))?;
+            it.fold(first, |acc, x| match op {
+                BigFoldOp::Add => acc.add(&x),
+                BigFoldOp::Mul => acc.mul(&x),
+                BigFoldOp::Min => {
+                    if x < acc {
+                        x
+                    } else {
+                        acc
+                    }
+                }
+                BigFoldOp::Max => {
+                    if x > acc {
+                        x
+                    } else {
+                        acc
+                    }
+                }
+            })
+        }
+    })
+}
+
+/// A zero divisor, named once so both arms report it identically.
+const DIVIDE_BY_ZERO: yesno_core::CodecError =
+    yesno_core::CodecError::Invariant("division by zero");
+
+/// The stored bits of one integer, before any sign is read into them.
+///
+/// Unlike `cardinality`, this materializes: `read_int` gathers from a set
+/// rather than walking a stream.
+fn read_raw(
+    a: &SetExpr,
+    width_bits: u64,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<BigUint> {
+    // The width is the bound on this: `read_int` allocates for the lesser of
+    // the width and the set's own extent, and the decoder has already refused a
+    // width above `MAX_VALUE_BITS`. A set with a distant maximum is otherwise
+    // cheap to store and expensive to render, which is the whole reason the
+    // wire requires a width rather than defaulting to the whole set.
+    let set = lower_in(a, snap, hole)?.collect_set()?;
+    Ok(set.read_int(width_bits))
 }
 
 fn eval_bool(e: &BoolExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<bool> {
@@ -1664,5 +1830,557 @@ mod tests {
         let snap = db.snapshot().unwrap();
         let e = SetExpr::And(vec![SetExpr::Key(404), SetExpr::Range(0, 100)]);
         assert_eq!(cardinality(&e, &snap).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod big_expr_tests {
+    use super::*;
+    use yesno_core::Db;
+    use yesno_core::OrdSet;
+
+    /// Store a series of integers through the lens, then name one of them in
+    /// the expression language and read it back.
+    ///
+    /// This is the gap the sort exists to close: the engine could already do
+    /// this reading, and nothing on the wire could ask for it.
+    #[test]
+    fn an_integer_stored_through_the_lens_is_readable_as_an_expression() {
+        let values = [
+            BigUint::from_u64(7),
+            BigUint::from_limbs_le(vec![0xDEAD_BEEF_CAFE_BABE, 0x1234_5678]),
+            BigUint::from_u64(0),
+            BigUint::from_limbs_le(vec![u64::MAX, u64::MAX >> 1]),
+        ];
+
+        // One set is one integer, so each value is its own key.
+        let db = Db::new();
+        for (k, v) in values.iter().enumerate() {
+            let ordinals: Vec<u64> = OrdSet::from_int(v).unwrap().iter().collect();
+            db.insert_many(11 + k as u64, &ordinals).unwrap();
+        }
+        let snap = db.snapshot().unwrap();
+
+        for (k, want) in values.iter().enumerate() {
+            let e = BigExpr::Read(Box::new(SetExpr::Key(11 + k as u64)), 128);
+            // Through the wire, not just the in-process value: this is the path
+            // a client actually takes.
+            let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+                AnyExpr::Big(b) => b,
+                other => panic!("decoded as {:?}", other.sort()),
+            };
+            let got = big(&decoded, &snap).unwrap();
+            assert!(!got.is_negative(), "a read is never negative");
+            assert_eq!(got.magnitude(), want, "integer {k}");
+        }
+    }
+
+    /// Reading under a **narrower** width is `x mod 2^width`, which is the
+    /// identity the least-significant-bit-first layout exists to buy. It holds
+    /// through the expression language, not only in the lens.
+    #[test]
+    fn a_narrower_read_is_the_value_modulo_two_to_the_width() {
+        let v = BigUint::from_limbs_le(vec![0xDEAD_BEEF_CAFE_BABE, 0x1234_5678]);
+        let ordinals: Vec<u64> = OrdSet::from_int(&v).unwrap().iter().collect();
+
+        let db = Db::new();
+        db.insert_many(3, &ordinals).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        let narrow = BigExpr::Read(Box::new(SetExpr::Key(3)), 64);
+        let got = big(&narrow, &snap).unwrap();
+        assert_eq!(got.magnitude(), &v.truncate(64));
+    }
+
+    #[test]
+    fn a_negative_literal_survives_the_wire() {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        let e = BigExpr::Lit(BigLit::from_i64(-256));
+        let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+            AnyExpr::Big(b) => b,
+            other => panic!("decoded as {:?}", other.sort()),
+        };
+        let got = big(&decoded, &snap).unwrap();
+        assert!(got.is_negative());
+        assert_eq!(got.magnitude(), &BigUint::from_u64(256));
+    }
+
+    /// The widening is the inclusion of the counts into the integers, so it
+    /// must agree with the count it widens.
+    #[test]
+    fn a_widened_cardinality_equals_the_cardinality() {
+        let db = Db::new();
+        db.insert_many(5, &[1, 2, 3, 9, 40]).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        let e = BigExpr::Widen(Box::new(IntExpr::Cardinality(Box::new(SetExpr::Key(5)))));
+        let got = big(&e, &snap).unwrap();
+        assert!(!got.is_negative());
+        assert_eq!(got.magnitude(), &BigUint::from_u64(5));
+    }
+
+    /// There is no unaddressable case left: a set is an integer, so every read
+    /// has an answer and a set with nothing in the width reads as zero.
+    #[test]
+    fn a_read_is_total() {
+        let db = Db::new();
+        db.insert_many(4, &[0, 1]).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        // Reading is total now: an empty region is zero, not an error, because
+        // absence and zero are the same thing in a set.
+        let e = BigExpr::Read(Box::new(SetExpr::Key(4)), 1024);
+        assert_eq!(
+            big(&e, &snap).unwrap().magnitude(),
+            &BigUint::from_u64(0b11)
+        );
+    }
+}
+
+#[cfg(test)]
+mod signed_read_tests {
+    use super::*;
+    use yesno_core::Db;
+    use yesno_core::OrdSet;
+
+    /// The same stored bits, read twice, denoting two different numbers.
+    ///
+    /// This is exactly why the signed reading is its own node and not a flag:
+    /// there is no bit pattern that announces which one was meant.
+    #[test]
+    fn a_signed_read_is_twos_complement_over_the_declared_width() {
+        // 255 -> -1, 128 -> -128, 127 -> 127, 0 -> 0.
+        let stored: [u64; 4] = [255, 128, 127, 0];
+        let want_signed: [i64; 4] = [-1, -128, 127, 0];
+
+        // One set is one integer, so each stored pattern is its own key.
+        let db = Db::new();
+        for (k, v) in stored.iter().enumerate() {
+            let ordinals: Vec<u64> = OrdSet::from_int(&BigUint::from_u64(*v))
+                .unwrap()
+                .iter()
+                .collect();
+            db.insert_many(21 + k as u64, &ordinals).unwrap();
+        }
+        let snap = db.snapshot().unwrap();
+
+        for (k, (raw, signed)) in stored.iter().zip(want_signed.iter()).enumerate() {
+            let key = 21 + k as u64;
+            let k = k as u64;
+
+            let unsigned = big(&BigExpr::Read(Box::new(SetExpr::Key(key)), 8), &snap).unwrap();
+            assert!(!unsigned.is_negative());
+            assert_eq!(unsigned.magnitude(), &BigUint::from_u64(*raw), "raw {k}");
+
+            let got = big(&BigExpr::ReadSigned(Box::new(SetExpr::Key(key)), 8), &snap).unwrap();
+            assert_eq!(got.is_negative(), *signed < 0, "sign of {k}");
+            assert_eq!(
+                got.magnitude(),
+                &BigUint::from_u64(signed.unsigned_abs()),
+                "magnitude of {k}"
+            );
+        }
+    }
+
+    /// A signed read survives the wire, and the two readings stay distinct
+    /// across it -- a client cannot lose which one it asked for.
+    #[test]
+    fn the_two_readings_stay_distinct_across_the_wire() {
+        let ordinals: Vec<u64> = OrdSet::from_int(&BigUint::from_u64(u64::MAX))
+            .unwrap()
+            .iter()
+            .collect();
+
+        let db = Db::new();
+        db.insert_many(22, &ordinals).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        for (e, negative) in [
+            (BigExpr::Read(Box::new(SetExpr::Key(22)), 64), false),
+            (BigExpr::ReadSigned(Box::new(SetExpr::Key(22)), 64), true),
+        ] {
+            let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+                AnyExpr::Big(b) => b,
+                other => panic!("decoded as {:?}", other.sort()),
+            };
+            let got = big(&decoded, &snap).unwrap();
+            assert_eq!(got.is_negative(), negative);
+        }
+    }
+
+    /// A one-bit signed integer holds only 0 and -1. The width is the whole
+    /// content of the sign, so the narrowest case is worth pinning.
+    #[test]
+    fn a_one_bit_signed_read_is_zero_or_minus_one() {
+        // Key 23 is empty, so it reads as zero. Key 24 holds ordinal 0, which
+        // at width 1 is the sign bit and nothing else.
+        let db = Db::new();
+        db.insert_many(24, &[0u64]).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        let zero = big(&BigExpr::ReadSigned(Box::new(SetExpr::Key(23)), 1), &snap).unwrap();
+        assert!(!zero.is_negative());
+        assert_eq!(zero.magnitude(), &BigUint::zero());
+
+        let minus_one = big(&BigExpr::ReadSigned(Box::new(SetExpr::Key(24)), 1), &snap).unwrap();
+        assert!(minus_one.is_negative());
+        assert_eq!(minus_one.magnitude(), &BigUint::one());
+    }
+}
+
+#[cfg(test)]
+mod big_arithmetic_tests {
+    use super::*;
+    use yesno_core::Db;
+
+    fn lit(v: i64) -> Box<BigExpr> {
+        Box::new(BigExpr::Lit(BigLit::from_i64(v)))
+    }
+
+    fn eval(e: BigExpr) -> BigInt {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        // Through the wire, so the tests cover the encoding too.
+        let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+            AnyExpr::Big(b) => b,
+            other => panic!("decoded as {:?}", other.sort()),
+        };
+        big(&decoded, &snap).unwrap()
+    }
+
+    /// Rust's own operators are the reference, which is available here because
+    /// the operands fit a machine word even though the sort does not require it.
+    #[test]
+    fn the_five_operations_agree_with_machine_arithmetic() {
+        for a in [-100i64, -7, -1, 0, 1, 7, 100] {
+            for b in [-9i64, -2, -1, 1, 2, 9] {
+                assert_eq!(eval(BigExpr::Add(lit(a), lit(b))), BigInt::from_i64(a + b));
+                assert_eq!(eval(BigExpr::Sub(lit(a), lit(b))), BigInt::from_i64(a - b));
+                assert_eq!(eval(BigExpr::Mul(lit(a), lit(b))), BigInt::from_i64(a * b));
+                assert_eq!(eval(BigExpr::Div(lit(a), lit(b))), BigInt::from_i64(a / b));
+                assert_eq!(eval(BigExpr::Rem(lit(a), lit(b))), BigInt::from_i64(a % b));
+            }
+            assert_eq!(eval(BigExpr::Neg(lit(a))), BigInt::from_i64(-a));
+        }
+    }
+
+    /// Beyond a machine word, which is the point of the sort.
+    #[test]
+    fn arithmetic_runs_past_sixty_four_bits() {
+        let big_lit = |v: BigLit| Box::new(BigExpr::Lit(v));
+        let a = BigLit::from_le_bytes(false, vec![0xFF; 16]).unwrap();
+        let squared = eval(BigExpr::Mul(big_lit(a.clone()), big_lit(a)));
+        // (2^128 - 1)^2 = 2^256 - 2^129 + 1, so the top bit is 255.
+        assert_eq!(squared.magnitude().bit_len(), 256);
+        assert!(!squared.is_negative());
+    }
+
+    #[test]
+    fn a_zero_divisor_is_an_error_not_a_value() {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        for e in [BigExpr::Div(lit(7), lit(0)), BigExpr::Rem(lit(7), lit(0))] {
+            assert!(big(&e, &snap).is_err());
+        }
+    }
+
+    /// The wrap and the ceiling are different rules, and the language keeps
+    /// them apart rather than offering one under two names.
+    #[test]
+    fn truncate_wraps_where_saturate_clamps() {
+        // One field, two overflow rules. Machine `i8` is the reference for the
+        // wrap; `clamp` for the ceiling.
+        for v in [-300i64, -129, -1, 0, 1, 127, 128, 255, 300] {
+            assert_eq!(
+                eval(BigExpr::Truncate(lit(v), 8)),
+                BigInt::from_i64(v as i8 as i64),
+                "truncate {v}"
+            );
+            assert_eq!(
+                eval(BigExpr::Saturate(lit(v), 8)),
+                BigInt::from_i64(v.clamp(-128, 127)),
+                "saturate {v}"
+            );
+        }
+        // Different rules, so they part company as soon as anything overflows.
+        assert_ne!(
+            eval(BigExpr::Truncate(lit(128), 8)),
+            eval(BigExpr::Saturate(lit(128), 8))
+        );
+    }
+
+    /// **The amplification the width budget exists to refuse, and it is a
+    /// `Read` that supplies it.**
+    ///
+    /// A multiplication over *literals* does not amplify: the wire has no
+    /// sharing, so `Mul( a, a )` writes `a` twice and the payload grows with
+    /// the width. A `Read` is the asymmetry -- six bytes that declare a width
+    /// -- so one `Mul` of two maximal reads is a fifteen-byte payload
+    /// describing a value no machine should try to build. Refused at decode,
+    /// before anything evaluates.
+    #[test]
+    fn a_multiplication_of_wide_reads_is_refused_before_it_runs() {
+        let read = || {
+            Box::new(BigExpr::Read(
+                Box::new(SetExpr::Key(1)),
+                MAX_VALUE_BITS as u32,
+            ))
+        };
+        let payload = AnyExpr::Big(BigExpr::Mul(read(), read())).encode();
+        assert!(
+            payload.len() < 64,
+            "payload was {} bytes, so it is not an amplification",
+            payload.len()
+        );
+        assert_eq!(AnyExpr::decode(&payload), Err(ExprError::ValueTooWide));
+    }
+
+    /// The same node one bit under the bound is accepted, so the refusal above
+    /// is the bound doing its job rather than the shape being rejected.
+    #[test]
+    fn the_same_shape_just_inside_the_bound_is_accepted() {
+        let read = || {
+            Box::new(BigExpr::Read(
+                Box::new(SetExpr::Key(1)),
+                (MAX_VALUE_BITS / 2) as u32,
+            ))
+        };
+        assert!(AnyExpr::decode(&AnyExpr::Big(BigExpr::Mul(read(), read())).encode()).is_ok());
+    }
+
+    /// And the bound is not so tight that ordinary arithmetic trips it.
+    #[test]
+    fn arithmetic_within_the_budget_is_accepted() {
+        let wide = BigLit::from_le_bytes(false, vec![0xAB; 4096]).unwrap();
+        let e = BigExpr::Mul(
+            Box::new(BigExpr::Lit(wide.clone())),
+            Box::new(BigExpr::Lit(wide)),
+        );
+        assert!(AnyExpr::decode(&AnyExpr::Big(e).encode()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod big_fold_tests {
+    use super::*;
+    use yesno_core::Db;
+
+    fn lit(v: i64) -> BigExpr {
+        BigExpr::Lit(BigLit::from_i64(v))
+    }
+
+    fn fold(values: &[i64], op: BigFoldOp) -> BigInt {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        let e = BigExpr::Fold(
+            Box::new(VecBigExpr::List(values.iter().copied().map(lit).collect())),
+            op,
+        );
+        // Through the wire, so the operator byte is covered too.
+        let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+            AnyExpr::Big(b) => b,
+            other => panic!("decoded as {:?}", other.sort()),
+        };
+        big(&decoded, &snap).unwrap()
+    }
+
+    /// All four operators, against the obvious reduction over machine ints.
+    #[test]
+    fn the_four_operators_reduce_as_they_say() {
+        let v = [3i64, -7, 2, 10];
+        assert_eq!(fold(&v, BigFoldOp::Add), BigInt::from_i64(8));
+        assert_eq!(fold(&v, BigFoldOp::Mul), BigInt::from_i64(-420));
+        assert_eq!(fold(&v, BigFoldOp::Min), BigInt::from_i64(-7));
+        assert_eq!(fold(&v, BigFoldOp::Max), BigInt::from_i64(10));
+    }
+
+    /// A one-element vector is its own fold under every operator, which is the
+    /// case an identity would be needed for if the vector could be empty.
+    #[test]
+    fn a_single_element_folds_to_itself() {
+        for op in [
+            BigFoldOp::Add,
+            BigFoldOp::Mul,
+            BigFoldOp::Min,
+            BigFoldOp::Max,
+        ] {
+            assert_eq!(fold(&[-5], op), BigInt::from_i64(-5));
+        }
+    }
+
+    /// **Only `mul` grows with the arity, and the budget knows it.** A sum of
+    /// `n` values costs a handful of bits; a product costs `n` times the
+    /// element width, which is the same unbounded product `MAX_RESULT_BITS`
+    /// exists for -- except that here it lands in one value, so `MAX_VALUE_BITS`
+    /// has to hold it.
+    #[test]
+    fn a_product_fold_is_bounded_where_a_sum_fold_is_not_troubled() {
+        let wide = || {
+            VecBigExpr::Map(
+                Box::new(VecSetExpr::View(
+                    Box::new(SetExpr::Key(1)),
+                    ViewSpec::interleaved(1024),
+                )),
+                Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 4096)),
+            )
+        };
+        // 1024 * 4096 = 4 Mibit, four times over MAX_VALUE_BITS.
+        let product = AnyExpr::Big(BigExpr::Fold(Box::new(wide()), BigFoldOp::Mul));
+        assert_eq!(
+            AnyExpr::decode(&product.encode()),
+            Err(ExprError::ValueTooWide)
+        );
+        // The same vector sums to 4096 + 11 bits, which is nowhere near it.
+        let sum = AnyExpr::Big(BigExpr::Fold(Box::new(wide()), BigFoldOp::Add));
+        assert!(AnyExpr::decode(&sum.encode()).is_ok());
+    }
+
+    /// The fold reads the same stored values the vector sort returns, so the
+    /// two agree by construction rather than by coincidence.
+    #[test]
+    fn a_fold_agrees_with_reducing_the_vector_it_folds() {
+        use yesno_core::bignum::BigUint;
+
+        let values = [BigUint::from_u64(11), BigUint::from_u64(4), BigUint::zero()];
+        let sets = 3u32;
+        let mut packed: Vec<u64> = Vec::new();
+        for (i, v) in values.iter().enumerate() {
+            for x in 0..v.bit_len() {
+                if v.bit(x) {
+                    packed.push(x * u64::from(sets) + i as u64);
+                }
+            }
+        }
+        let db = Db::new();
+        db.insert_many(77, &packed).unwrap();
+        let snap = db.snapshot().unwrap();
+
+        let vector = VecBigExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(77)),
+                ViewSpec::interleaved(sets),
+            )),
+            Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 64)),
+        );
+        let elements = vec_big(&vector, &snap).unwrap();
+        let summed = big(&BigExpr::Fold(Box::new(vector), BigFoldOp::Add), &snap).unwrap();
+
+        let want = elements
+            .iter()
+            .cloned()
+            .reduce(|a, b| a.add(&b))
+            .expect("non-empty");
+        assert_eq!(summed, want);
+        assert_eq!(summed.magnitude(), &BigUint::from_u64(15));
+    }
+}
+
+#[cfg(test)]
+mod pow_mod_tests {
+    use super::*;
+    use yesno_core::Db;
+
+    fn lit(v: i64) -> Box<BigExpr> {
+        Box::new(BigExpr::Lit(BigLit::from_i64(v)))
+    }
+
+    fn eval(e: BigExpr) -> yesno_core::Result<BigInt> {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        // Through the wire, so the node's encoding is covered too.
+        let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+            AnyExpr::Big(b) => b,
+            other => panic!("decoded as {:?}", other.sort()),
+        };
+        big(&decoded, &snap)
+    }
+
+    /// Against modular arithmetic done the slow way, which is available here
+    /// because the operands fit a machine word even though the node does not
+    /// require it.
+    #[test]
+    fn it_agrees_with_repeated_multiplication() {
+        for (b, e, m) in [(2i64, 10i64, 1000i64), (7, 0, 13), (5, 117, 19), (3, 5, 7)] {
+            let want = (0..e).fold(1i64, |acc, _| acc * b % m);
+            assert_eq!(
+                eval(BigExpr::PowMod(lit(b), lit(e), lit(m))).unwrap(),
+                BigInt::from_i64(want),
+                "{b}^{e} mod {m}"
+            );
+        }
+    }
+
+    /// `m == 1` makes every residue zero, **including** `base^0`. The classic
+    /// wrong answer is `1`, and `bignum`'s own header names this case.
+    #[test]
+    fn a_modulus_of_one_reduces_everything_including_a_zero_exponent() {
+        assert_eq!(
+            eval(BigExpr::PowMod(lit(5), lit(0), lit(1))).unwrap(),
+            BigInt::zero()
+        );
+        assert_eq!(
+            eval(BigExpr::PowMod(lit(5), lit(3), lit(1))).unwrap(),
+            BigInt::zero()
+        );
+    }
+
+    /// A negative base enters its residue class; the answer never carries a
+    /// sign out of `[ 0, m )`.
+    #[test]
+    fn a_negative_base_enters_its_residue_class() {
+        // (-1)^3 mod 7 = -1 mod 7 = 6.
+        let got = eval(BigExpr::PowMod(lit(-1), lit(3), lit(7))).unwrap();
+        assert!(!got.is_negative());
+        assert_eq!(got, BigInt::from_i64(6));
+        // (-2)^2 mod 7 = 4.
+        assert_eq!(
+            eval(BigExpr::PowMod(lit(-2), lit(2), lit(7))).unwrap(),
+            BigInt::from_i64(4)
+        );
+    }
+
+    /// Both are facts about the operands rather than answers, so both are
+    /// errors. A zero would be a well-formed wrong answer for either.
+    #[test]
+    fn a_zero_modulus_and_a_negative_exponent_are_errors() {
+        assert!(eval(BigExpr::PowMod(lit(2), lit(3), lit(0))).is_err());
+        assert!(eval(BigExpr::PowMod(lit(2), lit(-3), lit(7))).is_err());
+    }
+
+    /// **The amplification the work bound exists for, and the one the width
+    /// bound structurally cannot see.** The result is only as wide as the
+    /// modulus, so `width_bound` finds nothing wrong with a payload that names
+    /// a computation which would not finish.
+    #[test]
+    fn a_costly_exponentiation_is_refused_where_its_width_is_unremarkable() {
+        let wide = |bits: u32| Box::new(BigExpr::Read(Box::new(SetExpr::Key(1)), bits));
+        let e = BigExpr::PowMod(lit(2), wide(1 << 20), wide(1 << 20));
+
+        // The width bound is untroubled: a residue is as wide as its modulus.
+        assert_eq!(e.width_bound(), 1 << 20);
+        assert!(e.width_bound() <= MAX_VALUE_BITS);
+        // The work bound is not.
+        assert!(e.work_bound() > MAX_WORK);
+
+        let payload = AnyExpr::Big(e).encode();
+        assert!(payload.len() < 64, "payload was {} bytes", payload.len());
+        assert_eq!(AnyExpr::decode(&payload), Err(ExprError::TooMuchWork));
+    }
+
+    /// And the sizes a caller plausibly means are admitted, so the bound is
+    /// calibrated rather than merely restrictive.
+    #[test]
+    fn rsa_scale_exponentiation_is_admitted() {
+        for bits in [2048u32, 4096] {
+            let operand = || Box::new(BigExpr::Read(Box::new(SetExpr::Key(1)), bits));
+            let e = BigExpr::PowMod(lit(2), operand(), operand());
+            assert!(
+                e.work_bound() <= MAX_WORK,
+                "{bits}-bit modulus cost {} exceeds the budget",
+                e.work_bound()
+            );
+            assert!(AnyExpr::decode(&AnyExpr::Big(e).encode()).is_ok());
+        }
     }
 }
