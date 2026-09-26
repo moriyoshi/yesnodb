@@ -244,6 +244,58 @@ class SetExpressionTest {
     }
   }
 
+  /**
+   * A zip and a scale encode exactly the bytes the Rust encoder produces.
+   *
+   * <p>The reference strings come from yesno-wire, which is the authority on the format. A client
+   * checked only against its own decoder can be self-consistently wrong.
+   */
+  @Test
+  void bigZipAndScaleMatchTheRustEncoder() {
+    String[] want = {
+      "59534e580100280024020018000100000007180001000000082402001800010000000118000100000002",
+      "59534e5801002900250c030000000000000000000000000109000000000000001a800000000d18000100000003",
+      "59534e580100280124020018000100000007180001000000082402001800010000000118000100000002",
+      "59534e5801002901250c030000000000000000000000000109000000000000001a800000000d18000100000003",
+      "59534e580100280224020018000100000007180001000000082402001800010000000118000100000002",
+      "59534e5801002902250c030000000000000000000000000109000000000000001a800000000d18000100000003",
+      "59534e580100280324020018000100000007180001000000082402001800010000000118000100000002",
+      "59534e5801002903250c030000000000000000000000000109000000000000001a800000000d18000100000003",
+      "59534e580100280424020018000100000007180001000000082402001800010000000118000100000002",
+      "59534e5801002904250c030000000000000000000000000109000000000000001a800000000d18000100000003",
+    };
+    HexFormat hex = HexFormat.of();
+    for (BigBinOp op : BigBinOp.values()) {
+      VecBigExpression zip =
+          new VecBigExpression.Zip(
+              VecBigExpression.of(7, 8), VecBigExpression.of(1, 2), op);
+      assertEquals(want[2 * op.ordinal()], hex.formatHex(SetExpressionCodec.encodeBigVector(zip)));
+      assertEquals(zip, SetExpressionCodec.decodeBigVector(SetExpressionCodec.encodeBigVector(zip)));
+
+      VecBigExpression scale =
+          new VecBigExpression.Scale(
+              new VecBigExpression.MapBig(
+                  VecSetExpression.view(SetExpression.key(9), ViewSpec.interleaved(3)),
+                  new BigExpression.ReadUint(SetExpression.hole(), 128)),
+              BigExpression.of(3),
+              op);
+      assertEquals(
+          want[2 * op.ordinal() + 1], hex.formatHex(SetExpressionCodec.encodeBigVector(scale)));
+      assertEquals(
+          scale, SetExpressionCodec.decodeBigVector(SetExpressionCodec.encodeBigVector(scale)));
+    }
+  }
+
+  /** A zip of unequal arities is refused where it is built, not where it is evaluated. */
+  @Test
+  void aZipOfUnequalAritiesIsRefused() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new VecBigExpression.Zip(
+                VecBigExpression.of(1, 2), VecBigExpression.of(3), BigBinOp.ADD));
+  }
+
   /** {@code map} builds a vector of big integers and {@code fold} collapses one. */
   @Test
   void bigVectorIsBuiltByMapAndCollapsedByFold() {

@@ -74,6 +74,8 @@ _TAG_BIG_LIST = 36
 _TAG_MAP_BIG = 37
 _TAG_BIG_FOLD = 38
 _TAG_BIG_POW_MOD = 39
+_TAG_BIG_ZIP = 40
+_TAG_BIG_SCALE = 41
 
 # The widest value a big-integer node may denote. Mirrors `MAX_VALUE_BITS` in
 # the Rust crate: multiplication adds the operands' widths, so without this a
@@ -155,6 +157,8 @@ _TAG_SORTS = {
     _TAG_MAP_BIG: SORT_VEC_BIG,
     _TAG_BIG_FOLD: SORT_BIG,
     _TAG_BIG_POW_MOD: SORT_BIG,
+    _TAG_BIG_ZIP: SORT_VEC_BIG,
+    _TAG_BIG_SCALE: SORT_VEC_BIG,
 }
 
 
@@ -204,6 +208,44 @@ class BigFoldOp(IntEnum):
     MUL = 1
     MIN = 2
     MAX = 3
+
+
+class BigBinOp(IntEnum):
+    """How :class:`BigZip` and :class:`BigScale` combine two big integers.
+
+    The same five operations the scalar nodes offer, and bounded by the same
+    rules -- so a zip and the equivalent written out element by element are
+    bounded identically.
+    """
+
+    ADD = 0
+    SUB = 1
+    MUL = 2
+    DIV = 3
+    REM = 4
+
+    def width_bound(self, a: int, b: int) -> int:
+        """The width one result can reach, from its operands' widths."""
+
+        if self in (BigBinOp.ADD, BigBinOp.SUB):
+            return max(a, b) + 1
+        if self is BigBinOp.MUL:
+            return a + b
+        if self is BigBinOp.DIV:
+            return a
+        return min(a, b)
+
+    def element_work(self, a: int, b: int) -> int:
+        """Limb operations one element costs.
+
+        Additive operations are linear in the wider operand, multiplicative
+        ones are the product of both.
+        """
+
+        la, lb = _limbs(a), _limbs(b)
+        if self in (BigBinOp.ADD, BigBinOp.SUB):
+            return max(la, lb)
+        return la * lb
 
 
 class FoldOp(IntEnum):
@@ -1261,6 +1303,88 @@ class MapBig(VecBigExpr):
 
 
 @dataclass(frozen=True, slots=True)
+class BigZip(VecBigExpr):
+    """Combine two vectors of big integers position by position.
+
+    Both arities are statically known, so a mismatch is refused here rather
+    than discovered while evaluating -- which is what lets the evaluator's own
+    zip be total.
+    """
+
+    left: VecBigExpr
+    right: VecBigExpr
+    op: BigBinOp
+
+    def __post_init__(self) -> None:
+        _vec_big(self.left)
+        _vec_big(self.right)
+        if self.left.arity != self.right.arity:
+            raise ExpressionError(
+                f"zip needs equal arities, not {self.left.arity} and {self.right.arity}"
+            )
+        _vec_big(self)
+
+    @property
+    def arity(self) -> int:
+        return self.left.arity
+
+    def element_bound(self) -> int:
+        return self.op.width_bound(self.left.element_bound(), self.right.element_bound())
+
+    def work_bound(self) -> int:
+        # One operation per position, plus whatever the operands cost.
+        per = self.op.element_work(self.left.element_bound(), self.right.element_bound())
+        return self.left.work_bound() + self.right.work_bound() + self.arity * per
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_ZIP)
+        out.append(int(self.op))
+        self.left._encode_node(out)
+        self.right._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.left._append_keys(out)
+        self.right._append_keys(out)
+
+
+@dataclass(frozen=True, slots=True)
+class BigScale(VecBigExpr):
+    """Combine every element of a vector with one scalar."""
+
+    vector: VecBigExpr
+    scalar: BigExpr
+    op: BigBinOp
+
+    def __post_init__(self) -> None:
+        _vec_big(self.vector)
+        _big(self.scalar)
+        _vec_big(self)
+
+    @property
+    def arity(self) -> int:
+        return self.vector.arity
+
+    def element_bound(self) -> int:
+        return self.op.width_bound(self.vector.element_bound(), self.scalar.width_bound())
+
+    def work_bound(self) -> int:
+        per = self.op.element_work(
+            self.vector.element_bound(), self.scalar.width_bound()
+        )
+        return self.vector.work_bound() + self.scalar.work_bound() + self.arity * per
+
+    def _encode_node(self, out: bytearray) -> None:
+        out.append(_TAG_BIG_SCALE)
+        out.append(int(self.op))
+        self.vector._encode_node(out)
+        self.scalar._encode_node(out)
+
+    def _append_keys(self, out: list[int]) -> None:
+        self.vector._append_keys(out)
+        self.scalar._append_keys(out)
+
+
+@dataclass(frozen=True, slots=True)
 class BigFold(BigExpr):
     """Reduce a vector of big integers to one.
 
@@ -2117,7 +2241,23 @@ class _Cursor:
         if tag == _TAG_MAP_BIG:
             vector = self.vector(depth + 1)
             return MapBig(vector, self.body(depth + 1, _Cursor.big))
+        if tag == _TAG_BIG_ZIP:
+            op = self.big_bin_op()
+            left = self.big_vector(depth + 1)
+            right = self.big_vector(depth + 1)
+            return BigZip(left, right, op)
+        if tag == _TAG_BIG_SCALE:
+            op = self.big_bin_op()
+            scaled = self.big_vector(depth + 1)
+            return BigScale(scaled, self.big(depth + 1), op)
         raise _misplaced(SORT_VEC_BIG, tag)
+
+    def big_bin_op(self) -> BigBinOp:
+        (raw,) = self.unpack("<B")
+        try:
+            return BigBinOp(raw)
+        except ValueError:
+            raise ExpressionError(f"unknown fold operation {raw}") from None
 
     def int_vector(self, depth: int) -> VecIntExpr:
         if depth > MAX_DEPTH:

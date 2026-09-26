@@ -20,8 +20,11 @@ from yesnodb.client import (
     AnyExpr,
     At,
     BigExpr,
+    BigBinOp,
     BigFold,
     BigFoldOp,
+    BigScale,
+    BigZip,
     BigList,
     BigLit,
     Cardinality,
@@ -383,6 +386,35 @@ def test_a_vector_of_big_integers_is_built_by_map_and_round_trips() -> None:
     assert AnyExpr.decode(AnyExpr(BigList(BigLit(1), BigLit(-2))).encode()).expression == BigList(
         BigLit(1), BigLit(-2)
     )
+
+
+@pytest.mark.parametrize(
+    "op", [BigBinOp.ADD, BigBinOp.SUB, BigBinOp.MUL, BigBinOp.DIV, BigBinOp.REM]
+)
+def test_a_zip_and_a_scale_round_trip(op: BigBinOp) -> None:
+    z = BigZip(BigList(BigLit(7), BigLit(8)), BigList(BigLit(1), BigLit(2)), op)
+    assert AnyExpr(z).sort == SORT_VEC_BIG
+    assert AnyExpr.decode(AnyExpr(z).encode()).expression == z
+
+    sc = BigScale(_big_vector(), BigLit(3), op)
+    assert AnyExpr(sc).sort == SORT_VEC_BIG
+    assert AnyExpr.decode(AnyExpr(sc).encode()).expression == sc
+
+
+def test_a_zip_of_unequal_arities_is_refused_when_built() -> None:
+    """Both arities are statically known, so this never reaches evaluation."""
+
+    with pytest.raises(ExpressionError):
+        BigZip(BigList(BigLit(1), BigLit(2)), BigList(BigLit(3)), BigBinOp.ADD)
+
+
+def test_a_zip_is_bounded_like_the_elements_written_out() -> None:
+    """The point of sharing BigBinOp's rules with the scalar nodes."""
+
+    a = BigScale(_big_vector(), BigLit(3), BigBinOp.MUL)
+    # 128-bit elements times a 2-bit literal.
+    assert a.element_bound() == 128 + BigLit(3).width_bound()
+    assert BigScale(_big_vector(), BigLit(3), BigBinOp.ADD).element_bound() == 129
 
 
 @pytest.mark.parametrize("op", [BigFoldOp.ADD, BigFoldOp.MUL, BigFoldOp.MIN, BigFoldOp.MAX])

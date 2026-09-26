@@ -278,6 +278,16 @@ final class SetExpressionCodec {
       output.write(37);
       writeVector(map.vector(), output);
       writeBig(map.body(), output);
+    } else if (vector instanceof VecBigExpression.Zip zip) {
+      output.write(40);
+      output.write(zip.op().wire());
+      writeBigVector(zip.left(), output);
+      writeBigVector(zip.right(), output);
+    } else if (vector instanceof VecBigExpression.Scale scale) {
+      output.write(41);
+      output.write(scale.op().wire());
+      writeBigVector(scale.vector(), output);
+      writeBig(scale.scalar(), output);
     } else {
       throw new IllegalArgumentException("unknown big-vector implementation: " + vector);
     }
@@ -719,6 +729,15 @@ final class SetExpressionCodec {
       return new java.math.BigInteger(be);
     }
 
+    private BigBinOp readBigBinOp() {
+      byte raw = (byte) readUnsignedByte();
+      BigBinOp op = BigBinOp.fromWire(raw);
+      if (op == null) {
+        throw malformed("unknown fold operation " + (raw & 0xFF));
+      }
+      return op;
+    }
+
     private VecBigExpression readBigVector(int depth) {
       countNode(depth);
       int tag = readUnsignedByte();
@@ -742,6 +761,19 @@ final class SetExpressionCodec {
             case 37 -> {
               VecSetExpression vector = readVector(depth + 1);
               yield new VecBigExpression.MapBig(vector, readBigBody(depth + 1));
+            }
+            case 40 -> {
+              BigBinOp op = readBigBinOp();
+              VecBigExpression left = readBigVector(depth + 1);
+              VecBigExpression right = readBigVector(depth + 1);
+              // Statically known on both sides, so the record's own constructor
+              // refuses a mismatch here rather than at evaluation.
+              yield new VecBigExpression.Zip(left, right, op);
+            }
+            case 41 -> {
+              BigBinOp op = readBigBinOp();
+              VecBigExpression scaled = readBigVector(depth + 1);
+              yield new VecBigExpression.Scale(scaled, readBig(depth + 1), op);
             }
             default -> throw misplaced("vector of big integers", tag);
           };

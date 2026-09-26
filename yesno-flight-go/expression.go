@@ -79,6 +79,8 @@ const (
 	tagMapBig
 	tagBigFold
 	tagBigPowMod
+	tagBigZip
+	tagBigScale
 )
 
 // MaxValueBits is the widest value a big-integer node may denote.
@@ -139,7 +141,7 @@ func sortOfTag(tag byte) (string, bool) {
 		tagBigAdd, tagBigSub, tagBigMul, tagBigDiv, tagBigRem,
 		tagBigTruncate, tagBigSaturate, tagBigFold, tagBigPowMod:
 		return sortBig, true
-	case tagBigList, tagMapBig:
+	case tagBigList, tagMapBig, tagBigZip, tagBigScale:
 		return sortVecBig, true
 	}
 	return "", false
@@ -716,6 +718,107 @@ func (m MapBigExpr) ElementBound() uint64 { return m.Body.WidthBound() }
 // WorkBound: the body runs once per constituent.
 func (m MapBigExpr) WorkBound() uint64 { return uint64(m.Arity()) * m.Body.WorkBound() }
 
+// BigBinOp is how BigZipExpr and BigScaleExpr combine two big integers.
+//
+// The same five operations the scalar nodes offer, bounded by the same rules --
+// so a zip and the equivalent written out element by element are bounded
+// identically.
+type BigBinOp byte
+
+// The binary operations available to a zip or a scale.
+const (
+	BigBinAdd BigBinOp = 0
+	BigBinSub BigBinOp = 1
+	BigBinMul BigBinOp = 2
+	BigBinDiv BigBinOp = 3
+	BigBinRem BigBinOp = 4
+)
+
+// WidthBound reports the width one result can reach, from its operands' widths.
+func (op BigBinOp) WidthBound(a, b uint64) uint64 {
+	switch op {
+	case BigBinAdd, BigBinSub:
+		if a > b {
+			return a + 1
+		}
+		return b + 1
+	case BigBinMul:
+		return a + b
+	case BigBinDiv:
+		return a
+	default:
+		if a < b {
+			return a
+		}
+		return b
+	}
+}
+
+// ElementWork reports the limb operations one element costs: additive
+// operations are linear in the wider operand, multiplicative ones the product.
+func (op BigBinOp) ElementWork(a, b uint64) uint64 {
+	la, lb := limbsOf(a), limbsOf(b)
+	switch op {
+	case BigBinAdd, BigBinSub:
+		if la > lb {
+			return la
+		}
+		return lb
+	default:
+		return la * lb
+	}
+}
+
+// BigZipExpr combines two vectors of big integers position by position.
+//
+// Both arities are statically known, so a mismatch is refused at decode rather
+// than discovered while evaluating -- which is what lets the evaluator's own
+// zip be total.
+type BigZipExpr struct {
+	Left  VecBigExpr
+	Right VecBigExpr
+	Op    BigBinOp
+}
+
+func (BigZipExpr) yesnoVecBigExpr() {}
+
+// Arity reports the common arity of the two operands.
+func (z BigZipExpr) Arity() uint32 { return z.Left.Arity() }
+
+// ElementBound reports the width one combined element can reach.
+func (z BigZipExpr) ElementBound() uint64 {
+	return z.Op.WidthBound(z.Left.ElementBound(), z.Right.ElementBound())
+}
+
+// WorkBound: one operation per position, plus what the operands cost.
+func (z BigZipExpr) WorkBound() uint64 {
+	per := z.Op.ElementWork(z.Left.ElementBound(), z.Right.ElementBound())
+	return z.Left.WorkBound() + z.Right.WorkBound() + uint64(z.Arity())*per
+}
+
+// BigScaleExpr combines every element of a vector with one scalar.
+type BigScaleExpr struct {
+	Vector VecBigExpr
+	Scalar BigExpr
+	Op     BigBinOp
+}
+
+func (BigScaleExpr) yesnoVecBigExpr() {}
+
+// Arity reports the underlying vector's arity.
+func (s BigScaleExpr) Arity() uint32 { return s.Vector.Arity() }
+
+// ElementBound reports the width one scaled element can reach.
+func (s BigScaleExpr) ElementBound() uint64 {
+	return s.Op.WidthBound(s.Vector.ElementBound(), s.Scalar.WidthBound())
+}
+
+// WorkBound: one operation per position, plus what the operands cost.
+func (s BigScaleExpr) WorkBound() uint64 {
+	per := s.Op.ElementWork(s.Vector.ElementBound(), s.Scalar.WidthBound())
+	return s.Vector.WorkBound() + s.Scalar.WorkBound() + uint64(s.Arity())*per
+}
+
 // BigPowModExpr is base^exp mod modulus, by Barrett reduction.
 //
 // The node the work bound exists for: its result is only as wide as the
@@ -1104,6 +1207,21 @@ func validateBigVector(root VecBigExpr) error {
 		// over it is the cheapest way to reach it, and it carries the arity
 		// checks a nested index still needs.
 		return validateIntVector(MapIntExpr{Vector: v.Vector, Body: IntLitExpr{}})
+	case BigZipExpr:
+		// Statically known on both sides, so a mismatch is refused before the
+		// bytes are written rather than discovered while evaluating.
+		if v.Left.Arity() != v.Right.Arity() {
+			return fmt.Errorf("zip needs equal arities, not %d and %d", v.Left.Arity(), v.Right.Arity())
+		}
+		if err := validateBigVector(v.Left); err != nil {
+			return err
+		}
+		return validateBigVector(v.Right)
+	case BigScaleExpr:
+		if err := validateBigVector(v.Vector); err != nil {
+			return err
+		}
+		return validateBig(v.Scalar)
 	default:
 		return fmt.Errorf("unsupported big-vector type %T", root)
 	}
@@ -1620,6 +1738,14 @@ func appendBigVector(out []byte, vector VecBigExpr) []byte {
 		out = append(out, tagMapBig)
 		out = appendVector(out, v.Vector)
 		out = appendBig(out, v.Body)
+	case BigZipExpr:
+		out = append(out, tagBigZip, byte(v.Op))
+		out = appendBigVector(out, v.Left)
+		out = appendBigVector(out, v.Right)
+	case BigScaleExpr:
+		out = append(out, tagBigScale, byte(v.Op))
+		out = appendBigVector(out, v.Vector)
+		out = appendBig(out, v.Scalar)
 	}
 	return out
 }
@@ -2133,6 +2259,18 @@ func (c *expressionCursor) bigExpression(depth int) (BigExpr, error) {
 	return out, nil
 }
 
+// bigBinOp reads one operator byte, refusing an undefined one.
+func (c *expressionCursor) bigBinOp() (BigBinOp, error) {
+	raw, err := c.take(1)
+	if err != nil {
+		return 0, err
+	}
+	if raw[0] > byte(BigBinRem) {
+		return 0, fmt.Errorf("unknown fold operator %d", raw[0])
+	}
+	return BigBinOp(raw[0]), nil
+}
+
 func (c *expressionCursor) bigVector(depth int) (VecBigExpr, error) {
 	if depth > MaxExpressionDepth {
 		return nil, fmt.Errorf("expression nested deeper than %d", MaxExpressionDepth)
@@ -2178,6 +2316,39 @@ func (c *expressionCursor) bigVector(depth int) (VecBigExpr, error) {
 			return nil, err
 		}
 		out = MapBigExpr{Vector: vector, Body: bodyValue}
+	case tagBigZip:
+		op, err := c.bigBinOp()
+		if err != nil {
+			return nil, err
+		}
+		left, err := c.bigVector(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		right, err := c.bigVector(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		// Statically known on both sides, so a mismatch is refused here rather
+		// than discovered while evaluating.
+		if left.Arity() != right.Arity() {
+			return nil, fmt.Errorf("zip needs equal arities, not %d and %d", left.Arity(), right.Arity())
+		}
+		out = BigZipExpr{Left: left, Right: right, Op: op}
+	case tagBigScale:
+		op, err := c.bigBinOp()
+		if err != nil {
+			return nil, err
+		}
+		scaled, err := c.bigVector(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		scalar, err := c.bigExpression(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		out = BigScaleExpr{Vector: scaled, Scalar: scalar, Op: op}
 	default:
 		return nil, misplaced(sortVecBig, rawTag[0])
 	}

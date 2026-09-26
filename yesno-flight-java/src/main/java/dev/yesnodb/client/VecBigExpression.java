@@ -12,7 +12,10 @@ import java.util.Objects;
  * is a promise the element's own node already makes.
  */
 public sealed interface VecBigExpression
-    permits VecBigExpression.Listing, VecBigExpression.MapBig {
+    permits VecBigExpression.Listing,
+        VecBigExpression.MapBig,
+        VecBigExpression.Zip,
+        VecBigExpression.Scale {
 
   /**
    * The widest whole result such a vector may denote.
@@ -99,6 +102,73 @@ public sealed interface VecBigExpression
     @Override
     public long workBound() {
       return Integer.toUnsignedLong(arity()) * body.workBound();
+    }
+  }
+
+  /**
+   * Combine two vectors of big integers position by position.
+   *
+   * <p>Both arities are statically known, so a mismatch is refused when the node is built rather
+   * than discovered while evaluating -- which is what lets the evaluator's own zip be total.
+   */
+  record Zip(VecBigExpression left, VecBigExpression right, BigBinOp op)
+      implements VecBigExpression {
+    /** Construct a zip, refusing operands of unequal arity. */
+    public Zip {
+      Objects.requireNonNull(left, "left");
+      Objects.requireNonNull(right, "right");
+      Objects.requireNonNull(op, "op");
+      if (left.arity() != right.arity()) {
+        throw new IllegalArgumentException(
+            "zip needs equal arities, not " + left.arity() + " and " + right.arity());
+      }
+      checkResult(left.arity(), op.widthBound(left.elementBound(), right.elementBound()));
+    }
+
+    @Override
+    public int arity() {
+      return left.arity();
+    }
+
+    @Override
+    public long elementBound() {
+      return op.widthBound(left.elementBound(), right.elementBound());
+    }
+
+    /** One operation per position, plus whatever the operands cost. */
+    @Override
+    public long workBound() {
+      long per = op.elementWork(left.elementBound(), right.elementBound());
+      return left.workBound() + right.workBound() + Integer.toUnsignedLong(arity()) * per;
+    }
+  }
+
+  /** Combine every element of a vector with one scalar. */
+  record Scale(VecBigExpression vector, BigExpression scalar, BigBinOp op)
+      implements VecBigExpression {
+    /** Construct a scale. */
+    public Scale {
+      Objects.requireNonNull(vector, "vector");
+      Objects.requireNonNull(scalar, "scalar");
+      Objects.requireNonNull(op, "op");
+      checkResult(vector.arity(), op.widthBound(vector.elementBound(), scalar.widthBound()));
+    }
+
+    @Override
+    public int arity() {
+      return vector.arity();
+    }
+
+    @Override
+    public long elementBound() {
+      return op.widthBound(vector.elementBound(), scalar.widthBound());
+    }
+
+    /** One operation per position, plus whatever the operands cost. */
+    @Override
+    public long workBound() {
+      long per = op.elementWork(vector.elementBound(), scalar.widthBound());
+      return vector.workBound() + scalar.workBound() + Integer.toUnsignedLong(arity()) * per;
     }
   }
 
