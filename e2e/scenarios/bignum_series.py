@@ -76,3 +76,53 @@ for k, v in enumerate(SERIES):
 
 snap_release(snap)
 db_close(d)
+
+# --- signed values across the durable path -----------------------------------
+# What no Rust test reaches: a two's-complement pattern that has been through a
+# checkpoint and a reopen. A read on a live Db is answered from the memtable and
+# never touches the store, which is the blind spot this file exists for.
+WIDTH_S = 64
+SIGNED = [-1, -(1 << 63), (1 << 63) - 1, 0, -12345, 6789]
+SIGNED_KEY = 80
+
+d = db_open("main", shards=2)
+b = batch(d)
+for k, v in enumerate(SIGNED):
+    # Store the pattern a signed field of WIDTH_S bits would hold.
+    pattern = v if v >= 0 else (1 << WIDTH_S) + v
+    batch_store_set(b, SIGNED_KEY + k, bn_to_set(pattern))
+batch_commit(b)
+db_checkpoint(d)
+db_close(d)
+
+d = db_open("main", shards=2)
+snap = db_snapshot(d)
+for k, v in enumerate(SIGNED):
+    loaded = snap_load_set(snap, SIGNED_KEY + k)
+    # Read signed, and the value comes back exactly as it went in.
+    assert bi_of_set(loaded, WIDTH_S) == v, k
+    # The same bits read unsigned are a different number, which is why the two
+    # readings are separate verbs rather than a flag.
+    unsigned = bn_of_set(loaded, WIDTH_S)
+    assert unsigned == (v if v >= 0 else (1 << WIDTH_S) + v), k
+
+# Arithmetic on signed values that came off disk, with Python as the oracle.
+x = bi_of_set(snap_load_set(snap, SIGNED_KEY + 0), WIDTH_S)
+y = bi_of_set(snap_load_set(snap, SIGNED_KEY + 4), WIDTH_S)
+assert x == -1
+assert y == -12345
+assert bi_mul(x, y) == 12345
+assert bi_add(x, y) == -12346
+assert bi_sub(y, x) == -12344
+
+# The product is wider than the field it came from. Storing it needs no wider
+# declaration -- a set is as wide as its highest member -- but reading it back
+# at the ORIGINAL width would wrap, which is the caller's choice to make
+# explicitly rather than a surprise.
+product = bi_mul(bi_of_set(snap_load_set(snap, SIGNED_KEY + 1), WIDTH_S), bi_neg(2))
+assert product == (1 << 64)
+assert bi_truncate(product, WIDTH_S) == 0
+assert bi_saturate(product, WIDTH_S) == (1 << 63) - 1
+
+snap_release(snap)
+db_close(d)

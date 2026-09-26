@@ -497,10 +497,32 @@ impl QueryParser<'_> {
                 return self.big_expr().map(yesno_flight::AnyExpr::Big);
             }
             // `fold` names both sorts' folds, so one token cannot decide it:
-            // the *vector* does. Tried speculatively and rewound on failure,
-            // the same shape `map` uses just below -- and the set fold must
-            // keep working unchanged, which is the half this can get wrong.
+            // the *vector* does.
+            //
+            // When that vector is unambiguously big -- `zip`, `scale` or
+            // `big( [ .. ] )` -- the big path is **committed to** rather than
+            // tried, so a real error inside it is reported as itself. Rewinding
+            // there replaced "zip needs equal arities" with "'zip' is not a
+            // vector" from the set parser, which names neither the problem nor
+            // the sort the writer meant.
+            //
+            // Otherwise it is genuinely ambiguous ( a `map` body decides, and a
+            // bare list is always sets ), so it is tried and rewound.
             if id == "fold" {
+                let committed = {
+                    // `self.at` was rewound to before `fold`, so the probe has
+                    // to re-consume it before it can see the vector's head.
+                    let probe = self.at;
+                    let mut head = None;
+                    if self.ident().is_ok() && self.expect(b'(').is_ok() {
+                        head = self.ident().ok().map(str::to_ascii_lowercase);
+                    }
+                    self.at = probe;
+                    matches!(head.as_deref(), Some("zip" | "scale" | "big"))
+                };
+                if committed {
+                    return self.big_expr().map(yesno_flight::AnyExpr::Big);
+                }
                 if let Ok(e) = self.big_expr() {
                     return Ok(yesno_flight::AnyExpr::Big(e));
                 }
@@ -889,6 +911,22 @@ impl QueryParser<'_> {
         }
     }
 
+    fn big_bin_op(&mut self) -> Result<yesno_flight::BigBinOp, QueryParseError> {
+        use yesno_flight::BigBinOp;
+        let id = self.ident()?.to_ascii_lowercase();
+        match id.as_str() {
+            "add" => Ok(BigBinOp::Add),
+            "sub" => Ok(BigBinOp::Sub),
+            "mul" => Ok(BigBinOp::Mul),
+            "div" => Ok(BigBinOp::Div),
+            "rem" => Ok(BigBinOp::Rem),
+            other => Err(self.error(format!(
+                "'{other}' is not an element-wise operator; \
+                 expected add, sub, mul, div or rem"
+            ))),
+        }
+    }
+
     fn big_fold_op(&mut self) -> Result<yesno_flight::BigFoldOp, QueryParseError> {
         use yesno_flight::BigFoldOp;
         let id = self.ident()?.to_ascii_lowercase();
@@ -916,6 +954,35 @@ impl QueryParser<'_> {
         self.skip_ws();
         let save = self.at;
         let id = self.ident()?.to_ascii_lowercase();
+        // `zip` and `scale` produce vectors, so they belong here rather than
+        // with the scalar nodes.
+        if id == "zip" {
+            self.expect(b'(')?;
+            let a = self.vec_big_expr()?;
+            self.expect(b',')?;
+            let b = self.vec_big_expr()?;
+            self.expect(b',')?;
+            let op = self.big_bin_op()?;
+            self.expect(b')')?;
+            if a.arity() != b.arity() {
+                return Err(self.error(format!(
+                    "zip needs equal arities; the left is {} and the right is {}",
+                    a.arity(),
+                    b.arity()
+                )));
+            }
+            return Ok(VecBigExpr::Zip(Box::new(a), Box::new(b), op));
+        }
+        if id == "scale" {
+            self.expect(b'(')?;
+            let v = self.vec_big_expr()?;
+            self.expect(b',')?;
+            let x = self.big_expr()?;
+            self.expect(b',')?;
+            let op = self.big_bin_op()?;
+            self.expect(b')')?;
+            return Ok(VecBigExpr::Scale(Box::new(v), Box::new(x), op));
+        }
         if id == "big" {
             self.expect(b'(')?;
             self.skip_ws();
@@ -1788,6 +1855,57 @@ mod query_parser_tests {
             parse_query("fold(map(view(9, interleaved(3)), and(_, 7)), or)"),
             Ok(AnyExpr::Set(_))
         ));
+    }
+
+    /// `zip` correlates two vectors positionally; nothing else in the language
+    /// can. A `map` body never learns which constituent it is on, and a `fold`
+    /// is order-independent by construction.
+    #[test]
+    fn zip_and_scale_build_vectors_and_check_arity_statically() {
+        use yesno_flight::{AnyExpr, BigBinOp, BigExpr, BigLit, VecBigExpr};
+
+        let lit = |v: i64| BigExpr::Lit(BigLit::from_i64(v));
+
+        assert_eq!(
+            parse_query("fold(zip(big([1, 2]), big([3, 4]), add), add)").unwrap(),
+            AnyExpr::Big(BigExpr::Fold(
+                Box::new(VecBigExpr::Zip(
+                    Box::new(VecBigExpr::List(vec![lit(1), lit(2)])),
+                    Box::new(VecBigExpr::List(vec![lit(3), lit(4)])),
+                    BigBinOp::Add
+                )),
+                yesno_flight::BigFoldOp::Add
+            ))
+        );
+
+        // The scalar sits on the right, which is the half a reader cannot infer
+        // for the operators that are not commutative.
+        assert_eq!(
+            parse_query("fold(scale(big([10, 20]), 3, sub), add)").unwrap(),
+            AnyExpr::Big(BigExpr::Fold(
+                Box::new(VecBigExpr::Scale(
+                    Box::new(VecBigExpr::List(vec![lit(10), lit(20)])),
+                    Box::new(lit(3)),
+                    BigBinOp::Sub
+                )),
+                yesno_flight::BigFoldOp::Add
+            ))
+        );
+
+        // Both arities are statically known, so a mismatch is a parse error
+        // naming both sides rather than a runtime truncation.
+        let e = parse_query("fold(zip(big([1, 2, 3]), big([1, 2]), add), add)").unwrap_err();
+        assert!(
+            e.message.contains("equal arities"),
+            "unhelpful: {}",
+            e.message
+        );
+
+        // `min` and `max` fold but do not zip: an element-wise operation visits
+        // each position once and needs no associativity, while a fold does.
+        assert!(parse_query("fold(zip(big([1]), big([2]), min), add)").is_err());
+        // And `sub` zips but does not fold, for the mirror reason.
+        assert!(parse_query("fold(big([1, 2]), sub)").is_err());
     }
 
     /// A bare number is a big literal where a big integer is required, and a

@@ -42,8 +42,8 @@ use yesno_core::{
     ChunkStream, ChunkStreamExt, Container, Expr, KeyStream, OrdSet, Prefix48, Snapshot,
 };
 pub use yesno_wire::{
-    AnyExpr, BigExpr, BigFoldOp, BigLit, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr, Sort,
-    VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES,
+    AnyExpr, BigBinOp, BigExpr, BigFoldOp, BigLit, BoolExpr, ExprError, FoldOp, IntExpr, SetExpr,
+    Sort, VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAGIC, MAX_DEPTH, MAX_NODES,
     MAX_RESULT_BITS, MAX_VALUE_BITS, MAX_VIEW_SETS, MAX_WORK, VERSION,
 };
 
@@ -400,7 +400,43 @@ fn eval_vec_big(
             }
             Ok(out)
         }
+        // Position by position. The arities agree because the decoder refused
+        // the payload otherwise, so this cannot be a partial answer.
+        VecBigExpr::Zip(a, b, op) => {
+            let left = eval_vec_big(a, snap, hole)?;
+            let right = eval_vec_big(b, snap, hole)?;
+            debug_assert_eq!(left.len(), right.len(), "arity is checked at decode");
+            left.iter()
+                .zip(right.iter())
+                .map(|(x, y)| apply_bin(*op, x, y))
+                .collect()
+        }
+        // The scalar is evaluated once, not once per element: it cannot depend
+        // on the position, since nothing in the language can.
+        VecBigExpr::Scale(v, x, op) => {
+            let elements = eval_vec_big(v, snap, hole)?;
+            let scalar = eval_big(x, snap, hole)?;
+            elements
+                .iter()
+                .map(|e| apply_bin(*op, e, &scalar))
+                .collect()
+        }
     }
+}
+
+/// One element-wise application, with the scalar nodes' own semantics.
+///
+/// Routed through the same operations [`BigExpr`]'s binary nodes use, so a zip
+/// and the equivalent written out element by element cannot disagree -- which
+/// is the property a second implementation here would quietly break.
+fn apply_bin(op: BigBinOp, a: &BigInt, b: &BigInt) -> yesno_core::Result<BigInt> {
+    Ok(match op {
+        BigBinOp::Add => a.add(b),
+        BigBinOp::Sub => a.sub(b),
+        BigBinOp::Mul => a.mul(b),
+        BigBinOp::Div => a.divrem(b).ok_or(DIVIDE_BY_ZERO)?.0,
+        BigBinOp::Rem => a.divrem(b).ok_or(DIVIDE_BY_ZERO)?.1,
+    })
 }
 
 fn eval_big(e: &BigExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<BigInt> {
@@ -2382,5 +2418,138 @@ mod pow_mod_tests {
             );
             assert!(AnyExpr::decode(&AnyExpr::Big(e).encode()).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod vec_big_arithmetic_tests {
+    use super::*;
+    use yesno_core::Db;
+
+    fn vec_of(values: &[i64]) -> VecBigExpr {
+        VecBigExpr::List(
+            values
+                .iter()
+                .map(|v| BigExpr::Lit(BigLit::from_i64(*v)))
+                .collect(),
+        )
+    }
+
+    fn eval(v: VecBigExpr) -> Vec<BigInt> {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        // Through the wire, so the operator byte and the arity check are
+        // covered rather than bypassed.
+        let decoded = match AnyExpr::decode(&AnyExpr::VecBig(v).encode()).unwrap() {
+            AnyExpr::VecBig(x) => x,
+            other => panic!("decoded as {:?}", other.sort()),
+        };
+        vec_big(&decoded, &snap).unwrap()
+    }
+
+    fn want(values: &[i64]) -> Vec<BigInt> {
+        values.iter().map(|v| BigInt::from_i64(*v)).collect()
+    }
+
+    /// All five operators, position by position, against machine arithmetic.
+    #[test]
+    fn a_zip_applies_its_operator_position_by_position() {
+        let a = [10i64, -20, 7];
+        let b = [3i64, 4, -2];
+        for (op, expected) in [
+            (BigBinOp::Add, [13i64, -16, 5]),
+            (BigBinOp::Sub, [7, -24, 9]),
+            (BigBinOp::Mul, [30, -80, -14]),
+            (BigBinOp::Div, [3, -5, -3]),
+            (BigBinOp::Rem, [1, 0, 1]),
+        ] {
+            assert_eq!(
+                eval(VecBigExpr::Zip(
+                    Box::new(vec_of(&a)),
+                    Box::new(vec_of(&b)),
+                    op
+                )),
+                want(&expected),
+                "{op:?}"
+            );
+        }
+    }
+
+    /// The scalar is on the **right**, which matters for the two operators
+    /// that are not commutative and which the bytes do not announce.
+    #[test]
+    fn a_scale_puts_the_scalar_on_the_right() {
+        let v = vec_of(&[10, -20, 7]);
+        let three = Box::new(BigExpr::Lit(BigLit::from_i64(3)));
+        assert_eq!(
+            eval(VecBigExpr::Scale(
+                Box::new(v.clone()),
+                three.clone(),
+                BigBinOp::Sub
+            )),
+            want(&[7, -23, 4]),
+        );
+        assert_eq!(
+            eval(VecBigExpr::Scale(Box::new(v), three, BigBinOp::Div)),
+            want(&[3, -6, 2]),
+        );
+    }
+
+    /// **The arity check is static**, which is what makes the evaluator's
+    /// `zip` total rather than silently truncating to the shorter side.
+    #[test]
+    fn a_zip_of_unequal_arities_is_refused_at_decode() {
+        let e = AnyExpr::VecBig(VecBigExpr::Zip(
+            Box::new(vec_of(&[1, 2, 3])),
+            Box::new(vec_of(&[1, 2])),
+            BigBinOp::Add,
+        ));
+        assert_eq!(
+            AnyExpr::decode(&e.encode()),
+            Err(ExprError::ArityMismatch {
+                expected: 3,
+                found: 2
+            })
+        );
+    }
+
+    /// A zip and the same arithmetic written out element by element are bounded
+    /// identically, so neither spelling can smuggle work past the budget.
+    #[test]
+    fn a_zip_is_bounded_like_the_elements_it_stands_for() {
+        let wide = |bits: u32| {
+            VecBigExpr::Map(
+                Box::new(VecSetExpr::View(
+                    Box::new(SetExpr::Key(1)),
+                    ViewSpec::interleaved(8),
+                )),
+                Box::new(BigExpr::Read(Box::new(SetExpr::Hole), bits)),
+            )
+        };
+        // A product doubles the element width, exactly as the scalar `Mul`
+        // node does.
+        let zipped = VecBigExpr::Zip(Box::new(wide(1024)), Box::new(wide(1024)), BigBinOp::Mul);
+        assert_eq!(zipped.element_bound(), 2048);
+        assert_eq!(zipped.result_bound(), 8 * 2048);
+
+        // And the result bound still refuses what it refused before.
+        let huge = VecBigExpr::Zip(
+            Box::new(wide(MAX_VALUE_BITS as u32 / 2)),
+            Box::new(wide(MAX_VALUE_BITS as u32 / 2)),
+            BigBinOp::Mul,
+        );
+        assert!(AnyExpr::decode(&AnyExpr::VecBig(huge).encode()).is_err());
+    }
+
+    #[test]
+    fn a_zero_divisor_in_a_zip_is_an_error() {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+        let e = VecBigExpr::Zip(
+            Box::new(vec_of(&[1, 2])),
+            Box::new(vec_of(&[1, 0])),
+            BigBinOp::Div,
+        );
+        assert!(vec_big(&e, &snap).is_err());
     }
 }

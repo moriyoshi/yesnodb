@@ -60,6 +60,10 @@ BIG  := SIGNED
 
 BIGVEC := map(VEC, BIG)
         | big([ BIG, BIG, ... ])
+        | zip(BIGVEC, BIGVEC, BIGBIN)
+        | scale(BIGVEC, BIG, BIGBIN)
+
+BIGBIN := add | sub | mul | div | rem
 
 BIGFOLD := add | mul | min | max
 
@@ -385,6 +389,35 @@ fold(big([1, 2, 3]), add)  six
 
 Those two would otherwise be the same vector text meaning very different
 things, told apart only by the last token.
+
+### Element-wise arithmetic
+
+`zip` combines two vectors position by position, and `scale` applies one value
+to every position:
+
+```text
+zip(map(view(9, blocked(3, 64)), uint(_)), big([1, 2, 3]), mul)
+scale(map(view(9, blocked(3, 64)), uint(_)), 1000, div)
+```
+
+**The two vectors must have the same arity, and that is checked when the query
+is parsed** — both arities are known without evaluating anything, so a mismatch
+names both sides rather than silently pairing off the shorter one.
+
+The scalar in `scale` is the **right** operand: `scale(v, x, sub)` is
+`v[i] - x`. That matters for `sub`, `div` and `rem`, and nothing in the query
+says it otherwise.
+
+**`zip` is the only way to correlate two vectors by position.** A `map` body
+never learns which constituent it is on — the `_` hole is that constituent's
+set, not its index — and a `fold` combines elements in no particular order. So
+neither can express "pair element `i` with element `i`".
+
+The operators differ from `fold`'s for a reason rather than an oversight.
+`fold` offers `min` and `max` because a fold needs an answer that does not
+depend on visiting order; `zip` offers `sub`, `div` and `rem` because it visits
+each position once and needs no such property. `fold(v, sub)` and
+`zip(a, b, min)` are both rejected.
 
 The base enters its residue class first, so the answer is always in
 `[0, modulus)` and never carries a sign. A **zero modulus** and a **negative

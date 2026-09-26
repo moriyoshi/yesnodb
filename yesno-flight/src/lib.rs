@@ -113,8 +113,8 @@ enum Request2 {
 pub use client::{Ack, QueryInfo, QueryStream, YesnoClient};
 pub use ticket::Ticket;
 pub use yesno_wire::{
-    AnyExpr, BigExpr, BigFoldOp, BigLit, BoolExpr, FoldOp, IntExpr, QueryRequest, SetExpr, Sort,
-    VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAX_WORK,
+    AnyExpr, BigBinOp, BigExpr, BigFoldOp, BigLit, BoolExpr, FoldOp, IntExpr, QueryRequest,
+    SetExpr, Sort, VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAX_WORK,
 };
 
 /// Space and reader counters returned by the `stats` Flight action.

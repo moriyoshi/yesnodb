@@ -213,6 +213,8 @@ const TAG_BIG_LIST: u8 = 36;
 const TAG_MAP_BIG: u8 = 37;
 const TAG_BIG_FOLD: u8 = 38;
 const TAG_BIG_POW_MOD: u8 = 39;
+const TAG_BIG_ZIP: u8 = 40;
+const TAG_BIG_SCALE: u8 = 41;
 
 const VIEW_INTERLEAVED: u8 = 0;
 const VIEW_BLOCKED: u8 = 1;
@@ -340,7 +342,7 @@ fn sort_of_tag(tag: u8) -> Option<Sort> {
         TAG_BIG_LIT | TAG_BIG_WIDEN | TAG_BIG_READ | TAG_BIG_READ_SIGNED | TAG_BIG_NEG
         | TAG_BIG_ADD | TAG_BIG_SUB | TAG_BIG_MUL | TAG_BIG_DIV | TAG_BIG_REM
         | TAG_BIG_TRUNCATE | TAG_BIG_SATURATE => Sort::Big,
-        TAG_BIG_LIST | TAG_MAP_BIG => Sort::VecBig,
+        TAG_BIG_LIST | TAG_MAP_BIG | TAG_BIG_ZIP | TAG_BIG_SCALE => Sort::VecBig,
         TAG_BIG_FOLD | TAG_BIG_POW_MOD => Sort::Big,
         _ => return None,
     })
@@ -950,6 +952,67 @@ pub enum VecIntExpr {
     Map(Box<VecSetExpr>, Box<IntExpr>),
 }
 
+/// The binary arithmetic a vector operation applies element by element.
+///
+/// **Five, matching [`BigExpr`]'s binary nodes exactly.** A separate enum from
+/// [`BigFoldOp`] rather than a superset of it, because the two answer different
+/// questions: a fold needs associativity and commutativity so its answer does
+/// not depend on visiting order, which is why it offers `min` and `max` and not
+/// `sub`. An element-wise operation visits each position once and needs
+/// neither, which is why it offers `sub` and `div` and not `min`. Merging them
+/// would offer `fold( v, sub )`, whose answer would depend on an order the
+/// language deliberately does not fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BigBinOp {
+    /// Sum.
+    Add,
+    /// Difference.
+    Sub,
+    /// Product. **The one whose width grows**, here per element.
+    Mul,
+    /// Quotient, truncating toward zero. A zero divisor is an evaluation error.
+    Div,
+    /// Remainder, carrying the sign of the dividend.
+    Rem,
+}
+
+impl BigBinOp {
+    fn byte(self) -> u8 {
+        match self {
+            BigBinOp::Add => 0,
+            BigBinOp::Sub => 1,
+            BigBinOp::Mul => 2,
+            BigBinOp::Div => 3,
+            BigBinOp::Rem => 4,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<BigBinOp> {
+        Some(match b {
+            0 => BigBinOp::Add,
+            1 => BigBinOp::Sub,
+            2 => BigBinOp::Mul,
+            3 => BigBinOp::Div,
+            4 => BigBinOp::Rem,
+            _ => return None,
+        })
+    }
+
+    /// The width one result can reach, from its operands' widths.
+    ///
+    /// The same rules [`BigExpr::width_bound`] uses for the scalar nodes, so a
+    /// zip and the equivalent written out element by element are bounded
+    /// identically.
+    fn width_bound(self, a: u64, b: u64) -> u64 {
+        match self {
+            BigBinOp::Add | BigBinOp::Sub => a.max(b).saturating_add(1),
+            BigBinOp::Mul => a.saturating_add(b),
+            BigBinOp::Div => a,
+            BigBinOp::Rem => a.min(b),
+        }
+    }
+}
+
 /// How [`BigExpr::Fold`] combines a vector's elements.
 ///
 /// **Four, and the reason is different from [`FoldOp`]'s three.** That enum is
@@ -997,6 +1060,19 @@ impl BigFoldOp {
     }
 }
 
+/// Limb operations one element-wise application costs.
+///
+/// The same shape [`BigExpr::work_bound`] uses for the scalar nodes: additive
+/// operations are linear in the wider operand, multiplicative ones are the
+/// product of both.
+fn element_work(op: &BigBinOp, a: u64, b: u64) -> u64 {
+    let (la, lb) = (limbs_of(a), limbs_of(b));
+    match op {
+        BigBinOp::Add | BigBinOp::Sub => la.max(lb),
+        BigBinOp::Mul | BigBinOp::Div | BigBinOp::Rem => la.saturating_mul(lb),
+    }
+}
+
 /// One arbitrary-precision integer per constituent.
 ///
 /// The `Big` analogue of [`VecIntExpr`], and the shape a facet histogram takes
@@ -1009,6 +1085,24 @@ pub enum VecBigExpr {
     ///
     /// A **map, not a fold**, on the same terms as [`VecIntExpr::Map`].
     Map(Box<VecSetExpr>, Box<BigExpr>),
+    /// Two vectors combined position by position.
+    ///
+    /// **The arities must match, and that is checked while decoding** -- both
+    /// are statically known, exactly as [`SetExpr::At`]'s index is, so a
+    /// mismatch is [`ExprError::ArityMismatch`] rather than a runtime surprise.
+    ///
+    /// This is the only construct in the language that correlates two vectors
+    /// *positionally*. A `map` body never learns which constituent it is on --
+    /// the hole denotes the constituent's set, not its index -- and a `fold` is
+    /// order-independent by construction. Neither can do this, which is why it
+    /// is a node rather than sugar.
+    Zip(Box<VecBigExpr>, Box<VecBigExpr>, BigBinOp),
+    /// One scalar applied to every element, the scalar on the right.
+    ///
+    /// `scale( v, x, sub )` is `v[ i ] - x`, not `x - v[ i ]`. Stated because a
+    /// broadcast of a non-commutative operator has two readings and the bytes
+    /// carry no hint which was meant.
+    Scale(Box<VecBigExpr>, Box<BigExpr>, BigBinOp),
 }
 
 impl VecBigExpr {
@@ -1017,6 +1111,9 @@ impl VecBigExpr {
         match self {
             VecBigExpr::List(xs) => xs.len() as u32,
             VecBigExpr::Map(v, _) => v.arity(),
+            // Equal by construction: the decoder refuses a mismatch.
+            VecBigExpr::Zip(a, _, _) => a.arity(),
+            VecBigExpr::Scale(v, _, _) => v.arity(),
         }
     }
 
@@ -1025,6 +1122,8 @@ impl VecBigExpr {
         match self {
             VecBigExpr::List(xs) => xs.iter().map(BigExpr::width_bound).max().unwrap_or(0),
             VecBigExpr::Map(_, body) => body.width_bound(),
+            VecBigExpr::Zip(a, b, op) => op.width_bound(a.element_bound(), b.element_bound()),
+            VecBigExpr::Scale(v, x, op) => op.width_bound(v.element_bound(), x.width_bound()),
         }
     }
 
@@ -1037,6 +1136,19 @@ impl VecBigExpr {
                 .fold(0u64, u64::saturating_add),
             // The body runs once per constituent.
             VecBigExpr::Map(_, body) => u64::from(self.arity()).saturating_mul(body.work_bound()),
+            // One operation per position, plus whatever the operands cost.
+            VecBigExpr::Zip(a, b, op) => {
+                let per = element_work(op, a.element_bound(), b.element_bound());
+                a.work_bound()
+                    .saturating_add(b.work_bound())
+                    .saturating_add(u64::from(self.arity()).saturating_mul(per))
+            }
+            VecBigExpr::Scale(v, x, op) => {
+                let per = element_work(op, v.element_bound(), x.width_bound());
+                v.work_bound()
+                    .saturating_add(x.work_bound())
+                    .saturating_add(u64::from(self.arity()).saturating_mul(per))
+            }
         }
     }
 
@@ -1057,6 +1169,14 @@ impl VecBigExpr {
                 v.keys(out);
                 body.keys(out);
             }
+            VecBigExpr::Zip(a, b, _) => {
+                a.keys(out);
+                b.keys(out);
+            }
+            VecBigExpr::Scale(v, x, _) => {
+                v.keys(out);
+                x.keys(out);
+            }
         }
     }
 
@@ -1073,6 +1193,18 @@ impl VecBigExpr {
                 out.push(TAG_MAP_BIG);
                 v.write(out);
                 body.write(out);
+            }
+            VecBigExpr::Zip(a, b, op) => {
+                out.push(TAG_BIG_ZIP);
+                out.push(op.byte());
+                a.write(out);
+                b.write(out);
+            }
+            VecBigExpr::Scale(v, x, op) => {
+                out.push(TAG_BIG_SCALE);
+                out.push(op.byte());
+                v.write(out);
+                x.write(out);
             }
         }
     }
@@ -2054,6 +2186,29 @@ impl Cursor<'_> {
                 let body = self.body(depth + 1, Cursor::big_expr)?;
                 VecBigExpr::Map(Box::new(v), Box::new(body))
             }
+            TAG_BIG_ZIP => {
+                let raw = *self.take(1)?.first().expect("took exactly 1");
+                let op = BigBinOp::from_byte(raw).ok_or(ExprError::UnknownFoldOp(raw))?;
+                let a = self.big_vector(depth + 1)?;
+                let b = self.big_vector(depth + 1)?;
+                // Statically known on both sides, so a mismatch is refused here
+                // rather than discovered while evaluating -- which is what lets
+                // the evaluator's own zip be total.
+                if a.arity() != b.arity() {
+                    return Err(ExprError::ArityMismatch {
+                        expected: a.arity(),
+                        found: b.arity(),
+                    });
+                }
+                VecBigExpr::Zip(Box::new(a), Box::new(b), op)
+            }
+            TAG_BIG_SCALE => {
+                let raw = *self.take(1)?.first().expect("took exactly 1");
+                let op = BigBinOp::from_byte(raw).ok_or(ExprError::UnknownFoldOp(raw))?;
+                let v = self.big_vector(depth + 1)?;
+                let x = self.big_expr(depth + 1)?;
+                VecBigExpr::Scale(Box::new(v), Box::new(x), op)
+            }
             other => return Err(misplaced(Sort::VecBig, other)),
         };
         // The product bound, checked here because this is the only node that
@@ -2425,6 +2580,8 @@ mod tests {
             TAG_BIG_SATURATE,
             TAG_BIG_LIST,
             TAG_MAP_BIG,
+            TAG_BIG_ZIP,
+            TAG_BIG_SCALE,
             TAG_BIG_FOLD,
             TAG_BIG_POW_MOD,
         ];

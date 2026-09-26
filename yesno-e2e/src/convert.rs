@@ -16,7 +16,7 @@
 
 use monty_types::{ExcType, MontyException, MontyObject};
 use num_bigint::BigInt;
-use yesno_core::bignum::BigUint;
+use yesno_core::bignum::{BigInt as SignedBig, BigUint};
 
 /// A `ValueError` — the argument had the right type but an impossible value.
 pub fn value_err(msg: impl std::fmt::Display) -> MontyException {
@@ -58,6 +58,26 @@ pub fn int_obj(v: u64) -> MontyObject {
 #[must_use]
 pub fn bignum_obj(v: &BigUint) -> MontyObject {
     let b = BigInt::from_bytes_le(num_bigint::Sign::Plus, &v.to_le_bytes());
+    match i64::try_from(b.clone()) {
+        Ok(i) => MontyObject::Int(i),
+        Err(_) => MontyObject::BigInt(b),
+    }
+}
+
+/// A signed value back to Python, where `int` is signed and unbounded too.
+///
+/// The mirror of [`Args::signed`]. Python's `int` is the oracle for the signed
+/// operations for the same reason it is for the unsigned ones -- it is the same
+/// type, so a scenario writes `assert bi_mul( a, b ) == a * b` with no
+/// reference implementation of its own.
+#[must_use]
+pub fn signed_obj(v: &SignedBig) -> MontyObject {
+    let magnitude = BigInt::from_bytes_le(num_bigint::Sign::Plus, &v.magnitude().to_le_bytes());
+    let b = if v.is_negative() {
+        -magnitude
+    } else {
+        magnitude
+    };
     match i64::try_from(b.clone()) {
         Ok(i) => MontyObject::Int(i),
         Err(_) => MontyObject::BigInt(b),
@@ -212,6 +232,32 @@ impl<'a> Args<'a> {
                     return Err(sign_err());
                 }
                 Ok(BigUint::from_le_bytes(&bytes))
+            }
+            other => Err(type_err(format!(
+                "{}() argument {} must be an int, got {}",
+                self.verb,
+                i + 1,
+                other.type_name()
+            ))),
+        }
+    }
+
+    /// An arbitrary-magnitude int, **signed**.
+    ///
+    /// The companion to [`Args::bignum`], which refuses negatives on purpose so
+    /// that `bn_sub`'s absent answer stays testable. `BigInt` has no such case
+    /// -- subtraction is total there -- so this accepts the whole range Python
+    /// does, and the two accessors keep the two domains apart at the boundary
+    /// rather than inside a verb.
+    pub fn signed(&self, i: usize) -> Result<SignedBig, MontyException> {
+        match self.at(i)? {
+            MontyObject::Int(v) => Ok(SignedBig::from_i64(*v)),
+            MontyObject::BigInt(b) => {
+                let (sign, bytes) = b.to_bytes_le();
+                Ok(SignedBig::from_magnitude(
+                    sign == num_bigint::Sign::Minus,
+                    BigUint::from_le_bytes(&bytes),
+                ))
             }
             other => Err(type_err(format!(
                 "{}() argument {} must be an int, got {}",

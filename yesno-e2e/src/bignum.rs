@@ -41,9 +41,10 @@
 //! `bn_` prefix is what makes it a non-issue.
 
 use monty_types::{MontyException, MontyObject};
+use yesno_core::bignum::{BigInt as SignedBig, BigUint};
 use yesno_core::OrdSet;
 
-use crate::convert::{bignum_obj, int_obj, tuple, value_err, Args};
+use crate::convert::{bignum_obj, int_obj, signed_obj, tuple, value_err, Args};
 use crate::world::World;
 
 pub const OWNS: &[&str] = &[
@@ -56,6 +57,21 @@ pub const OWNS: &[&str] = &[
     "bn_shl",
     "bn_shr",
     "bn_truncate",
+    "bn_saturate",
+    // Signed. A separate family rather than widening `bn_*`, because
+    // `Args::bignum` refuses negatives on purpose -- that is what keeps
+    // `bn_sub`'s absent answer testable from a scenario.
+    "bi_add",
+    "bi_sub",
+    "bi_mul",
+    "bi_divmod",
+    "bi_div_euclid",
+    "bi_neg",
+    "bi_abs",
+    "bi_cmp",
+    "bi_truncate",
+    "bi_saturate",
+    "bi_of_set",
     // inspection
     "bn_bit_len",
     "bn_limb_len",
@@ -119,6 +135,91 @@ impl World {
                 a.exact(2)?;
                 Ok(bignum_obj(&a.bignum(0)?.truncate(a.u64(1)?)))
             }
+            "bn_saturate" => {
+                a.exact(2)?;
+                Ok(bignum_obj(&a.bignum(0)?.saturate(a.u64(1)?)))
+            }
+
+            // --- signed ---
+            "bi_add" => {
+                a.exact(2)?;
+                Ok(signed_obj(&a.signed(0)?.add(&a.signed(1)?)))
+            }
+            "bi_sub" => {
+                a.exact(2)?;
+                Ok(signed_obj(&a.signed(0)?.sub(&a.signed(1)?)))
+            }
+            "bi_mul" => {
+                a.exact(2)?;
+                Ok(signed_obj(&a.signed(0)?.mul(&a.signed(1)?)))
+            }
+            // Truncating toward zero, so the remainder carries the sign of the
+            // dividend. Python's own `divmod` is *floored*, which is why a
+            // scenario has to spell the oracle out rather than compare to it.
+            "bi_divmod" => {
+                a.exact(2)?;
+                Ok(match a.signed(0)?.divrem(&a.signed(1)?) {
+                    Some((q, r)) => tuple(vec![signed_obj(&q), signed_obj(&r)]),
+                    None => MontyObject::None,
+                })
+            }
+            // The non-negative remainder, which *is* Python's `a % abs( b )`.
+            "bi_div_euclid" => {
+                a.exact(2)?;
+                Ok(match a.signed(0)?.div_euclid_rem(&a.signed(1)?) {
+                    Some((q, r)) => tuple(vec![signed_obj(&q), signed_obj(&r)]),
+                    None => MontyObject::None,
+                })
+            }
+            "bi_neg" => {
+                a.exact(1)?;
+                Ok(signed_obj(&a.signed(0)?.neg()))
+            }
+            "bi_abs" => {
+                a.exact(1)?;
+                Ok(signed_obj(&a.signed(0)?.abs()))
+            }
+            // -1, 0 or 1, so a scenario can compare against Python's own
+            // ordering without a second spelling of it.
+            "bi_cmp" => {
+                a.exact(2)?;
+                let ordering = a.signed(0)?.cmp(&a.signed(1)?);
+                Ok(MontyObject::Int(match ordering {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }))
+            }
+            // The wrap and the clamp, into the *same* two's-complement field.
+            "bi_truncate" => {
+                a.exact(2)?;
+                Ok(signed_obj(&a.signed(0)?.truncate(a.u64(1)?)))
+            }
+            "bi_saturate" => {
+                a.exact(2)?;
+                Ok(signed_obj(&a.signed(0)?.saturate(a.u64(1)?)))
+            }
+            // The same stored bits as `bn_of_set`, read as two's complement.
+            "bi_of_set" => {
+                a.exact(2)?;
+                let set = self.set(a.handle(0)?, verb)?.clone();
+                let width = a.u64(1)?;
+                if width == 0 {
+                    return Err(value_err(format!("{verb}(): width must not be zero")));
+                }
+                let raw = set.read_int(width);
+                let value = if raw.bit(width - 1) {
+                    let modulus = BigUint::one().shl(width);
+                    SignedBig::from_magnitude(
+                        true,
+                        modulus.sub(&raw).expect("a read value is below 2^width"),
+                    )
+                } else {
+                    SignedBig::from_uint(raw)
+                };
+                Ok(signed_obj(&value))
+            }
+
             "bn_bit_len" => {
                 a.exact(1)?;
                 Ok(int_obj(a.bignum(0)?.bit_len()))

@@ -19,8 +19,8 @@ use tonic::transport::{Channel, Server};
 use yesno_core::bignum::BigUint;
 use yesno_core::{Db, DbOptions, OrdSet};
 use yesno_flight::{
-    AnyExpr, BigExpr, BigLit, IntExpr, QueryRequest, SetExpr, VecIntExpr, VecSetExpr, ViewSpec,
-    YesnoFlightService,
+    AnyExpr, BigBinOp, BigExpr, BigLit, IntExpr, QueryRequest, SetExpr, VecBigExpr, VecIntExpr,
+    VecSetExpr, ViewSpec, YesnoFlightService,
 };
 
 async fn serve(db: Arc<Db>) -> (String, tokio::sync::oneshot::Sender<()>) {
@@ -240,6 +240,115 @@ async fn a_vector_of_big_integers_travels_and_returns_one_value_per_constituent(
             magnitude.value(i),
             want.to_le_bytes().as_slice(),
             "value {i}"
+        );
+    }
+
+    let _ = stop.send(());
+}
+
+/// A zip and a scale cross Flight and are applied position by position.
+///
+/// `Map` was the only `VecBig` shape with transport coverage, and it is the one
+/// whose result comes straight from the reader. These two *compute* per
+/// element, so they are where a per-position misalignment would show up -- and
+/// a misalignment is invisible to a scalar test, which has only one position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_and_a_scale_travel_and_are_applied_position_by_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Db::open_with(
+            dir.path(),
+            DbOptions {
+                shards: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+
+    // Deliberately distinct per constituent, so swapping two positions changes
+    // the answer. Equal values would make an off-by-one invisible.
+    let values = [
+        BigUint::from_u64(6),
+        BigUint::from_u64(10),
+        BigUint::from_u64(15),
+    ];
+    let sets = 3u32;
+    let mut packed: Vec<u64> = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        for x in 0..v.bit_len() {
+            if v.bit(x) {
+                packed.push(x * u64::from(sets) + i as u64);
+            }
+        }
+    }
+    packed.sort_unstable();
+    db.insert_many(17, &packed).unwrap();
+
+    let (url, stop) = serve(db.clone()).await;
+    let mut c =
+        FlightServiceClient::new(Channel::from_shared(url).unwrap().connect().await.unwrap());
+
+    let stored = || {
+        VecBigExpr::Map(
+            Box::new(VecSetExpr::View(
+                Box::new(SetExpr::Key(17)),
+                ViewSpec::interleaved(sets),
+            )),
+            Box::new(BigExpr::Read(Box::new(SetExpr::Hole), 64)),
+        )
+    };
+    let literals = VecBigExpr::List(vec![
+        BigExpr::Lit(BigLit::from_i64(100)),
+        BigExpr::Lit(BigLit::from_i64(200)),
+        BigExpr::Lit(BigLit::from_i64(300)),
+    ]);
+
+    // zip: [ 6, 10, 15 ] * [ 100, 200, 300 ]
+    let zip = AnyExpr::VecBig(VecBigExpr::Zip(
+        Box::new(stored()),
+        Box::new(literals),
+        BigBinOp::Mul,
+    ));
+    let (batch, total) = fetch(&mut c, zip).await;
+    assert_eq!(total, i64::from(sets));
+    let magnitude = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("the declared column type");
+    for (i, want) in [600u64, 2000, 4500].iter().enumerate() {
+        assert_eq!(
+            magnitude.value(i),
+            BigUint::from_u64(*want).to_le_bytes().as_slice(),
+            "position {i}"
+        );
+    }
+
+    // scale: [ 6, 10, 15 ] - 4, the asymmetric operator, so the scalar being
+    // taken as the left operand would be visible.
+    let scale = AnyExpr::VecBig(VecBigExpr::Scale(
+        Box::new(stored()),
+        Box::new(BigExpr::Lit(BigLit::from_i64(4))),
+        BigBinOp::Sub,
+    ));
+    let (batch, _) = fetch(&mut c, scale).await;
+    let negative = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("the declared column type");
+    let magnitude = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("the declared column type");
+    for (i, want) in [2u64, 6, 11].iter().enumerate() {
+        assert!(!negative.value(i), "position {i} is not negative");
+        assert_eq!(
+            magnitude.value(i),
+            BigUint::from_u64(*want).to_le_bytes().as_slice(),
+            "position {i}"
         );
     }
 
