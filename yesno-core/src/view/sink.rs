@@ -8,16 +8,16 @@
 //! re-select the representation of the same containers once per constituent.
 //! The sink accumulates and [`Container::optimize`](crate::Container::optimize)
 //! runs **once**, at [`ViewSink::build`]. Same shape as
-//! [`MatrixSink`](crate::matrix::MatrixSink) and
-//! [`IntSink`](crate::bignum::IntSink).
+//! [`MatrixSink`](crate::matrix::MatrixSink), and the same shape the integer
+//! writer in [`bignum`](crate::bignum) uses.
 //!
 //! # Build memory is proportional to the packed cardinality
 //!
 //! [`OrdinalSink`](crate::pack::OrdinalSink) accumulates a `Vec<u64>`, so
 //! building a view costs 8 bytes per ordinal placed, against the roughly 2 bytes
 //! per ordinal the packed form settles at. That is a **transient 4x**, paid only
-//! during construction, and it is the same bargain `MatrixSink` and `IntSink`
-//! already make.
+//! during construction, and it is the same bargain `MatrixSink` and the
+//! integer writer already make.
 //!
 //! Unlike theirs it is **not bounded by the descriptor**: a matrix and an
 //! integer have a width, a view constituent is an arbitrary `OrdSet`. So placing
@@ -64,7 +64,7 @@ impl ViewSink {
     }
 
     // There is deliberately no `view()` accessor, and since 2026-09-06
-    // neither `MatrixSink` nor `IntSink` has one either. All three had the same
+    // neither `MatrixSink` nor the integer writer has one. All three had the same
     // shape: a caller who built a sink already holds the descriptor it was built
     // from, so handing it back is public API earning nothing — the `stats.rs`
     // precedent in `CLAUDE.md` is exactly this at larger scale. The other two
@@ -224,7 +224,7 @@ mod tests {
         ));
     }
 
-    /// Diverges from `IntSink`, which refuses a repeat, and follows
+    /// Diverges from the integer writer, which refuses a repeat, and follows
     /// `MatrixSink`, which unions one. Unioning two *sets* is meaningful.
     #[test]
     fn placing_a_constituent_twice_unions_it() {

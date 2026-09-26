@@ -22,9 +22,9 @@
 //! [`MatrixSink`](crate::matrix::MatrixSink) unions a repeat, since OR-ing two
 //! boolean matrices *is* addition under
 //! [`Semiring::Boolean`](crate::matrix::Semiring);
-//! [`IntSink`](crate::bignum::IntSink) refuses one, since OR-ing 5 and 3 yields
-//! 7 and that is nothing a caller could have meant. Do not lift either policy
-//! in here.
+//! the integer writer in [`bignum`](crate::bignum) refuses one, since OR-ing 5
+//! and 3 yields 7 and that is nothing a caller could have meant. Do not lift
+//! either policy in here.
 
 use crate::OrdSet;
 

@@ -254,7 +254,8 @@ impl OrdSet {
     ///
     /// Do not repair it by counting first when the range touches one chunk:
     /// `rank` on a bitmap scans the whole prefix below `hi`, so exactly that
-    /// case is the 138 ns row, and it is the case `int_is_zero` asks.
+    /// case is the 138 ns row, and it is the case a narrow-span emptiness
+    /// probe asks.
     pub fn range_summary(&self, lo: u64, hi: u64) -> RangeSummary {
         let width = hi.saturating_sub(lo);
         if width == 0 {

@@ -6,24 +6,33 @@
 //! Nothing here can overflow. `add`, `shl` and later `mul` grow the limb vector,
 //! and the only failure available is allocation — which is what it means for the
 //! value type to carry no width. Overflow exists at exactly one place, where a
-//! value meets a fixed `width_bits`: [`IntSink::place`](super::IntSink::place),
-//! which **refuses** rather than clamping.
+//! value meets a fixed `width_bits`, and that boundary **refuses** rather than
+//! clamping.
 //!
-//! **There is no saturating arithmetic and there will not be**, for three
-//! reasons in increasing force. QG §6 already rules out the silent clamp.
-//! Saturating needs `2^W - 1`, so it would put a width into `add` and from there
-//! into every kernel — the coupling the seam doctrine exists to prevent. And,
-//! decisively: **the reader cannot saturate.**
+//! **There is no saturating write rule**, and this paragraph used to say there
+//! would be no saturating arithmetic at all. That was too strong and is
+//! corrected here rather than beside: [`BigUint::saturate`] and
+//! [`BigInt::saturate`](super::BigInt::saturate) exist, added 2026-09-25. What
+//! the original argument actually established survives intact, and it is the
+//! reason saturation is spelled the way it is.
 //!
-//! Reading integer `k` at `width_bits = W` gathers exactly the ordinals
-//! `[k*stride, k*stride + W)`. The bits above `W` are not clamped, they are
-//! simply not in the range being read, so the read is `x mod 2^W` *by
+//! The argument: **the reader cannot saturate.** Reading a set at width `W`
+//! gathers exactly the ordinals `[0, W)`. The bits above `W` are not clamped,
+//! they are simply not in the range being read, so a read is `x mod 2^W` *by
 //! construction* — there is no clamp available to it and no way to give it one.
 //! Truncation is therefore the only write rule that agrees with the read rule.
-//! Under a saturating write, storing `x` wide and reading it narrow would
+//! Under a saturating *write*, storing `x` wide and reading it narrow would
 //! disagree with storing `x` narrow, and the two would drift apart silently.
 //! `truncating_before_the_write_agrees_with_reading_at_that_width` is the
-//! property, and it is the one a saturating implementation fails.
+//! property, and it is the one a saturating write rule fails.
+//!
+//! So saturation is **an operation a caller names, never a mode a width
+//! implies.** `add` and `mul` still carry no width, QG §6's ban on the silent
+//! clamp still holds, and `saturate( x, W )` already fits in `W` bits — so
+//! storing its result and reading it back at `W` round-trips, and the property
+//! above is not weakened by its existence. A saturating `add` that clamped
+//! because a width was configured somewhere is the thing that remains
+//! forbidden.
 //!
 //! **Two tempting arguments against saturation are wrong, and were checked
 //! rather than assumed.** Saturating addition and multiplication *are*
@@ -87,10 +96,10 @@ impl BigUint {
         debug_assert!(self.is_normalized() && rhs.is_normalized());
         let n = rhs.limbs().len();
         if self.limbs().len() < n {
-            self.limbs_mut().resize(n, 0);
+            self.resize_limbs(n, 0);
         }
         let mut carry = 0u64;
-        for (i, x) in self.limbs.iter_mut().enumerate() {
+        for (i, x) in self.limbs_mut_slice().iter_mut().enumerate() {
             // The exit test is `i >= n`, not `b == 0`. A zero limb *inside*
             // `rhs` says nothing about the limbs above it, so stopping on one
             // would drop the rest of the addend.
@@ -103,13 +112,42 @@ impl BigUint {
             carry = c;
         }
         if carry != 0 {
-            self.limbs_mut().push(carry);
+            self.push_limb(carry);
         }
         debug_assert!(self.is_normalized());
     }
 
     /// `self + rhs`.
+    ///
+    /// `#[inline]` for the reason [`BigUint::mul`] states: with no LTO, a
+    /// cross-crate caller cannot see the narrow arm otherwise.
+    #[inline]
     pub fn add(&self, rhs: &BigUint) -> BigUint {
+        // The narrow arm. Two values below 128 bits sum inside a `u128` with no
+        // limb vector formed; see `BigUint::mul` for why the arm rather than
+        // the inline storage is what pays.
+        if let (Some(a), Some(b)) = (self.to_u128(), rhs.to_u128()) {
+            // `overflowing_add`, not `checked_add`. The carry out is a third
+            // limb, not a reason to abandon the arm -- and an abandoned arm
+            // here was **the** slow case rather than a rare one: two operands
+            // that each fill 128 bits are exactly the pair that carries, so
+            // `checked_add` fell through to the generic path precisely at the
+            // width the arm was written for. Measured 41.8 ns against `sub`'s
+            // 16.4 ns on the same operands before this changed.
+            let (sum, carry) = a.overflowing_add(b);
+            return if carry {
+                BigUint::from_slice(&[sum as u64, (sum >> 64) as u64, 1], 3)
+            } else {
+                BigUint::from_u128(sum)
+            };
+        }
+        self.add_wide(rhs)
+    }
+
+    /// The general addition, kept out of line so `add` stays small enough to
+    /// inline without carrying this with it.
+    #[inline(never)]
+    fn add_wide(&self, rhs: &BigUint) -> BigUint {
         // Clone the longer operand so the in-place form never has to grow.
         let (mut acc, other) = if self.limbs().len() >= rhs.limbs().len() {
             (self.clone(), rhs)
@@ -132,7 +170,7 @@ impl BigUint {
         }
         let n = rhs.limbs().len();
         let mut borrow = 0u64;
-        for (i, x) in self.limbs.iter_mut().enumerate() {
+        for (i, x) in self.limbs_mut_slice().iter_mut().enumerate() {
             if i >= n && borrow == 0 {
                 break;
             }
@@ -155,7 +193,20 @@ impl BigUint {
     /// only two honest answers are a value and no value. `None` follows
     /// [`BitMatrix::invert_gf2`](crate::matrix::BitMatrix::invert_gf2), which
     /// says the same thing about a singular matrix.
+    #[inline]
     pub fn sub(&self, rhs: &BigUint) -> Option<BigUint> {
+        // The narrow arm. Underflow stays `None`, as it must: the answer is not
+        // in the domain, and a fast path that wrapped would be a different
+        // function wearing the same name.
+        if let (Some(a), Some(b)) = (self.to_u128(), rhs.to_u128()) {
+            return a.checked_sub(b).map(BigUint::from_u128);
+        }
+        self.sub_wide(rhs)
+    }
+
+    /// The general subtraction, out of line for the reason `add_wide` is.
+    #[inline(never)]
+    fn sub_wide(&self, rhs: &BigUint) -> Option<BigUint> {
         let mut acc = self.clone();
         acc.sub_assign(rhs).then_some(acc)
     }
@@ -306,11 +357,11 @@ impl BigUint {
         // `bits < bit_len() <= limbs.len() * 64`, so `keep <= limbs.len()` and
         // the cast cannot lose anything on any target.
         let keep = bits.div_ceil(64) as usize;
-        self.limbs.truncate(keep);
+        self.truncate_limbs(keep);
         let rem = (bits % 64) as u32;
         if rem != 0 {
             // `keep` rounded up, so the last kept limb is the partial one.
-            if let Some(last) = self.limbs.last_mut() {
+            if let Some(last) = self.limbs_mut_slice().last_mut() {
                 *last &= (1u64 << rem) - 1;
             }
         }
@@ -485,5 +536,96 @@ mod tests {
         assert_eq!(a.shl(1).limbs().len(), 1);
         assert_eq!(a.shl(64).limbs().len(), 2);
         assert!(a.shl(63).is_normalized());
+    }
+}
+
+#[cfg(test)]
+mod narrow_arm_tests {
+    use super::*;
+
+    /// The carry out of a 128-bit addition is a third limb.
+    ///
+    /// This is the case `checked_add` used to decline, sending the widest
+    /// operands the arm serves down the generic path instead -- so it is both
+    /// the correctness boundary of the new code and the case that was slow.
+    #[test]
+    fn a_full_width_addition_carries_into_a_third_limb() {
+        let max128 = BigUint::from_limbs_le(vec![u64::MAX, u64::MAX]);
+        let sum = max128.add(&max128);
+        // 2 * ( 2^128 - 1 ) == 2^129 - 2.
+        assert_eq!(sum.limbs(), &[u64::MAX - 1, u64::MAX, 1]);
+        assert!(sum.is_normalized());
+        assert_eq!(sum.bit_len(), 129);
+
+        // And it agrees with the generic path it used to fall through to.
+        let mut acc = max128.clone();
+        acc.add_assign(&max128);
+        assert_eq!(sum, acc);
+
+        // The other side of the boundary: the largest sum that does *not*
+        // carry is `2^128 - 1`, and it must still produce two limbs. Reaching
+        // it needs two halves of the range -- `max128 + anything nonzero`
+        // carries, which is what the first draft of this test got wrong.
+        let half = BigUint::from_limbs_le(vec![0, 1 << 63]); // 2^127
+        let half_less_one = half.sub(&BigUint::one()).unwrap(); // 2^127 - 1
+        let no_carry = half.add(&half_less_one);
+        assert_eq!(no_carry.limbs(), &[u64::MAX, u64::MAX], "exactly 2^128 - 1");
+        assert!(no_carry.is_normalized());
+
+        // And one more is the smallest sum that does carry.
+        assert_eq!(half.add(&half).limbs(), &[0, 0, 1], "exactly 2^128");
+    }
+
+    /// Every width the specialized arms claim to serve, against the generic path.
+    ///
+    /// 4 through 64 bits are one limb and 128 is two, so these six widths are
+    /// two kernels rather than six -- this is what pins that they agree.
+    #[test]
+    fn the_narrow_arms_agree_with_the_generic_path_at_every_claimed_width() {
+        for bits in [4u64, 8, 16, 32, 64, 128] {
+            let n = bits.div_ceil(64) as usize;
+            let mut limbs = vec![u64::MAX; n];
+            // Trim the top limb to exactly `bits`.
+            let top = bits % 64;
+            if top != 0 {
+                limbs[n - 1] = (1u64 << top) - 1;
+            }
+            let a = BigUint::from_limbs_le(limbs);
+            let b = BigUint::from_u64(3);
+            assert_eq!(a.bit_len(), bits, "operand must fill {bits} bits");
+
+            // add against add_assign
+            let mut acc = a.clone();
+            acc.add_assign(&b);
+            assert_eq!(a.add(&b), acc, "add at {bits}");
+
+            // sub against sub_assign
+            let mut acc = a.clone();
+            assert!(acc.sub_assign(&b));
+            assert_eq!(a.sub(&b), Some(acc), "sub at {bits}");
+
+            // mul against the schoolbook oracle
+            assert_eq!(a.mul(&b), a.mul_schoolbook(&b), "mul at {bits}");
+
+            // divrem against Algorithm D, and the identity it must satisfy
+            let (q, r) = a.divrem(&b).expect("nonzero divisor");
+            assert_eq!(
+                (q.clone(), r.clone()),
+                a.divrem_knuth(&b).unwrap(),
+                "divrem at {bits}"
+            );
+            assert_eq!(q.mul(&b).add(&r), a, "q*d + r == a at {bits}");
+            assert!(r < b, "remainder must be below the divisor at {bits}");
+        }
+    }
+
+    /// A zero divisor stays `None` on the narrow path too.
+    #[test]
+    fn the_narrow_divrem_declines_a_zero_divisor() {
+        assert_eq!(BigUint::from_u64(7).divrem(&BigUint::zero()), None);
+        assert_eq!(BigUint::zero().divrem(&BigUint::zero()), None);
+        // And zero divided by something is zero, not None.
+        let (q, r) = BigUint::zero().divrem(&BigUint::from_u64(5)).unwrap();
+        assert!(q.is_zero() && r.is_zero());
     }
 }

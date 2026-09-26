@@ -362,7 +362,40 @@ impl BigUint {
     /// `self * rhs`.
     ///
     /// Dispatches on the shorter operand's limb count; see [`KARATSUBA_MIN`].
+    ///
+    /// **`#[inline]` is what makes the narrow arm below reachable.** The
+    /// workspace sets no LTO, so a call from another crate -- the expression
+    /// evaluator is one -- cannot see through a non-inline function, and the
+    /// arm's whole value is being folded into the caller. The generic path
+    /// stays out of line behind `mul_with_min`, so what gets duplicated at each
+    /// call site is a register multiply and a branch, not Karatsuba.
+    #[inline]
     pub fn mul(&self, rhs: &BigUint) -> BigUint {
+        // The narrow arm, and the only reason the inline representation pays.
+        //
+        // Below 64 bits a product fits a `u128` and the whole operation is one
+        // machine multiply into registers. The general path allocates a limb
+        // vector for the result whatever its size, and that allocation -- not
+        // the arithmetic -- was measured as the entire cost at these widths:
+        // 13.3 ns flat from 4 to 64 bits against 0.55 ns native, because the
+        // cost did not depend on the width.
+        //
+        // **Inline storage alone does not deliver this.** It makes a value
+        // cheap to hold, and the first version of this change was a regression
+        // for exactly that reason -- `mul` still built a `Vec` and then copied
+        // it inline, paying the allocation *and* the copy. The saving is in not
+        // forming the vector at all, which only a dedicated arm can do.
+        if let (Some(a), Some(b)) = (self.to_u64(), rhs.to_u64()) {
+            return BigUint::from_u128(u128::from(a) * u128::from(b));
+        }
+        // Two limbs by two limbs, which is every width up to 128 bits. The
+        // product needs four limbs and so must reach the heap once whatever
+        // happens -- but forming it directly skips the general path's
+        // bookkeeping, and 128 bits was the one width where the inline
+        // representation alone left this *slower* than before.
+        if let (Some(a), Some(b)) = (self.to_u128(), rhs.to_u128()) {
+            return BigUint::from_u128_product(a, b);
+        }
         self.mul_with_min(rhs, KARATSUBA_MIN)
     }
 
