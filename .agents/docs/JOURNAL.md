@@ -5267,3 +5267,10 @@ and `differential`. Byte identity is untouched by this change on purpose:
 nothing here alters a container's representation, only how its bits are
 transferred into limbs. **`./scripts/gate-pg.sh` passed, exit 0** as well, which
 `yesno-core` changes owe because Bazel builds that crate independently.
+
+**That `gate-pg` run predated the block fast path**, which was added afterwards
+out of the packed-lane question, so it did not cover what was committed. Re-run
+against the committed tree ( `9870a93` ): **`gate-pg passed`, exit 0**. Recorded
+because the first sentence was true when written and would have read as covering
+the final state, which is the way a verification claim goes stale fastest -- it
+is accurate about a tree that no longer exists.
