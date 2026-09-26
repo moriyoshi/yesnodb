@@ -4818,3 +4818,452 @@ cargo doc` ( the intra-doc links ). Both clean.
 **Outstanding**: `PowMod` is not in the Python, Go or Java clients yet -- the
 other twelve big-integer nodes are. The gates were green *before* this stage,
 so both need re-running.
+
+## 2026-09-26 -- Fused big-integer arithmetic was the wrong lever, and two stale rationales
+
+**Task**: explore a performance boost for fused big-integer arithmetic in the
+JIT, then close the remaining client gap.
+
+### The JIT is the wrong mechanism, by the JIT's own admission rule
+
+Measured with a standalone probe under `.agents-workspace/tmp/` ( since deleted;
+the numbers and their construction are in
+`LTM/packed-lenses-matrix-bignum-and-views.md` ). At 64 bits a `Vec[Big]`
+element costs 9-11 ns against 0.42 ns for the native operation, so roughly
+**95% of it is value bookkeeping and fusion has about a 20x ceiling**. At 1024
+bits the 260 ns per element is a real 16-by-16-limb multiply and there is no
+fusion headroom at all.
+
+**But the ceiling is not the argument -- the amortisation is.** `worth_jitting`
+admits an expression only at four or more leaves over many dense bitmap chunks,
+because it earns Cranelift's compilation back across *data volume*, which for a
+bitmap DAG is unbounded. A big-integer vector has a hard ceiling:
+`MAX_VIEW_SETS` caps arity at 4096, so an entire 4096-element zip at 64 bits is
+**37.5 us**. Compiling even a small function is of that order, and the operator
+set is five binary operations by a few width classes -- about fifteen shapes,
+all statically enumerable. **A static specialization reaches the same ceiling
+with nothing to amortise.** No change made; the finding is the deliverable.
+
+**The probe found a different opportunity than the one it went looking for.**
+`BigInt::mul` is 10.7 ns where `BigUint::mul` is 7.1 ns on the same magnitudes,
+so the signed wrapper costs ~3.6 ns that the narrow arm underneath it does not.
+That gap is the cheap half and it is not in the JIT. Nothing is asking for it
+yet, so it is recorded rather than implemented.
+
+### A correction to yesterday's inline-storage numbers
+
+Yesterday's entry recorded `clone` at one limb improving 6.6 ns to 0.8 ns. **The
+0.8 ns is not a usable figure.** It was measured on a local the optimizer can
+see through, and an inline clone with no side effect is eliminable where a `Vec`
+clone is not -- so the "after" column is partly measuring a clone that did not
+happen. Behind a reference, where it cannot be folded, the same one-limb clone
+measures **7.0 ns**. The `mul` figures stand ( the result is consumed through
+`black_box` ). The general lesson, added to LTM: **a before/after pair is not
+comparable when the optimization also makes the operation eliminable.**
+
+### Two stale rationale comments, one of them false
+
+The gate's `doc links resolve` step failed again on dead intra-doc links to
+types deleted this week -- the third time this class has been the only thing to
+catch a stale `//!`. Fixing them surfaced something worse in
+`bignum/addsub.rs`, which opened:
+
+> **There is no saturating arithmetic and there will not be**
+
+`BigUint::saturate` and `BigInt::saturate` were added the day before, at the
+user's request. The block also still described a `stride` that no longer exists.
+Rewritten rather than patched beside, and the rewrite keeps what the original
+argument actually established: **the reader cannot saturate**, so truncation
+remains the only *write rule* that agrees with the read rule, and saturation is
+therefore an operation a caller names rather than a mode a width implies. A
+saturating `add` that clamped because a width was configured somewhere is still
+forbidden, and the block now says that instead of the false thing.
+
+**This is the hazard CLAUDE.md names -- "a stale rationale comment is worse than
+none" -- reached by the ordinary route**: the feature was added, the tests were
+written, the gate was run, and nothing in any of that reads a `//!` block for
+whether it still describes the code. Only `cargo doc` did, and only because the
+same file happened to carry a broken link.
+
+### The client gap closed, and checked against the encoder rather than itself
+
+`zip` and `scale` existed on the wire and in the CLI but in none of the three
+clients. Added to Python, Go and Java, and **verified byte-for-byte against
+bytes emitted by the Rust encoder** for all five operators in both node shapes,
+rather than through each client's own decoder.
+
+That mattered immediately. Go's `EncodeBigVector` runs `validateBigVector`,
+which is a *second* type switch beyond the one that writes the bytes -- and it
+rejected both new types with "unsupported big-vector type". `gofmt`, `go vet`
+and the existing suite all passed over it; only encoding a zip found it. Python
+gained `BigBinOp` with the shared width and work rules, and mypy caught a local
+shadowing the `MAP_BIG` arm's `VecSetExpr` that its 85 passing tests did not.
+
+**The recurring finding, now at five instances: doctests, the Flight stream
+encoder, rustdoc links, feature-gated dead code, mypy -- and now a client's
+validation path that its own round-trip tests never enter.** Each was invisible
+to `clippy --all-targets --all-features` plus `cargo test`. The common shape is
+a second implementation of a decision that the first implementation's tests do
+not reach.
+
+**Outstanding**: `PowMod` is still absent from the three clients. Both gates
+need re-running; `gate.sh` is running as this is written.
+
+**Verification ( same day )**. `./scripts/gate.sh` **passed, exit 0** -- clippy
+`--workspace --all-targets --all-features -D warnings` clean, the workspace
+suite green, `doc links resolve` green ( the step that had been failing ),
+`docs/` self-contained, rustfmt clean. Clients: Python `uv run mypy src` clean
+and 92 tests green; Go `gofmt`, `go vet` and the suite green; Java
+`./gradlew build` green with both new tests confirmed present in the JUnit XML
+rather than assumed -- a first run reported "23 tests" and only reading the case
+names showed whether the new ones were among them.
+
+**A socket-level `zip` / `scale` test was added and then sabotaged twice.**
+`Map` was the only `VecBig` shape with transport coverage, and it is the one
+whose result comes straight from the reader; a zip and a scale *compute* per
+element, so they are where a per-position misalignment would appear -- and a
+misalignment is structurally invisible to a scalar test, which has one position.
+Swapping the scale's operand order and rotating the zip's right operand by one
+each reddened **only** the new test, the other three staying green. The values
+are distinct per constituent and the chosen operators asymmetric for exactly
+that reason; equal values or a commutative operator would have let both
+sabotages pass.
+
+`./scripts/gate-pg.sh` **passed, exit 0**, which is the obligation a
+`yesno-core` or `yesno-flight` change carries: Bazel builds those crates too, so
+a change that satisfies cargo can still break through a stale lockfile
+resolution. No `CARGO_BAZEL_REPIN` prompt, so `crate_universe` still reads the
+same `Cargo.lock` cargo does.
+
+## 2026-09-26 -- The narrow-width kernels, finished properly
+
+**The ask was specialized kernels at 4, 8, 16, 32, 64 and 128 bits. What had
+been delivered was inline storage plus narrow arms in `mul`, `add` and `sub`
+only**; `divrem` and the whole signed surface never got them, and the earlier
+session moved on to the JIT question instead. The user pointed this out. Closed
+now, and closing it found three defects that no test could have caught because
+none of them is a wrong answer.
+
+Full before/after table, the decomposition, and the reasoning are in
+`LTM/packed-lenses-matrix-bignum-and-views.md`. The headlines:
+
+* **`BigUint::add` at 128 bits, 41.8 -> 9.0 ns.** The arm used `checked_add`,
+  and two operands that each fill 128 bits are exactly the pair that carries --
+  so it declined at the one width it was written for and fell through to the
+  generic path. It was slower than `sub` and `mul` on the same operands, which
+  is the shape that should have been noticed earlier and was not.
+* **`BigUint::divrem`, 23.1 -> 7.9 ns at one limb.** It had no narrow arm, so a
+  one-limb division ran Algorithm D and paid three allocations.
+* **`BigInt::sub`, 45.8 -> 11.3 ns at 128 bits.** It was `self.add( &rhs.neg() )`
+  and `neg` clones the magnitude to flip a bool, so every signed subtraction
+  built a whole operand to throw away.
+* **`BigInt::to_i128` returned `None` for every value between `2^64` and
+  `i128::MAX`** -- it asked `to_u64`. A function answering "not representable"
+  about values that fit its own return type exactly.
+
+**The six widths are two kernels, and saying so is the substance rather than a
+dodge.** 4 through 64 bits are one `u64` limb and measure identically -- 7.1 ns
+for `add` at every one, before and after. Limb count separates these paths;
+width does not. A regression test now pins that the arms agree with the generic
+path at all six claimed widths.
+
+**`#[inline]` on the wrappers turned out to be load-bearing.** The workspace
+sets no LTO, so a cross-crate caller -- the expression evaluator is one -- cannot
+see through a non-inline function, and an arm the caller cannot see does not
+exist for it. Each kernel is now a small `#[inline]` arm over an
+`#[inline(never)]` body.
+
+**The measurement that outranks the table.** Decomposing `add` at 64 bits:
+reading both operands 0.68 ns, constructing a value 0.39 ns, the whole `add`
+7.11 ns -- and **the same `add` with its result folded into a scalar, 2.06 ns**.
+So ~5 ns is returning a 32-byte `BigUint` by value and drop-checking it, not
+arithmetic. The kernel is about 2 ns.
+
+**That replaces the "20x fusion headroom" figure this journal recorded earlier
+today with something that names the mechanism**: the win in fusing is not
+materializing each intermediate, it is worth about 3.5x at narrow widths, and it
+wants a static specialization that keeps values in registers -- which is the same
+conclusion the amortisation argument reached by a different route. The earlier
+figure was not wrong, but it measured a gap without identifying what sat in it.
+
+**Two self-corrections worth keeping.** The first draft of the carry regression
+test asserted that `max128 + ( 2^128 - 1 - 2^64 )` does not carry; it does, and
+`max128 + x` carries for every nonzero `x`. The no-carry boundary has to be
+reached from two halves of the range. And the `clone` row read 0.65, 1.35 and
+0.77 ns across three runs of the same binary -- it is at the noise floor and is
+not quoted anywhere; the harness now prints a spread warning when passes
+disagree by more than 25%.
+
+**Verification**: `clippy --workspace --all-targets --all-features -D warnings`
+clean, `cargo fmt --check` clean, **939 `yesno-core` tests** green including five
+new ones ( the third-limb carry and its two boundaries, agreement with the
+generic path at all six widths, the zero divisor on the narrow path,
+`to_i128` across the whole signed range including `i128::MIN`, and `sub`
+against `add( neg )` ). **`./scripts/gate.sh` passed, exit 0.**
+
+**`./scripts/gate-pg.sh` passed, exit 0**, which these changes required: they
+are in `yesno-core`, which Bazel builds independently, so a change that
+satisfies cargo can still break there through a stale lockfile resolution. No
+`CARGO_BAZEL_REPIN` prompt.
+
+## 2026-09-26 -- PowMod was already in the clients, and I said twice that it was not
+
+Asked to implement `PowMod` in the Python, Go and Java clients. **It was already
+there, complete, and committed in `HEAD` before this session started.** Nothing
+was implemented; the entry exists because the claim that it was missing was
+wrong and had been propagated into two records.
+
+**What is actually there**, verified against the code rather than against the
+claim: the node type, the encoder, the decoder, the `width_bound` ( the modulus
+and nothing else ) and the `work_bound` ( `e_bits * 4 * m_limbs^2` plus the
+operands ) in all three clients, the public export in each, the validation walk
+in Go's `validateBig`, and `BigExpression.PowMod` in Java's `permits` clause.
+All three encode `powmod( 2, 10, 1000 )` as exactly the bytes `yesno-wire`
+produces --
+`59534e58010027180001000000021800010000000a180002000000e803` -- and Java already
+carried `powModWireVectorMatchesTheRustCrate` asserting that string, alongside
+`aCostlyExponentiationIsRefusedWhereItsWidthIsUnremarkable` and
+`rsaScaleExponentiationIsAdmitted`.
+
+**How the false claim travelled.** An earlier entry in this journal closed with
+"**Outstanding**: `PowMod` is not in the Python, Go or Java clients yet". Today I
+copied that into `TODO.md` as `pow-mod-is-absent-from-the-three-clients`, wrote
+supporting detail for it, and reported it to the user as outstanding work twice
+-- in a summary and again in a closing status -- without ever grepping for
+`PowMod`. One `grep` in three files would have settled it, and the grep that
+finally did it took under a minute. The TODO item is removed; `TODO.md` is a
+backlog, so a false item is deleted rather than annotated.
+
+**This is the session's own recurring finding turned on its author.** Three
+entries today are about a second implementation of a decision going stale
+because nothing reads it -- the `//!` block claiming saturation would never
+exist, the `stride` in a rationale comment, the dead intra-doc links. A
+backlog entry and a status report are also implementations of a claim, and they
+rot the same way. **The rule that would have caught it is already written in
+`CLAUDE.md` for recalled memories: if it names a file, function or flag, verify
+it still exists before recommending it.** It applies to this journal's own
+"Outstanding" lines, which are the least verified prose in the tree -- written
+last, when a session is closing, and read first by the next one.
+
+**Carry forward**: before filing or reporting an item as outstanding, grep for
+the thing it says is missing. An "Outstanding" line inherited from an earlier
+entry is a hypothesis, not a finding.
+
+## 2026-09-26 -- A SIMD kernel for zip/scale, and the 875x it led to instead
+
+Asked to explore a special kernel for `zip` / `scale` over block-backed
+`Vec[Big]` using SIMD, computing without materializing intermediates. **The SIMD
+kernel works, wins 1.5-2.65x on its own terms, and is not worth building.** Full
+numbers and constructions in
+`LTM/packed-lenses-matrix-bignum-and-views.md`; the short form:
+
+* **Vertical NEON is the right shape and it does win** at 1 to 16 limbs
+  ( 2.65x, 2.08x, 1.51x ), losing beyond 64 limbs where the loop-carried carry
+  dependency makes vector latency the binding constraint. Lane `j` holds
+  constituent `j`; SIMD across the limbs of one value would be wrong, since a
+  carry chain is serial.
+* **The arithmetic is 1.2-1.5% of a real blocked zip.** `read_int` is 47-79% and
+  `view_select` is 5-39%. So a perfect arithmetic kernel is worth about 1.5% and
+  the measured 2x is worth about 0.7%.
+* **Two structural blockers on top of that.** The winning kernel needs
+  limb-interleaved operands, which no view layout produces -- `Blocked` puts
+  constituents far apart, `Interleaved` interleaves *bits*. And SIMD over words
+  needs a `Bitmap` container, which a blocked constituent only gets from about
+  16 384 bits at intermediate density; **a fully dense value is a `Run` at every
+  width**, so "all ones" has no word array either. The widths where the kernel
+  is possible and the widths where it would pay do not overlap.
+
+**What the measurement found instead.** `read_int` block-transfers a bitmap and
+walked an Array **or a Run** ordinal by ordinal. A run is a list of intervals,
+and an interval of set bits is whole words of `u64::MAX` with a partial word at
+each end. Filling rather than walking:
+
+```text
+   bits    before     after   speedup
+     64     137.7      22.6      6.1x     ns per limb
+   1024     108.0       1.7       62x
+   4096     106.0       0.5      226x
+  16384     105.4       0.2      509x
+  65536     105.1       0.1      875x
+```
+
+**The densest values were taking the slowest path** -- a flat ~105 ns per limb
+regardless of width, because a contiguous stretch of ones coalesces into one run.
+An all-ones integer is the simplest bit pattern there is and it was the worst
+case. The run path now matches the bitmap path.
+
+**Verified by sabotage rather than by the numbers.** Three new tests compare the
+interval fill against the ordinal walk it replaced, across thirteen interval
+shapes chosen for the word boundaries `fill_bits` branches on and eleven widths,
+plus a test asserting the dense case really is a `Run` so the suite is not
+vacuously exercising the array arm. Each of the three components of the fill was
+then broken in turn -- the low mask, the high mask, the middle `fill` -- and each
+sabotage reddened the suite. The existing `proptest_oracle` and `differential`
+gates also pass, and the byte-identity half of `differential` is what makes the
+run representation legitimate in the first place.
+
+**The reusable lesson is the ordering, and it is the second time today.** The
+kernel was proposed for the arithmetic; one measurement of where the time
+actually went redirected the work to a fix that is 62-875x, needs no `unsafe`, no
+SIMD, no new public API, and took about twenty lines. The JIT exploration earlier
+today made the same error in the same direction -- reaching for a mechanism
+before splitting the cost. **Measure the split before choosing the mechanism.**
+
+**Left unexamined on purpose**: `view_select` is 34-39% of a narrow-value zip,
+and `view/mod.rs` claims a chunk-aligned blocked view should be "close to free"
+there. Nothing has checked that claim against a measurement, and it is now the
+largest unexplained term in this operation.
+
+### Addendum, same day: the shared decode buffer and run-to-bitmap promotion
+
+Both were asked for before any SIMD work. **Neither landed, both were measured
+rather than argued, and the `read_int` interval fill above is unaffected.** Detail
+in `LTM/packed-lenses-matrix-bignum-and-views.md`.
+
+**A shared decode buffer in core made `read_int` slower at every width** -- 122 to
+198 ns at 65 536 bits, 904 to 1079 at 1024. The facility itself was built to the
+house pattern ( thread-local, grown never shrunk, only the used prefix cleared,
+after `ops::nary::Scratch` ) and is fine; the call site is wrong.
+`BigUint::from_limbs_le` takes its vector **by value and moves it**, so an owned
+`vec![0u64; n]` is one allocation and no copy, while filling a shared buffer
+forces a copy out. **A shared buffer pays where the buffer is transient and
+discarded, and cannot pay where the buffer becomes the result.** The facility was
+removed rather than left unused, per the `stats.rs` precedent.
+
+**The answer was already written in the function I was editing.**
+`from_limbs_le`'s comment records the same trade from the other direction, from
+an earlier session: routing it through the copying path regressed a 128-bit
+multiply from 15.5 ns to 24.3 ns. I added the scratch first and read the comment
+after. That is the third time today a load-bearing comment had the answer before
+the measurement did.
+
+**Automatic run/array to bitmap promotion cannot be an in-place change**, for
+three independent reasons: the `Shared` stores are documented immutable and may
+alias an mmap, and that immutability is what makes `Container: 'static + Send +
+Sync`; `Roaring32::serialize` branches on `c.kind()` for the run-flag bitset, so
+changing a kind changes serialized bytes and breaks
+`serialized_bytes_are_identical_to_the_roaring_crate`, which is also what makes
+`O( container count )` import legitimate; and containers are shared across
+snapshots, so mutating on read changes what another live snapshot sees.
+
+The safe demand-shaped design is a **side cache** of decoded words, changing no
+representation and no byte -- but **it does not help the operation that prompted
+it**, because a `zip` or `scale` reads each constituent exactly once. It would
+help repeated queries over the same chunks, which is unmeasured.
+
+**And the demand is largely gone.** Promotion was attractive because a run cost
+~105 ns per limb to read; the interval fill brought that to 0.1-1.7, matching the
+bitmap path. **A representation change to reach a speed the existing
+representation already reaches is not worth the invariants it costs.** If the
+remaining array cost ( ~55-85 ns per limb at half density, proportional to set
+bits ) becomes the bottleneck, that is the place to look, and grouping its writes
+by limb was tried today and measured no gain.
+
+**Correction to the addendum, same day.** The claim that a shared decode buffer
+regressed `read_int` "at every width" rested partly on the half-density **Array**
+rows, and those rows span **894 to 1247 ns across process runs of the same
+binary**. Three samples either side read as a clean 17% regression; it was noise,
+and so was a later change that appeared to fix it. The 65 536-bit rows are stable
+to about +/- 2 ns and do show the regression ( 122 to 198, 134 to 207 ), so the
+conclusion holds -- but on two rows, not on the table. **Take a distribution
+across process runs before believing a row in this harness.**
+
+**And the narrow case turned out to be a real win that the first attempt hid.**
+The user asked why a shared buffer has to be copied at all, and the answer is
+that it does not: the wide case must own its buffer, but a value of
+`INLINE_LIMBS` or fewer is held in registers and keeps nothing, so its
+`vec![0u64; words]` was a malloc and free of scratch that was then discarded. The
+right tool there is a **stack array**, not a thread-local -- no allocator, no
+`RefCell`, and the one- or two-word move into inline storage happens either way,
+so the allocation goes away at no copy cost. `read_int` now branches on the width
+and shares one `fill_limbs` so the two cannot disagree about which bits are set.
+Measured over six runs: 64-bit Run **23-26 to 14-19 ns**, 64-bit Array at tenth
+density **41 to 24 ns**, and both 65 536-bit rows unchanged.
+
+**I routed every width through the scratch first and only split the cases after
+being asked.** The measurement that killed the idea was taken on a design that
+bundled two opposite requirements, which is why it looked like a dead end instead
+of a half-win.
+
+**Verification for the `read_int` work ( Run interval fill plus the narrow/wide
+buffer split ).** `./scripts/gate.sh` **passed, exit 0** -- clippy
+`--workspace --all-targets --all-features -D warnings` clean, `cargo fmt --check`
+clean, the workspace suite green including `proptest_oracle` and `differential`,
+`doc links resolve` green, `docs/` self-contained. The byte-identity half of
+`differential` passing matters here specifically: nothing in this change alters a
+container's representation, only how its bits are transferred into limbs.
+
+**`./scripts/gate-pg.sh` passed, exit 0**, which `yesno-core` changes owe because
+Bazel builds that crate independently and a change that satisfies cargo can still
+break there through a stale lockfile resolution. No `CARGO_BAZEL_REPIN` prompt.
+
+The measurement harness is kept at `.agents-workspace/tmp/simdzip/` rather than
+deleted with the other probes, because it is the instrument for the open
+array-to-bitmap question in `TODO.md`. Its README carries the noise caveat, so a
+later session cannot pick it up and repeat this session's mistake of reading a
+40%-spread row as a 17% effect.
+
+## 2026-09-26 -- SIMD on the array scatter: 1.05x, and 4x from the setup
+
+Asked to try the SIMD boost in the `read_int` harness. **NEON measured 1.05x at
+half density and 0.32x at a twentieth**, and is not worth building. The same
+work produced **4x from two scalar changes** found while setting the question up
+properly. Detail and tables in
+`LTM/packed-lenses-matrix-bignum-and-views.md`.
+
+**The harness had to be repaired first.** One set per configuration made the
+half-density Array rows bimodal -- 894 to 1247 ns for the same row of the same
+binary, allocation-address luck that a best-of-five inside the process cannot
+see through. Nine coexisting independently allocated sets, median across them,
+brings every row within 1% of its own min and max.
+
+**`Container::iter` was 1.4x to 3.5x of the array read**: it wraps the slice
+iterator in an enum, so the arm paid a discriminant branch per value, 32 per
+limb at half density. `ArrayContainer::as_slice` removes it, which is what
+`ops::nary` already did.
+
+**Grouping writes by limb paid another ~2x** -- values are sorted, so a limb's
+arrive consecutively, and a register accumulator with one store per limb
+replaces a load-or-store per value.
+
+```text
+  bits   density   original   +as_slice   +grouping   total
+  1024      0.50       1065         583         286    3.7x
+  4096      0.50       4137        2204        1029    4.0x
+ 16384      0.10       3345         947         861    3.9x
+```
+
+**Grouping was tried earlier the same day and measured as no gain.** That
+measurement was right and the conclusion was wrong: the enum dispatch was still
+present and dominated it. **Removing the larger term is what made the smaller
+one visible**, which is the same ordering lesson as the JIT and the zip kernel,
+now three for three.
+
+**Then the SIMD question, asked in the right place.** The scalar kernel is
+~0.50 ns per value, about 1.5 cycles. A NEON version accumulating in a vector
+and folding only at limb boundaries -- the one arrangement that does not give
+the lane count straight back -- is a wash at half density and loses badly as
+density falls, because the reduction target is a **single 64-bit accumulator**
+so lanes must fold before every store, and the limb-boundary test is
+**data-dependent** so it cannot leave the loop. At density 0.05 there are about
+three values per limb and the vector path stops hitting at all.
+
+**Three SIMD-shaped proposals in this tree have now failed on the same
+property** -- a serial carry chain, a per-element value cost, and a scatter
+reduction. SIMD wants many independent lanes and no cross-lane reduction;
+big-integer work keeps supplying the opposite.
+
+**Verified by sabotage.** Two new tests cover the array path against the
+ordinal-walk oracle across ten shapes -- all values in one limb, one value per
+limb, jumping limbs, half density, irregular, chunk-crossing -- and a second
+asserts the sparse case really is an `Array`, so the suite is not vacuously
+exercising the run arm. Breaking the final flush, the accumulator reset, and the
+flush target each reddened 8, 4 and 6 tests respectively.
+
+**Verification for the array scatter work.** `./scripts/gate.sh` **passed, exit
+0** -- clippy `--workspace --all-targets --all-features -D warnings` clean,
+`cargo fmt --check` clean, the workspace suite green including `proptest_oracle`
+and `differential`. Byte identity is untouched by this change on purpose:
+nothing here alters a container's representation, only how its bits are
+transferred into limbs. **`./scripts/gate-pg.sh` passed, exit 0** as well, which
+`yesno-core` changes owe because Bazel builds that crate independently.

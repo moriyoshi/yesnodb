@@ -774,3 +774,519 @@ is therefore the strict range endpoint, not estimated output sparsity.
 - Do not add an arithmetic rung because it exists in a mature library; measure it against reachable indexed operands.
 - Do not add lazy view nodes without planner bounds, statistics, streaming cardinality, termination evidence, and an allocation-motivated workload.
 - Do not use lane-level word-operation counts as time predictions or treat the withdrawn CSA and `Slice` parts as an implementation queue.
+
+### Modular exponentiation: what two deferred arms are actually worth ( measured 2026-09-25 )
+
+`pow_mod` became a query operation on 2026-09-25 and `MAX_WORK` was calibrated
+on its square-and-multiply cost, so the two deferred arms bearing on its inner
+loop were measured rather than left as estimates. The probe was a standalone
+crate under `.agents-workspace/tmp/` with a path dependency, run twice to check
+stability; both runs agreed to within 1% on every row except where noted.
+
+**Frame**: random odd moduli with the top bit set, a full-width random
+exponent, `--release`, on this workstation. Every arm asserts equality with the
+shipped loop before being timed, so a faster wrong answer cannot be reported.
+
+```text
+  m bits   baseline    w = 4     w = 5    known-reduced   window gain
+    1024     1.11 ms   0.86 ms   0.85 ms      1.00 ms          1.30x
+    2048     6.70      5.38      5.24         6.66             1.28x
+    4096    40.94     33.40     32.20        40.79             1.27x
+```
+
+**Windowed exponentiation is worth about 1.27x, flat across sizes**, and `w = 5`
+beats `w = 4` slightly at every width. That is a real gain for what the record
+calls "a straightforward later refinement", and it is **larger than the
+operation count predicts**: at 1024 bits the baseline is ~1536 `mul_mod` calls
+against ~1279 for `w = 4`, which is 1.20x against 1.30x measured. Note the
+direction -- the op-count model *under*-predicts here, where the carry-save
+model over-predicted by two to three times. Neither is evidence the models work;
+both are evidence they do not track time, which is the standing conclusion.
+
+**A squaring kernel does not exist to be measured, and the ratio says so.**
+`a.mul( &a )` costs the same as `a.mul( &b )` at every size ( 1.00-1.02x over
+16 to 256 limbs ). That is the **premise**, not a refutation: the record's "worth
+about a factor of two" is what a *dedicated* kernel exploiting `a_i a_j == a_j
+a_i` would deliver, and this measurement only confirms the general multiply gets
+no such benefit today. **Do not read the 1.00x as the squaring arm being
+worthless** -- it has not been built, so it has not been measured.
+
+**The optimization the numbers suggested is worth nothing, and that is the most
+useful row.** `mul_mod` is `reduce( a ) * reduce( b )` then reduce; the operand
+reductions short-circuit on an already-reduced value but return `x.clone()`, so
+every call copies `k` limbs twice -- and in `pow_mod`'s loop every operand is
+already a residue. An arm skipping both ( `b.reduce( &x.mul( y ) )` ) measures
+**1.00-1.01x at 2048 and 4096 bits**. The copies are `O( k )` against an
+`O( k^2 )` multiply, so they vanish exactly where they were expected to matter.
+An earlier run showed 1.65x at 1024 bits from eight iterations; at sixty it is
+1.11x and unstable, and the honest reading is measurement noise rather than a
+small-modulus effect. **Recorded because it looked obviously right on
+inspection and was not.**
+
+**What this changes**: nothing yet, and deliberately. Windowing is the only arm
+with a measured gain, `MAX_WORK`'s calibration would move by about 1.27x if it
+landed, and none of it has a caller asking for faster modular exponentiation.
+The numbers are here so the next session does not re-derive them.
+
+### Narrow values: inline storage and the arms that make it pay ( 2026-09-25 )
+
+**The question was whether a JIT could speed up 4 to 128-bit arithmetic. The
+measurement said the target was somewhere else.** A `mul` cost 13.3 ns against
+0.55 ns for the native product and was **flat from 4 to 64 bits** -- the cost
+did not depend on the width, so it was not the arithmetic. The breakdown named
+it: one heap allocation was ~6.5 ns, a `mul` was about two of them, `cmp`
+( which allocates nothing ) was 0.9 ns, and the arithmetic itself was ~0.4 ns,
+about 3% of the total. A JIT compiles the 3% and still allocates the result.
+
+**`BigUint` now holds up to two limbs inline**, 128 bits, chosen because that is
+every width that measured flat.
+
+```text
+  bits    before    after    operation           before    after
+     4   13.8 ns   8.3 ns    clone (1 limb)     6.6 ns   0.8 ns*
+     8   13.3      8.3       from_u64           6.5      0.5
+    16   13.3      8.3       mul               13.2      7.0
+    32   13.3      7.1       add               10.7      7.7
+    64   13.2      7.1       cmp                0.9      1.4
+   128   15.5     11.0       mul then add      22.6      8.3
+                             mul, 16 limbs    202.7    192.3
+```
+
+**Inline storage alone was a regression, and that is the part worth carrying
+forward.** With the representation changed and nothing else, `mul` went from
+13.2 ns to **17.5 ns**: the kernels still built a limb vector and then copied it
+inline, paying the allocation *and* the copy. Cheap storage does not remove an
+allocation that something else performs. The saving needed dedicated narrow
+arms -- `u64 x u64` and `u128 x u128` products, and `u128` add and subtract --
+that never form the vector.
+
+**Two further defects the numbers caught, both mine.** `from_limbs_le` takes its
+vector by value; routing it through the copying constructor made every
+heap-sized result pay a second allocation, which showed as a 128-bit multiply
+regressing to 24.3 ns while every narrow width improved. And the first probe
+reported 3.0 ns at four bits, which looked like a win and was
+`0xDEAD..DEF0 & 0xF == 0` -- a multiply by zero hitting an early return.
+
+**The prediction was wrong by about seven times, in the optimistic direction.**
+Before building, this record would have said removing the allocation takes
+`mul` to "roughly 1 ns". It reached 7.0 ns. Allocation was the *largest* cost,
+not the whole one, and what remains is enum dispatch, two 32-byte value moves
+and the narrow-arm checks. **A cost attributed entirely to the one thing that
+was measured will over-promise by whatever was never measured.**
+
+**\* The 0.8 ns clone is not a usable figure ( corrected 2026-09-26 ).** It was
+measured on a local the optimizer could see through, and an inline clone with
+no side effect is eliminable where a `Vec` clone is not -- so the "after" column
+is partly measuring a clone that did not happen. Behind a reference, where it
+cannot be folded, the same one-limb clone measures **7.0 ns**. The `mul` figures
+are sound ( the result is consumed through `black_box` ), but treat the
+allocation-only rows as an upper bound on the improvement rather than a
+measurement of it. **A before/after pair is not comparable when the
+optimization also makes the operation eliminable.**
+
+**`cmp` regressed, 0.9 ns to 1.4 ns**, from the branch `limbs()` now carries.
+Kept because `reduce`'s short circuit calls it about 4 600 times in a 2048-bit
+modular exponentiation, which is 2.3 us against that operation's 6.7 ms.
+Recorded rather than buried: it is a real loss and the argument for it is an
+arithmetic one, not an absence.
+
+**The representation is not observable**, which is the whole safety argument:
+`PartialEq`, `Hash` and `Ord` all read the limb slice and never the variant, so
+a value that spilled to the heap and one that never left the inline arm compare
+and hash alike. A representation leaking into equality would give one number two
+identities -- the defect the canonical form exists to prevent, one level down --
+and `where_the_limbs_live_is_not_observable` is what holds it.
+
+### Fused `Vec[Big]` arithmetic: why not the JIT ( measured 2026-09-26 )
+
+The question was whether `jit.rs` could fuse element-wise big-integer work. The
+measurement says the headroom is real and the JIT is the wrong mechanism, and
+the argument is the JIT's **own admission rule**.
+
+```text
+     n    bits   BigInt ns   native ns    ratio   per element
+    64      64         711          51    14.0x      11.1 ns
+   512      64       4 932         243    20.3x       9.6
+  4096      64      37 128       1 861    19.9x       9.1
+  4096     128     135 461       1 858    72.9x      33.1
+  4096    1024   1 063 242       1 857   572.5x     259.6
+```
+
+**At 64 bits about 95% of an element is value bookkeeping, not arithmetic** --
+`BigInt::mul` is 10.7 ns against 0.42 ns native, and the vector machinery
+( iterator, `collect` ) adds almost nothing on top of the scalar op. So fusion
+has roughly a 20x ceiling on narrow vectors. **At 1024 bits there is no fusion
+headroom at all**: 260 ns per element is a 16-by-16-limb schoolbook multiply
+doing real work, and the native `u64` column is not a meaningful floor for it.
+
+**The JIT cannot amortise here, by its own standard.** `worth_jitting` admits an
+expression only at four or more leaves over many dense bitmap chunks -- it earns
+compilation back across *data volume*, which for a bitmap DAG is unbounded. A
+big-integer vector has a hard ceiling: `MAX_VIEW_SETS` caps arity at 4096, and a
+4096-element zip at 64 bits is **37.5 us** end to end. Cranelift compiling even a
+small function is of that order or more, so a JIT'd kernel would need the *same
+shape* repeated several times merely to break even, against an operator set that
+is 5 binary operations by a few width classes -- about fifteen shapes, all
+statically enumerable. **A static specialization gets the same ceiling with no
+compilation to amortise**, which is the whole reason the bitmap JIT's admission
+test is written the way it is.
+
+**The measurement found a different opportunity than the one it went looking
+for.** `x.magnitude().clone()` costs **7.0 ns** where a directly held
+`BigUint::clone` measures 0.66 ns -- the same type, the same one-limb inline
+value, ten times apart, because the second is a local the optimizer folds away
+and the first is behind a reference it does not. `BigInt::mul` is 10.7 ns
+against `BigUint::mul`'s 7.1 ns for the same magnitudes, so the signed wrapper
+costs about 3.6 ns that the narrow arm underneath it does not.
+
+**If narrow big-integer work is ever worth speeding up, that gap is the cheap
+half and it is not in the JIT**: give `BigInt` the narrow arms `BigUint` has
+rather than reaching them through `from_magnitude`, and stop cloning magnitudes
+behind references. No caller is asking for either yet, which is why this is a
+record and not a change.
+
+### Specialized narrow kernels at 4/8/16/32/64/128 bits ( measured 2026-09-26 )
+
+**The six widths are two kernels, and the measurement is what proves it.** 4, 8,
+16, 32 and 64 bits all occupy one `u64` limb, so they take the same path and
+time identically -- 7.1 ns for `add` at every one of them, before and after this
+work. 128 bits is the two-limb case. **Width does not separate these operations;
+limb count does**, which is why the arms are spelled `to_u64` / `to_u128` and
+not as six cases. Specializing below 64 bits would buy nothing: the hardware
+adds 64-bit registers whatever the value's bit length.
+
+Before and after, ns per operation, best of five passes:
+
+```text
+BigUint            4-32 bits        64 bits         128 bits
+  add            7.2 -> 7.1      7.2 -> 7.1     41.8 -> 9.0
+  sub            7.2 -> 6.5      7.2 -> 6.6     16.4 -> 17.0
+  mul            7.0 -> 7.1      7.0 -> 7.1     12.4 -> 10.6
+  divrem        23.1 -> 7.9     32.8 -> 14.0    85.7 -> 86.9
+
+BigInt ( signed )
+  sub           11.5 -> 10.0    11.4 -> 10.0    45.8 -> 11.3
+  divrem        28.8 -> 10.4    38.9 -> 17.1    89.8 -> 92.3
+```
+
+**Three defects, each invisible to every test because none is a wrong answer.**
+
+**`add`'s 128-bit arm used `checked_add`.** Two operands that each fill 128 bits
+are exactly the pair that carries, so the arm declined precisely at the width it
+was written for and fell through to the generic path -- 41.8 ns, worse than
+`sub` and `mul` on the same operands. `overflowing_add` plus a three-limb
+construction fixes it. The carry case is `2^128`, and the largest non-carrying
+sum is `2^128 - 1`, which needs two halves of the range to reach: `max128 + x`
+carries for every nonzero `x`, a boundary the first draft of the regression test
+got wrong.
+
+**`divrem` had no narrow arm at all**, so a one-limb division ran Algorithm D:
+three allocations ( normalized dividend, normalized divisor, quotient vector )
+to do what one machine divide does. The `divrem` row above is the largest win
+here. **The 128-bit column is not a failure**: that row divides a 256-bit
+dividend, which genuinely needs Knuth. A 128-bit dividend takes the arm.
+
+**`BigInt::sub` was `self.add( &rhs.neg() )`, and `neg` clones the magnitude**
+to flip one bool -- so every signed subtraction allocated a whole second operand
+to discard. Replaced by `add_signed( &magnitude, negative )`, which takes the
+sign as an argument so the negation never exists as a value. `neg` itself still
+costs 6.7 ns and must: it returns an owned value.
+
+**`#[inline]` on the wrappers is load-bearing, not decoration.** The workspace
+sets no LTO, so a caller in another crate -- the expression evaluator is one --
+cannot see through a non-inline function, and an arm the caller cannot see is an
+arm that does not exist for it. Each public kernel is now a small `#[inline]`
+narrow arm over an `#[inline(never)]` generic body, so what duplicates at a call
+site is a register operation and a branch rather than Karatsuba.
+
+### Where a narrow operation's time actually goes
+
+This is the finding that outranks the table, and it was reached by decomposing
+`add` at 64 bits rather than assuming:
+
+```text
+  read both operands     0.68 ns
+  construct one value    0.39 ns
+  add ( whole )          7.11 ns
+  add, result consumed   2.06 ns    <- the same add, folded into a scalar
+```
+
+**About 5 ns of the 7.11 is returning a 32-byte `BigUint` by value and dropping
+it, not arithmetic.** The kernel is ~2 ns. `BigUint` is 32 bytes and carries a
+destructor because of its `Heap` variant, so every result is moved into the
+caller's frame and drop-checked there.
+
+**This is a much better-grounded version of the fused-arithmetic argument than
+the 20x headroom figure recorded above.** It says exactly where a fusion win
+comes from -- not materializing each intermediate -- and sizes it at about 3.5x
+at narrow widths. It also says the mechanism is a static specialization that
+keeps intermediates in registers, not codegen, which agrees with the
+amortisation argument for the same conclusion by a different route.
+
+**Do not quote the `clone` row from any of these runs.** It read 0.65, 1.35 and
+0.77 ns across three runs of the same binary. It is at the noise floor and the
+harness prints a spread warning for exactly this reason.
+
+### SIMD for zip/scale on block views: the arithmetic is 1.4% ( measured 2026-09-26 )
+
+The proposal was a special kernel for `zip` / `scale` over block-backed
+`Vec[Big]`, using SIMD to compute without materializing intermediates. **The
+SIMD kernel works and is not worth building**, and the reason is Amdahl rather
+than anything about SIMD.
+
+**A vertical NEON add does win.** Lane `j` holds constituent `j`, so the carry
+chains are independent -- SIMD across the limbs of one value would be wrong,
+because a carry chain is serial by construction. Two independent values added
+together, ns per pair, against scalar doing both in one call over the same
+buffer:
+
+```text
+   bits  limbs   scalar   neon    ratio
+     64      1      3.2    1.2    2.65x
+    128      2      4.5    2.2    2.08x
+   1024     16     20.6   13.6    1.51x
+   4096     64     77.4   89.3    0.87x
+  16384    256    308.8  480.2    0.64x
+  65536   1024   1218.4 2036.8    0.60x
+```
+
+**The crossover at ~64 limbs is the loop-carried carry dependency.** NEON has no
+carry flag, so each lane costs an add, two compares, an or and a shift where
+AArch64's `ADCS` costs one instruction -- but it does two lanes at once. At short
+lengths the instruction count wins; at long lengths the serial dependency chain
+does, and vector ops have the higher latency. **Two earlier framings of this
+measurement were wrong and are worth not repeating**: comparing one NEON call
+against two scalar calls makes the narrow rows look like a SIMD win that is
+mostly function-call overhead, and a kernel that assembles lanes with
+`vsetq_lane_u64` loses everywhere ( 0.82-1.00x ), so it measures lane assembly
+rather than arithmetic.
+
+**None of that matters, because the arithmetic is not the cost.** A real blocked
+zip, chunk-aligned stride, half density:
+
+```text
+  sets   bits   arith %   view_select %   read_int %
+    64     64      1.5%          34.5%        51.7%
+    64   1024      1.2%           4.7%        79.4%
+  4096     64      1.4%          39.3%        47.4%
+  4096   1024      1.2%           5.8%        77.6%
+```
+
+So a perfect arithmetic kernel is worth **1.2-1.5%** of the operation and the
+measured 2x is worth about 0.7%. **And the data the winning kernel needs does
+not exist anyway**: it wants limb-interleaved operands, which no view layout
+produces -- `Blocked` puts constituents far apart and `Interleaved` interleaves
+*bits*, not limbs.
+
+**There is a second, independent blocker, and it is the more interesting one.**
+SIMD over words needs a `Bitmap` container, the only kind with a word array. A
+blocked constituent's kind by width and density:
+
+```text
+   bits   density=1.0   0.5      0.1
+     64        Run      Array    Array
+   1024        Run      Array    Array
+   4096        Run      Array    Array
+  16384        Run      Bitmap   Array
+  65536        Run      Bitmap   Bitmap
+```
+
+**A fully dense value is a `Run` container at every width**, because a
+contiguous stretch of ones coalesces into one run -- so "all ones" never has
+words either. Words appear only from about 16 384 bits at intermediate density,
+which is exactly where materializing is already negligible. The bands where the
+kernel is possible and the bands where it would pay do not overlap.
+
+### What the exploration found instead: read_int walked runs bit by bit
+
+`read_int` block-transfers a bitmap and, before this, walked an Array **or a
+Run** ordinal by ordinal. A run is a list of intervals, and an interval of set
+bits maps onto whole words of `u64::MAX` with a partial word at each end. Filling
+instead of walking, ns per limb:
+
+```text
+   bits    Run before   Run after   speedup    Bitmap ( for scale )
+     64         137.7        22.6       6.1x
+   1024         108.0         1.7       62x
+   4096         106.0         0.5      226x
+  16384         105.4         0.2      509x                     1.0
+  65536         105.1         0.1      875x                     0.1
+```
+
+**The densest values took the slowest path.** An all-ones integer is the
+simplest bit pattern there is and it was the worst case, at a flat ~105 ns per
+limb independent of width. The run path now matches the bitmap path.
+
+**The lesson is the ordering.** The kernel was proposed for the arithmetic, and
+one measurement of where the time went ( 1.4% arithmetic, 47-79% `read_int` )
+redirected the work to a 62-875x fix requiring no `unsafe`, no SIMD and no new
+public API. **Measure the split before choosing the mechanism** -- the same error
+the JIT exploration made and the same correction.
+
+`view_select` at 34-39% on narrow values is the remaining unexamined term, and
+the module header claims a chunk-aligned blocked view should be "close to free"
+there. That claim has not been checked against a measurement.
+
+### A shared decode buffer for read_int is a regression, and run-to-bitmap promotion is blocked ( 2026-09-26 )
+
+Both were asked for directly. Both were implemented far enough to measure and
+then reverted, which is the useful part of the record.
+
+**A shared word scratch made `read_int` slower at every width.** The facility was
+built the way the house already does it -- thread-local, grown never shrunk, only
+the used prefix cleared, following `ops::nary::Scratch` -- and routed through
+`read_int`:
+
+```text
+   bits   kind      owned vec   shared scratch
+  65536   Run             122              198
+  65536   Bitmap          134              207
+```
+
+**Only the wide rows are quoted, and that is deliberate.** The half-density
+**Array** rows in this harness span **894 to 1247 ns across process runs of the
+same binary** -- a 40% spread, bimodal, evidently allocation-address luck. Three
+samples either side read as a clean 17% regression and it was noise; a later
+"fix" for it that read as restoring the number was also noise. The 65 536-bit
+rows are stable to about +/- 2 ns and are what the conclusion rests on. **Take a
+distribution across process runs before believing a row in this harness.**
+
+**The narrow case is a different story, and the shared buffer was the wrong tool
+for it rather than the wrong idea.** A value of `INLINE_LIMBS` or fewer is held in
+registers, so nothing keeps the buffer it was assembled in -- the
+`vec![0u64; words]` was a malloc and a free of scratch space that was then
+discarded. The fix is a **stack array**, not a thread-local: no allocator, no
+`RefCell`, and the one- or two-word move into inline storage happens either way,
+so avoiding the allocation costs no copy at all. Measured over six process runs,
+with the wide path untouched:
+
+```text
+   bits   kind          before        after
+     64   Run            23-26        14-19
+     64   Array ( .1 )      41           24
+  65536   Run            122-3      122-124   unchanged
+  65536   Bitmap         131-4      132-143   unchanged
+```
+
+**The mechanism for the wide case is that `read_int` returns an owned value.**
+`BigUint::from_limbs_le` takes the vector **by value and moves it** when the
+value stays on the heap, so `vec![0u64; n]` costs one allocation and no copy.
+Filling a shared buffer instead forces `from_slice`, which copies out -- an
+allocation *and* a memcpy, and the wider the value the worse the trade. A shared
+buffer pays only where the buffer is **transient and discarded**; it cannot pay
+where the buffer *becomes* the result.
+
+**`from_limbs_le`'s own doc comment already recorded this**, from the other
+direction and an earlier session: "routing it through the copying path made every
+heap-sized product pay a second allocation, which showed up as a 128-bit multiply
+regressing from 15.5 ns to 24.3 ns while the narrow widths improved." The answer
+was written in the function being edited. **Read the rationale on the constructor
+before changing who owns its buffer.**
+
+The place a shared buffer would pay is [`BitStore::decode_words`], which takes a
+whole `BITMAP_WORDS` vector whenever a shared buffer is unaligned or the host is
+big-endian -- including for `min` and `max`, which read one word and discard
+1 023. That path is rare in practice, because `arrow_buffer` allocations are
+over-aligned and `try_words` therefore succeeds, so it was not pursued. The
+better fix there is for `min` / `max` not to decode 1 024 words at all.
+
+**Automatic run/array to bitmap promotion cannot be an in-place representation
+change.** Three independent blockers, each sufficient:
+
+* **The containers are immutable.** `U16Store::Shared` and `BitStore::Shared` are
+  documented as "immutable, refcounted, possibly aliasing an mmap". That
+  immutability is what makes `Container: 'static + Send + Sync`, which is what
+  lets streams be boxed and sent across threads.
+* **It would break the M0 gate.** `Roaring32::serialize` branches on `c.kind()`
+  to set the run-flag bitset, so changing a container's kind changes the
+  serialized bytes -- and `serialized_bytes_are_identical_to_the_roaring_crate`
+  requires our kind choice to match `roaring`'s for the same data. Byte identity
+  is also what makes `O( container count )` import of `.roaring` files
+  legitimate, so it is not a test to relax.
+* **Containers are shared across snapshots.** Mutating one on read would change
+  what another live snapshot sees.
+
+**The demand-shaped design that *is* safe is a side cache** of decoded words
+keyed by container identity, valid for a snapshot's lifetime, changing no
+representation and no serialized byte. **It would not help the operation that
+prompted it**: in a `zip` or `scale` each constituent is read exactly once, so
+there is no second read to serve from a cache. It would help repeated queries
+over the same chunks, which is a different workload and has not been measured.
+
+**And the demand is mostly gone anyway.** The reason a run container was worth
+promoting was that reading one cost ~105 ns per limb; filling intervals instead
+of walking ordinals brought that to 0.1-1.7 ns per limb, matching the bitmap
+path. **A representation change to reach a speed the existing representation can
+already reach is not worth the invariants it costs.**
+
+One further thing measured and reverted: grouping the array arm's writes by limb,
+on the reasoning that sorted values share a word and the loop paid a
+read-modify-write per value. **No gain, some rows slightly worse** -- the cost is
+`container.iter()`, not the store, and LLVM was already keeping the word live.
+The remaining array cost is ~55-85 ns per limb at half density and is genuinely
+proportional to set bits.
+
+### The array scatter: 4x from scalar changes, and NEON measured at 1.05x ( 2026-09-26 )
+
+Asked to try SIMD on the remaining slow path in the `read_int` harness. The
+answer is that **NEON does not pay**, and that the same harness gave **4x from
+two scalar changes** found while setting up to ask the question properly.
+
+**First the harness had to be fixed.** Timing one set per configuration made the
+half-density Array rows bimodal, 894 to 1247 ns for the same row of the same
+binary -- allocation-address luck, fixed for a process's lifetime, which a
+best-of-five *inside* the process cannot see through. Building nine
+independently allocated sets that coexist, and taking the median, brought every
+row to within 1% of its own min and max. **A before/after on an unstable row is
+not a measurement**, and two conclusions drawn on that row earlier the same day
+were noise.
+
+**`Container::iter` cost 1.4x to 3.5x of the array read.** It wraps the slice
+iterator in an enum, so the array arm paid a discriminant branch per value --
+32 of them per limb at half density. Reading `ArrayContainer::as_slice`
+directly, as `ops::nary` already did, removes it.
+
+**Grouping the writes by limb then paid another ~2x**, because values are sorted
+and a limb's arrive consecutively: a register accumulator and one store per limb
+replaces a load-or-store per value. **This exact change was tried earlier the
+same day and measured as no gain** -- correctly, at the time, because the enum
+dispatch was still there and dominated it. Removing the larger term is what made
+the smaller one visible.
+
+```text
+  bits   density   original   +as_slice   +grouping   total
+    64      0.50         75          53          27    2.8x
+  1024      0.50       1065         583         286    3.7x
+  4096      0.50       4137        2204        1029    4.0x
+  4096      0.10        868         264         243    3.6x
+ 16384      0.10       3345         947         861    3.9x
+```
+
+**Only then is the SIMD question worth asking**, and the answer is no. The
+scalar kernel is now ~0.50 ns per value, about 1.5 cycles. A NEON version that
+accumulates in a vector and folds only at a limb boundary -- the one arrangement
+that does not immediately give the lane count back -- measured against it on one
+65 536-bit chunk:
+
+```text
+  density   values   scalar ns   neon ns   ratio
+     0.50    32768       12867     12210    1.05x
+     0.25    16384        6397      6670    0.96x
+     0.10     6554        2623      4255    0.62x
+     0.05     3277        1372      4327    0.32x
+```
+
+**A wash at best, and it collapses as density falls.** Two structural reasons,
+both inherent rather than fixable by a better kernel: the reduction target is a
+**single 64-bit accumulator**, so lanes must be folded before every store; and
+the limb-boundary test is **data-dependent**, so it cannot be hoisted out of the
+loop. As density drops the values per limb drop with it -- about three at
+density 0.05 -- and the vector fast path stops hitting, leaving the fold
+overhead with nothing to amortise.
+
+**This is the third SIMD-shaped proposal in this file to fail on the same
+property**: a carry chain, a per-element value cost, and now a scatter
+reduction. In each case the arithmetic was not where the time was, and in each
+case the useful result came from measuring the split first. The pattern worth
+carrying: **SIMD wants many independent lanes with no cross-lane reduction, and
+big-integer work keeps supplying the opposite.**
