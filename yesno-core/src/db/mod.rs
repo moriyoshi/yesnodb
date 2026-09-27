@@ -351,6 +351,37 @@ impl Drop for LifecycleGuard {
     }
 }
 
+/// Directories this **process** has opened, ever.
+///
+/// Punching a freed slab must not zero bytes that a `Container` held from an
+/// earlier instance is still reading. A `Container` aliases this process's mapping
+/// and cannot cross a process boundary, so such a container exists only if *this
+/// process* opened this directory before. If it did not, every inherited slab is
+/// punchable. See [`crate::store::alloc::Allocator::allow_punching_inherited_slabs`]
+/// for why the cross-process case is not protected and is not made worse.
+///
+/// Entries are never removed. Once this process has opened a directory, a container
+/// from that open may live as long as the process does, and nothing here can see
+/// whether one still does.
+static OPENED_DIRS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Record `dir` as opened by this process, returning whether it is the first time.
+///
+/// Canonicalized, so two spellings of one directory are one entry. A path that
+/// cannot be canonicalized answers **false**: refusing to punch is the safe
+/// direction and costs only space.
+fn first_open_in_this_process(dir: &std::path::Path) -> bool {
+    let Ok(key) = dir.canonicalize() else {
+        return false;
+    };
+    OPENED_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key)
+}
+
 struct DbInner {
     /// Held for the lifetime of the `Db`; dropping it releases the file lock.
     ///
@@ -1285,6 +1316,21 @@ impl Db {
             for shard in &shards {
                 if let Some(store) = shard.store.as_ref() {
                     store.lock().unwrap().rebuild_allocator_at_open()?;
+                }
+            }
+        }
+
+        // **After the rebuild, because that is what sets the floor and fills the
+        // queue.** `adopt_live_at_open` frees every slab the committed root does
+        // not reach and offers each one, then marks all inherited slabs
+        // unpunchable. If this process has never opened this directory, no
+        // `Container` from an earlier instance can alias them and the offers can
+        // be taken -- which is the difference between 0 bytes and the whole
+        // inherited free pool for a CLI, a restarted daemon, or a compaction.
+        if !read_only && first_open_in_this_process(dir) {
+            for shard in &shards {
+                if let Some(store) = shard.store.as_ref() {
+                    store.lock().unwrap().allow_punching_inherited_slabs();
                 }
             }
         }
@@ -5076,6 +5122,105 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry answers "first open in this process", canonically.
+    #[test]
+    fn the_open_registry_is_canonical_and_answers_once() {
+        let dir = std::env::temp_dir().join(format!("yesno-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            first_open_in_this_process(&dir),
+            "a directory no open has named must answer true"
+        );
+        assert!(!first_open_in_this_process(&dir), "and false thereafter");
+        // Two spellings of one directory must be one entry, or a caller spelling
+        // the path differently would punch slabs an earlier open may alias.
+        assert!(
+            !first_open_in_this_process(&dir.join(".")),
+            "a non-canonical spelling must not answer true"
+        );
+        // Uncanonicalizable answers false: refusing to punch is the safe direction.
+        assert!(
+            !first_open_in_this_process(&dir.join("nope")),
+            "an uncanonicalizable path must answer false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reopen in this process must not punch what it inherited.
+    ///
+    /// The fixture uses a directory no other test names, so the first open is
+    /// naturally the first in this process and the second is not -- no global
+    /// state is touched. An earlier version cleared a process-wide registry to
+    /// simulate a fresh process, which **passed alone and failed in the suite**:
+    /// the registry is global and tests run in parallel, so another test clearing
+    /// it between these two opens made the second one look like a first.
+    ///
+    /// **This is the half of the confinement that is verified.** The other half --
+    /// that a *fresh* process does return the inherited space -- is implemented
+    /// ( `adopt_live_at_open` now offers every slab it frees, and the registry
+    /// lifts `punch_floor` when no `Container` from an earlier in-process instance
+    /// can exist ) but is **not asserted here**, because this fixture does not
+    /// reach the state it needs: `adopt_live_at_open` frees no slab in it, so there
+    /// is nothing to offer. See
+    /// `the-fresh-process-half-of-punching-is-unverified` in `TODO.md`. Asserting
+    /// it on a fixture that cannot produce the state would be a test that passes
+    /// for the wrong reason.
+    #[test]
+    fn a_reopen_in_this_process_does_not_punch_inherited_slabs() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("yesno-pf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blocks = || -> u64 {
+            std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("shard-"))
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.blocks())
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        let opts = || DbOptions {
+            shards: 1,
+            ..Default::default()
+        };
+        let ords: Vec<u64> = (0..40u64)
+            .flat_map(|c| (0..5_000u64).map(move |i| c * 65_536 + i * 13))
+            .collect();
+
+        {
+            let db = Db::open_with(&dir, opts()).unwrap();
+            for k in 0..24u64 {
+                db.insert_many(k, &ords).unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+        let peak = blocks();
+        assert!(peak > 4 * 1024 * 1024 / 512, "fixture too small: {peak}");
+
+        // Delete everything and drain. Slabs do empty here -- instrumentation
+        // showed five offered -- and every one must be refused, because a
+        // `Container` from the first open may alias any of them.
+        {
+            let db = Db::open_with(&dir, opts()).unwrap();
+            let mut b = db.batch();
+            for k in 0..24u64 {
+                b.delete_key(k);
+            }
+            b.commit().unwrap();
+            for _ in 0..8 {
+                db.checkpoint().unwrap();
+            }
+        }
+        assert_eq!(
+            blocks(),
+            peak,
+            "a reopen in this process must return nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A write through the **real** write path evicts no verified region,
     /// however many keys share a page.

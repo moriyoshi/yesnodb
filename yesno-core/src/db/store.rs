@@ -510,6 +510,13 @@ impl ShardStore {
         self.read_container(cref)
     }
 
+    /// Let punching reach slabs inherited at open. See
+    /// [`crate::store::alloc::Allocator::allow_punching_inherited_slabs`] for the
+    /// proof the caller owes.
+    pub(crate) fn allow_punching_inherited_slabs(&mut self) {
+        self.alloc.allow_punching_inherited_slabs();
+    }
+
     /// Free deferred extents whose three conditions have all been met.
     ///
     /// Kept here rather than in `Db::checkpoint` because it needs a **split

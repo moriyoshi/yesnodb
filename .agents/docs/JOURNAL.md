@@ -5950,3 +5950,65 @@ it to the consumer as working. **An implementation that does not move the number
 was built to move is not a partial win to keep.** The finding is the deliverable:
 the answer to their question is "yes, and it does not help, because `Opaque` gets
 there first."
+
+## 2026-09-27 -- Asked to do a format change that had shipped two weeks earlier
+
+Asked to persist slab occupancy into the reserved `SLAB_META` region. **It was
+done on 2026-09-13.** `store/slabmeta.rs` writes it, `ShardStore::open` reads it
+back, and `Allocator::restore` falls back to `Opaque` only for a block that is
+missing or torn. The consumer confirmed it on real files independently: inherited
+slabs come back `InUse` **with their class**, which an `Opaque` slab could not
+report.
+
+**How I got it wrong, and it is the worst instance of this week's pattern.**
+`SlabState::Opaque`'s doc said "slab classes are not persisted yet ( the
+`SLAB_META` region is reserved and unwritten )". `ARCHITECTURE.md` said the same
+and named an `Allocator::reopened` constructor **deleted on 2026-09-06**. I read
+both and treated their agreement as corroboration.
+
+**But `ARCHITECTURE.md` also said the opposite, four lines earlier** -- "Slab
+occupancy is persisted in the region each slab reserves ( `store/slabmeta.rs` )".
+Both sentences were in my first grep of that file. I followed one and did not
+resolve the contradiction, told a downstream maintainer that inherited slabs are
+dead weight because occupancy is not persisted, and filed a format change for
+shipped work. `slabmeta.rs`'s own header had said "the bug is fixed by *this file
+existing*" the entire time.
+
+**Two stale claims agreeing is not corroboration when one was copied from the
+other**, and a document that contradicts itself is telling you at least one of its
+sentences is false -- which is a reason to check the code, not to pick a side.
+Both are corrected, with the correction recorded in place rather than the sentence
+quietly swapped.
+
+### The real gap, which the consumer located precisely
+
+`adopt_live_at_open` set `slab.state = SlabState::Free` **without**
+`self.punchable.push( id )`, so a slab emptied across a close became *reusable*
+and never punchable. They measured 69 slabs and 2 125 extents returning to the
+free pool at reopen with **nothing** reaching the filesystem. It pushes now, and
+`Db::open_with` lifts `punch_floor` when a process-wide registry proves no
+`Container` from an earlier in-process instance can exist. **No format change.**
+
+### Only half of it is verified, and the entry says so
+
+**Verified**: a reopen in this process refuses every inherited slab --
+instrumentation showed five offered and all five correctly refused -- and
+`zero_copy_mvcc` still passes. **Not verified**: that a fresh process returns that
+space. No fixture here reaches the state: at the next open `adopt_live_at_open`
+frees nothing, because a slab's `Free` state is persisted only by a checkpoint
+*after* the one whose reclaim emptied it, and `reclaim_deferred` runs on the
+**dirty** checkpoint path only. Filed as
+`the-fresh-process-half-of-punching-is-unverified` with those two facts, so the
+next session does not re-derive them.
+
+**I did not assert it anyway.** A fixture that cannot produce the state would pass
+for the wrong reason, and this session has already shipped one test that did
+exactly that -- the punch-offset sabotage an end-to-end cycle could not see.
+
+**And my own test had a shared-state bug worth recording.** It cleared a
+process-wide registry to simulate a fresh process, **passed alone and failed in
+the suite**: the registry is global and tests run in parallel, so another test
+clearing it between two opens made the second look like a first. The seam is
+deleted; each test now uses a directory no other test names, which needs no global
+mutation at all. **A test seam that mutates process-wide state is a test that
+depends on execution order**, and the suite is where that shows.

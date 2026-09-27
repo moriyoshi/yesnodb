@@ -77,11 +77,23 @@ pub enum SlabState {
         class: u8,
         gen: u32,
     },
-    /// Existed before this process opened the shard, contents unknown.
+    /// Existed before this process opened the shard, and its metadata block was
+    /// **missing or torn**, so its contents are unknown.
     ///
-    /// Slab classes are not persisted yet ( the `SLAB_META` region is reserved
-    /// and unwritten ), so a reopened shard cannot tell which slots in an
-    /// existing slab are live. It must therefore treat them all as live:
+    /// **This is the exception now, not the rule** ( corrected 2026-09-27 ). This
+    /// doc used to say slab classes "are not persisted yet ( the `SLAB_META`
+    /// region is reserved and unwritten )", which stopped being true when
+    /// [`crate::store::slabmeta`] landed on 2026-09-13: the open path reads each
+    /// slab's header and [`Allocator::restore`] falls back to `Opaque` only when
+    /// `slabmeta::decode` returns `None`. A consumer's probe confirmed it on real
+    /// files -- inherited slabs come back `InUse` with their class, which an
+    /// `Opaque` slab could not report.
+    ///
+    /// The stale sentence cost real work: it was read as current, cross-checked
+    /// against an equally stale line in `ARCHITECTURE.md`, and a format change
+    /// was filed for something that had shipped two weeks earlier.
+    ///
+    /// Where it does apply, an unknown slab must be treated as **entirely live**:
     /// allocating into one would write over extents the current root still
     /// points at.
     ///
@@ -689,6 +701,16 @@ impl Allocator {
             if slab.used_count == 0 {
                 slab.state = SlabState::Free;
                 self.retire_from_active(id);
+                // **Offer it, which `free_now` does and this did not.** A slab
+                // freed here is one the committed root does not reach, and at open
+                // there are no readers, no deferred queue and no previous root --
+                // which is exactly why this map is trusted in the first place.
+                // Without the push, a slab emptied across a close became
+                // *reusable* and never punchable: a consumer measured 69 slabs and
+                // 2 125 extents returning to the free pool at reopen with
+                // **nothing** reaching the filesystem. `punch_floor` above still
+                // decides whether the offer is taken.
+                self.punchable.push(id);
             }
         }
         reclaimed
@@ -915,6 +937,28 @@ impl Allocator {
             // live snapshot can reach any byte of this slab.
             self.punchable.push(id);
         }
+    }
+
+    /// Allow punching slabs inherited at open, because no `Container` in this
+    /// process can alias them.
+    ///
+    /// # Why the in-process case is the only one worth protecting
+    ///
+    /// A `Container` aliases *this process's* mapping and cannot cross a process
+    /// boundary, so one that punching could disturb must have come from a `Db`
+    /// this process opened. The cross-process case is **already unavailable** and
+    /// not made worse: `flock` releases when a `Db` drops, so another process can
+    /// open and **reuse** the same slots, overwriting a retained container's bytes
+    /// whatever punching does. Confining the punch therefore buys that container
+    /// nothing while costing every reopening workload everything -- a consumer
+    /// measured 8.35 MB returned within one open and **zero** across a cycle that
+    /// reopens, because a CLI, a restarted daemon and each compaction inherit all
+    /// of it.
+    ///
+    /// The caller owes the proof. `Db::open_with` gets it from a process-wide
+    /// registry of directories this process has opened.
+    pub fn allow_punching_inherited_slabs(&mut self) {
+        self.punch_floor = 0;
     }
 
     /// Take the file ranges of slabs that have become free since the last call.
