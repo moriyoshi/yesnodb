@@ -6042,3 +6042,41 @@ the right party close it.
 0** and `./scripts/gate-pg.sh` **passed, exit 0**, both against `03cd5a3` -- which
 is the commit the consumer archived and measured, so their 26.82 MB and this
 tree's gates describe the same code.
+
+### Asked to delete the stale `persist-slab-metadata` entry: it never existed
+
+`git log -S "persist-slab-metadata" -- .agents/docs/TODO.md` returns **nothing**.
+The slug was never an entry. Its only occurrence anywhere was the
+`ARCHITECTURE.md` sentence corrected earlier today, which pointed at a backlog
+item that was never filed -- so the deletion asked for had already happened when
+that sentence was rewritten, and there is nothing left to remove.
+
+**The interesting part is why no gate ever saw it**, and it was measured rather
+than assumed. `scripts/check-todo-refs.py` scans `SEARCH_GLOBS` -- source, tests,
+benches, `scripts/`, `e2e/` -- and **not `.agents/docs/**`**; its own failure text
+says "cited **from source**". Verified by planting a fake slug: appended to
+`ARCHITECTURE.md` it passes cleanly, appended to `yesno-core/src/lib.rs` it is
+reported `UNRECORDED`. **A citation inside the agent docs is unchecked**, which is
+how a pointer to a nonexistent entry sat in the file agents read as current.
+
+**Blast radius, measured before proposing anything**: counting a slug as defined
+when it is a `- [ ] **slug**` heading, 26 slugs cited under `.agents/docs/` appear
+neither as an entry nor in any other file -- `TODO.md` 11, **`ARCHITECTURE.md` 4**,
+LTM 5, `TESTING.md` 2, `QUALITY_GATE.md` 1, `JOURNAL.md` 2.
+
+**Filed rather than fixed, for a reason that is itself the finding.** Two of the 26
+are mine from today, in `JOURNAL.md`, naming entries this tree deliberately
+withdrew -- and that is **correct** for an append-only record, which has to be able
+to say what a removed entry was called. So extending the checker would flag honest
+history, and a check that flags honest history is noise. The source-side check has
+a zero baseline precisely because it only asks something that is always wrong when
+it fails. Extending it needs a decision about what a citation means in a historical
+record first.
+
+Two smaller facts worth keeping: extending the **scan** alone would be vacuous,
+because resolution is `slug not in corpus` over every agent-doc file concatenated,
+so a slug cited inside that corpus resolves against its own occurrence -- scan and
+rule have to change together. And my first attempt to measure the blast radius
+reported 46, because it counted every self-contained `TODO.md` entry as dangling:
+**a slug's own entry heading is its definition**, and a rule that does not know
+that measures the wrong thing.
