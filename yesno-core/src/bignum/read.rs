@@ -555,3 +555,170 @@ mod run_fill_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod prime_bit_tests {
+    //! Primes as bit patterns, because they are adversarial for exactly the
+    //! paths this module chooses between.
+    //!
+    //! A **Mersenne** prime is `2^p - 1`: every bit set, which coalesces into one
+    //! run and takes the interval fill. Any **other** prime is odd and otherwise
+    //! structureless, so it lands in an array or a bitmap depending on its width
+    //! and gives the masking and normalization paths a pattern with no runs to
+    //! hide an off-by-one in. And a prime is never a power of two, so its top
+    //! bit is set with lower bits still in play -- the case a round number
+    //! cannot produce.
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// `2^p - 1` for a Mersenne exponent: all ones, and therefore one run.
+    fn mersenne(p: u64) -> BigUint {
+        let full = (p / 64) as usize;
+        let mut limbs = vec![u64::MAX; full];
+        if !p.is_multiple_of(64) {
+            limbs.push((1u64 << (p % 64)) - 1);
+        }
+        BigUint::from_limbs_le(limbs)
+    }
+
+    /// The Mersenne exponents that fit comfortably in a test.
+    const MERSENNE_EXPONENTS: [u64; 9] = [2, 3, 5, 7, 13, 17, 19, 31, 61];
+
+    /// Primes wide enough to cross limbs, as little-endian limb lists.
+    ///
+    /// `2^89 - 1` and `2^107 - 1` are Mersenne primes spanning two limbs;
+    /// `2^64 + 13` and `2^127 - 1` pin the limb seam from either side.
+    fn wide_primes() -> Vec<(&'static str, BigUint)> {
+        vec![
+            ("2^61 - 1", mersenne(61)),
+            ("2^89 - 1", mersenne(89)),
+            ("2^107 - 1", mersenne(107)),
+            ("2^127 - 1", mersenne(127)),
+            ("2^64 + 13", BigUint::from_limbs_le(vec![13, 1])),
+            ("2^64 - 59", BigUint::from_u64(u64::MAX - 58)),
+            // 18446744073709551557 is the largest prime below 2^64.
+            (
+                "largest u64 prime",
+                BigUint::from_u64(18_446_744_073_709_551_557),
+            ),
+        ]
+    }
+
+    /// A prime survives the set round trip, and a Mersenne one really is a run.
+    ///
+    /// `from_int` then `read_int` is the identity, and the representation it
+    /// passes through is asserted rather than assumed -- an all-ones value that
+    /// silently became a bitmap would still round-trip and would stop testing
+    /// the interval fill.
+    #[test]
+    fn a_prime_round_trips_through_a_set_and_a_mersenne_one_is_a_run() {
+        use crate::ContainerKind;
+        for p in MERSENNE_EXPONENTS {
+            let v = mersenne(p);
+            assert_eq!(v.bit_len(), p, "2^{p} - 1 must be exactly {p} bits");
+            let s = OrdSet::from_int(&v).expect("a prime is a representable value");
+            assert_eq!(s.len(), p, "all {p} bits are set");
+            // A run only wins from five bits up: below that the `OPT_GAIN`
+            // margin declines it, so `2^2 - 1` and `2^3 - 1` are arrays. That is
+            // the size-class policy behaving, not an exception to it -- and
+            // asserting the boundary is what keeps the run arm covered above it
+            // and the array arm covered below.
+            let kinds: Vec<ContainerKind> = s.chunks().map(|(_, c)| c.kind()).collect();
+            let want = if p >= 5 {
+                ContainerKind::Run
+            } else {
+                ContainerKind::Array
+            };
+            assert_eq!(kinds, vec![want], "2^{p} - 1 at {p} bits");
+            assert_eq!(s.read_int(p), v, "2^{p} - 1 round trip");
+            // And a wider read finds nothing above the value.
+            assert_eq!(s.read_int(p + 64), v, "2^{p} - 1 read wide");
+        }
+        for (name, v) in wide_primes() {
+            let s = OrdSet::from_int(&v).expect("representable");
+            assert_eq!(s.read_int(v.bit_len()), v, "{name} round trip");
+            assert!(s.read_int(v.bit_len()).is_normalized(), "{name}");
+        }
+    }
+
+    /// Reading a prime narrower than itself is the value modulo `2^w`.
+    ///
+    /// Truncation is the only write rule that agrees with the reader, which is
+    /// what the module header argues; this checks it on values whose low bits are
+    /// not all ones and not all zeros.
+    #[test]
+    fn a_narrow_read_of_a_prime_is_the_prime_modulo_two_to_the_width() {
+        for (name, v) in wide_primes() {
+            let s = OrdSet::from_int(&v).expect("representable");
+            for w in [1u64, 7, 63, 64, 65, 89, 127, 128] {
+                let got = s.read_int(w);
+                assert_eq!(got, v.truncate(w), "{name} at width {w}");
+                assert!(got.bit_len() <= w, "{name} at width {w} exceeded it");
+                // The truncated value agrees with the bits one at a time.
+                for i in 0..w.min(v.bit_len()) {
+                    assert_eq!(got.bit(i), v.bit(i), "{name} bit {i} at width {w}");
+                }
+            }
+        }
+    }
+
+    /// The set of prime *ordinals* is a sparse, structureless array container.
+    ///
+    /// The transpose of the tests above: instead of a prime as a value, the
+    /// primes below a bound as the *positions* of set bits. That is an array
+    /// container with no runs, which is the arm the blocked scatter serves, and
+    /// its value is checked against the bits one at a time.
+    #[test]
+    fn the_primes_below_a_bound_read_as_the_integer_their_bits_denote() {
+        use crate::ContainerKind;
+        let bound = 5_000u64;
+        let mut sieve = vec![true; bound as usize];
+        sieve[0] = false;
+        sieve[1] = false;
+        let mut i = 2usize;
+        while i * i < bound as usize {
+            if sieve[i] {
+                let mut j = i * i;
+                while j < bound as usize {
+                    sieve[j] = false;
+                    j += i;
+                }
+            }
+            i += 1;
+        }
+        let primes: Vec<u64> = (0..bound).filter(|&n| sieve[n as usize]).collect();
+        assert_eq!(primes.len(), 669, "pi(5000) is 669");
+
+        let s = OrdSet::from_int(
+            &primes
+                .iter()
+                .fold(BigUint::zero(), |acc, &p| acc.add(&BigUint::one().shl(p))),
+        )
+        .expect("representable");
+        assert_eq!(s.len(), primes.len() as u64);
+        let kinds: Vec<ContainerKind> = s.chunks().map(|(_, c)| c.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![ContainerKind::Array],
+            "669 scattered ordinals must be an array, or the scatter arm is untested"
+        );
+
+        // Every bit, both directions, against the sieve.
+        let v = s.read_int(bound);
+        let want: BTreeSet<u64> = primes.iter().copied().collect();
+        for n in 0..bound {
+            assert_eq!(v.bit(n), want.contains(&n), "bit {n}");
+        }
+        assert_eq!(v.bit_len(), primes.last().copied().unwrap() + 1);
+
+        // And a narrow read is the primes below that width, not a prefix of the
+        // limbs -- the case a width that is not a multiple of 64 decides.
+        for w in [2u64, 3, 100, 1000, 4093] {
+            let narrow = s.read_int(w);
+            for n in 0..w {
+                assert_eq!(narrow.bit(n), want.contains(&n), "bit {n} at width {w}");
+            }
+            assert!(!narrow.bit(w), "nothing at or above {w}");
+        }
+    }
+}

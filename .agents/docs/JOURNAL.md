@@ -5415,7 +5415,12 @@ Committed `f36ccbf` guarded the arm on `sets % 64 == 0 && sets <= BITMAP_WORDS`.
 **That is not sufficient.** `sets / 64` words per logical ordinal only partitions
 a chunk when it divides `BITMAP_WORDS`: at `sets = 192`, `1024 / 3` truncates to
 341, so the logical ordinal straddling the chunk boundary was **dropped**. The
-arm fired and returned a set missing logical 1023.
+arm fired and returned a set missing logical 1023. **( Corrected later the same
+day: that is the smallest case, not the failure -- a truncated
+`logicals_per_chunk` also shifts `output_base_bit` for every later chunk, so the
+consumer's differential found `Any` short by up to four and `Parity` wrong in
+both directions, inventing members as well as losing them. See the addendum
+below. )**
 
 **Every test used a power of two, where "multiple of 64" and "tiles a chunk" are
 the same condition.** The declining list I wrote checked 2, 4, 8, 16, 32, 96 and
@@ -5439,3 +5444,53 @@ which are correct.
 It also cost nothing to find. The test that caught it is four lines over four
 arities, and I only wrote it because the follow-up question "does this generalise
 to 16 and 32" made me re-read the guard and notice it admitted 192.
+
+### Corrections and a fix from the consumer's measurement ( 2026-09-27 )
+
+`haiiie-a6` ran the arm against its real index and found two things, one a
+correction to my record and one a design flaw in what I wrote.
+
+**My description of the `sets = 192` bug understated it, and they are right to
+say so.** I wrote that the arm "returned a set missing one element". Their
+differential against `f36ccbf` found **22 mismatches across all eleven
+non-power-of-two widths**, and the failure was worse than loss: `Any` was short
+by up to **four** elements ( 640: 510 against 512 ), and `Parity` was wrong in
+**both directions** -- five widths returned **extra** members ( 576: 303 against
+281 ) and six returned fewer. A truncated `logicals_per_chunk` does not merely
+drop the straddling ordinal; it shifts `output_base_bit` for every later chunk,
+so bits land on the wrong logical ordinals. **"Missing one element" describes the
+smallest case I happened to look at, not the failure.**
+
+**The whole-call gate was wrong, and their number makes the case.** The arm
+required *every* container in the set to be a bitmap. Their binary index is 4 096
+bitmaps and got 287 ms -> 2.57 ms at `sets = 256`. Their residual index is **757
+bitmaps and one array** -- a partial final chunk of 1 762 bits -- and that single
+container sent the entire fold back to the per-bit walk: 51 ms, unchanged. As
+they point out, that is not a quirk of their fixture: any index whose document
+count leaves a short tail, or where deletes thin a chunk below `ARRAY_MAX`, has at
+least one array container, **so on a live mutable index the gate would rarely let
+the arm run at all.**
+
+Now per chunk. A chunk with words takes the popcount path, one without takes the
+ordinal walk, and both write into the same accumulator. Measured here on eight
+dense chunks plus one sparse array tail: **0.05-0.07 ns per set bit against
+0.04-0.06 for the all-bitmap case**, where before the whole call would have run
+at ~1.76. A new test builds exactly that mixed shape and asserts both container
+kinds are present, so it cannot silently become a single-path test.
+
+**And I lifted the shape of their differential, because it is the test my own
+lesson called for and I had not written.** `every_multiple_of_64_agrees_with_the_definition`
+walks every multiple of 64 from 64 to 1024 against the counted definition, over
+data with both a dense and a sparse region. Sabotaging the divisibility guard
+back to `if false` reddens it -- so the domain-derived test catches by **answers**
+what the guard-derived lists could not catch at all. I had written down that the
+values must come from the domain rather than from the predicate, and then filed a
+regression test that checked the guard's shape again; a consumer wrote the test I
+had argued for.
+
+**Their measurement also inverts a `view_count` closure figure rather than
+weakening it.** The walk proxy at 2.57 ms is now *faster* than their inverted
+path at 4.12 ms, where it had been ~72x slower. The closure still stands on its
+other reason -- the data is local, the co-located scorer popcounts the same bits,
+and there is no caller -- and they say so themselves. Recorded so the number is
+not restated in either direction without a re-measurement.

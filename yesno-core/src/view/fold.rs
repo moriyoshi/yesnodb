@@ -892,19 +892,12 @@ impl OrdSet {
         // chunk boundary is dropped and the fold silently loses it. The first
         // version of this arm checked only `n % 64 == 0`, and every test used a
         // power of two, where the two conditions coincide.
-        if BITMAP_WORDS % (n / 64) as usize != 0 {
+        if !BITMAP_WORDS.is_multiple_of((n / 64) as usize) {
             return None;
         }
         if self.is_empty() {
             return Some(OrdSet::new());
         }
-        if self
-            .chunks()
-            .any(|(_, c)| crate::unstable_arrow::bitmap_words(c).is_none())
-        {
-            return None;
-        }
-
         let words_per_logical = (n / 64) as usize;
         let logicals_per_chunk = BITMAP_WORDS / words_per_logical;
         let mut chunks = Vec::new();
@@ -929,20 +922,54 @@ impl OrdSet {
                 current_prefix = Some(output_prefix);
                 cardinality = 0;
             }
-            let words = crate::unstable_arrow::bitmap_words(container)
-                .expect("the preflight checked every bitmap payload");
             // Where this chunk's logical ordinals start inside the output chunk.
             let output_base_bit = (prefix % n) as usize * logicals_per_chunk;
-            for j in 0..logicals_per_chunk {
-                let lo = j * words_per_logical;
-                let count: u32 = words[lo..lo + words_per_logical]
-                    .iter()
-                    .map(|w| w.count_ones())
-                    .sum();
-                if reduce.keep(u64::from(count), n) {
+            let mut emit = |j: usize, count: u64| {
+                if reduce.keep(count, n) {
                     let bit = output_base_bit + j;
                     output_words[bit / 64] |= 1u64 << (bit % 64);
                     cardinality += 1;
+                }
+            };
+            // **Per chunk, not per call.** Requiring every container in the set
+            // to be a bitmap switched this arm off for an entire index whenever
+            // one chunk was not: a consumer measured a 758-chunk key with 757
+            // bitmaps and a single array tail falling back completely, 51 ms
+            // against the 2.57 ms its all-bitmap sibling got. A short final
+            // chunk, or deletes thinning any chunk below `ARRAY_MAX`, is enough
+            // -- so on a live index the all-or-nothing gate would rarely let the
+            // arm run at all. A chunk without words takes the ordinal walk and
+            // writes into the same accumulator.
+            match crate::unstable_arrow::bitmap_words(container) {
+                Some(words) => {
+                    for j in 0..logicals_per_chunk {
+                        let lo = j * words_per_logical;
+                        let count: u32 = words[lo..lo + words_per_logical]
+                            .iter()
+                            .map(|w| w.count_ones())
+                            .sum();
+                        emit(j, u64::from(count));
+                    }
+                }
+                None => {
+                    // `sets` divides `CHUNK_CARD`, so `low / sets` is this
+                    // chunk's own logical index and cannot leave its range.
+                    let mut cur = usize::MAX;
+                    let mut count = 0u64;
+                    for low in container.iter() {
+                        let j = (u64::from(low) / n) as usize;
+                        if j != cur {
+                            if cur != usize::MAX {
+                                emit(cur, count);
+                            }
+                            cur = j;
+                            count = 0;
+                        }
+                        count += 1;
+                    }
+                    if cur != usize::MAX {
+                        emit(cur, count);
+                    }
                 }
             }
         }
@@ -1644,13 +1671,15 @@ mod wide_fold_tests {
         assert!(s
             .fold_interleaved_wide_words(&View::blocked(256, 1 << 16), Reduce::Any)
             .is_none());
-        // An array container has no word view, so the arm declines.
+        // An array container no longer declines: it takes the ordinal walk
+        // inside the same arm, so a mixed index keeps the word path on the
+        // chunks that have words.
         let sparse = build(&[0, 5, 9, 100_000]);
         assert!(
             sparse
                 .fold_interleaved_wide_words(&View::interleaved(256), Reduce::Any)
-                .is_none(),
-            "a non-bitmap payload must decline rather than expect words"
+                .is_some(),
+            "a non-bitmap payload is handled per chunk, not declined"
         );
     }
 
@@ -1775,6 +1804,77 @@ mod wide_fold_tests {
                     .iter()
                     .collect();
                 assert_eq!(got, want, "sets = {sets} (fires: {fires}), {reduce:?}");
+            }
+        }
+    }
+
+    /// A **mixed** index: many bitmap chunks and one array tail.
+    ///
+    /// This is the shape a live index actually has -- a short final chunk, or
+    /// deletes thinning one below `ARRAY_MAX` -- and under the original
+    /// whole-call gate a single such chunk sent the entire fold back to the
+    /// per-bit walk. A consumer measured 51 ms against 2.57 ms for its
+    /// all-bitmap sibling on exactly this shape.
+    #[test]
+    fn a_bitmap_index_with_one_array_tail_still_folds_correctly() {
+        let c = u64::from(crate::CHUNK_CARD);
+        for sets in [64u64, 256, 1024] {
+            // Three dense chunks, then a sparse tail chunk that stays an array.
+            let mut ords: Vec<u64> = (0..3 * c).step_by(2).collect();
+            ords.extend((0..400u64).map(|i| 3 * c + i * 7));
+            let s = build(&ords);
+            let kinds: Vec<_> = s.chunks().map(|(_, x)| x.kind()).collect();
+            assert!(
+                kinds.contains(&crate::ContainerKind::Array),
+                "the fixture must have an array chunk at sets = {sets}, got {kinds:?}"
+            );
+            assert!(
+                kinds.contains(&crate::ContainerKind::Bitmap),
+                "and a bitmap chunk, or it tests only one path"
+            );
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets as u32), Reduce::Any)
+                    .is_some(),
+                "the arm must handle a mixed index at sets = {sets}"
+            );
+            let hi = ords.iter().copied().max().unwrap() / sets + 2;
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let want = oracle(&s, sets, reduce, hi);
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "mixed index at sets = {sets}, {reduce:?}");
+            }
+        }
+    }
+
+    /// Every multiple of 64 up to 1024, against the definition.
+    ///
+    /// **The values come from the domain, not from the guard.** The firing and
+    /// declining lists elsewhere in this module were both drawn from the shape of
+    /// the condition being tested, so neither contained a multiple of 64 that is
+    /// not a power of two -- which is exactly where the first version of this arm
+    /// was wrong. A consumer running this same comparison against that commit
+    /// found 22 mismatches at all eleven such widths: `Any` short by up to four
+    /// elements and `Parity` wrong in **both** directions, inventing members as
+    /// well as losing them.
+    #[test]
+    fn every_multiple_of_64_agrees_with_the_definition() {
+        let c = u64::from(crate::CHUNK_CARD);
+        // Dense so the word path runs, plus a sparse tail so the walk does too.
+        let mut ords: Vec<u64> = (0..2 * c).step_by(2).collect();
+        ords.extend((0..300u64).map(|i| 2 * c + i * 11));
+        let s = build(&ords);
+        let hi = ords.iter().copied().max().unwrap();
+        for sets in (64..=1024).step_by(64).map(|x| x as u64) {
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let want = oracle(&s, sets, reduce, hi / sets + 2);
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "sets = {sets}, {reduce:?}");
             }
         }
     }
