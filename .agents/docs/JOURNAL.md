@@ -5601,3 +5601,80 @@ The domain differential now runs every multiple of 64 up to `MAX_VIEW_SETS`
 rather than stopping at 1 024, and the firing list asserts all of
 64 / 128 / 256 / 512 / 1024 / 2048 / 4096. Re-imposing the deleted bound reddens
 it, as does dropping the divisibility guard.
+
+**And the three arms' boundaries were then checked rather than assumed.** With a
+scalar bit-field arm in hand, the question is whether it should also take 2, 4 and
+8 and retire the byte table and its NEON / SSE code. Measured by disabling
+`fold_interleaved_bitmaps`: the table wins **4.3x / 4.1x / 4.1x** at 2 / 4 / 8,
+and the two tie at **16**, which is exactly where the sub-word arm begins. At
+`sets = 2` a word holds 32 logical ordinals, so the bit-field form does 32
+shift-mask-popcount triples per word against 8 table lookups -- the narrower the
+constituent, the more a table amortises.
+
+**The boundary was picked from the structure and the measurement puts it in the
+same place**, which is what makes the three-arm split a design rather than three
+accidents. It also sharpens `simd-arms-without-a-crate-level-case` in the
+direction *opposite* to that entry's thesis: its own figures are `ops::mixed` at
+1.00x and `ops::run` at 1.10x, while the fold's vector arms are 4.1x-4.3x.
+**"SIMD in this crate is unproven" is true of two `ops` arms and false of the
+fold's**, and the entry now says so.
+
+**The probe is deleted, and I had kept it on a justification I never checked.**
+Its README said it was retained as the harness for "the open array-to-bitmap
+question in `TODO.md`". **There is no such item.** The array-to-bitmap question was
+settled in conversation -- blocked by immutable shared payloads and by the
+byte-identity gate, and then largely dissolved when the run interval fill removed
+the demand for promotion -- and was never filed. So the probe had been sitting
+there for a day on a pointer to nothing, which is the same error as copying a
+stale "Outstanding" line into the backlog: **a justification written down is not a
+justification verified.** All six of its binaries' findings are in
+`LTM/packed-lenses-matrix-bignum-and-views.md` with their constructions, checked
+by grep before deleting rather than assumed, so rebuilding any of them is cheap.
+
+**Verification for the top-end fix.** `./scripts/gate.sh` **passed, exit 0** and
+`./scripts/gate-pg.sh` **passed, exit 0**, both against `094c757`.
+
+## 2026-09-27 -- Reclassifying unbounded growth under delete churn as a defect
+
+`haiiie`'s maintainer asked, through `haiiie-a6`, that unbounded disk growth under
+scattered deletes be moved from "intended, document it" to an open defect. **Filed
+as one, and the source chain was verified here link by link before accepting it.**
+Entry: `scattered-deletes-reclaim-nothing-with-default-options`.
+
+**The chain holds.** A slab recycles only at `used_count == 0`
+( `store/alloc.rs:623`, `:836` ); the write path twice and deliberately refuses to
+scavenge partly-used slabs, saying "that is the compactor's job" ( `:452`, `:502` );
+and scattered deletes leave every slab partly live, so nothing ever drains.
+
+**One sharpening, and it makes this much smaller than the report framed it.**
+There is no separate compactor, and the job those comments assign is
+**evacuation** -- which exists and is correctly wired. `evacuation_candidates`
+selects `used_count > 0 && live_fraction() < COMPACT_LIVE_FRACTION`, exactly the
+slabs scattered deletes create, and `Db::checkpoint` calls it at
+`db/mod.rs:2848`. **The next line is `.take( evacuate_per_checkpoint )`, and that
+defaults to 0.** So every checkpoint computes the candidates and throws them away.
+**This is a defect in a default, not an absent component.**
+
+**And `EVACUATE_PER_CHECKPOINT`'s own doc reserved itself for this case**: kept
+behind the knob because "every measurement so far uses uniform key sizes and
+round-robin churn; a skewed corpus may yet show a case for it", with "do not raise
+this default without a measurement that shows a benefit". Scattered deletes over
+bitmap chunks are that corpus, and the bar is the right one.
+
+**What changed my classification was the argument, not the numbers.** The only
+consumer-side remedy is rebuilding into a fresh directory, which presupposes
+owning the directory -- so a multi-namespace server or a remote client has no
+workaround, and one namespace's churn permanently inflates files everyone shares.
+That is an operational liability rather than a documented property.
+
+**Asked for a sweep at 0 / 1 / 2 / 4 / 8, and for `Db::evacuated_chunks()`
+alongside the byte counts.** That counter is the part that decides what the defect
+*is*: if it stays 0 at non-zero settings, the fault is in candidate selection
+rather than in the throttle, and a flat byte curve alone cannot tell those apart.
+**Two repairs that look identical in the headline metric want opposite code**, so
+the diagnostic goes in the request rather than into a later re-run.
+
+Their measured totals are recorded as theirs and explicitly not reproduced here,
+and their derived split is labelled derived. Their two exclusions are kept in the
+entry because they stop the next reader chasing `SpaceAmpPolicy`, which governs
+bytes pinned by open snapshots and is irrelevant with no long-lived readers.

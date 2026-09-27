@@ -1439,3 +1439,38 @@ The full per-set-bit curve, with every arity a view can name:
 
 **Monotone from 8 onward and with no hole anywhere.** At the start of the day
 everything above 8 read 1.7-2.0.
+
+### The three arms' boundaries are measured, not assumed ( 2026-09-27 )
+
+Having written the sub-word arm, the obvious question is whether it should also
+take 2, 4 and 8 and retire the byte table and its NEON / SSE code. Measured by
+disabling `fold_interleaved_bitmaps` so the scalar bit-field arm takes those
+widths, same fixture, `Any` in ns:
+
+```text
+  sets   scalar bit-field   table + SIMD   SIMD wins by
+     2            424 436         98 348          4.3x
+     4            212 087         51 316          4.1x
+     8            106 813         26 327          4.1x
+    16             54 851         55 291          0.99x
+```
+
+**The table and its vector arms earn their place by about 4x, and the crossover
+sits exactly at 16** -- where the two formulations tie, and where the sub-word arm
+in fact begins. The boundary was chosen from the structure ( a logical ordinal
+fits in a byte, in a word, or spans words ) and the measurement puts it in the
+same place, which is the outcome that makes the three-arm split a design rather
+than three accidents.
+
+The reason is that at `sets = 2` a word holds **32** logical ordinals, so the
+bit-field formulation does 32 shift-mask-popcount triples per word where the table
+does 8 lookups. The narrower the constituent, the more the per-field overhead
+multiplies, and the more a table amortises.
+
+**This also sharpens `simd-arms-without-a-crate-level-case`, in the direction
+opposite to that entry's thesis.** That entry's measured figures are `ops::mixed`
+at **1.00x** and `ops::run` at **1.10x** -- arms that are correct but not shown to
+pay. `view::fold`'s vector arms are **not** in that category: 4.1x-4.3x against
+the best scalar formulation available for the same widths, measured the same way
+by alternating builds. **"SIMD in this crate is unproven" is not a crate-level
+claim; it is true of two `ops` arms and false of the fold's.**
