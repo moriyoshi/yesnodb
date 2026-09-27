@@ -5323,3 +5323,60 @@ prints status, and the tree was verified intact against `HEAD` afterwards -- but
 `CLAUDE.md` forbids the command outright because another agent may share the
 checkout, and "it happened to be harmless" is not the standard. Recorded rather
 than left out.
+
+## 2026-09-27 -- The wide interleaved fold, and a caution of mine that was wrong
+
+Looked into the `wide-interleaved-folds-fall-off-the-fast-path` item, filed
+yesterday from `haiiie-a6`. **Landed: `fold_interleaved_wide_words`, 31x at
+`sets` 64, 46x at 256, 127x at 1024.** Tables and reasoning in
+`LTM/packed-lenses-matrix-bignum-and-views.md`.
+
+**The consumer's observation was right and it inverts the intuition.**
+`fold_table` covers `sets` of 2, 4 and 8, and `fold_interleaved_bitmaps` is
+gated on it, so every wider arity fell to the per-bit walk. But a `sets` that is
+a multiple of 64 is the **easy** case: at `sets = 2` a logical ordinal's bits sit
+inside one word and must be shuffled out, while at 256 it spans four *whole*
+words and its population is a sum of `count_ones`. No shuffle, no table, no
+vector instruction -- the new arm is scalar. Wide is now cheaper per set bit than
+narrow: 0.01-0.06 against 0.10-0.38.
+
+**I filed a caution with this item and it was wrong.** It said part of the
+measured 2.1 ns per bit was the `Container::iter` enum dispatch, citing the
+1.4x-3.5x measured in `read_int`'s array arm the day before, and told the next
+session to try a scalar pass before any kernel. I tried it first, as filed:
+specializing the container kind and replacing `/ self.sets` with a shift for
+power-of-two arities measured **no change at all**, 1.74-1.78 against
+1.76-1.77. Reverted.
+
+The reason is worth keeping: the dispatch tax is real for an **array** payload,
+where `iter` yields one value per step, and these payloads are **bitmaps**, where
+`iter` already scans words and the per-bit cost is bit extraction. **A measured
+cost does not transfer to another call site just because the same function
+appears in both.** The ordering advice in the caution was still right -- split
+before choosing a mechanism -- it was the specific term I predicted that did not
+exist.
+
+**Verification found a hole that matters more than the speedup.** No test in the
+tree exercised a wide interleaved fold at all, so the 44 passing `view` tests
+were no evidence for a new arm. Four tests now compare against the definition --
+count each logical ordinal's slots and reduce -- across three arities, all three
+reduces and six shapes including chunk seams. Sabotaging the per-chunk bit
+offset, the word span per logical, and the cardinality each reddened them.
+
+**Sabotaging `output_prefix` to a constant `0` did not.** At `sets = 256` it
+takes 256 input chunks to fill one output chunk, so a fixture of two or three
+adjacent chunks maps entirely into output chunk 0 and `prefix / n` is
+indistinguishable from `0`. A fixture with chunks at prefix 0 and prefix `sets`
+closes it. **When an addressing term only matters at a scale the fixtures do not
+reach, the fixtures agree with any value of it** -- and that is a different
+failure from an untested branch, because the branch *is* executed and simply
+cannot disagree.
+
+One more self-correction along the way: the first version of that spanning test
+asserted the far span was non-empty for all three reduces. At half density the
+far span holds 32 of 64 slots, so `All` keeps nothing and an even count makes
+`Parity` keep nothing either. My own guard assertion caught my own bad
+assertion, which is the argument for writing the guard.
+
+`sets` of 16 and 32 stay on the per-bit walk: too wide for the byte table, not a
+multiple of 64, and a third structure would be needed. Nothing has asked.

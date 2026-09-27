@@ -738,6 +738,9 @@ impl OrdSet {
         if let Some(out) = self.fold_interleaved_bitmaps(v, reduce) {
             return out;
         }
+        if let Some(out) = self.fold_interleaved_wide_words(v, reduce) {
+            return out;
+        }
         if let Some(out) = self.fold_interleaved(v, reduce) {
             return out;
         }
@@ -839,6 +842,97 @@ impl OrdSet {
                 let shift = (word_index % n) * (64 / n);
                 output_words[output_index] |= folded << shift;
                 cardinality += folded.count_ones();
+            }
+        }
+        if let Some(prefix) = current_prefix {
+            if cardinality != 0 {
+                chunks.push((
+                    prefix,
+                    Container::Bitmap(BitmapContainer::from_words(output_words, cardinality)),
+                ));
+            }
+        }
+        let mut out = OrdSet::from_chunks(chunks);
+        out.optimize();
+        Some(out)
+    }
+
+    /// The **wide** interleaved arm: whole words per logical ordinal.
+    ///
+    /// `fold_table` and [`fold_words_simd`] handle `sets` of 2, 4 and 8, where
+    /// several logical ordinals share one word and the work is a sub-word
+    /// shuffle. **A `sets` that is a multiple of 64 is the opposite and simpler
+    /// case**: one logical ordinal spans `sets / 64` *whole* words, so its
+    /// population is a sum of `count_ones` with no shuffle, no table and no
+    /// vector instruction. The hard case was solved and this one was not,
+    /// because it only appears at widths nothing exercised.
+    ///
+    /// Declines unless the layout is interleaved, `sets` is a multiple of 64 and
+    /// at most [`BITMAP_WORDS`] words worth of constituents ( so one input chunk
+    /// yields at least one output bit ), and every container is a bitmap whose
+    /// payload can be read as words.
+    ///
+    /// The output addressing is deliberately the same as the narrow arm's:
+    /// `prefix / sets` names the output chunk and `( prefix % sets ) *
+    /// ( BITMAP_WORDS / sets )` its first word, because `logical = physical /
+    /// sets` makes both arms the same relabel seen from two directions.
+    fn fold_interleaved_wide_words(&self, v: &View, reduce: Reduce) -> Option<OrdSet> {
+        if v.layout() != ViewLayout::Interleaved {
+            return None;
+        }
+        let n = u64::from(v.sets());
+        if n % 64 != 0 || n > BITMAP_WORDS as u64 {
+            return None;
+        }
+        if self.is_empty() {
+            return Some(OrdSet::new());
+        }
+        if self
+            .chunks()
+            .any(|(_, c)| crate::unstable_arrow::bitmap_words(c).is_none())
+        {
+            return None;
+        }
+
+        let words_per_logical = (n / 64) as usize;
+        let logicals_per_chunk = BITMAP_WORDS / words_per_logical;
+        let mut chunks = Vec::new();
+        let mut current_prefix = None;
+        let mut output_words = vec![0u64; BITMAP_WORDS];
+        let mut cardinality = 0u32;
+
+        for (prefix, container) in self.chunks() {
+            let output_prefix = prefix / n;
+            if current_prefix != Some(output_prefix) {
+                if let Some(old) = current_prefix {
+                    if cardinality != 0 {
+                        let words = std::mem::replace(&mut output_words, vec![0; BITMAP_WORDS]);
+                        chunks.push((
+                            old,
+                            Container::Bitmap(BitmapContainer::from_words(words, cardinality)),
+                        ));
+                    } else {
+                        output_words.fill(0);
+                    }
+                }
+                current_prefix = Some(output_prefix);
+                cardinality = 0;
+            }
+            let words = crate::unstable_arrow::bitmap_words(container)
+                .expect("the preflight checked every bitmap payload");
+            // Where this chunk's logical ordinals start inside the output chunk.
+            let output_base_bit = (prefix % n) as usize * logicals_per_chunk;
+            for j in 0..logicals_per_chunk {
+                let lo = j * words_per_logical;
+                let count: u32 = words[lo..lo + words_per_logical]
+                    .iter()
+                    .map(|w| w.count_ones())
+                    .sum();
+                if reduce.keep(u64::from(count), n) {
+                    let bit = output_base_bit + j;
+                    output_words[bit / 64] |= 1u64 << (bit % 64);
+                    cardinality += 1;
+                }
             }
         }
         if let Some(prefix) = current_prefix {
@@ -1475,5 +1569,189 @@ mod tests {
         let s = OrdSet::from_iter_unsorted([1u64, 2]);
         assert!(s.view_fold(&bad, Reduce::Any).is_empty());
         assert!(s.view_expand(&bad).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wide_fold_tests {
+    use super::*;
+    use crate::OrdSet;
+    use std::collections::BTreeSet;
+
+    /// Count how many constituents hold each logical ordinal, from scratch.
+    ///
+    /// The oracle is deliberately the definition rather than another arm of the
+    /// implementation: constituent `i` of logical `x` is physical `x * sets + i`,
+    /// so this asks `contains` once per slot and reduces the count itself.
+    fn oracle(set: &OrdSet, sets: u64, reduce: Reduce, logical_hi: u64) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        for x in 0..logical_hi {
+            let count = (0..sets).filter(|i| set.contains(x * sets + i)).count() as u64;
+            if count > 0 && reduce.keep(count, sets) {
+                out.insert(x);
+            }
+        }
+        out
+    }
+
+    fn build(ords: &[u64]) -> OrdSet {
+        let mut v = ords.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        let mut s = OrdSet::from_sorted_slice(&v);
+        s.optimize();
+        s
+    }
+
+    /// The wide arm must fire, or every assertion below is about the old path.
+    #[test]
+    fn the_wide_arm_fires_where_it_claims_to_and_declines_elsewhere() {
+        // Dense enough over whole chunks that every container is a bitmap.
+        let ords: Vec<u64> = (0..3 * u64::from(crate::CHUNK_CARD)).step_by(2).collect();
+        let s = build(&ords);
+        assert!(
+            s.chunks()
+                .all(|(_, c)| crate::unstable_arrow::bitmap_words(c).is_some()),
+            "the fixture must be all bitmaps or the arm declines for the wrong reason"
+        );
+        for sets in [64u32, 128, 256, 512, 1024] {
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets), Reduce::Any)
+                    .is_some(),
+                "the arm must fire at sets = {sets}"
+            );
+        }
+        // Not a multiple of 64, so the narrow arms or the generic walk answer.
+        for sets in [2u32, 4, 8, 16, 32, 96, 2048] {
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets), Reduce::Any)
+                    .is_none(),
+                "the arm must decline at sets = {sets}"
+            );
+        }
+        // Blocked is a different relabel and this arm must not claim it.
+        assert!(s
+            .fold_interleaved_wide_words(&View::blocked(256, 1 << 16), Reduce::Any)
+            .is_none());
+        // An array container has no word view, so the arm declines.
+        let sparse = build(&[0, 5, 9, 100_000]);
+        assert!(
+            sparse
+                .fold_interleaved_wide_words(&View::interleaved(256), Reduce::Any)
+                .is_none(),
+            "a non-bitmap payload must decline rather than expect words"
+        );
+    }
+
+    /// The wide arm agrees with the definition, across arities and reduces.
+    #[test]
+    fn a_wide_interleaved_fold_agrees_with_a_counted_oracle() {
+        let c = u64::from(crate::CHUNK_CARD);
+        let shapes: Vec<(&str, Vec<u64>)> = vec![
+            // Half density over three chunks: bitmaps, and every logical held.
+            ("half density", (0..3 * c).step_by(2).collect()),
+            // Every bit: All must keep everything.
+            ("all bits", (0..2 * c).collect()),
+            // One slot of one logical ordinal, at a chunk seam.
+            ("one bit at a seam", vec![c]),
+            // The last slot of the last logical of a chunk, and the first of the
+            // next -- the addressing that `output_base_bit` gets wrong if the
+            // per-chunk offset is dropped.
+            ("across a seam", vec![c - 1, c, c + 1, 2 * c - 1, 2 * c]),
+            // A whole logical ordinal set, so All keeps exactly it.
+            ("one full logical", (256..512).collect()),
+            // Odd counts, to separate Parity from Any.
+            ("odd counts", (0..3 * c).step_by(3).collect()),
+        ];
+        for sets in [64u64, 256, 1024] {
+            for (name, ords) in &shapes {
+                let s = build(ords);
+                let hi = ords.iter().copied().max().unwrap_or(0) / sets + 2;
+                for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                    let want = oracle(&s, sets, reduce, hi);
+                    let got: BTreeSet<u64> = s
+                        .view_fold(&View::interleaved(sets as u32), reduce)
+                        .iter()
+                        .collect();
+                    assert_eq!(got, want, "{name} at sets = {sets}, {reduce:?}");
+                }
+            }
+        }
+    }
+
+    /// Two input chunks far enough apart to land in **different output
+    /// chunks**, which is the only thing that pins `output_prefix`.
+    ///
+    /// At `sets = 256` it takes 256 input chunks to fill one output chunk, so a
+    /// fixture of two or three adjacent chunks maps entirely into output chunk 0
+    /// and `prefix / n` is indistinguishable from `0`. Replacing it with `0`
+    /// passed every other test here, which is exactly why this one exists.
+    #[test]
+    fn input_chunks_that_span_output_chunks_land_in_the_right_one() {
+        let c = u64::from(crate::CHUNK_CARD);
+        for sets in [64u64, 256] {
+            // One dense chunk at prefix 0, one at prefix `sets`, so the second
+            // belongs to output chunk 1 and the first to output chunk 0.
+            let far = sets * c;
+            let mut ords: Vec<u64> = (0..c).step_by(2).collect();
+            ords.extend((far..far + c).step_by(2));
+            let s = build(&ords);
+            assert!(
+                s.chunks()
+                    .all(|(_, x)| crate::unstable_arrow::bitmap_words(x).is_some()),
+                "both chunks must be bitmaps at sets = {sets}"
+            );
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets as u32), Reduce::Any)
+                    .is_some(),
+                "the arm must fire at sets = {sets}"
+            );
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                // Two disjoint logical spans, checked against the definition on
+                // each rather than over the whole 16M-ordinal gap between them.
+                let mut want = oracle(&s, sets, reduce, c / sets);
+                let lo = far / sets;
+                for x in lo..lo + c / sets {
+                    let count = (0..sets).filter(|i| s.contains(x * sets + i)).count() as u64;
+                    if count > 0 && reduce.keep(count, sets) {
+                        want.insert(x);
+                    }
+                }
+                assert_eq!(got, want, "two output chunks at sets = {sets}, {reduce:?}");
+                // Only `Any` is guaranteed to keep anything in the far span:
+                // half the slots are set, so `All` keeps nothing and an even
+                // count makes `Parity` keep nothing either. Asserting reach for
+                // all three was wrong, and the guard caught it.
+                if reduce == Reduce::Any {
+                    assert!(
+                        want.iter().any(|&x| x >= lo),
+                        "the fixture must reach the second output chunk at sets = {sets}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the arm declines, the answer must still be right -- so a decline is
+    /// a fallback and never a wrong answer.
+    #[test]
+    fn declining_arities_still_answer_correctly() {
+        let c = u64::from(crate::CHUNK_CARD);
+        let s = build(&(0..2 * c).step_by(2).collect::<Vec<_>>());
+        for sets in [16u64, 32, 96] {
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let hi = 2 * c / sets + 2;
+                let want = oracle(&s, sets, reduce, hi);
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "declining sets = {sets}, {reduce:?}");
+            }
+        }
     }
 }

@@ -1290,3 +1290,66 @@ reduction. In each case the arithmetic was not where the time was, and in each
 case the useful result came from measuring the split first. The pattern worth
 carrying: **SIMD wants many independent lanes with no cross-lane reduction, and
 big-integer work keeps supplying the opposite.**
+
+### The wide interleaved fold: 31x to 127x, and it wanted no SIMD ( 2026-09-27 )
+
+A consumer observed that a `sets` which is a multiple of 64 looks like the
+**easy** case for word-parallelism rather than the hard one. It is, and the
+existing arms had solved only the hard one.
+
+`fold_table` covers `sets` of 2, 4 and 8, and the whole
+`fold_interleaved_bitmaps` arm is gated on it -- so every wider arity fell to
+`fold_interleaved`, which walks every set bit. Measured over 8 dense chunks,
+262 144 set bits, ns per set bit:
+
+```text
+  sets      before      after
+     2        0.38       0.38      table plus a vector arm
+     4        0.19       0.19
+     8        0.10       0.10
+    16        1.99       1.99      still declines: not a multiple of 64
+    64        1.76       0.06      31x
+   256        1.77       0.04      46x
+  1024        1.72       0.01      127x
+```
+
+**Wide is now cheaper per bit than narrow** ( 0.01-0.06 against 0.10-0.38 ),
+which is the consumer's point measured: at `sets = 2` a logical ordinal's bits
+sit inside one word and have to be shuffled out, while at `sets = 256` a logical
+ordinal spans **four whole words**, so its population is a sum of `count_ones`
+with no shuffle, no table, and no vector instruction. **The hard case was solved
+and the easy one was not, because the easy one only appears at widths nothing
+exercised.**
+
+The output addressing is deliberately identical to the narrow arm's --
+`prefix / sets` names the output chunk, `( prefix % sets ) * ( BITMAP_WORDS /
+sets )` its first word -- because `logical = physical / sets` makes both arms the
+same relabel seen from opposite directions.
+
+**The caution filed with this item was wrong, and that is worth more than the
+speedup.** It said part of the 2.1 ns per bit was the `Container::iter` enum
+dispatch, measured at 1.4x-3.5x in `read_int`'s array arm the day before, and
+that a scalar pass should be tried first. Tried first, as filed: specializing
+the container kind and replacing `/ self.sets` with a shift for power-of-two
+arities measured **no change at all** ( 1.74-1.78 against 1.76-1.77 ). The
+dispatch tax is real for an **array** payload, where `iter` yields one value per
+step; these payloads are **bitmaps**, where `iter` already scans words and the
+per-bit cost is bit extraction. **A measured cost does not transfer to another
+call site just because the same function appears in both.**
+
+**Verification, and a coverage hole worth remembering.** No test in the tree
+exercised a wide interleaved fold at all, so the 44 passing `view` tests were no
+evidence. Four new tests compare against the definition -- count the slots of
+each logical ordinal and reduce -- across arities, all three reduces, and six
+shapes including chunk seams. Sabotaging the per-chunk bit offset, the word span
+per logical, and the cardinality each reddened them. **Sabotaging
+`output_prefix` to a constant `0` did not**, because at `sets = 256` it takes 256
+input chunks to fill one output chunk and every fixture of two or three adjacent
+chunks maps entirely into output chunk 0. A fixture with chunks at prefix 0 and
+prefix `sets` closes it. **When an addressing term only matters at a scale the
+fixtures do not reach, the fixtures agree with any value of it.**
+
+`sets` of 16 and 32 remain on the per-bit walk: too wide for the byte table, not
+a multiple of 64. Nothing has asked for them, and they would need a third
+structure ( several logicals per word, but more than 8 constituents ), so they
+are left alone deliberately.
