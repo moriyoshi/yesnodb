@@ -109,6 +109,7 @@ NOT_SLUGS: set[str] = {
     "aws-sdk-ssm",
     "rt-multi-thread",
     "x86-64-unknown-linux-gnu",
+    "yesno-aws-cleanup",
     "yesno-operator-e2e",
     "yesno-snapshot-agent",
     "yesno-snapshot-stage",

@@ -971,7 +971,7 @@ resolution reached the numeric filter.
   block-in-the-host trick applies to Flight, and the other two are synchronous
   and cheaper still. The runner **fails loudly** on `ResolveFutures` rather than
   ignoring it, so if a verb ever does need to suspend the interpreter the gap
-  will be visible rather than silent. See `e2e-network-verbs` in `JOURNAL.md` ( closed ).
+  will be visible rather than silent. ( This used to cite a closed `JOURNAL.md` entry that is not there; the reasoning is the sentence above it. )
 * **A disk-lazy leaf.** `q_key` materializes the key through `Snapshot::load`;
   the tree above it is genuinely lazy, but the leaf is not, because the public
   API has no lazy leaf.

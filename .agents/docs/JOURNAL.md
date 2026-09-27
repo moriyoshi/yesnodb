@@ -6127,3 +6127,42 @@ entry that was later withdrawn.
 cited, 0 baselined** with no `UNRECORDED` line, where before this it reported clean
 while five source citations resolved only against `ARCHITECTURE.md`'s own broken
 pointers.
+
+## 2026-09-28 -- Triaging the dangling citations: 22 became 2
+
+Read all 22 remaining dangling doc-internal citations instead of treating the
+count as a backlog. **The actionable number was 2**, both now fixed, and the
+sweep's figure was over-counting by an order of magnitude.
+
+* **Genuine dangles in standing documents: 2.** One in `QUALITY_GATE.md`, one in
+  `TESTING.md`, both the same shape as ARCHITECTURE.md's four -- a sentence that
+  states its reasoning, then a pointer to a `JOURNAL.md` entry that is not there.
+  Restated and dropped.
+* **Deliberate historical naming: about 9.** Five in LTM, two in `JOURNAL.md`, at
+  least two in `TODO.md`. They read "the historical X slug is closed", "is a
+  closed, false claim", "absorbed X". **These are correct and must not be
+  "fixed"**: a durable record has to be able to name an entry that was withdrawn,
+  and a check that flagged them would be flagging honest history.
+* **A false positive: 1.** `yesno-aws-cleanup` is a **real binary** in
+  `yesno-e2e/src/bin/`, used by `e2e/aws/gate.py` as `CLEANUP_COMMAND`. My probe's
+  kebab-case pattern cannot tell an artifact name from a backlog slug -- which is
+  exactly why the checker carries a `NOT_SLUGS` list with three other `yesno-*`
+  names in it. Added there.
+* **`TODO.md` cross-references: about 10**, mixed between real "see X" pointers and
+  honest "closed by X" history, and low value either way: a backlog entry citing a
+  closed sibling misleads nobody the way a standing document does.
+
+**And the entry I filed was the complement of one that already existed.**
+`dangling-backlog-citations`, closed 2026-09-14, did exactly this for the **source**
+side -- 25 found, 9 non-slugs, 16 genuine, baseline driven to zero. It is where
+`NOT_SLUGS` and the empty `BASELINE` come from. I had not looked, and the entry now
+cites it. **Two entries on the same defect in different scopes want a stated
+relationship**, or the second reads as a duplicate and gets closed as one.
+
+**The reusable part is what a raw count is worth.** 26, then 22, then 2. The
+difference is entirely in reading the citations rather than counting them, and
+every step of the reduction was a category error of mine: a pattern that cannot
+distinguish an artifact name from a slug, a rule that treats an entry heading as a
+citation, and a measurement that treats "named as history" as "dangling". **A
+sweep's number is a hypothesis about a category, and the category is the part worth
+checking.**
