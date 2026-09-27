@@ -121,6 +121,18 @@ fn validate_stream_chunk(
 /// both directions**, because a constituent is then a whole number of chunks and
 /// extracting it is a prefix relabel with the container payloads shared rather
 /// than rebuilt. That is the case [`crate::OrdSet::view_select`] specialises.
+///
+/// **"Close to free" is about the relabel, not about the call, and the
+/// difference is most of the cost ( measured 2026-09-27 ).** The relabel really
+/// does move no bits -- the payload clone is a refcount bump, verified by
+/// `Container::is_shared` -- but `view_select` returns an owned `OrdSet`, and
+/// allocating and freeing that set's two vectors is about **80%** of what it
+/// costs: 53 ns per constituent against `view_cardinality`'s 10 ns over the same
+/// chunks, and **flat in the constituent's width** ( the same 54 ns at 64 bits
+/// and at 65 536 ). So the cheap direction is cheap in the payload and not in
+/// the call, and a caller extracting many constituents pays per constituent
+/// whatever their size. `view_cardinality` and `view_contains` are the members
+/// of this family that answer without materializing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ViewLayout {
     /// Constituent `i`'s logical ordinal `x` sits at `x * sets + i`.

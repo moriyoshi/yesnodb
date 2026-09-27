@@ -361,6 +361,13 @@ impl OrdSet {
     }
 
     /// Number of prefixes in `[lo, hi)` that are `< prefix`. Backs galloping seek.
+    ///
+    /// **The answer is relative to `lo`, not an absolute chunk index.** It
+    /// partitions the slice `prefixes[lo..hi]`, so a caller passing a nonzero
+    /// `lo` must add `lo` back. Every caller today passes `lo = 0`, where the
+    /// two coincide, which is why nothing has needed this sentence -- and why
+    /// the first caller to pass a nonzero `lo` selected a short run of chunks
+    /// and reddened four `view::select` tests.
     #[inline]
     pub fn partition_point_in(&self, lo: usize, hi: usize, prefix: Prefix48) -> usize {
         let hi = hi.min(self.prefixes.len());

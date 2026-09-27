@@ -5274,3 +5274,52 @@ against the committed tree ( `9870a93` ): **`gate-pg passed`, exit 0**. Recorded
 because the first sentence was true when written and would have read as covering
 the final state, which is the way a verification claim goes stale fastest -- it
 is accurate about a tree that no longer exists.
+
+## 2026-09-27 -- view_select: the specialisation was fine, the premise was mine
+
+Looked into the `view_select` item filed yesterday, which asked whether
+`view/mod.rs`'s "close to free in both directions" disagrees with a measurement
+putting it at 34-39% of a blocked zip. **The specialisation is present and
+correct; the premise was wrong; the diff is two comments.** Full record in
+`TODO.md` under the now-closed entry.
+
+* **The deep-copy hypothesis was wrong.** I opened the item suspecting
+  `Container::clone` deep-copies a `Mut` payload, since the arm's doc claims a
+  refcount bump unconditionally while `Container`'s own doc says "O(1) **for
+  shared payloads**". But `is_shared()` is already true for an in-memory set
+  built by `from_sorted_slice` plus `optimize`, and freezing first changes
+  nothing ( 1.00x-1.05x over six shapes ). The relabel moves no bits.
+* **80% of the cost is materializing the returned set.** `view_cardinality`
+  touches the same chunks and builds nothing: 10-17 ns against `view_select`'s
+  53-68 ns, **flat in the constituent's width** -- 54 ns at 64 bits and at
+  65 536 alike.
+* **Cutting three allocations to two is unmeasurable**: 53 ns against 52. The
+  malloc/free pair is the cost, not how many. Reverted, with the `pub(crate)`
+  constructor it needed.
+* **And my premise was measured on a construction, not on the code.** The
+  34-39% came from a probe spelled `view_select( .. ).read_int( .. )`, and
+  `VecBigExpr::Map` does not do that -- it uses
+  `lower_vec_at( .. ).collect_set()`. `view_select`'s real callers are the
+  Bool-map and fold paths. **This is the migrated-fixture error in a probe**: a
+  measurement that asserts about its own construction.
+
+**The reverted change looked like a 3.5x win and was wrong.**
+`OrdSet::partition_point_in` answers **relative to its `lo`**, and every caller
+today passes `lo = 0`, where relative and absolute coincide. My second call did
+not add `start` back, so it selected a short run of chunks and built near-empty
+sets -- fast, and wrong. Four `view::select` tests caught it, and that is the
+only reason the number was not reported. **A speedup that arrives with failing
+tests is a correctness bug until proven otherwise**, and the size of the
+"speedup" was proportional to how much work it skipped.
+
+Both comments that landed are about traps rather than behaviour: `view/mod.rs`
+now separates "cheap in the payload" from "cheap in the call", and
+`partition_point_in` now states the relative-index contract that its single
+`lo = 0` caller had made invisible.
+
+**Process note, and it is not a good one.** I typed a bare `git checkout` in a
+shell command during the revert. With no pathspec it restores nothing and only
+prints status, and the tree was verified intact against `HEAD` afterwards -- but
+`CLAUDE.md` forbids the command outright because another agent may share the
+checkout, and "it happened to be harmless" is not the standard. Recorded rather
+than left out.
