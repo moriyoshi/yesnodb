@@ -6166,3 +6166,46 @@ distinguish an artifact name from a slug, a rule that treats an entry heading as
 citation, and a measurement that treats "named as history" as "dangling". **A
 sweep's number is a hypothesis about a category, and the category is the part worth
 checking.**
+
+## 2026-09-28 -- Why evacuation never fires: the trigger, not the threshold
+
+Set out to check whether punching changed evacuation's economics, since the sweep
+that set `EVACUATE_PER_CHECKPOINT = 0` ran against an allocator that could not
+return space. **Found the reason every `evacuated_chunks = 0` measured here and
+downstream was zero, and it is neither the default nor the threshold.**
+
+**`Db::checkpoint` computes `evacuation_candidates` only on the dirty path.** A
+shard with no dirty work takes the clean branch, which flips the superblock and
+calls `reclaim_deferred` -- freeing slots, emptying slabs, punching them -- and then
+`continue`s, **skipping evacuation entirely**. So a slab becomes sparse on the path
+that cannot evacuate it, and the path that can only runs while new writes arrive.
+With `RECLAIM_CKPT_DELAY` = 2, a delete's slots are not free until two checkpoints
+later, and in a delete-then-quiesce workload those are idle.
+
+**I finally built the fixture I had been missing, and it still evacuated nothing.**
+Keeping only 10% of the keys, so survivors spread across every slab and each one is
+genuinely partly live, gives zero at thresholds 0.40 through 0.90 and at
+`evacuate_per_checkpoint` 0 through 16. Instrumenting the candidate walk showed it
+runs **twice** in the whole run -- the two dirty checkpoints -- with every slab at
+`live_fraction` **1.00** at both moments. **The fixture was right and the timing
+was wrong**, which no amount of tuning the predicate would have revealed.
+
+So `COMPACT_LIVE_FRACTION` is **unreachable, not miscalibrated**, and its
+annotation now says that instead of "unexercised". Evacuation fires only when new
+writes arrive at a moment when a slab is *already* sparse -- the single case a
+consumer reproduced, reopen plus refill on a compacted store.
+
+**Filed rather than fixed, because the fix is a decision with a real cost.** The
+clean branch is deliberately gated on `deferred_count() > 0` so "a genuinely
+quiescent database stays silent", and evacuation writes far more than a superblock
+flip: it rewrites live chunks. Evaluating it there unconditionally would make a
+quiescent database do background write amplification, which is exactly what that
+gate prevents. The shape that keeps both is to evaluate candidates on the clean
+path **at the moment the deferred queue drains** -- when sparsity appears -- still
+bounded by a default of 0. Nothing is broken today because of that default.
+
+**The method note is the one I keep relearning in new forms.** Three records of
+mine named this constant as the next thing to fix, each time from reading the
+selection predicate. The predicate was correct at every reading. What was wrong was
+**when it is consulted**, which no amount of reading a condition can show -- only
+asking how often it runs, and what the world looks like at those moments.

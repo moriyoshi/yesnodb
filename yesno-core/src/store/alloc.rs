@@ -354,11 +354,29 @@ pub const RECLAIM_CKPT_DELAY: u64 = 2;
 /// sawtoothing between 6.95 and 8.76 MB with a 1.75 MB drop every sixth cycle as
 /// slabs drain and are punched. Bounded and periodic, with no evacuation at all.
 ///
-/// **So do not change this on the model alone.** A workload that *does* produce a
-/// partly live slab needs a slab holding chunks from several keys where only some
-/// are touched, and neither this tree's probes nor the consumer's reproduced that.
-/// Until one does, the value is arbitrary within the flat part of its own curve,
-/// and the sweep above is what a *non*-finding looks like.
+/// # And on 2026-09-28 the reason was found, and it is not this constant
+///
+/// A fixture keeping only a fraction of its keys -- so surviving chunks spread
+/// across every slab and each one is genuinely partly live -- still evacuates
+/// nothing, at any threshold up to 0.90 and any `evacuate_per_checkpoint` up to
+/// 16. Instrumenting [`Allocator::evacuation_candidates`] shows why: it is called
+/// **twice** in the whole run, on the two *dirty* checkpoints, and at both moments
+/// the slabs read `live_fraction` **1.00**.
+///
+/// **Reclamation and evacuation are on different checkpoint paths.** A shard with
+/// no dirty work takes the clean branch in `Db::checkpoint`, which flips the
+/// superblock and calls `reclaim_deferred` -- freeing slots, emptying slabs,
+/// punching them -- and then `continue`s, **skipping evacuation entirely**. So
+/// sparsity appears on the path that cannot act on it, and the path that can only
+/// runs while new writes arrive. With `RECLAIM_CKPT_DELAY` = 2, a delete's slots
+/// are not free until two checkpoints later, which in a delete-then-quiesce
+/// workload are idle.
+///
+/// **So the threshold is not what excludes candidates; the trigger's placement
+/// is.** This constant is **unreachable, not miscalibrated**. Do not change it:
+/// its value is arbitrary within the flat part of its own curve until something
+/// can reach it. See `evacuation-is-evaluated-only-where-sparsity-cannot-appear`
+/// in `TODO.md`.
 pub const COMPACT_LIVE_FRACTION: f64 = 0.40;
 
 /// Slab and extent allocator.
