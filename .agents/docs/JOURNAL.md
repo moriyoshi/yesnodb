@@ -5408,3 +5408,34 @@ data is local and there is no caller ) *and* a ratio, and only the ratio moved.
 A closure resting on a ratio alone would now be in doubt. That is the argument
 for recording which of a decision's reasons is which -- it is what lets a later
 session tell a weakened reason from a dead decision.
+
+### Same day: the wide fold arm was wrong at sets = 192, and my tests said nothing
+
+Committed `f36ccbf` guarded the arm on `sets % 64 == 0 && sets <= BITMAP_WORDS`.
+**That is not sufficient.** `sets / 64` words per logical ordinal only partitions
+a chunk when it divides `BITMAP_WORDS`: at `sets = 192`, `1024 / 3` truncates to
+341, so the logical ordinal straddling the chunk boundary was **dropped**. The
+arm fired and returned a set missing logical 1023.
+
+**Every test used a power of two, where "multiple of 64" and "tiles a chunk" are
+the same condition.** The declining list I wrote checked 2, 4, 8, 16, 32, 96 and
+2048 -- 96 is not a multiple of 64 and 2048 is out of range, so nothing in it
+exercised the gap, and the firing list was 64 / 128 / 256 / 512 / 1024, all
+powers of two. The multiples of 64 that are *not* powers of two -- 192, 320, 576,
+960 -- were in neither list, which is exactly the set the bug lives on.
+
+Fixed by adding `BITMAP_WORDS % ( sets / 64 ) == 0`, which is equivalent to
+`sets` dividing `CHUNK_CARD` and is the condition the arithmetic actually needs.
+Sabotaging it back to `if false` reddens the new test.
+
+**The lesson is about how the test list was chosen, not about the arithmetic.**
+Both lists were drawn from the shape of the *guard* -- one list satisfying it,
+one violating it -- and the guard was the thing under test. A list derived from
+the condition you are checking cannot find a condition you failed to write.
+**The values to enumerate come from the domain, not from the predicate**: here,
+the multiples of 64 up to 1024, all of which the guard admitted and only five of
+which are correct.
+
+It also cost nothing to find. The test that caught it is four lines over four
+arities, and I only wrote it because the follow-up question "does this generalise
+to 16 and 32" made me re-read the guard and notice it admitted 192.

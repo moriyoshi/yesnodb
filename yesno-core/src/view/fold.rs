@@ -884,6 +884,17 @@ impl OrdSet {
         if n % 64 != 0 || n > BITMAP_WORDS as u64 {
             return None;
         }
+        // **`sets` must also tile a chunk exactly.** `sets / 64` words per
+        // logical ordinal only partitions a chunk if it divides
+        // [`BITMAP_WORDS`] -- and since `sets = 64 * ( sets / 64 )`, that is the
+        // same as `sets` dividing [`CHUNK_CARD`]. At `sets = 192` it does not:
+        // `1024 / 3` truncates to 341, so the logical ordinal straddling the
+        // chunk boundary is dropped and the fold silently loses it. The first
+        // version of this arm checked only `n % 64 == 0`, and every test used a
+        // power of two, where the two conditions coincide.
+        if BITMAP_WORDS % (n / 64) as usize != 0 {
+            return None;
+        }
         if self.is_empty() {
             return Some(OrdSet::new());
         }
@@ -1732,6 +1743,38 @@ mod wide_fold_tests {
                         "the fixture must reach the second output chunk at sets = {sets}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Multiples of 64 that do **not** tile a chunk must decline, and the
+    /// fallback must still be right.
+    ///
+    /// `sets / 64` words per logical only partitions a chunk when it divides
+    /// `BITMAP_WORDS`. At 192 it does not -- `1024 / 3` truncates -- and the
+    /// first version of this arm fired anyway and dropped the straddling logical
+    /// ordinal. Every other test here uses a power of two, where "multiple of
+    /// 64" and "tiles a chunk" are the same condition, so nothing caught it.
+    #[test]
+    fn multiples_of_64_that_do_not_divide_a_chunk_decline() {
+        for sets in [192u64, 320, 576, 960] {
+            let c = u64::from(crate::CHUNK_CARD);
+            let ords: Vec<u64> = (0..3 * c).step_by(2).collect();
+            let s = build(&ords);
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets as u32), Reduce::Any)
+                    .is_none(),
+                "sets = {sets} does not tile a chunk and must decline"
+            );
+            let fires = false;
+            let hi = 3 * c / sets + 2;
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let want = oracle(&s, sets, reduce, hi);
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "sets = {sets} (fires: {fires}), {reduce:?}");
             }
         }
     }
