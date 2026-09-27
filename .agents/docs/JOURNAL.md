@@ -5494,3 +5494,18 @@ path at 4.12 ms, where it had been ~72x slower. The closure still stands on its
 other reason -- the data is local, the co-located scorer popcounts the same bits,
 and there is no caller -- and they say so themselves. Recorded so the number is
 not restated in either direction without a re-measurement.
+
+**Verification for the per-chunk fallback and the prime tests.**
+`./scripts/gate.sh` **passed, exit 0** and `./scripts/gate-pg.sh` **passed, exit
+0**, both against the committed tree, with 954 `yesno-core` lib tests green.
+
+**One process note, because it is the same shape twice in one day.** The lint
+that failed an earlier gate ( a manual `%` where `is_multiple_of` belongs ) got
+past me because I put `cargo clippy` in the **same backgrounded call** that
+launched the gate, then printed "clippy clean" from a command whose output I had
+not read -- the tool returns a launch message, not the result. This is the
+background-task reading error from earlier in the week in a new disguise: last
+time I read a wrapper's exit code instead of the gate's, this time I read
+nothing at all and narrated success. **A check whose output was not read is a
+check that was not run**, and a backgrounded command's result has to be fetched
+from its log before anything is claimed about it.
