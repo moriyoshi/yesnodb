@@ -5546,3 +5546,25 @@ through `view_fold` to check that a new arm did not steal a case from the table 
 the wide path. Five sabotages each reddened the suite -- wrong field, wrong
 logical index, dropped chunk offset, mask one bit narrow, wrong output chunk --
 and `output_prefix` was caught this time rather than a day later by a consumer.
+
+**Verification for the sub-word arm.** `./scripts/gate.sh` **passed, exit 0** and
+`./scripts/gate-pg.sh` **passed, exit 0**, both against `9238c1e`, with 958
+`yesno-core` lib tests green.
+
+**The per-chunk fallback is confirmed on real data, by the consumer that found
+the flaw.** On haiiie's residual index -- 96 903 documents, `sets = 512`, 757
+bitmap chunks and one array tail -- the fold went **51 ms to 0.23 ms** for `Any`,
+0.18 for `All`, 0.57 for `Parity`, and their all-bitmap index is unchanged as
+expected. They checked correctness before timing, against an independent per-bit
+answer streaming `OrdSet::iter` and sharing no code with the arm. Per set bit that
+is about 0.009 ns, better than the larger index, because a small index with a tiny
+array tail is nearly all word path.
+
+**They labelled their numbers with the commit they built against rather than with
+my `HEAD`, which had moved, and that caution is worth honouring rather than
+waving off.** Checked here: `9238c1e` is **273 insertions and zero deletions** on
+`view/fold.rs`, adds no dispatch ahead of the wide arm -- the order is bitmaps,
+wide, sub-word, generic -- and the sub-word arm declines at `sets >= 64`. So
+`sets` of 256 and 512 cannot reach it and their `a529540` figures carry to
+`9238c1e` unchanged. **A measurement labelled with a commit can be re-validated
+against a later one; a measurement labelled "current" cannot.**
