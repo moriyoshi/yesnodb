@@ -5380,3 +5380,8 @@ assertion, which is the argument for writing the guard.
 
 `sets` of 16 and 32 stay on the per-bit walk: too wide for the byte table, not a
 multiple of 64, and a third structure would be needed. Nothing has asked.
+
+**Verification for the wide fold arm.** `./scripts/gate.sh` **passed, exit 0**
+and `./scripts/gate-pg.sh` **passed, exit 0**, both against the committed tree --
+the Bazel gate is owed here because this changes `yesno-core` code rather than
+only comments, unlike the `view_select` entry above.
