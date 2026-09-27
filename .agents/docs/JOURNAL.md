@@ -5908,3 +5908,45 @@ where the wrong reasoning was mine twice over: I named this constant as the next
 fix in two separate records, from reading a predicate rather than running it. **A
 constant's rationale can be sound and its relevance still unestablished**, and the
 second is the thing to check before touching the first.
+
+### punch_floor is not what costs a reopening workload its space: `SlabState::Opaque` is
+
+The consumer remeasured punching and found it returns 8.35 MB within one open and
+**zero** across any cycle that reopens -- and they asked a good question: since the
+aliasing hazard is a `Container` from an earlier instance *in the same process*,
+could an open that proves no such instance existed lift `punch_floor`?
+
+**The reasoning is sound and I implemented it, and it delivers nothing.** Recorded
+because the implementation was the only way to find out, and because the real
+blocker is deeper and more useful to know.
+
+**The safety argument does hold.** A `Container` aliases *this process's* mapping
+and cannot cross a process boundary, so one that punching could disturb must have
+come from a `Db` this process opened. And the cross-process case is not protected
+today and is not made worse by punching: `flock` releases when a `Db` drops, so
+process B can open and **reuse** a slot process A's retained container is reading,
+overwriting it whatever punching does. So a process-wide registry of opened
+directories is a valid discriminator, and `first_open_in_this_process` was written
+and tested, canonicalization included.
+
+**But no inherited slab is ever punchable, for a reason that has nothing to do
+with the floor.** `punchable` is filled by `free_now`, so it holds only slabs that
+*transition* to `Free` during this instance -- and seeding it with slabs already
+`Free` at open finds none either, because **an inherited slab is `SlabState::Opaque`,
+not `Free`.** Its own doc settles it: "Slab classes are not persisted yet ( the
+`SLAB_META` region is reserved and unwritten ), so a reopened shard cannot tell
+which slots in an existing slab are live. **It must therefore treat them all as
+live** [...] **Do not let a compactor treat this as reusable.** It means 'unknown',
+not 'free'." `adopt_live_at_open` skips `Opaque` slabs for exactly that reason.
+
+So an inherited slab is neither reclaimable **nor reusable**, and the real
+constraint on a reopening workload is that slab occupancy is not persisted. That is
+structural, it is where the consumer's compaction cycle loses its space, and it is
+a different and larger item than punching. Filed.
+
+**The registry work is reverted.** It was a global registry, a test seam and a
+queue-seeding loop for a measured benefit of zero, and I would have had to describe
+it to the consumer as working. **An implementation that does not move the number it
+was built to move is not a partial win to keep.** The finding is the deliverable:
+the answer to their question is "yes, and it does not help, because `Opaque` gets
+there first."
