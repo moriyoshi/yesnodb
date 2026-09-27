@@ -991,17 +991,26 @@ impl OrdSet {
             return None;
         }
         let n = u64::from(v.sets());
-        if n % 64 != 0 || n > BITMAP_WORDS as u64 {
+        if !n.is_multiple_of(64) {
             return None;
         }
-        // **`sets` must also tile a chunk exactly.** `sets / 64` words per
-        // logical ordinal only partitions a chunk if it divides
-        // [`BITMAP_WORDS`] -- and since `sets = 64 * ( sets / 64 )`, that is the
-        // same as `sets` dividing [`CHUNK_CARD`]. At `sets = 192` it does not:
-        // `1024 / 3` truncates to 341, so the logical ordinal straddling the
-        // chunk boundary is dropped and the fold silently loses it. The first
-        // version of this arm checked only `n % 64 == 0`, and every test used a
-        // power of two, where the two conditions coincide.
+        // **`sets` must also tile a chunk exactly, and that is the only other
+        // condition.** `sets / 64` words per logical ordinal partitions a chunk
+        // only if it divides [`BITMAP_WORDS`] -- equivalently, `sets` divides
+        // [`CHUNK_CARD`]. At `sets = 192` it does not: `1024 / 3` truncates to
+        // 341, so the logical ordinal straddling the chunk boundary is dropped
+        // and the fold silently loses it. The first version of this arm checked
+        // only `n % 64 == 0`, and every test used a power of two, where the two
+        // conditions coincide.
+        //
+        // **This also replaces a `sets <= BITMAP_WORDS` bound that was not the
+        // real condition and cost 2 048 and 4 096 the arm entirely.** Those are
+        // legal views -- `MAX_VIEW_SETS` is 4 096 -- and they tile a chunk
+        // perfectly ( 32 and 64 words per logical, both dividing 1 024 ), yet
+        // they walked every set bit at 1.70 ns against 1 024's 0.01. The
+        // divisibility test subsumes an upper bound on its own: once
+        // `sets / 64` exceeds `BITMAP_WORDS` it cannot divide it, so a `sets`
+        // too wide to yield one logical ordinal per chunk declines here anyway.
         if !BITMAP_WORDS.is_multiple_of((n / 64) as usize) {
             return None;
         }
@@ -1769,8 +1778,16 @@ mod wide_fold_tests {
                 "the arm must fire at sets = {sets}"
             );
         }
+        // 2 048 and 4 096 now fire too: they tile a chunk and are legal views.
+        for sets in [64u32, 128, 256, 512, 1024, 2048, 4096] {
+            assert!(
+                s.fold_interleaved_wide_words(&View::interleaved(sets), Reduce::Any)
+                    .is_some(),
+                "the arm must fire at sets = {sets}"
+            );
+        }
         // Not a multiple of 64, so the narrow arms or the generic walk answer.
-        for sets in [2u32, 4, 8, 16, 32, 96, 2048] {
+        for sets in [2u32, 4, 8, 16, 32, 96] {
             assert!(
                 s.fold_interleaved_wide_words(&View::interleaved(sets), Reduce::Any)
                     .is_none(),
@@ -1977,7 +1994,9 @@ mod wide_fold_tests {
         ords.extend((0..300u64).map(|i| 2 * c + i * 11));
         let s = build(&ords);
         let hi = ords.iter().copied().max().unwrap();
-        for sets in (64..=1024).step_by(64).map(|x| x as u64) {
+        // Every multiple of 64 up to `MAX_VIEW_SETS`, so the widths that used to
+        // be excluded by a bound rather than by the arithmetic are covered.
+        for sets in (64..=4096).step_by(64).map(|x| x as u64) {
             for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
                 let want = oracle(&s, sets, reduce, hi / sets + 2);
                 let got: BTreeSet<u64> = s

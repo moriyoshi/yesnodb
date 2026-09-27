@@ -1403,3 +1403,39 @@ and 64 run through `view_fold` to check that adding an arm did not steal a case
 from the table or the wide path. Five sabotages -- wrong field, wrong logical
 index, dropped chunk offset, mask one bit narrow, wrong output chunk -- each
 reddened the suite, `output_prefix` included this time.
+
+### And the top end, where the bound was not the condition ( 2026-09-27 )
+
+Closing the arity range completely. The wide arm was guarded on
+`sets % 64 == 0 && sets <= BITMAP_WORDS`, and that second clause **was never the
+real condition**. `MAX_VIEW_SETS` is 4 096, so 2 048 and 4 096 are legal views;
+they tile a chunk perfectly ( 32 and 64 words per logical ordinal, both dividing
+1 024 ); and they were walking every set bit.
+
+```text
+  sets      before      after   speedup
+  2048   446 758 ns   2 371 ns    188x
+  4096   446 577 ns   1 968 ns    227x
+```
+
+**The fix was to delete a condition, not add one.** The divisibility test the
+`sets = 192` bug forced already subsumes an upper bound: once `sets / 64` exceeds
+`BITMAP_WORDS` it cannot divide it, so a `sets` too wide to yield one logical
+ordinal per chunk declines on its own. One condition now does the work of two and
+is the one the arithmetic actually needs.
+
+**Both of this arm's defects were in the guard rather than in the loop**, and in
+opposite directions -- `sets = 192` was **admitted** and wrong, 2 048 and 4 096
+were **refused** and correct. A guard assembled from plausible-looking clauses
+rather than derived from what the addressing requires can fail either way, and a
+test list drawn from that guard's shape finds neither.
+
+The full per-set-bit curve, with every arity a view can name:
+
+```text
+  sets      2     4     8    16    32    64   256  1024  2048  4096
+  ns/bit 0.36  0.19  0.10  0.21  0.11  0.06  0.04  0.01  0.01  0.01
+```
+
+**Monotone from 8 onward and with no hole anywhere.** At the start of the day
+everything above 8 read 1.7-2.0.

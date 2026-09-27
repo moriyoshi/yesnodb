@@ -5568,3 +5568,36 @@ wide, sub-word, generic -- and the sub-word arm declines at `sets >= 64`. So
 `sets` of 256 and 512 cannot reach it and their `a529540` figures carry to
 `9238c1e` unchanged. **A measurement labelled with a commit can be re-validated
 against a later one; a measurement labelled "current" cannot.**
+
+## 2026-09-27 -- The top of the arity range, where a bound stood in for a condition
+
+`sets` of 2 048 and 4 096 were walking every set bit, at 1.70 ns against 1 024's
+0.01. **188x and 227x**, and the fix was to **delete** a clause rather than add
+one.
+
+The wide arm was guarded on `sets % 64 == 0 && sets <= BITMAP_WORDS`. The second
+clause was never the real condition: `MAX_VIEW_SETS` is 4 096, so both widths are
+legal views, and both tile a chunk perfectly -- 32 and 64 words per logical
+ordinal, each dividing 1 024. The divisibility test that the `sets = 192` bug
+forced already subsumes an upper bound, because once `sets / 64` exceeds
+`BITMAP_WORDS` it cannot divide it. One condition does the work of two and is the
+one the addressing requires.
+
+**Both defects in this arm were in its guard, not its loop, and they pointed
+opposite ways.** `sets = 192` was admitted and wrong; 2 048 and 4 096 were refused
+and correct. That is the argument for deriving a guard from what the arithmetic
+needs rather than assembling it from clauses that each look reasonable: a
+plausible clause can be too loose or too tight, and **a test list drawn from the
+guard's own shape finds neither kind of error.** The domain-derived list caught the
+first once a consumer wrote it; noticing the second took re-reading the guard while
+answering a different question.
+
+Per set bit, now, across every arity a view can name: 0.36, 0.19, 0.10, 0.21,
+0.11, 0.06, 0.04, 0.01, 0.01, 0.01 at 2 / 4 / 8 / 16 / 32 / 64 / 256 / 1024 /
+2048 / 4096. **Monotone from 8 onward, no hole anywhere.** This morning everything
+above 8 read 1.7-2.0.
+
+The domain differential now runs every multiple of 64 up to `MAX_VIEW_SETS`
+rather than stopping at 1 024, and the firing list asserts all of
+64 / 128 / 256 / 512 / 1024 / 2048 / 4096. Re-imposing the deleted bound reddens
+it, as does dropping the divisibility guard.
