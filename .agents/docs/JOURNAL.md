@@ -6209,3 +6209,48 @@ mine named this constant as the next thing to fix, each time from reading the
 selection predicate. The predicate was correct at every reading. What was wrong was
 **when it is consulted**, which no amount of reading a condition can show -- only
 asking how often it runs, and what the world looks like at those moments.
+
+## 2026-09-28 -- The shard mutex: narrowed, and about 40% of the contention was it
+
+`haiiie` measured concurrent `key_stream` opens at ~1.9x serial, did the split they
+could do from outside, and named the narrower hold as the direct test. It was, and
+the change is in.
+
+**Their split is the part that made this actionable.** Four arms at 8 threads:
+serial 22 us per set of 23 opens; 8 threads on **disjoint** shards ~40 us -- the
+parallelism floor, bandwidth and scheduling and timer; 8 threads sharing 4 shards
+~190 us; their real interleaved shape ~80 us, 2.0x the disjoint floor. Everything
+above the disjoint arm is shard-shared, about half their cost. **And they said
+plainly that "shard-shared" still bundles the mutex with any contended cache line**,
+that they could not separate those from outside, and that the change itself was the
+experiment. That is a better handoff than a conclusion would have been.
+
+**Reproduced here and measured as a paired A/B**, three runs each, alternating the
+same binary:
+
+```text
+              A serial      B disjoint      D shared      D/B      shard-shared
+  before    76.9-77.5      82.8-84.8    128.0-143.6   1.55-1.72        35-42%
+  after     75.0-77.4      81.2-84.5    105.2-114.6   1.24-1.41        20-29%
+```
+
+So **roughly 40% of the shard-shared component was the lock hold**; the rest is
+something else, plausibly the `Arc` refcounts they named. A and B unchanged, so
+nothing was traded.
+
+**The invariant the fix rests on, which is the durable part.** `ShardStore::node`
+needs `pending_nodes`, `sb.node_size` and `seg`. `seg` is an `Arc<SegmentedMmap>`
+whose caches are each behind their own `Mutex`, so it needs no outer exclusion --
+and `Db::checkpoint` already clones that same `Arc` and drops the store lock to run
+its `fsync`s, so the technique was established here for the write path. `node_size`
+is a copied `u32`. That leaves `pending_nodes`, which holds pages "not yet reachable
+from any superblock" -- and a snapshot's root **is** a superblock root, since
+`ShardStore::tree` returns `self.sb.root`. **So a snapshot scan provably never
+consults it**, which is what lets the reader omit it rather than lock for it.
+
+**And a measurement caution I nearly published.** My first "before" was a single run
+taken when the machine was quieter: A = 51.5 us against 77 after. That reads as a
+48% serial **regression** plus a larger concurrent win than is real. Both dissolved
+under a paired A/B at matched conditions. **An unpaired before/after on a shared
+machine measures the machine**, and the tell was that the "regression" appeared in
+an arm the change cannot touch -- a single thread has no contention to remove.

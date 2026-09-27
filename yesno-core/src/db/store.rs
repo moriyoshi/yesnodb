@@ -742,6 +742,69 @@ fn io_err(e: std::io::Error) -> CodecError {
 /// already checks every node inline and names the page it found, which is
 /// strictly more useful than an error propagating out.
 ///
+/// A `NodeReader` over a **published** root that needs no store lock.
+///
+/// # Why this is sound, and it rests on one invariant
+///
+/// `ShardStore::node` needs three things and only one of them is mutable state:
+/// `pending_nodes`, `sb.node_size`, and `seg`. `seg` is an `Arc<SegmentedMmap>`
+/// whose methods take `&self` and whose caches are each behind their own `Mutex`,
+/// so it needs no outer exclusion -- `Db::checkpoint` already relies on exactly
+/// that, cloning the `Arc` and releasing the store lock to run its `fsync`s.
+/// `node_size` is a `u32` copied out.
+///
+/// That leaves `pending_nodes`, which holds pages "written earlier in the current
+/// checkpoint, not yet reachable from any superblock". **A snapshot's root is a
+/// superblock root** -- `ShardStore::tree` returns `self.sb.root`, the committed
+/// index -- so a scan over a snapshot root provably never consults that map. Which
+/// is why this reader can omit it rather than having to lock for it.
+///
+/// # What it is for
+///
+/// `build_plan_range` used to hold `Mutex<ShardStore>` across its whole index
+/// range scan, so one key's open serialised every other open on that shard. With
+/// key-only sharding a consumer's parallel query opens the same keys from every
+/// worker at once and they queue on the same mutexes: measured at 8 threads,
+/// sharing shards cost **1.80x** the same work on disjoint shards, of which
+/// 44% was above the no-sharing floor.
+///
+/// Do **not** use this where a root may be in flight. It would silently miss
+/// pages that are only in `pending_nodes`, which is a wrong answer rather than an
+/// error.
+pub(crate) struct PublishedNodes {
+    seg: std::sync::Arc<crate::store::segment::SegmentedMmap>,
+    node_size: usize,
+}
+
+impl NodeReader for PublishedNodes {
+    fn node(&self, id: PageId) -> Result<Page> {
+        let cell = page_id_to_cell(id);
+        let buf = self.seg.buffer_at(cell, self.node_size)?;
+        // The same once-per-region check `ShardStore::node` does, and for the same
+        // reason: a corrupt internal node misdirects a search rather than
+        // corrupting one answer. The cache behind it is `Mutex`-guarded, so this is
+        // safe to call from several threads at once.
+        self.seg.verify_once(cell, self.node_size, || {
+            crate::index::node::verify_checksum(buf.as_slice())
+        })?;
+        Ok(Page::from_buffer(buf))
+    }
+}
+
+impl ShardStore {
+    /// A lock-free reader for this shard's **published** pages.
+    ///
+    /// Cheap by construction: an `Arc` clone and a `u32` copy, so the caller holds
+    /// the store lock only for those. See [`PublishedNodes`] for why omitting
+    /// `pending_nodes` is sound.
+    pub(crate) fn published_nodes(&self) -> PublishedNodes {
+        PublishedNodes {
+            seg: std::sync::Arc::clone(&self.seg),
+            node_size: self.sb.node_size as usize,
+        }
+    }
+}
+
 /// Stateless on purpose. The alternative considered was a "diagnostic mode" flag
 /// on `ShardStore`, which makes the refusal depend on when it is read rather than
 /// on who is reading, and leaves a way for production to be in the wrong mode.

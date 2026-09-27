@@ -1243,3 +1243,82 @@ fn a_snapshot_reads_packed_neighbours_at_its_own_version() {
     drop(before);
     drop(after);
 }
+
+/// Concurrent `key_stream` opens on one shard agree with serial ones.
+///
+/// `build_plan_range` builds its node reader under the store lock and then scans
+/// **unlocked**, which is only sound because a snapshot's root is a superblock root
+/// and `pending_nodes` holds nothing reachable from one. This is the test that
+/// would fail if that stopped being true, or if the lock-free reader raced.
+///
+/// It is a correctness test, not a timing one -- the effect is measured by a probe
+/// whose numbers live in `TODO.md`. What it pins is that eight threads hammering
+/// the same keys of the same shards see exactly what one thread sees.
+#[test]
+fn concurrent_opens_on_shared_shards_agree_with_serial_ones() {
+    use std::sync::{Arc, Barrier};
+    use yesno_core::stream::ChunkStream;
+
+    let dir = tmpdir("concopen");
+    let _c = CleanDir(dir.clone());
+    // Few shards, so every thread contends on the same ones.
+    let db = Arc::new(
+        Db::open_with(
+            &dir,
+            DbOptions {
+                shards: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let keys: Vec<u64> = (0..24).collect();
+    for &k in &keys {
+        // Several chunks per key so the index walk is more than one node.
+        let ords: Vec<u64> = (0..20u64)
+            .flat_map(|c| (0..300u64).map(move |i| c * 65_536 + i * 97 + k))
+            .collect();
+        db.insert_many(k, &ords).unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let snap = Arc::new(db.snapshot().unwrap());
+    // The serial answer, which every thread must reproduce exactly.
+    let want: Vec<(u64, Vec<u64>)> = keys
+        .iter()
+        .map(|&k| {
+            let mut s = snap.key_stream(k).unwrap();
+            let mut out = Vec::new();
+            while let Some(c) = s.next_chunk().unwrap() {
+                out.push(c.0);
+            }
+            (k, out)
+        })
+        .collect();
+    assert!(
+        want.iter().any(|(_, v)| v.len() > 1),
+        "the fixture must give some key more than one chunk, or the walk is trivial"
+    );
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut hs = Vec::new();
+    for _ in 0..8 {
+        let (snap, barrier, want) = (snap.clone(), barrier.clone(), want.clone());
+        hs.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..4 {
+                for (k, expect) in &want {
+                    let mut s = snap.key_stream(*k).unwrap();
+                    let mut got = Vec::new();
+                    while let Some(c) = s.next_chunk().unwrap() {
+                        got.push(c.0);
+                    }
+                    assert_eq!(&got, expect, "key {k} differed under concurrency");
+                }
+            }
+        }));
+    }
+    for h in hs {
+        h.join().expect("a concurrent opener panicked or disagreed");
+    }
+}
