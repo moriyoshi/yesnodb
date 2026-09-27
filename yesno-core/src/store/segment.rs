@@ -27,7 +27,12 @@
 //! - `SEGMENT_SIZE` is a multiple of [`SLAB_SIZE`], so **no slab — and therefore
 //!   no extent — straddles a segment boundary** and a single `Buffer` never
 //!   needs two guards.
-//! - Space is returned by punching holes, never by truncating. Truncating under
+//! - Space is returned by punching holes, never by truncating -- see
+//!   [`SegmentedMmap::punch`], which `DbStore::reclaim_deferred` calls for each
+//!   slab that empties. **This sentence described a mechanism that did not exist
+//!   until 2026-09-27**; a consumer measured the consequence before any test
+//!   could, because the only test of I6 asserted apparent size, which punching
+//!   does not change. Truncating under
 //!   a live mapping raises `SIGBUS`, which is not catchable as a `Result` and
 //!   would abort the process.
 //!
@@ -519,6 +524,70 @@ impl SegmentedMmap {
             for k in doomed {
                 gen.remove(&k);
             }
+        }
+    }
+
+    /// Return `[cell, cell + len)` to the filesystem, leaving the file's
+    /// apparent size alone.
+    ///
+    /// # Why punching and not truncating
+    ///
+    /// Truncating under a live mapping is **SIGBUS**, uncatchable as a `Result`,
+    /// and invariant I6 exists to prevent it. `FALLOC_FL_PUNCH_HOLE` with
+    /// `FALLOC_FL_KEEP_SIZE` deallocates blocks without moving the end of the
+    /// file, so every mapped address stays mapped and no fault is possible.
+    ///
+    /// # What a reader sees
+    ///
+    /// A punched range reads back as **zeroes**, through the mapping and through
+    /// `pread` alike. That is the fail-safe direction: a caller that punched a
+    /// range something still referenced would get a checksum failure on the next
+    /// read rather than plausible stale bytes. It is not a licence to be careless
+    /// -- the caller owes the same guarantee `write_at` documents, that the range
+    /// is unreachable from any published snapshot -- but the consequence of
+    /// breaking it is a refusal rather than a wrong answer.
+    ///
+    /// # Not an error to ignore, and not one to fail a checkpoint over
+    ///
+    /// Filesystems that do not implement punching return `EOPNOTSUPP`, and a
+    /// short or refused punch loses nothing but space. Callers therefore treat
+    /// the result as advisory. Returning `io::Result` rather than swallowing it
+    /// here keeps that decision at the call site, where the tracing lives.
+    pub fn punch(&self, cell: u64, len: u64) -> std::io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `fallocate` takes a borrowed descriptor and two integers
+            // and writes no memory. `self.file` outlives the call, and the mode
+            // keeps the file length so no mapped page is withdrawn.
+            let rc = unsafe {
+                libc::fallocate(
+                    self.file.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    cell as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // **The same reason `write_at` invalidates, and the same ordering.**
+            // A punched range reads as zeroes, so any cached verdict that its
+            // checksum was good is now false. Afterwards, not before: doing it
+            // first leaves a window where a reader re-verifies the old bytes and
+            // caches a verdict the punch then falsifies.
+            self.invalidate_verified(cell, len);
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No portable equivalent. Not an error: the caller is returning
+            // space it no longer needs, and failing to do so costs only space.
+            let _ = (cell, len);
+            Ok(())
         }
     }
 

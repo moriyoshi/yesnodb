@@ -36,6 +36,10 @@ thiserror = "2"
 # dominate the once-per-fault-in verification path.
 crc32c = "0.6"
 memmap2 = "0.9"
+# Only for `fallocate( FALLOC_FL_PUNCH_HOLE )`, which returns freed slab bodies to
+# the filesystem. Already in the lock file via memmap2, so this compiles nothing
+# new; it is a direct dependency so the call site does not rely on a transitive one.
+libc = "0.2"
 tracing = "0.1"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }

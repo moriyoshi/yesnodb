@@ -7583,6 +7583,7 @@ dependencies = [
  "cranelift-native",
  "crc32c",
  "criterion",
+ "libc",
  "memmap2",
  "num-bigint 0.4.8",
  "proptest",

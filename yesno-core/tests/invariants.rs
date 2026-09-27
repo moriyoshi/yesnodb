@@ -329,11 +329,19 @@ fn i5_commit_versions_never_go_backwards_within_a_shard() {
 // I6 - mappings are append-only; the file never shrinks
 // ---------------------------------------------------------------------------
 
-/// Space is returned by punching holes, never by truncating.
+/// The file is never truncated.
 ///
 /// `ftruncate` under a live mapping is a SIGBUS factory, and SIGBUS cannot be
 /// caught as a `Result` — so a regression here is an uncatchable crash in a
 /// reader that did nothing wrong.
+///
+/// **This test asserts apparent size only, and that is now stated rather than
+/// implied.** Its doc used to open "space is returned by punching holes", which
+/// this test cannot see: `metadata().len()` is unrelated to allocated blocks for
+/// a sparse file. The punching half is
+/// `i6_punching_returns_allocated_blocks_to_the_filesystem`, which reads
+/// `st_blocks`. For as long as the two were conflated, a comment asserting a
+/// mechanism's existence sat in front of a test that could not check it.
 #[test]
 fn i6_the_shard_file_never_shrinks() {
     let dir = tmpdir("i6");
@@ -620,4 +628,152 @@ fn shard_commit_clocks(dir: &std::path::Path) -> Vec<u64> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// I6, the other half - space IS returned, by punching
+// ---------------------------------------------------------------------------
+
+/// Allocated blocks fall once a slab empties and is reclaimed.
+///
+/// # Why this test has to read `st_blocks`
+///
+/// `i6_the_shard_file_never_shrinks` above asserts `metadata().len()` is
+/// non-decreasing, which is **apparent** size -- for a sparse file that is
+/// unrelated to the blocks the filesystem has allocated. So it tests the second
+/// clause of I6's doc ( never truncate ) and is **silent on the first** ( space is
+/// returned by punching ). For a year the first clause named a mechanism that did
+/// not exist, and no gate could see that, because the only test of I6 measured the
+/// quantity punching does not change.
+///
+/// This one measures the quantity punching *does* change, and it is the only test
+/// in the tree that can fail if punching stops happening.
+#[test]
+fn i6_punching_returns_allocated_blocks_to_the_filesystem() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // `FALLOC_FL_PUNCH_HOLE` is Linux-only and `punch` is a deliberate no-op
+        // elsewhere, so there is nothing to observe rather than something broken.
+        eprintln!("skipped: hole punching is implemented on Linux only");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tmpdir("i6punch");
+        let _c = CleanDir(dir.clone());
+        let db = Db::open_with(&dir, opts(1)).unwrap();
+        let path = dir.join("shard-0000.yno");
+        let blocks = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.blocks()).unwrap_or(0);
+
+        // Enough **bitmap** containers to fill more than one slab. `insert_range`
+        // will not do: a contiguous range coalesces into a run container of a few
+        // intervals, which is why the first version of this fixture allocated 36
+        // KiB. Scattered-but-dense ordinals put more than `ARRAY_MAX` values in a
+        // chunk, which is what promotes it to an 8 KiB bitmap in the widest size
+        // class -- the shape that actually consumes slabs.
+        let scattered = |n: u64| -> Vec<u64> {
+            (0..n)
+                .flat_map(|chunk| (0..5_000u64).map(move |i| chunk * 65_536 + i * 13))
+                .collect()
+        };
+        let keys: Vec<u64> = (0..16).collect();
+        for &k in &keys {
+            db.insert_many(k, &scattered(30)).unwrap();
+        }
+        // **Survivors, and they are what makes this test able to see a punch that
+        // hits the wrong range.** Punching is silent data loss when aimed wrongly,
+        // so the test must read live bytes back **from the file** afterwards.
+        // Without these, pointing the punch at offset 0 -- over the superblock and
+        // slab 0 -- passed every assertion here.
+        let survivors: Vec<u64> = (100..106).collect();
+        let mut expected: Vec<(u64, Vec<u64>)> = Vec::new();
+        for &k in &survivors {
+            let ords = scattered(8);
+            db.insert_many(k, &ords).unwrap();
+            expected.push((k, ords));
+        }
+        db.checkpoint().unwrap();
+        let peak = blocks(&path);
+        assert!(
+            peak > 2 * 1024 * 1024 / 512,
+            "the fixture must allocate at least a slab's worth, got {peak} blocks"
+        );
+
+        // Delete every key, so every chunk they own is superseded and the slabs
+        // they occupied become empty rather than merely sparse. That is the case
+        // punching serves; a partly-live slab is a different open problem.
+        let mut b = db.batch();
+        for &k in &keys {
+            b.delete_key(k);
+        }
+        b.commit().unwrap();
+        // Past `RECLAIM_CKPT_DELAY` and the reader floor. Reclamation needs a
+        // checkpoint to advance both, and the punch happens inside it.
+        for _ in 0..6 {
+            db.checkpoint().unwrap();
+        }
+
+        let after = blocks(&path);
+        assert!(
+            after < peak,
+            "allocated blocks must fall once slabs are reclaimed: {peak} -> {after}"
+        );
+        // The apparent size must NOT have fallen: that is the SIGBUS hazard I6
+        // exists for, and punching must not reintroduce it.
+        assert!(
+            std::fs::metadata(&path).unwrap().len() >= (peak * 512) / 2,
+            "punching must keep the file's apparent size, never truncate it"
+        );
+        // Still correct through the punched file, in this open.
+        let snap_a = db.snapshot().unwrap();
+        let snap = &snap_a;
+        for &k in &keys {
+            assert_eq!(snap.load(k).unwrap().len(), 0, "key {k} was deleted");
+        }
+        for (k, ords) in &expected {
+            assert_eq!(
+                snap.load(*k).unwrap().iter().collect::<Vec<_>>(),
+                *ords,
+                "survivor {k} must be intact in this open"
+            );
+        }
+        // `insert_range` is inclusive, so the count comes from the call rather
+        // than from a literal repeated here.
+        let added = db.insert_range(1234, 0, 50_000).unwrap();
+        db.checkpoint().unwrap();
+        let snap_b = db.snapshot().unwrap();
+        let snap = &snap_b;
+        assert_eq!(
+            snap.load(1234).unwrap().len(),
+            added,
+            "a write after punching must land and read back"
+        );
+
+        // **And correct after a reopen**, which is the assertion with teeth: it
+        // drops every cache and every verified-region verdict, so the survivors
+        // are re-read and re-checksummed straight out of the punched file. A punch
+        // aimed at live bytes fails here and nowhere earlier.
+        // Every snapshot **and** the handle: a live `Snapshot` holds the database
+        // open, and a shadowed binding lives to the end of the scope rather than
+        // to its last use, so these have to be named and dropped explicitly or the
+        // reopen fails with `AlreadyOpen` against this test's own handle.
+        drop(snap_a);
+        drop(snap_b);
+        drop(db);
+        let db = Db::open_with(&dir, opts(1)).unwrap();
+        let snap = db.snapshot().unwrap();
+        for (k, ords) in &expected {
+            assert_eq!(
+                snap.load(*k).unwrap().iter().collect::<Vec<_>>(),
+                *ords,
+                "survivor {k} must survive punching and a reopen"
+            );
+        }
+        for &k in &keys {
+            assert_eq!(snap.load(k).unwrap().len(), 0, "key {k} stays deleted");
+        }
+        assert_eq!(snap.load(1234).unwrap().len(), added, "and the late write");
+    }
 }

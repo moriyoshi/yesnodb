@@ -321,6 +321,40 @@ pub struct Allocator {
     generation: u32,
     deferred: VecDeque<Pending>,
     freed_total: u64,
+    /// Slabs that existed when this instance opened, and are therefore **never
+    /// punchable**.
+    ///
+    /// # The guarantee this protects
+    ///
+    /// A `Container` is refcounted and may alias an mmap, which is what lets one
+    /// outlive the `Db` it came from -- and
+    /// `zero_copy_mvcc::reopening_does_not_disturb_a_container_from_the_previous_instance`
+    /// asserts that reopening and churning does not disturb such a container. A
+    /// new instance's reclamation gates cannot see it: they answer about *this*
+    /// instance's readers, and a container held across a close belongs to no
+    /// reader this instance knows.
+    ///
+    /// Reuse would break that guarantee too, so it was already conditional --
+    /// punching only makes it observable, by destroying the bytes promptly
+    /// instead of waiting for an allocation to land on them. **The fix is not to
+    /// weaken the guarantee**: a slab created *after* this instance opened cannot
+    /// be aliased by an earlier container, because it did not exist then. So
+    /// punching is confined to those, and space inherited at open is only ever
+    /// reused, never returned.
+    ///
+    /// The cost is bounded and falls on the wrong shape for the workload that
+    /// wanted this: a long-running process that deletes and refills allocates
+    /// most of its slabs during the run, and those are punchable.
+    punch_floor: u32,
+    /// Slabs that reached [`SlabState::Free`] and whose bodies the store may
+    /// return to the filesystem.
+    ///
+    /// **Recorded rather than punched here on purpose.** This type is a pure
+    /// data structure with no file and no mapping -- which is what lets its unit
+    /// tests drive it directly -- so it reports the opportunity and
+    /// `DbStore::reclaim_deferred` takes it, being the one place that holds the
+    /// allocator mutably and the mapping immutably at once.
+    punchable: Vec<u32>,
     /// Live payload bytes per packed page, keyed by the page's cell.
     ///
     /// Deliberately in RAM and never in the page: decrementing a counter inside
@@ -346,6 +380,8 @@ impl Allocator {
             deferred: VecDeque::new(),
             packed_live: std::collections::HashMap::new(),
             freed_total: 0,
+            punch_floor: 0,
+            punchable: Vec::new(),
         }
     }
 
@@ -601,6 +637,10 @@ impl Allocator {
     /// or dangling references. An incomplete map here is not a lost repair, it
     /// is data loss.
     pub fn adopt_live_at_open(&mut self, live: &BTreeMap<u32, BTreeSet<u32>>) -> usize {
+        // Every slab that exists now predates this instance, so a container held
+        // from an earlier one may alias it and it must never be punched. See
+        // [`Allocator::punch_floor`].
+        self.punch_floor = self.slabs.len() as u32;
         let empty = BTreeSet::new();
         let mut reclaimed = 0usize;
         for id in 0..self.slabs.len() as u32 {
@@ -838,9 +878,59 @@ impl Allocator {
         if emptied {
             self.slabs[id as usize].state = SlabState::Free;
             self.retire_from_active(id);
-            // Do not shrink the file: space is returned by punching a hole, never
-            // by truncating, because truncating under a live mapping is SIGBUS.
+            // Do not shrink the file: space is returned by **punching a hole**,
+            // never by truncating, because truncating under a live mapping is
+            // SIGBUS. The punch itself belongs to whoever holds the file, so the
+            // slab is queued here and `DbStore::reclaim_deferred` performs it.
+            //
+            // Safe to offer precisely because this is `free_now`, reached only
+            // after `reclaim` has cleared all three conditions -- past the
+            // checkpoint delay, below the reader floor, and unpinned -- so no
+            // live snapshot can reach any byte of this slab.
+            self.punchable.push(id);
         }
+    }
+
+    /// Take the file ranges of slabs that have become free since the last call.
+    ///
+    /// Draining rather than reading: a slab must be offered once, because
+    /// punching an already-punched range is wasted work and because the slab may
+    /// be recycled by `new_slab_for` before the next drain, after which its bytes
+    /// are live again.
+    ///
+    /// # The arithmetic lives here, and that is the point
+    ///
+    /// Returning `( offset, len )` rather than a slab id keeps the geometry with
+    /// the type that defines it, where `punchable_ranges_are_slab_bodies`
+    /// tests it directly. Computed at the call site instead, **a wrong offset was
+    /// invisible to an end-to-end test**: whether punching the wrong slab destroys
+    /// anything depends on which slab happens to hold live data, so aiming it at
+    /// offset 0 passed a full write-delete-reopen-verify cycle.
+    ///
+    /// The body only, never [`SLAB_META`]: a punched range reads as zeroes, and
+    /// the 8 KiB header is left mapped so a reader that touches a free slab before
+    /// `new_slab_for` re-initializes it does not see a zeroed one. It is 0.4% of
+    /// the slab.
+    ///
+    /// Slabs no longer `Free` are skipped, which cannot happen today -- nothing
+    /// recycles between the push and the drain inside one `reclaim` -- and is
+    /// filtered anyway so that a future caller reordering those cannot punch live
+    /// bytes.
+    pub fn take_punchable_ranges(&mut self) -> Vec<(u64, u64)> {
+        let ids = std::mem::take(&mut self.punchable);
+        let floor = self.punch_floor;
+        ids.into_iter()
+            // Inherited at open, so possibly aliased by a container that outlived
+            // a previous instance. Reusable, never returnable.
+            .filter(|id| *id >= floor)
+            .filter(|id| {
+                matches!(
+                    self.slabs.get(*id as usize).map(|s| &s.state),
+                    Some(SlabState::Free)
+                )
+            })
+            .map(|id| (id as u64 * SLAB_SIZE + SLAB_META, SLAB_BODY))
+            .collect()
     }
 
     /// Slabs whose live fraction has fallen below [`COMPACT_LIVE_FRACTION`],
@@ -1209,6 +1299,95 @@ mod tests {
         // All three satisfied.
         assert_eq!(a.reclaim(u64::MAX, 102, |_, _| false), 1);
         assert_eq!(a.deferred_count(), 0);
+    }
+
+    /// The punchable ranges are exactly the free slabs' bodies.
+    ///
+    /// **This is the only test that can see a wrong offset.** Whether punching
+    /// the wrong slab destroys data depends on which slab holds live data, so an
+    /// end-to-end write-delete-reopen-verify cycle passed with the punch aimed at
+    /// offset 0 -- over the first slab's header and body. Deterministic here.
+    #[test]
+    fn punchable_ranges_are_slab_bodies() {
+        let mut a = Allocator::new();
+        // Fill one slab's worth of the widest class and free it all, so the slab
+        // empties and is offered.
+        let class = (CLASS_SIZES.len() - 1) as u8;
+        let cap = slab_capacity(class);
+        assert!(cap > 1, "the widest class must hold several slots");
+        let cells: Vec<u64> = (0..cap).map(|_| a.alloc(class).unwrap()).collect();
+        assert!(
+            a.take_punchable_ranges().is_empty(),
+            "nothing is punchable while every slot is live"
+        );
+
+        let id = slab_of(cells[0]);
+        for (i, &c) in cells.iter().enumerate() {
+            a.defer_free(c, 0);
+            // Only the last release can empty the slab.
+            if i + 1 < cells.len() {
+                a.reclaim(u64::MAX, u64::MAX, |_, _| false);
+                assert!(
+                    a.take_punchable_ranges().is_empty(),
+                    "a partly live slab must never be offered ( after {} of {} )",
+                    i + 1,
+                    cells.len()
+                );
+            }
+        }
+        a.reclaim(u64::MAX, u64::MAX, |_, _| false);
+
+        let ranges = a.take_punchable_ranges();
+        assert_eq!(
+            ranges,
+            vec![(id as u64 * SLAB_SIZE + SLAB_META, SLAB_BODY)],
+            "the offered range must be the slab's body, past its header"
+        );
+        // The header is excluded, and the range stays inside the slab.
+        let (off, len) = ranges[0];
+        assert!(off >= SLAB_META, "the slab header must not be punched");
+        assert_eq!(
+            off + len,
+            (id as u64 + 1) * SLAB_SIZE,
+            "the range must end at the slab boundary"
+        );
+        // Drained, not merely read: offering twice would punch a recycled slab.
+        assert!(
+            a.take_punchable_ranges().is_empty(),
+            "the queue must drain on read"
+        );
+    }
+
+    /// A slab recycled before the drain must not be offered.
+    ///
+    /// `new_slab_for` recycles a `Free` slab before extending the file, so a
+    /// caller that frees, allocates, and only then drains would be handed a range
+    /// whose bytes are **live again**. That is what the `Free` filter prevents,
+    /// and it is reachable rather than theoretical -- it needs only the drain to
+    /// happen after the next allocation instead of before.
+    #[test]
+    fn a_recycled_slab_is_not_offered_for_punching() {
+        let mut a = Allocator::new();
+        let class = (CLASS_SIZES.len() - 1) as u8;
+        let cap = slab_capacity(class);
+        let cells: Vec<u64> = (0..cap).map(|_| a.alloc(class).unwrap()).collect();
+        let id = slab_of(cells[0]);
+        for &c in &cells {
+            a.defer_free(c, 0);
+        }
+        a.reclaim(u64::MAX, u64::MAX, |_, _| false);
+
+        // Recycle it *before* draining, which is the whole hazard.
+        let again = a.alloc(class).unwrap();
+        assert_eq!(
+            slab_of(again),
+            id,
+            "the freed slab must be the one recycled, or this proves nothing"
+        );
+        assert!(
+            a.take_punchable_ranges().is_empty(),
+            "a slab holding live bytes again must never be offered for punching"
+        );
     }
 
     /// A packed chunk's cell must be refused, not freed.

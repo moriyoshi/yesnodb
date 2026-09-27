@@ -5730,3 +5730,116 @@ never fires on the workload at all. **Reading a mechanism tells you what it woul
 do; only a measurement tells you what it does.** The counter that settled it was
 in the request only because two repairs would have looked identical in the
 headline metric, and that is the part of my own process that worked.
+
+## 2026-09-27 -- Hole punching, and the plateau that bounded the severity
+
+**Implemented.** `SegmentedMmap::punch` calls `fallocate( FALLOC_FL_PUNCH_HOLE |
+FALLOC_FL_KEEP_SIZE )`, and `DbStore::reclaim_deferred` punches the body of every
+slab that emptied inside the `reclaim` it just ran. Until this existed, **nothing
+in the crate returned a byte to the filesystem**, whatever three comments claimed;
+all three now say what the code does.
+
+**The consumer's plateau run settled the severity first, and it is bounded.** With
+compaction each cycle it reaches **58.77 MB by cycle 4 and stays flat through cycle
+8** -- 3.2x an 18.24 MB fresh store, with `used_extents` and deferred identical at
+every cycle end, so the peak-deferred-plus-peak-live high-water model holds exactly.
+Their no-compaction run climbs, but they identified the confound themselves:
+haiiie never reuses retired ids, so its live chunk count grows for its own reasons
+( `used_extents` 5402 -> 15008 while deferred stays flat ). **So the original
+"unbounded" is withdrawn: it is a permanent overhead, not unbounded growth**, and
+punching is what returns it.
+
+**Why whole slabs and not freed slots.** The size classes are 576 to 8256 bytes and
+slots are bump-allocated at `SLAB_META + slot * size`, so a slot is neither
+block-aligned nor a whole number of 4 KiB blocks -- punching one frees an irregular
+subset of the blocks it covers, or none. A slab body is 2 MiB minus 8 KiB, aligned,
+and whole. The header is left mapped: a punched range reads as **zeroes**, and
+`new_slab_for` re-initializes a recycled slab rather than trusting its header, so
+punching the header would buy 0.4% and hand a zeroed header to any reader that
+touches a free slab first.
+
+**`libc` is a new direct dependency and compiles nothing new** -- 0.2.189 was
+already in the lock file via `memmap2`. The earlier objection that this "needs a
+syscall dependency `yesno-core` does not have" was true of the manifest and false
+of the build.
+
+**Punching is fail-safe in the direction that matters.** A punched range reads as
+zeroes rather than faulting, because `KEEP_SIZE` leaves every mapped address
+mapped -- so a range punched in error produces a checksum failure on the next read,
+not plausible stale bytes. It also invalidates the verified-region cache exactly as
+`write_at` does, and for the same reason and in the same order: a cached verdict
+that those bytes checksummed correctly is now false.
+
+### Three tests, and the one that mattered was the third
+
+* **`i6_punching_returns_allocated_blocks_to_the_filesystem`** reads `st_blocks`,
+  which is the quantity punching changes and the quantity no existing test
+  measured. `i6_the_shard_file_never_shrinks` asserts `metadata().len()` --
+  apparent size, unrelated to allocated blocks for a sparse file -- so it tested
+  "never truncate" and was **silent on punching for the life of the comment above
+  it.** Its doc now says so.
+* Its first fixture allocated **36 KiB**: `insert_range` makes a contiguous run
+  container of a few intervals, not bitmaps. Scattered-but-dense ordinals put more
+  than `ARRAY_MAX` values per chunk, which is what promotes them to 8 KiB bitmaps
+  and consumes slabs.
+* **The end-to-end test could not see a wrong offset, and that is a structural
+  limit rather than a gap I could close there.** Aiming the punch at offset 0 --
+  over the first slab's header and body -- passed a full
+  write-delete-checkpoint-reopen-verify cycle **twice**, once before and once after
+  I strengthened it with surviving keys and a reopen. Whether punching the wrong
+  slab destroys anything depends on which slab happens to hold live data, which no
+  fixture controls.
+
+  So the arithmetic moved into the allocator as `take_punchable_ranges`, returning
+  `( offset, len )` rather than a slab id, where `punchable_ranges_are_slab_bodies`
+  pins it deterministically. Both offset sabotages now fail. **Geometry belongs
+  next to the type that defines the geometry, and an end-to-end test is the wrong
+  instrument for an address computation.**
+* A third test covers the `Free`-state filter, which I had written as defensive and
+  then found reachable: free a slab, allocate so `new_slab_for` recycles it, drain
+  after. Removing the filter fails it.
+
+**Two of my own slips worth recording.** The scripted insert landed my tests
+between an existing `#[test]` and its `fn`, which silently disabled
+`reclaim_requires_all_three_conditions` -- and the tell was `punchable_ranges`
+appearing **twice** in the test list, which I saw and did not chase for two
+rounds. And my first assertion encoded `50_000` for an inclusive
+`insert_range( 0, 50_000 )`; it now asserts against the count the call returns, so
+the test cannot re-learn that off-by-one.
+
+### The gate caught a real regression, and the fix is a confinement not a weakening
+
+`zero_copy_mvcc::reopening_does_not_disturb_a_container_from_the_previous_instance`
+failed. Its doc states the guarantee plainly -- "reopening the database must not
+disturb a container held from the previous instance, the second `Db` maps the same
+file independently" -- and punching broke it.
+
+**The mechanism.** A `Container` is refcounted and may alias an mmap, which is what
+lets one outlive the `Db` it came from. A new instance's reclamation gates answer
+about *that instance's* readers; a container held across a close belongs to no
+reader the new instance knows. So db2 deletes the key, reclaims the slots, and
+punches bytes the held container is still reading.
+
+**This was already latent and punching only made it observable.** Reuse breaks the
+same guarantee -- db2 is entitled to allocate into space it believes free -- so the
+test was passing because the churn happened to land elsewhere, not because anything
+prevented it. **Punching does not introduce the unsoundness; it removes the luck.**
+
+**The fix is a confinement, and deliberately not a weakened test.** A slab created
+*after* this instance opened cannot be aliased by an earlier container, because it
+did not exist then. So `punch_floor` is set to the slab count at
+`adopt_live_at_open`, and only slabs above it are ever punched. Space inherited at
+open is reused but never returned.
+
+**The cost lands on the shape that does not need it.** A short-lived process that
+opens, deletes and exits returns nothing -- but it also had nothing to gain, since
+its file is about to be closed. A long-running process that deletes and refills
+allocates most of its slabs during the run, and those are exactly the punchable
+ones. That is the workload the consumer measured.
+
+**What I would have done wrong without the gate.** The tempting reading was that
+the test asserts more than the design guarantees and should be narrowed. That
+would have been true *and* the wrong move: the guarantee is keepable, just not by
+punching indiscriminately, and narrowing it would have traded a real property for
+a few megabytes on a workload that does not want them. **"The test is asserting too
+much" is a conclusion to reach after looking for a confinement, not before.**

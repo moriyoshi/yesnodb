@@ -523,10 +523,38 @@ impl ShardStore {
     /// another.
     pub fn reclaim_deferred(&mut self, reader_ckpt_floor: u64, ckpt_seq: u64) -> usize {
         let seg = &self.seg;
-        self.alloc
+        let freed = self
+            .alloc
             .reclaim(reader_ckpt_floor, ckpt_seq, |cell, size| {
                 seg.any_pinned_in(cell, size)
-            })
+            });
+        // **Return emptied slabs to the filesystem.** Reclaiming a slot puts it
+        // back in the free pool, which stops the file *growing*; it does not give
+        // the space back. A slab that reached `Free` inside the call above has no
+        // live slot and is past all three reclamation conditions, so its body can
+        // be punched -- and until this existed, nothing in the crate returned a
+        // byte to the filesystem, whatever three comments claimed.
+        //
+        // Only `SLAB_BODY`, leaving the 8 KiB of slab metadata mapped: a punched
+        // range reads as zeroes, and `new_slab_for` re-initializes a recycled
+        // slab's header rather than assuming it survived. Punching the header too
+        // would save 0.4% and put a zeroed header in front of every reader that
+        // touches a free slab before it is re-initialized.
+        // The ranges come from the allocator rather than being computed here, so
+        // the geometry is unit-tested next to the type that defines it. A wrong
+        // offset computed at this call site is **not** catchable end to end:
+        // whether it destroys anything depends on which slab holds live data.
+        for (offset, len) in self.alloc.take_punchable_ranges() {
+            // Advisory. A filesystem without `FALLOC_FL_PUNCH_HOLE` returns
+            // `EOPNOTSUPP`, and failing to reclaim space must not fail a
+            // checkpoint -- the space is already unreachable either way.
+            if let Err(e) = self.seg.punch(offset, len) {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(offset, len, error = %e, "hole punch declined");
+                let _ = e;
+            }
+        }
+        freed
     }
 
     /// Recompute occupancy from the committed index and adopt it, returning
