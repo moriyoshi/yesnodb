@@ -5856,3 +5856,55 @@ that count per file. Updated to 91 with `store/segment.rs` at 3, stamped today.
 **A count in prose that a script verifies against the tree is the one kind of
 documentation that cannot go stale silently** -- the same mechanism ARCHITECTURE's
 module diagram has, and worth more than its bookkeeping cost every time it fires.
+
+## 2026-09-27 -- COMPACT_LIVE_FRACTION is not the blocker, and the value is unchanged
+
+Asked to fix `COMPACT_LIVE_FRACTION`, on my own recorded reasoning that 0.40
+against a ~0.50 scattered-delete steady state is why evacuation never fires.
+**Measured first, because this constant carries a derived model and `CLAUDE.md`
+forbids changing that class of constant without one. The reasoning was wrong and
+the value is unchanged.**
+
+**Swept at 0.40, 0.50, 0.60, 0.70 and 0.90 over fourteen delete-and-refill cycles:
+`evacuated_chunks` is 0 at every value.** At 0.90 almost any partly live slab
+qualifies, so the threshold is not what excludes them -- **there are none to
+exclude.**
+
+**The reason is that a chunk is immutable.** Modifying one supersedes its whole
+extent and writes a new one elsewhere, so a slab's slots free *wholesale* as its
+chunks are rewritten. Slabs go **full to empty**, never full to partial. An empty
+slab is `Free`, which `new_slab_for` reuses and `reclaim_deferred` punches --
+neither consulting this constant. Evacuation's *input* does not arise.
+
+**And the workload is bounded, which the same probe showed only after its own
+confound was removed.** The first version refilled at ever-fresh ordinals, which
+spreads the same ordinal count over more chunks every cycle and grows live data
+for the workload's own reasons -- **the exact confound the consumer had identified
+in their no-compaction run, repeated by me one message later.** Refilling into the
+range just deleted holds the chunk count fixed, and then:
+
+```text
+  cycle   fs MB   evacuated   extents   allocMB   slabs
+      0    6.67           0       814     12.58       6
+      6    8.76           0       814     20.97      10
+      7    7.01           0       814     20.97      10   -1.75
+     13    6.95           0       814     20.97      10   -1.75
+     14    7.29           0       814     20.97      10
+```
+
+Live data constant at 4 M ordinals and 814 extents throughout. Allocated bytes
+flat at 20.97 MB; the **file** sawtooths between 6.95 and 8.76 MB, dropping 1.75
+MB every sixth cycle as slabs drain and are punched. **Bounded and periodic, with
+no evacuation at all** -- which is punching doing the whole job, and the file
+holding 7-9 MB where the allocator's high-water footprint is 21.
+
+**What I did instead of changing it**: recorded the sweep on the constant itself,
+saying it is **unexercised rather than validated**, and what a workload would have
+to look like to exercise it -- a slab holding chunks from several keys where only
+some are touched, which neither this tree's probes nor the consumer's produced.
+
+**Three times today the task changed on first measurement**, and this is the one
+where the wrong reasoning was mine twice over: I named this constant as the next
+fix in two separate records, from reading a predicate rather than running it. **A
+constant's rationale can be sound and its relevance still unestablished**, and the
+second is the thing to check before touching the first.

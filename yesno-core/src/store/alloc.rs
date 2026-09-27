@@ -311,6 +311,32 @@ pub const RECLAIM_CKPT_DELAY: u64 = 2;
 /// and page size. At 0.40 that is 1.53x space for 1.67x writes. The curve is
 /// sharp on the high side and flat on the low side ( 0.80 buys 27% space for 3x
 /// the writes ), so err low. Product-optimal is 0.285.
+///
+/// # This constant is **unexercised**, not validated ( measured 2026-09-27 )
+///
+/// It was suspected of being the reason evacuation never fires under scattered
+/// deletes -- a 50% delete leaves each slab about 0.50 live, just above 0.40.
+/// **Swept at 0.40, 0.50, 0.60, 0.70 and 0.90 over fourteen delete-and-refill
+/// cycles: `evacuated_chunks` is 0 at every value.** At 0.90 almost any partly
+/// live slab would qualify, so the threshold is not what excludes them. There are
+/// none to exclude.
+///
+/// **The reason is that a chunk is immutable.** Modifying one supersedes its whole
+/// extent and writes a new one elsewhere, so a slab's slots are freed *wholesale*
+/// as its chunks are rewritten. Slabs go **full to empty**, not full to partial,
+/// and an empty slab is `Free` -- reused by `new_slab_for` and punched by
+/// `DbStore::reclaim_deferred`, neither of which consults this constant.
+///
+/// Measured shape over fourteen cycles at constant live data ( 4 M ordinals, 814
+/// extents throughout ): allocated bytes flat at 20.97 MB, and the **file**
+/// sawtoothing between 6.95 and 8.76 MB with a 1.75 MB drop every sixth cycle as
+/// slabs drain and are punched. Bounded and periodic, with no evacuation at all.
+///
+/// **So do not change this on the model alone.** A workload that *does* produce a
+/// partly live slab needs a slab holding chunks from several keys where only some
+/// are touched, and neither this tree's probes nor the consumer's reproduced that.
+/// Until one does, the value is arbitrary within the flat part of its own curve,
+/// and the sweep above is what a *non*-finding looks like.
 pub const COMPACT_LIVE_FRACTION: f64 = 0.40;
 
 /// Slab and extent allocator.
