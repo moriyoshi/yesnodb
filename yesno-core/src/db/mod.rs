@@ -2304,10 +2304,17 @@ impl Db {
     /// Run `f` inside `checkpoint`, after the watermarks are sampled and before
     /// any shard is touched.
     ///
-    /// **Testing seam, not an extension point.** It exists so that the
-    /// reclamation hazard in `stale-root-blocks-idle-reclamation` has a
-    /// *deterministic* regression instead of a threaded one that passes by
-    /// luck. Nothing in production sets it.
+    /// **Testing seam, not an extension point.** It exists so that one
+    /// reclamation hazard has a *deterministic* regression instead of a threaded
+    /// one that passes by luck. Nothing in production sets it.
+    ///
+    /// The hazard, named here rather than pointed at because the slug this used to
+    /// cite resolves nowhere: **a checkpoint does not prune the memtable**, so
+    /// consecutive checkpoints with no commits between them supersede extents at
+    /// the *same* `obsolete_ckpt`. Gating reclamation on the oldest pinned root is
+    /// therefore unsound -- the precise condition is about checkpoint *sequence
+    /// numbers* and needs per-reader state that does not exist. `ARCHITECTURE.md`
+    /// carries the full argument beside invariant I2's `>` versus `>=` discussion.
     #[doc(hidden)]
     pub fn set_checkpoint_hook(&self, f: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
         *self.inner.checkpoint_hook.lock().unwrap() = f;
@@ -2759,8 +2766,9 @@ impl Db {
         // reaching what this checkpoint supersedes.
         //
         // Not a general extension point: it exists so that hazard has a
-        // deterministic regression rather than a threaded one. See
-        // `stale-root-blocks-idle-reclamation` in `JOURNAL.md`.
+        // deterministic regression rather than a threaded one. The hazard is the
+        // paragraph above; this used to end in a pointer to a `JOURNAL.md` entry
+        // that is not there and never was.
         if let Some(hook) = self.inner.checkpoint_hook.lock().unwrap().clone() {
             hook();
         }

@@ -284,9 +284,18 @@ impl Slab {
 ///    Loosening this to `>=` was tried on 2026-08-25 and is unsound. It does
 ///    not fail loudly: the generational allocator rarely re-hands-out a single
 ///    freed slot, so the corruption stays latent until the slab empties and is
-///    recycled whole. See `stale-root-blocks-idle-reclamation` in JOURNAL.md for
-///    the *correct* way to sharpen this ( gate on the oldest pinned root, not
-///    on versions ).
+///    recycled whole.
+///
+///    **This used to say the correct sharpening is to gate on the oldest pinned
+///    root rather than on versions, and that is wrong** ( corrected 2026-09-27,
+///    found chasing the dangling slug this sentence pointed at ).
+///    `ARCHITECTURE.md` records the second reason, beside I2's `>` versus `>=`
+///    discussion: a checkpoint does not prune the memtable, so consecutive
+///    checkpoints with no commits between them supersede extents at the **same**
+///    `obsolete_ckpt`, and a root-based gate cannot separate them either. The
+///    precise condition is about checkpoint *sequence numbers* and needs
+///    per-reader state that does not exist, which is why condition 3 asks
+///    reachability directly instead.
 /// 2. `checkpoint_seq >= reclaim_after_ckpt` — the A/B superblock rule; slot A
 ///    still names the previous root, so an extent freed by checkpoint N cannot
 ///    be reused until N+2 is durable. Same two-transaction delay as LMDB.
@@ -309,8 +318,9 @@ pub struct Pending {
     /// live reader holds a root from below `k`. `obsolete_at` is a *version*,
     /// and a version does not determine which root a reader captured: the two
     /// are read at different moments in `Db::snapshot`, so a reader can hold a
-    /// version above `obsolete_at` and a root from before `k`. See
-    /// `stale-root-blocks-idle-reclamation` in `JOURNAL.md`.
+    /// version above `obsolete_at` and a root from before `k`. ( That sentence is
+    /// the whole argument; it used to end in a pointer to a `JOURNAL.md` entry
+    /// which is not there and never was. )
     pub obsolete_ckpt: u64,
 }
 

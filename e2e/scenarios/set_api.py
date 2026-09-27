@@ -214,8 +214,10 @@ d = db_open("stored")
 # at all — so it is a property of how it was *opened* and is constant across
 # commits and checkpoints. Pinned here in that form deliberately: asserting it
 # flips at a checkpoint looks like a durability test, passes for the wrong
-# reason, and would be testing nothing. See `is-durable-reads-as-a-claim` in
-# JOURNAL.md ( closed; folded there 2026-09-08 ). Actual durability is what `wal_size.py` and `durability.py` check,
+# reason, and would be testing nothing. ( This used to cite a JOURNAL.md entry
+# said to have been folded there on 2026-09-08. It is not there and `git log -S`
+# finds it never was, so the pointer is dropped: the reasoning is above and prose
+# cannot dangle. ) Actual durability is what `wal_size.py` and `durability.py` check,
 # by reopening and reading the data back.
 fresh = db_is_durable(d)
 assert fresh, "a file-backed database reports a store before anything is written"

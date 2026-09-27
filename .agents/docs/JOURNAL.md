@@ -6080,3 +6080,44 @@ rule have to change together. And my first attempt to measure the blast radius
 reported 46, because it counted every self-contained `TODO.md` entry as dangling:
 **a slug's own entry heading is its definition**, and a rule that does not know
 that measures the wrong thing.
+
+### Pulling the dangling-slug thread: two broken references were propping each other up
+
+Fixed `ARCHITECTURE.md`'s four dangling slug citations, and the thread ran further
+than the file.
+
+**All four were the same shape**: a sentence that states its reasoning in full,
+followed by `see `some-slug``. Two claimed a `JOURNAL.md` entry that `git log -S`
+says never existed, one named the backlog entry a reconstructed fixture was rebuilt
+from ( since removed ), one pointed at the distinction stated in the clause before
+it. Every one was **dropped rather than repaired**, which is the checker's own
+first preference -- prose cannot dangle -- with the removal stated in place so a
+later reader knows a pointer went rather than wondering whether one was lost.
+
+**Then the source-side gate started failing, which is the interesting part.**
+Removing `ARCHITECTURE.md`'s mentions made **three source citations** dangle:
+`e2e/scenarios/set_api.py` and two sites in `db/mod.rs`, then two more in
+`store/alloc.rs`. They had all been resolving against `ARCHITECTURE.md`'s own
+broken pointers, because resolution is "appears anywhere under `.agents/docs/`".
+**Two dangling references were validating each other**, and the gate reported zero
+the whole time. Five source sites repaired, all by restating and dropping.
+
+**And chasing one of them found a contradiction between two comments.**
+`store/alloc.rs` said the *correct* way to sharpen reclamation condition 1 is to
+"gate on the oldest pinned root, not on versions". `ARCHITECTURE.md` says that is
+**also unsound**, for a second reason: a checkpoint does not prune the memtable, so
+consecutive checkpoints with no commits between them supersede extents at the same
+`obsolete_ckpt`. The comment was pointing a future reader at a fix the architecture
+document had already refuted. Corrected in `alloc.rs`, with the reason inline.
+
+**One recursion worth recording.** The entry I filed about dangling slugs **named
+them in backticks**, which under an appears-anywhere rule made them resolve -- so
+the report repaired the thing it reported, and moved four items from
+`ARCHITECTURE.md`'s column into `TODO.md`'s. The entry now names neither the slugs
+nor the files in backticks and says why. **A report on broken references must not
+be written in a form that repairs them.**
+
+Count: 26 dangling doc-internal citations before, **22 after**, with
+`ARCHITECTURE.md` at zero. The remaining 22 are mostly `TODO.md` and LTM, and two
+in `JOURNAL.md` are correct -- an append-only record has to be able to name an
+entry that was later withdrawn.
