@@ -5678,3 +5678,55 @@ Their measured totals are recorded as theirs and explicitly not reproduced here,
 and their derived split is labelled derived. Their two exclusions are kept in the
 entry because they stop the next reader chasing `SpaceAmpPolicy`, which governs
 bytes pinned by open snapshots and is irrelevant with no long-lived readers.
+
+### The sweep refuted my diagnosis, the same day I filed it
+
+`haiiie` ran the 0 / 1 / 2 / 4 / 8 sweep and the `evacuated_chunks` counter did
+its job: **0 at every `n` through delete and refill**, so the fault is candidate
+selection, not the throttle. **My filed conclusion -- "a defect in a default, not
+an absent component" -- is wrong, and the entry is rewritten rather than
+amended.**
+
+**Two independent refutations, and one of them is that my proposed fix is
+harmful.**
+
+* **No slab falls below `COMPACT_LIVE_FRACTION` 0.40**, and the arithmetic is
+  embarrassingly simple once measured: deleting every other id leaves each slab
+  about **0.50** live. **The canonical churn workload sits in the gap the constant
+  leaves**, just above the threshold, so no candidate is ever produced. I had read
+  the selection predicate and the call site and the default, and never asked what
+  live fraction the workload actually produces.
+* **Where evacuation does fire, the file gets bigger**: 416 / 1037 / 1073 chunks
+  moved at `n` = 2 / 4 / 8, and fs grew 59.74 to **63.25 MB**. Without hole
+  punching, evacuation rewrites bytes into fresh pages and frees nothing on disk,
+  so it is pure write and space amplification. **Raising the default -- the fix I
+  named and told the consumer was tractable -- makes the measured problem worse.**
+
+**The real blocker is hole punching**, which both `store/segment.rs:30` and
+`store/alloc.rs:841` name as the only way space is returned, and which does not
+exist. Until vacated space can go back to the filesystem, *every* reclamation
+mechanism can only add bytes. Fix order is forced: hole punching, then
+`COMPACT_LIVE_FRACTION` against a 0.50 steady state, then the default.
+
+**Their sweep also corrected the accounting in yesno's favour.** The 17 MB delete
+growth is the **deferred-free queue**, not stranded space -- three idle
+checkpoints drain it to zero and extents return to a reusable pool. And part of
+the growth is a timing artifact of `RECLAIM_CKPT_DELAY = 2`: the refill bumped
+8.8 MB of fresh pages while those 17 MB were still deferred and unusable. So
+"nothing reclaims" was too strong in the other direction too: space *is* reclaimed
+internally and reused; what never happens is returning it to the filesystem.
+
+**And "unbounded" is still not established, which I should have questioned when I
+filed it.** Internal reuse works, so a repeating cycle should plateau at a
+high-water mark of peak deferred plus peak live -- a permanent overhead, not
+unbounded growth. One cycle cannot distinguish those, and the distinction changes
+how serious this is. Asked for the same cycle repeated five to ten times at
+`n = 0`.
+
+**The lesson is the one this week keeps teaching in new costumes.** I traced a
+control path through source -- predicate, call site, default -- and concluded from
+its *shape* which term was at fault. The measurement then showed the predicate
+never fires on the workload at all. **Reading a mechanism tells you what it would
+do; only a measurement tells you what it does.** The counter that settled it was
+in the request only because two repairs would have looked identical in the
+headline metric, and that is the part of my own process that worked.
