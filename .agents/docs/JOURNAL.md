@@ -6121,3 +6121,9 @@ Count: 26 dangling doc-internal citations before, **22 after**, with
 `ARCHITECTURE.md` at zero. The remaining 22 are mostly `TODO.md` and LTM, and two
 in `JOURNAL.md` are correct -- an append-only record has to be able to name an
 entry that was later withdrawn.
+
+**Verification.** `./scripts/gate.sh` **passed, exit 0** and
+`./scripts/gate-pg.sh` **passed, exit 0**. The citation checker now reports **42
+cited, 0 baselined** with no `UNRECORDED` line, where before this it reported clean
+while five source citations resolved only against `ARCHITECTURE.md`'s own broken
+pointers.
