@@ -5843,3 +5843,16 @@ would have been true *and* the wrong move: the guarantee is keepable, just not b
 punching indiscriminately, and narrowing it would have traded a real property for
 a few megabytes on a workload that does not want them. **"The test is asserting too
 much" is a conclusion to reach after looking for a confinement, not before.**
+
+**Verification for hole punching.** `./scripts/gate.sh` **passed, exit 0** and
+`./scripts/gate-pg.sh` **passed, exit 0** -- the latter mattering more than usual
+here, because it is the gate that resolves the new `libc` dependency through
+`crate_universe`, and it asked for no `CARGO_BAZEL_REPIN`.
+
+**Two gate failures on the way, and both were the gate doing its job.** The first
+was the MVCC regression above. The second was `check-unsafe-count.py`: the new
+`unsafe` block in `punch` moved the tree from 90 to 91, and a backlog entry records
+that count per file. Updated to 91 with `store/segment.rs` at 3, stamped today.
+**A count in prose that a script verifies against the tree is the one kind of
+documentation that cannot go stale silently** -- the same mechanism ARCHITECTURE's
+module diagram has, and worth more than its bookkeeping cost every time it fires.
