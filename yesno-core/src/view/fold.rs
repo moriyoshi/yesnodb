@@ -741,6 +741,9 @@ impl OrdSet {
         if let Some(out) = self.fold_interleaved_wide_words(v, reduce) {
             return out;
         }
+        if let Some(out) = self.fold_interleaved_subword(v, reduce) {
+            return out;
+        }
         if let Some(out) = self.fold_interleaved(v, reduce) {
             return out;
         }
@@ -842,6 +845,113 @@ impl OrdSet {
                 let shift = (word_index % n) * (64 / n);
                 output_words[output_index] |= folded << shift;
                 cardinality += folded.count_ones();
+            }
+        }
+        if let Some(prefix) = current_prefix {
+            if cardinality != 0 {
+                chunks.push((
+                    prefix,
+                    Container::Bitmap(BitmapContainer::from_words(output_words, cardinality)),
+                ));
+            }
+        }
+        let mut out = OrdSet::from_chunks(chunks);
+        out.optimize();
+        Some(out)
+    }
+
+    /// The **sub-word** interleaved arm: several logical ordinals share a word.
+    ///
+    /// The third structure, and the one between the other two. `fold_table`
+    /// reaches `sets` of 2, 4 and 8, where a logical ordinal fits inside a
+    /// **byte** and a 256-entry table folds one byte at a time.
+    /// [`OrdSet::fold_interleaved_wide_words`] takes a `sets` of 64 or more,
+    /// where a logical ordinal spans whole words. Between them sit 16 and 32:
+    /// too wide for a byte, too narrow for a word, and they walked every set bit.
+    ///
+    /// A logical ordinal is a contiguous bit-field of `sets` bits inside one
+    /// word, so its population is `( word >> k * sets ) & mask` counted -- one
+    /// shift, one mask, one `count_ones`, no table and no shuffle.
+    ///
+    /// Declines unless the layout is interleaved and `sets` divides 64 and is
+    /// strictly between 8 and 64, so `sets` is 16 or 32. Dividing 64 also makes
+    /// it a power of two, hence a divisor of [`CHUNK_CARD`], so no logical
+    /// ordinal straddles a chunk -- the condition the wide arm has to check
+    /// separately and got wrong on its first attempt.
+    fn fold_interleaved_subword(&self, v: &View, reduce: Reduce) -> Option<OrdSet> {
+        if v.layout() != ViewLayout::Interleaved {
+            return None;
+        }
+        let n = u64::from(v.sets());
+        if n <= 8 || n >= 64 || !64u64.is_multiple_of(n) {
+            return None;
+        }
+        if self.is_empty() {
+            return Some(OrdSet::new());
+        }
+
+        let per_word = (64 / n) as usize;
+        let logicals_per_chunk = BITMAP_WORDS * per_word;
+        let mask = (1u64 << n) - 1;
+        let mut chunks = Vec::new();
+        let mut current_prefix = None;
+        let mut output_words = vec![0u64; BITMAP_WORDS];
+        let mut cardinality = 0u32;
+
+        for (prefix, container) in self.chunks() {
+            let output_prefix = prefix / n;
+            if current_prefix != Some(output_prefix) {
+                if let Some(old) = current_prefix {
+                    if cardinality != 0 {
+                        let words = std::mem::replace(&mut output_words, vec![0; BITMAP_WORDS]);
+                        chunks.push((
+                            old,
+                            Container::Bitmap(BitmapContainer::from_words(words, cardinality)),
+                        ));
+                    } else {
+                        output_words.fill(0);
+                    }
+                }
+                current_prefix = Some(output_prefix);
+                cardinality = 0;
+            }
+            let output_base_bit = (prefix % n) as usize * logicals_per_chunk;
+            let mut emit = |j: usize, count: u64| {
+                if reduce.keep(count, n) {
+                    let bit = output_base_bit + j;
+                    output_words[bit / 64] |= 1u64 << (bit % 64);
+                    cardinality += 1;
+                }
+            };
+            // Per chunk, for the reason the wide arm is: one array tail must not
+            // switch the arm off for a whole index.
+            match crate::unstable_arrow::bitmap_words(container) {
+                Some(words) => {
+                    for (wi, &word) in words.iter().enumerate() {
+                        for k in 0..per_word {
+                            let count = ((word >> (k * n as usize)) & mask).count_ones();
+                            emit(wi * per_word + k, u64::from(count));
+                        }
+                    }
+                }
+                None => {
+                    let mut cur = usize::MAX;
+                    let mut count = 0u64;
+                    for low in container.iter() {
+                        let j = (u64::from(low) / n) as usize;
+                        if j != cur {
+                            if cur != usize::MAX {
+                                emit(cur, count);
+                            }
+                            cur = j;
+                            count = 0;
+                        }
+                        count += 1;
+                    }
+                    if cur != usize::MAX {
+                        emit(cur, count);
+                    }
+                }
             }
         }
         if let Some(prefix) = current_prefix {
@@ -1894,6 +2004,169 @@ mod wide_fold_tests {
                     .iter()
                     .collect();
                 assert_eq!(got, want, "declining sets = {sets}, {reduce:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod subword_fold_tests {
+    //! The sub-word arm, at `sets` of 16 and 32.
+    //!
+    //! Written to the standard the wide arm had to be repaired to: the firing and
+    //! declining lists come from the **domain** of arities rather than from the
+    //! shape of the guard, a fixture spans two *output* chunks, and one mixes
+    //! container kinds. The wide arm's first version passed a guard-derived list
+    //! while being wrong on eleven widths, which is why none of that is optional.
+    use super::*;
+    use crate::OrdSet;
+    use std::collections::BTreeSet;
+
+    fn build(ords: &[u64]) -> OrdSet {
+        let mut v = ords.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        let mut s = OrdSet::from_sorted_slice(&v);
+        s.optimize();
+        s
+    }
+
+    /// Count each logical ordinal's slots from the definition and reduce.
+    fn oracle(set: &OrdSet, sets: u64, reduce: Reduce, logical_hi: u64) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        for x in 0..logical_hi {
+            let count = (0..sets).filter(|i| set.contains(x * sets + i)).count() as u64;
+            if count > 0 && reduce.keep(count, sets) {
+                out.insert(x);
+            }
+        }
+        out
+    }
+
+    /// Exactly 16 and 32, over every arity from 1 to 96 plus the wide ones.
+    ///
+    /// The list is every value in the range rather than a pair of hand-picked
+    /// sets, so an arity the guard admits by accident cannot hide in the gap
+    /// between a firing example and a declining one.
+    #[test]
+    fn the_subword_arm_fires_at_exactly_sixteen_and_thirty_two() {
+        let ords: Vec<u64> = (0..2 * u64::from(crate::CHUNK_CARD)).step_by(2).collect();
+        let s = build(&ords);
+        for sets in (1u32..=96).chain([128, 192, 256, 512, 1024, 2048]) {
+            let fires = s
+                .fold_interleaved_subword(&View::interleaved(sets), Reduce::Any)
+                .is_some();
+            assert_eq!(
+                fires,
+                sets == 16 || sets == 32,
+                "sets = {sets} fired: {fires}"
+            );
+        }
+        // And a blocked view is a different relabel, which this arm must not claim.
+        assert!(s
+            .fold_interleaved_subword(&View::blocked(16, 1 << 16), Reduce::Any)
+            .is_none());
+    }
+
+    /// The answers agree with the definition, over the arities around the seam.
+    ///
+    /// 8 and 64 are included deliberately: they are the neighbours this arm sits
+    /// between, and running them through `view_fold` checks that adding an arm
+    /// did not steal a case from the table or the wide path.
+    #[test]
+    fn subword_and_neighbouring_arities_agree_with_the_definition() {
+        let c = u64::from(crate::CHUNK_CARD);
+        let shapes: Vec<(&str, Vec<u64>)> = vec![
+            ("half density", (0..2 * c).step_by(2).collect()),
+            ("every bit", (0..c).collect()),
+            ("one bit at a seam", vec![c]),
+            ("across a seam", vec![c - 1, c, c + 1]),
+            ("one full logical of 32", (32..64).collect()),
+            ("thirds", (0..2 * c).step_by(3).collect()),
+            // Sparse, so the ordinal walk inside the arm runs.
+            ("sparse", (0..500u64).map(|i| i * 131).collect()),
+        ];
+        for sets in [8u64, 16, 32, 64] {
+            for (name, ords) in &shapes {
+                let s = build(ords);
+                let hi = ords.iter().copied().max().unwrap_or(0) / sets + 2;
+                for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                    let want = oracle(&s, sets, reduce, hi);
+                    let got: BTreeSet<u64> = s
+                        .view_fold(&View::interleaved(sets as u32), reduce)
+                        .iter()
+                        .collect();
+                    assert_eq!(got, want, "{name} at sets = {sets}, {reduce:?}");
+                }
+            }
+        }
+    }
+
+    /// Input chunks far enough apart to land in different **output** chunks.
+    ///
+    /// At `sets = 16` one input chunk contributes 4 096 logical ordinals, so it
+    /// takes 16 of them to fill an output chunk -- and a fixture of adjacent
+    /// chunks would agree with `output_prefix = 0`. This is the hole that let the
+    /// wide arm ship with a wrong `output_prefix` for a day.
+    #[test]
+    fn subword_input_chunks_that_span_output_chunks_land_in_the_right_one() {
+        let c = u64::from(crate::CHUNK_CARD);
+        for sets in [16u64, 32] {
+            let far = sets * c;
+            let mut ords: Vec<u64> = (0..c).step_by(2).collect();
+            ords.extend((far..far + c).step_by(2));
+            let s = build(&ords);
+            assert!(
+                s.fold_interleaved_subword(&View::interleaved(sets as u32), Reduce::Any)
+                    .is_some(),
+                "the arm must fire at sets = {sets}"
+            );
+            let lo = far / sets;
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let mut want = oracle(&s, sets, reduce, c / sets);
+                for x in lo..lo + c / sets {
+                    let count = (0..sets).filter(|i| s.contains(x * sets + i)).count() as u64;
+                    if count > 0 && reduce.keep(count, sets) {
+                        want.insert(x);
+                    }
+                }
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "two output chunks at sets = {sets}, {reduce:?}");
+                if reduce == Reduce::Any {
+                    assert!(
+                        want.iter().any(|&x| x >= lo),
+                        "the fixture must reach the second output chunk at sets = {sets}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A mixed index: bitmap chunks plus a sparse array tail.
+    #[test]
+    fn a_subword_fold_handles_a_mixed_index() {
+        let c = u64::from(crate::CHUNK_CARD);
+        for sets in [16u64, 32] {
+            let mut ords: Vec<u64> = (0..2 * c).step_by(2).collect();
+            ords.extend((0..400u64).map(|i| 2 * c + i * 7));
+            let s = build(&ords);
+            let kinds: Vec<_> = s.chunks().map(|(_, x)| x.kind()).collect();
+            assert!(
+                kinds.contains(&crate::ContainerKind::Array)
+                    && kinds.contains(&crate::ContainerKind::Bitmap),
+                "the fixture must mix kinds at sets = {sets}, got {kinds:?}"
+            );
+            let hi = ords.iter().copied().max().unwrap() / sets + 2;
+            for reduce in [Reduce::Any, Reduce::All, Reduce::Parity] {
+                let want = oracle(&s, sets, reduce, hi);
+                let got: BTreeSet<u64> = s
+                    .view_fold(&View::interleaved(sets as u32), reduce)
+                    .iter()
+                    .collect();
+                assert_eq!(got, want, "mixed index at sets = {sets}, {reduce:?}");
             }
         }
     }

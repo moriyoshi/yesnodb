@@ -5509,3 +5509,40 @@ time I read a wrapper's exit code instead of the gate's, this time I read
 nothing at all and narrated success. **A check whose output was not read is a
 check that was not run**, and a backgrounded command's result has to be fetched
 from its log before anything is claimed about it.
+
+## 2026-09-27 -- sets of 16 and 32: the third structure, and the simplest
+
+Closed the arity hole the wide arm left. **`sets` 16: 9.7x. `sets` 32: 17.4x.**
+Tables in `LTM/packed-lenses-matrix-bignum-and-views.md`.
+
+There are three structures, not two, decided by where a logical ordinal's `sets`
+bits sit relative to a word: **inside a byte** ( 2, 4, 8 -- the table and the
+vector arms, which exist because those bits must be *gathered out of* a byte ),
+**inside a word but wider than a byte** ( 16, 32 -- a contiguous bit-field,
+`( word >> k * sets ) & mask` counted ), and **spanning whole words** ( 64 up -- a
+sum of `count_ones` ). The middle case is the simplest of the three and was the
+last written, purely because 16 and 32 fall between the two arms that existed.
+
+**The shape of the cost curve is the argument for having done it.** Per set bit,
+across 2 / 4 / 8 / 16 / 32 / 64 / 128 / 256 / 1024: 0.36, 0.19, 0.10, **2.00,
+1.84**, 0.06, 0.03, 0.04, 0.01 before -- the middle two twenty times their
+neighbours on both sides. Now 0.21 and 0.11, and the curve is monotone with no
+hole. That anomaly was invisible while everything above 8 was slow; making the
+right-hand side fast is what turned a uniform slow region into a pothole.
+
+**Its guard is stronger than the wide arm's and deliberately so.** `sets`
+dividing 64 makes it a power of two, hence a divisor of `CHUNK_CARD`, so no
+logical ordinal can straddle a chunk -- the condition the wide arm has to check
+separately and got wrong for a day. The arm's doc says this, so the asymmetry
+between the two guards reads as a consequence rather than an oversight.
+
+**The tests were written to the standard the wide arm had to be repaired to,
+which is the point of having been wrong there.** The firing list is every arity
+from 1 to 96 plus the wide ones, asserting `fires == ( sets == 16 || sets == 32 )`
+-- from the domain, not from the guard. A fixture spans two output chunks, since
+at `sets = 16` it takes 16 input chunks to fill one and adjacent chunks agree with
+`output_prefix = 0`. One mixes container kinds. The neighbours 8 and 64 run
+through `view_fold` to check that a new arm did not steal a case from the table or
+the wide path. Five sabotages each reddened the suite -- wrong field, wrong
+logical index, dropped chunk offset, mask one bit narrow, wrong output chunk --
+and `output_prefix` was caught this time rather than a day later by a consumer.

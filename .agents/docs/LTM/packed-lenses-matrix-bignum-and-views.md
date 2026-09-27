@@ -1353,3 +1353,53 @@ fixtures do not reach, the fixtures agree with any value of it.**
 a multiple of 64. Nothing has asked for them, and they would need a third
 structure ( several logicals per word, but more than 8 constituents ), so they
 are left alone deliberately.
+
+### The third structure: sets of 16 and 32 ( 2026-09-27 )
+
+Closing the hole the wide arm left. There are **three** structures, not two, and
+they are decided by where a logical ordinal's `sets` bits sit relative to a word:
+
+* **inside a byte** ( `sets` 2, 4, 8 ) -- `fold_table`, a 256-entry lookup per
+  byte, plus the NEON and SSE arms. The bits of one logical ordinal have to be
+  *gathered out of* a byte, which is why this case needed a shuffle.
+* **inside a word, wider than a byte** ( `sets` 16, 32 ) -- a contiguous bit-field:
+  `( word >> k * sets ) & mask`, counted. One shift, one mask, one `count_ones`.
+* **spanning whole words** ( `sets` a power of two from 64 up ) -- a sum of
+  `count_ones` over `sets / 64` words.
+
+The middle case was the last to be written and is the simplest of the three. It
+existed only because 16 and 32 are too wide for a byte table and too narrow for a
+word, so neither of the arms that were written reached them.
+
+Measured over 8 dense chunks, 262 144 set bits, `Any`:
+
+```text
+  sets      before      after   speedup
+    16   524 333 ns   54 092 ns    9.7x
+    32   482 395 ns   27 761 ns   17.4x
+```
+
+**Per set bit the curve is now monotone in `sets` and has no hole**: 0.36, 0.19,
+0.10, 0.21, 0.11, 0.06, 0.03, 0.04, 0.01 at 2 / 4 / 8 / 16 / 32 / 64 / 128 / 256
+/ 1024. Before this the middle two read 2.00 and 1.84 -- **twenty times their
+neighbours on both sides**, which is a strange shape for a library to have and
+was only visible once the wide arm made the right-hand side fast.
+
+**`sets` dividing 64 is a stronger condition than the wide arm's and needs no
+separate chunk-tiling check.** A divisor of 64 is a power of two, hence a divisor
+of `CHUNK_CARD`, so no logical ordinal can straddle a chunk -- which is exactly
+the condition the wide arm has to test for itself and got wrong on its first
+attempt. Stated in the arm's doc so the asymmetry between the two guards is not
+read as an oversight.
+
+**The tests were written to the standard the wide arm had to be repaired to.**
+The firing list is **every arity from 1 to 96** plus the wide ones, asserting
+`fires == ( sets == 16 || sets == 32 )` -- drawn from the domain, not from the
+guard, because the wide arm passed a guard-derived list while being wrong on
+eleven widths. There is a fixture spanning two *output* chunks ( at `sets = 16` it
+takes 16 input chunks to fill one, so adjacent chunks agree with
+`output_prefix = 0` ), a mixed-container fixture, and the neighbouring arities 8
+and 64 run through `view_fold` to check that adding an arm did not steal a case
+from the table or the wide path. Five sabotages -- wrong field, wrong logical
+index, dropped chunk offset, mask one bit narrow, wrong output chunk -- each
+reddened the suite, `output_prefix` included this time.
