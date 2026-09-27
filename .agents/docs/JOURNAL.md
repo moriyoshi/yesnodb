@@ -5385,3 +5385,26 @@ multiple of 64, and a third structure would be needed. Nothing has asked.
 and `./scripts/gate-pg.sh` **passed, exit 0**, both against the committed tree --
 the Bazel gate is owed here because this changes `yesno-core` code rather than
 only comments, unlike the `view_select` entry above.
+
+**Relayed to `haiiie-a6`, and one closure reason updated.** Told them the arm
+landed, with the measured 1.77 -> 0.04 ns per set bit at `sets = 256`, and
+deliberately **did not** predict what their 287 ms becomes: that was their
+corpus at 138M set bits and mine is 262k bits of synthetic half-density data, so
+`287 / 46` is not a number either of us has. Flagged the gating condition they
+most need, which is that the arm declines for the **whole call** unless every
+container is a bitmap with readable words -- one Array or Run anywhere in their
+`FWD` key sends the entire fold back to the per-bit walk, so a re-measurement
+near 287 ms means it declined rather than that it is slow.
+
+Also told them the caution I had sent was wrong, having measured it before
+building the arm rather than after.
+
+**The `view_count` closure note is updated, because one of its two reasons
+moved.** "About 72x slower than the consumer's inverted path" was true of the
+per-bit walk and the walk is gone at that width, so that figure must not be
+restated without a re-measurement. **It does not reopen the entry**, and the
+structure of why is the thing worth keeping: the closure rested on a fact ( the
+data is local and there is no caller ) *and* a ratio, and only the ratio moved.
+A closure resting on a ratio alone would now be in doubt. That is the argument
+for recording which of a decision's reasons is which -- it is what lets a later
+session tell a weakened reason from a dead decision.
