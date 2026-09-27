@@ -6012,3 +6012,33 @@ clearing it between two opens made the second look like a first. The seam is
 deleted; each test now uses a directory no other test names, which needs no global
 mutation at all. **A test seam that mutates process-wide state is a test that
 depends on execution order**, and the suite is where that shows.
+
+**The returning half is verified, on the consumer's corpus rather than ours.**
+Against `03cd5a3`, one process per phase: their compaction cycle settles at
+**26.82 MB** where it plateaued at 58.77, so **3.2x of a fresh 18.24 MB store
+becomes 1.47x**. Three idle checkpoints punch nothing, matching the
+dirty-path-only fact exactly; the first dirty checkpoint after the reopen punches
+while 131 072 documents are written. About **8.2 MB returned** against the
+in-process figure -- they had predicted 17 and said to record the measurement, not
+the prediction. **The same-process control is unchanged at 58.77 MB**, so the
+registry refuses exactly where it should.
+
+**A caveat that belongs with any advice about this**, and it is theirs: their
+`compact()` and `acknowledge_compaction()` each call open, so an embedder running
+them **inside its serving process** gets the refused path and none of the benefit.
+That is the confinement being correct, not a defect -- but it decides whether a
+deployment benefits at all, and "punching returns your space" is false for a
+long-lived process that compacts in-band.
+
+**Worth noting where the verification came from.** The half I could not test was
+tested by the consumer whose workload defined it, in a harness that runs each phase
+as its own process -- and they were careful enough to say that an in-process reopen
+for diagnostics would have run the open-time rebuild unpunched and persisted that,
+invalidating the run. **A fixture this tree cannot build is not an untestable
+claim; it is a claim testable somewhere else**, and saying so precisely is what let
+the right party close it.
+
+**Verification for the punch-at-open change.** `./scripts/gate.sh` **passed, exit
+0** and `./scripts/gate-pg.sh` **passed, exit 0**, both against `03cd5a3` -- which
+is the commit the consumer archived and measured, so their 26.82 MB and this
+tree's gates describe the same code.
