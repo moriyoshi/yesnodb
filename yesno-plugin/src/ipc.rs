@@ -443,6 +443,13 @@ pub enum Frame {
         arena_bytes: u64,
         max_lanes: u32,
         max_handles: u32,
+        /// Most blocks one [`Frame::Blocks`] will carry, whatever a peer asks for.
+        ///
+        /// Advertised rather than discovered, because it is the knob that decides
+        /// the channel's cost: one block per round trip is several times slower than
+        /// a batched one, so a peer that guessed low would be slow for a reason it
+        /// could not see.
+        max_blocks: u32,
     },
     SnapshotOpened {
         snapshot: u64,
@@ -578,6 +585,7 @@ impl Frame {
                 arena_bytes,
                 max_lanes,
                 max_handles,
+                max_blocks,
             } => {
                 p.extend_from_slice(&protocol.to_le_bytes());
                 p.extend_from_slice(&generation.to_le_bytes());
@@ -586,6 +594,7 @@ impl Frame {
                 p.extend_from_slice(&arena_bytes.to_le_bytes());
                 p.extend_from_slice(&max_lanes.to_le_bytes());
                 p.extend_from_slice(&max_handles.to_le_bytes());
+                p.extend_from_slice(&max_blocks.to_le_bytes());
             }
             Frame::SnapshotOpened { snapshot, version } => {
                 p.extend_from_slice(&snapshot.to_le_bytes());
@@ -766,6 +775,7 @@ impl Frame {
                 arena_bytes: r.u64()?,
                 max_lanes: r.u32()?,
                 max_handles: r.u32()?,
+                max_blocks: r.u32()?,
             },
             Kind::SnapshotOpened => Frame::SnapshotOpened {
                 snapshot: r.u64()?,
@@ -1037,6 +1047,7 @@ mod tests {
                 arena_bytes: 2 * 1024 * 1024,
                 max_lanes: 256,
                 max_handles: 8,
+                max_blocks: 16,
             },
             Frame::SnapshotOpened {
                 snapshot: 7,

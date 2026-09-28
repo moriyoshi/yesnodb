@@ -234,6 +234,22 @@ pub fn start_with_plugin(
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
     facility: crate::plugin::SharedFacility,
 ) -> Result<FollowerNode, ConfigError> {
+    start_with_channel(cfg, event_sink, facility, None)
+}
+
+/// As [`start_with_plugin`], also notifying out-of-process channel peers.
+///
+/// A channel peer must learn about a rebootstrap for the same reason an in-process
+/// plugin must: every handle it holds names a database that is about to stop
+/// existing. It does **not** have to drain, because closing is not required -- the
+/// session's snapshots are released by the host when it drops them, and the peer's
+/// next request answers `UNAVAILABLE`.
+pub fn start_with_channel(
+    cfg: &Config,
+    event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
+    facility: crate::plugin::SharedFacility,
+    channel: Option<Arc<crate::plugin::Channel>>,
+) -> Result<FollowerNode, ConfigError> {
     let dir = cfg.data_dir().to_path_buf();
     let status = Arc::new(FollowerStatus::default());
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
@@ -247,6 +263,7 @@ pub fn start_with_plugin(
     let cfg = cfg.clone();
     let st = status.clone();
     let db_slot = slot.clone();
+    let chan = channel.clone();
     let task = tokio::spawn(async move {
         let poll = Duration::from_secs(cfg.follower.poll_interval_secs.max(1));
         let max_backoff = Duration::from_secs(cfg.follower.max_backoff_secs.max(1));
@@ -290,7 +307,10 @@ pub fn start_with_plugin(
                 &st,
                 db_slot.as_ref(),
                 event_sink.as_ref(),
-                facility.as_ref(),
+                crate::plugin::Listeners {
+                    facility: facility.as_ref(),
+                    channel: chan.as_deref(),
+                },
             )
             .await
             {
@@ -343,7 +363,7 @@ async fn one_pass(
     st: &Arc<FollowerStatus>,
     slot: Option<&DbSlot>,
     event_sink: Option<&Arc<dyn yesno_core::events::CoreEventSink>>,
-    facility: Option<&Arc<crate::plugin::Facility>>,
+    listeners: crate::plugin::Listeners<'_>,
 ) -> Result<u64, ()> {
     // The shard count comes from the leader, not from the config: it is a
     // property of the database, and a standby that guessed would bootstrap
@@ -405,7 +425,7 @@ async fn one_pass(
         .filter(|s| !dir.join(format!("shard-{s:04}.yno")).exists() || f.cursor(*s).is_none())
         .collect();
     if !needs_bootstrap.is_empty() {
-        close_for_rebuild(slot, st, facility);
+        close_for_rebuild(slot, st, listeners);
         for shard in &needs_bootstrap {
             match f.bootstrap_shard(client, *shard).await {
                 Ok(off) => tracing::info!(shard, replay_from = off, "bootstrapped"),
@@ -429,7 +449,7 @@ async fn one_pass(
         // holds `len`, `base` and `synced` in memory — and the failure is a log
         // that decodes to the first foreign byte and then silently stops.
         if let Some(slot) = slot {
-            let db = open_if_needed(slot, cfg, dir, st, event_sink, facility)?;
+            let db = open_if_needed(slot, cfg, dir, st, event_sink, listeners)?;
             match f.apply_shard_into(client, &db, shard, budget).await {
                 Ok(c) => {
                     moved += c.bytes;
@@ -440,7 +460,7 @@ async fn one_pass(
                     if matches!(react(shard, &e), Reaction::Rebootstrap) {
                         tracing::warn!(shard, error = %e, "re-bootstrapping: the leader reclaimed the required WAL generation");
                         st.rebootstraps.fetch_add(1, Ordering::Relaxed);
-                        close_for_rebuild(Some(slot), st, facility);
+                        close_for_rebuild(Some(slot), st, listeners);
                         let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.wal")));
                         let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.yno")));
                         // The next pass finds no image and runs phase one.
@@ -471,7 +491,7 @@ async fn one_pass(
                 if matches!(react(shard, &e), Reaction::Rebootstrap) {
                     tracing::warn!(shard, error = %e, "re-bootstrapping: the leader reclaimed the required WAL generation");
                     st.rebootstraps.fetch_add(1, Ordering::Relaxed);
-                    close_for_rebuild(slot, st, facility);
+                    close_for_rebuild(slot, st, listeners);
                     let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.wal")));
                     match f.bootstrap_shard(client, shard).await {
                         Ok(off) => {
@@ -511,18 +531,9 @@ async fn one_pass(
 fn close_for_rebuild(
     slot: Option<&DbSlot>,
     st: &Arc<FollowerStatus>,
-    facility: Option<&Arc<crate::plugin::Facility>>,
+    listeners: crate::plugin::Listeners<'_>,
 ) {
-    if let Some(f) = facility {
-        match f.before_close() {
-            crate::plugin::Drained::Clean => {}
-            other => tracing::error!(
-                library = f.library(),
-                outcome = ?other,
-                "the plugin did not drain; the rebuild will proceed but the reopen may                  fail until it releases"
-            ),
-        }
-    }
+    listeners.before_close();
     let Some(slot) = slot else { return };
     let taken = slot.write().map(|mut g| g.take()).unwrap_or(None);
     if taken.is_some() {
@@ -549,7 +560,7 @@ fn open_if_needed(
     dir: &std::path::Path,
     st: &Arc<FollowerStatus>,
     event_sink: Option<&Arc<dyn yesno_core::events::CoreEventSink>>,
-    facility: Option<&Arc<crate::plugin::Facility>>,
+    listeners: crate::plugin::Listeners<'_>,
 ) -> Result<Arc<yesno_core::Db>, ()> {
     if let Ok(g) = slot.read() {
         if let Some(db) = g.as_ref() {
@@ -581,10 +592,7 @@ fn open_if_needed(
             // plugin derived from the previous instance is stale. Bumping first
             // and announcing second means a plugin that races the callback still
             // reads a generation that has already moved.
-            if let Some(f) = facility {
-                let generation = f.after_replace();
-                f.after_open(generation);
-            }
+            listeners.after_replace();
             Ok(db)
         }
         Err(e) => {

@@ -212,7 +212,15 @@ yesno/
                                 #   EBS may publish a provisional lease whose materialization is
                                 #   explicitly deferred, but yesnod never launches ECS or EKS work;
                                 #   a core backup barrier excludes concurrent checkpoints.
-                                #   plugin.rs owns the plugin facility: when to load, and the
+                                #   plugin.rs owns both plugin shapes. Channel is the
+                                #   out-of-process one: a Unix socket, one arena and one
+                                #   Session per connection, and notifications pushed to live
+                                #   peers. Closing a connection releases that peer's
+                                #   snapshots, so reclamation needs no pid, no timeout and no
+                                #   cooperation -- the property the in-process shape cannot
+                                #   have. Listeners bundles the two so the replication path
+                                #   threads one value, in the order notify-act-notify.
+                                #   Facility is the in-process one: when to load, and the
                                 #   ordering of the callbacks around a rebootstrap. The drain is
                                 #   why it exists -- a plugin's lease holds Arc<DbInner> and so
                                 #   the directory lock, and NO host call takes one back, so

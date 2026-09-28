@@ -174,6 +174,13 @@ impl Arena {
         std::os::fd::AsFd::as_fd(&self.fd)
     }
 
+    /// Write into the arena. Exposed for tests that assert the region a peer
+    /// receives is the same memory rather than a copy of it.
+    #[doc(hidden)]
+    pub fn write_at_for_test(&mut self, off: usize, bytes: &[u8]) {
+        self.write_at(off, bytes)
+    }
+
     fn write_at(&mut self, off: usize, bytes: &[u8]) {
         let end = off + bytes.len();
         // Bounds are the session's arithmetic, checked here rather than trusted: a
@@ -263,6 +270,7 @@ impl Session {
             },
             max_lanes: self.limits.max_lanes as u32,
             max_handles: self.limits.max_handles as u32,
+            max_blocks: self.limits.max_blocks.max(1) as u32,
         }
     }
 
@@ -686,4 +694,167 @@ impl InvalidData for std::io::Error {
     fn new_invalid(e: crate::ipc::IpcError) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     }
+}
+
+/// Send `fd` to the peer on `stream`, with one byte of payload.
+///
+/// # Why a byte of payload
+///
+/// `sendmsg` with only ancillary data and an empty `iovec` is permitted but is not
+/// reliably *received*: a zero-length datagram on a stream socket is
+/// indistinguishable from nothing arriving, so a reader cannot tell it apart from a
+/// peer that has not spoken yet. One byte makes the descriptor's arrival an event
+/// the reader can wait for.
+///
+/// The byte is the protocol version, so a peer that reads it and disagrees learns
+/// that before it maps anything.
+#[cfg(target_os = "linux")]
+pub fn send_fd<S: std::os::fd::AsRawFd>(
+    stream: &S,
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut byte = [crate::ipc::VERSION; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // The control buffer must be aligned for `cmsghdr`, which a plain byte array is
+    // not guaranteed to be. A `u64` array gives 8-byte alignment, which is enough on
+    // every platform this builds for.
+    const SPACE: usize = 32;
+    let mut control = [0u64; SPACE / 8];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = SPACE as _;
+
+    // SAFETY: `msg.msg_control` points at `SPACE` writable, suitably aligned bytes,
+    // which is what CMSG_FIRSTHDR requires to return a usable header.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        let raw = fd.as_raw_fd();
+        std::ptr::copy_nonoverlapping(
+            &raw as *const libc::c_int,
+            libc::CMSG_DATA(cmsg) as *mut libc::c_int,
+            1,
+        );
+        msg.msg_controllen = (*cmsg).cmsg_len;
+    }
+
+    loop {
+        // SAFETY: `msg` describes one writable byte and one well-formed control
+        // message, both alive for the call.
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
+        if n >= 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        // A signal here is not a failure; anything else is.
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Receive a descriptor sent by [`send_fd`], with the version byte it carried.
+///
+/// Written here rather than left to each peer because the two are one protocol: a
+/// receiver that sizes its control buffer differently, or forgets `MSG_CMSG_CLOEXEC`,
+/// fails in ways that look like the sender's fault.
+#[cfg(target_os = "linux")]
+pub fn recv_fd<S: std::os::fd::AsRawFd>(stream: &S) -> std::io::Result<(std::os::fd::OwnedFd, u8)> {
+    use std::os::fd::FromRawFd;
+
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    const SPACE: usize = 32;
+    let mut control = [0u64; SPACE / 8];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = SPACE as _;
+
+    let n = loop {
+        // SAFETY: `msg` describes one writable byte and a control buffer of SPACE
+        // aligned bytes. MSG_CMSG_CLOEXEC is what stops a received descriptor
+        // leaking across an exec in the receiver.
+        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n >= 0 {
+            break n;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the peer closed before sending the arena descriptor",
+        ));
+    }
+    // SAFETY: `msg` was filled by `recvmsg` above.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no descriptor accompanied the arena message",
+        ));
+    }
+    // SAFETY: non-null, and produced by `recvmsg` for this buffer.
+    unsafe {
+        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the ancillary message was not SCM_RIGHTS",
+            ));
+        }
+        let mut raw: libc::c_int = -1;
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg) as *const libc::c_int, &mut raw, 1);
+        Ok((std::os::fd::OwnedFd::from_raw_fd(raw), byte[0]))
+    }
+}
+
+/// Serve one connection, writing responses through a shared, lockable writer.
+///
+/// [`serve_blocking`] owns the whole stream, which is right for a test and wrong for
+/// a server: a notification has to reach a peer while its serving thread is blocked
+/// in `read`, so the write half must be reachable from elsewhere. The lock is held
+/// for exactly one frame, and a frame is the protocol's unit, so a notification may
+/// land between responses but never inside one.
+pub fn serve_locked<R>(
+    session: &mut Session,
+    mut reader: R,
+    writer: &std::sync::Mutex<impl std::io::Write>,
+) -> std::io::Result<()>
+where
+    R: std::io::Read,
+{
+    let write_frame = |f: &Frame| -> std::io::Result<()> {
+        let bytes = f
+            .encode()
+            .map_err(<std::io::Error as InvalidData>::new_invalid)?;
+        let mut w = writer
+            .lock()
+            .map_err(|_| std::io::Error::other("the channel writer lock was poisoned"))?;
+        w.write_all(&bytes)
+    };
+
+    write_frame(&session.hello())?;
+    let mut buf = Vec::new();
+    while let Some(frame) = read_frame(&mut reader, &mut buf)? {
+        let reply = session.handle(frame);
+        write_frame(&reply)?;
+    }
+    Ok(())
 }

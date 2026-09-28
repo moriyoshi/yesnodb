@@ -56,6 +56,12 @@ pub struct Running {
     grace: Duration,
     /// The loaded plugin, drained before the readers are waited on.
     facility: crate::plugin::SharedFacility,
+    /// The out-of-process channel, closed before the readers are waited on.
+    ///
+    /// Closing is what releases its peers' snapshots, so it belongs in the same
+    /// place as the in-process drain and for the same reason -- except that here it
+    /// needs no cooperation from anyone.
+    channel: Option<crate::plugin::Channel>,
     /// The slot the Flight service reads through.
     ///
     /// Held so teardown can **empty** it. The slot owns an `Arc<Db>`, so a slot
@@ -206,7 +212,7 @@ pub async fn start_with_events(
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
     adopted: Option<crate::metrics::Adopted>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
-    start_with_plugin(cfg, event_sink, adopted, None, None).await
+    start_with_plugin(cfg, event_sink, adopted, None, None, None).await
 }
 
 /// As [`start_with_events`], with a loaded plugin to notify.
@@ -230,6 +236,7 @@ pub async fn start_with_plugin(
     adopted: Option<crate::metrics::Adopted>,
     slot: Option<crate::guard::DbSlot>,
     facility: crate::plugin::SharedFacility,
+    channel: Option<crate::plugin::Channel>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
     crate::tls::install_crypto_provider();
     let dir = cfg.data_dir().to_path_buf();
@@ -346,6 +353,11 @@ pub async fn start_with_plugin(
     if let Some(f) = facility.as_ref() {
         f.after_open(f.generation());
     }
+    // Channel peers connect on their own schedule, so the greeting they receive on
+    // connect already carries the generation. This tells the ones already attached.
+    if let Some(c) = channel.as_ref() {
+        c.notify(&yesno_plugin::ipc::Frame::Available { generation: 1 });
+    }
 
     Ok(Running {
         flight_addr,
@@ -362,6 +374,7 @@ pub async fn start_with_plugin(
         db,
         grace: Duration::from_secs(cfg.server.shutdown_grace_secs),
         facility,
+        channel,
         slot,
     })
 }
@@ -398,6 +411,7 @@ impl Running {
             grace,
             counters,
             facility,
+            channel,
             slot,
             ..
         } = self;
@@ -449,6 +463,20 @@ impl Running {
             }
         }
         drop(facility);
+
+        // 1b-bis. Close the channel, which releases its peers' snapshots.
+        //
+        // Same position and the same reason as the drain above -- a channel peer's
+        // snapshot is a registered reader slot, so step 2 would otherwise wait out
+        // the grace period on readers it cannot attribute. The difference is that
+        // this needs no cooperation: closing the sockets is what releases them.
+        if let Some(c) = channel {
+            let peers = c.peers();
+            if peers > 0 {
+                tracing::info!(peers, "closing plugin channel connections");
+            }
+            c.stop();
+        }
 
         // 1c. Empty the slot, which owns an `Arc<Db>`.
         //

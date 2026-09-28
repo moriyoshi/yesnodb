@@ -7722,6 +7722,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "libloading",
+ "memmap2",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",

@@ -350,10 +350,16 @@ async fn a_leader_announces_on_start_and_drains_at_shutdown() {
         .map(Arc::new);
     assert!(facility.is_some());
 
-    let running =
-        yesno_server::lifecycle::start_with_plugin(&cfg, None, None, Some(slot), facility.clone())
-            .await
-            .expect("a leader with a plugin must start");
+    let running = yesno_server::lifecycle::start_with_plugin(
+        &cfg,
+        None,
+        None,
+        Some(slot),
+        facility.clone(),
+        None,
+    )
+    .await
+    .expect("a leader with a plugin must start");
 
     assert_eq!(
         probe.get0::<i32>(b"yesno_test_serving\0"),

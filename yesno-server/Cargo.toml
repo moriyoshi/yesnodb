@@ -141,6 +141,8 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+# The channel test maps the arena a peer receives over the socket.
+memmap2 = "0.9"
 # The facility test reads back the C fixture plugin's own statics.
 libloading = "0.8"
 tempfile = "3"

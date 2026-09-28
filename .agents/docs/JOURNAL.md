@@ -7268,3 +7268,43 @@ peer ever wants the codec without the engine, splitting it into its own crate is
 file move rather than an untangling. That should wait for the consumer to exist --
 the same argument `stats.rs` was deleted on, applied before building rather than
 after.
+
+## 2026-09-28 -- Wiring the channel into yesnod
+
+`plugin::Channel` binds the configured Unix socket, gives each connection its own
+arena and `Session` on its own blocking thread, and pushes notifications to live
+peers. Wired into both paths: the leader closes it at teardown step 1b, before the
+reader wait, and the follower notifies it around a rebootstrap.
+
+**Descriptor passing is the only real FFI**, and both halves live here rather than
+being left to each peer: a receiver that sizes its control buffer differently, or
+forgets `MSG_CMSG_CLOEXEC`, fails in ways that look like the sender's fault. The
+message carries one byte -- the protocol version -- because `sendmsg` with an empty
+`iovec` is permitted but not reliably *received* on a stream socket, so a
+zero-length send is indistinguishable from the peer not having spoken yet. A test
+writes through the sender's mapping **after** the send and reads it back through a
+mapping made from the received descriptor, because a test that only checked the
+descriptor arrived would pass for a descriptor to the wrong thing. The seals travel
+with it, so a peer cannot resize what it was handed.
+
+**The reclamation property now has a test that earns it.** A peer opens a snapshot
+and is then simply dropped -- no close, no goodbye. The kernel closes the socket, the
+serving thread's read returns zero, the session drops, and `live_readers()` falls to
+zero. Nothing polls and no pid is consulted. There is a companion for the polite
+case: `Channel::stop` shuts down live connections so teardown does not depend on a
+peer choosing to disconnect.
+
+**Two things the wiring found that the design had missed.**
+
+`ServerHello` advertised `max_lanes` and `max_handles` and **not** `max_blocks` --
+so a peer could not size its batch requests, and the batch cap is the knob that
+decides whether the channel costs 1x or 7x. A peer that guessed low would have been
+slow for a reason it could not see. Added, and the session test now asserts it.
+
+And clippy refused `one_pass` at eight arguments, which was the right signal rather
+than a nuisance: I had been threading `facility` and `channel` separately through
+the replication path, two parameters that always travel together and always in the
+order notify-act-notify. They are now one `Listeners` value with `before_close` and
+`after_replace` on it, which removed a duplicated drain block I had left behind in
+`close_for_rebuild` as well. **An argument-count lint caught a cohesion problem**,
+which is not what it is for and is what it found.

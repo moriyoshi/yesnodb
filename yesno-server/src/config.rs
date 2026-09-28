@@ -322,7 +322,7 @@ impl ClientTls {
 /// exception escape a callback the process aborts. Naming one here is an operator
 /// decision of the same weight as naming the data directory, not a sandboxed
 /// extension point.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
     /// Absolute path to the shared library. Empty disables the facility.
@@ -334,12 +334,53 @@ pub struct PluginConfig {
     /// delivered, but it is never asked to serve -- which is what a node that
     /// should score without answering queries wants.
     pub listen: String,
+
+    /// Unix socket path for the **out-of-process** channel. Empty disables it.
+    ///
+    /// Independent of `library`: a node may serve the channel without loading
+    /// anything in-process, which is the recommended shape. A peer connecting here
+    /// runs in its own process, so it cannot abort this one, needs no filesystem
+    /// access to the data directory, and its snapshots are released when its socket
+    /// closes.
+    pub channel_socket: String,
+
+    /// Lane handles one channel connection may hold at once.
+    pub channel_max_handles: usize,
+
+    /// Lanes one handle may hold. Bounds the arena with the two fields around it.
+    pub channel_max_lanes: usize,
+
+    /// Blocks one response may carry.
+    ///
+    /// **This is the performance knob.** One round trip per block costs 4.9x to
+    /// 7.6x against an in-process plugin; batching brings that to roughly the cost
+    /// of the copy. Measurement supports `>= 4` and does not resolve a best value,
+    /// so 16 is a default rather than an optimum.
+    pub channel_max_blocks: usize,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        PluginConfig {
+            library: String::new(),
+            listen: String::new(),
+            channel_socket: String::new(),
+            channel_max_handles: 4,
+            channel_max_lanes: 256,
+            channel_max_blocks: 16,
+        }
+    }
 }
 
 impl PluginConfig {
-    /// Whether a library is configured at all.
+    /// Whether an in-process library is configured.
     pub fn enabled(&self) -> bool {
         !self.library.trim().is_empty()
+    }
+
+    /// Whether the out-of-process channel is configured.
+    pub fn channel_enabled(&self) -> bool {
+        !self.channel_socket.trim().is_empty()
     }
 }
 

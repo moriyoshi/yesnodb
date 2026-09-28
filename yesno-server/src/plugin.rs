@@ -31,6 +31,8 @@
 use std::sync::Arc;
 
 use yesno_plugin::abi::{Role, Status};
+use yesno_plugin::channel::{Arena, Limits, Session};
+use yesno_plugin::ipc::Frame;
 use yesno_plugin::loader::{LoadError, LoadedPlugin};
 use yesno_plugin::Host;
 
@@ -237,3 +239,261 @@ impl Facility {
 
 /// Shared handle, so the follower task and the startup path see one facility.
 pub type SharedFacility = Option<Arc<Facility>>;
+
+/// The out-of-process channel: a Unix socket yesnod serves peers on.
+///
+/// # What a connection owns, and why that is the whole lifecycle
+///
+/// One connection gets one arena, one [`Session`], and one serving thread. The
+/// session owns every snapshot the peer opened, so **closing the socket releases
+/// them** -- peer exit, crash, container stop, `SIGKILL`, or this side dropping the
+/// listener. Nothing polls, nothing times out, and no pid is involved, which is what
+/// makes the reclamation namespace-independent and why the in-process facility's
+/// drain contract has no counterpart here.
+///
+/// # Blocking threads rather than a reactor
+///
+/// Every request touches the engine, which faults mmap pages and may read from
+/// disk. That is exactly the reason `do_get` uses `spawn_blocking`, and a reactor
+/// thread serving one would stall every other connection on it.
+pub struct Channel {
+    path: std::path::PathBuf,
+    /// Write halves of live connections, for pushing notifications.
+    ///
+    /// A peer cannot ask whether its database went away -- it would have to poll --
+    /// so availability and generation changes are pushed. The mutex is per
+    /// connection and held only for one frame, and frames are the unit of the
+    /// protocol, so a notification can interleave with responses but never inside
+    /// one.
+    peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Channel {
+    /// Bind the configured socket and start accepting, or `None` when unconfigured.
+    pub fn start(cfg: &Config, host: Host) -> std::io::Result<Option<Channel>> {
+        if !cfg.plugin.channel_enabled() {
+            return Ok(None);
+        }
+        let path = std::path::PathBuf::from(cfg.plugin.channel_socket.trim());
+        // A stale socket from a previous run refuses `bind` with `EADDRINUSE`, which
+        // is indistinguishable from a live server. Removing it is safe because the
+        // database lock already proves no other yesnod holds this directory.
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+
+        let limits = Limits {
+            max_handles: cfg.plugin.channel_max_handles.max(1),
+            max_lanes: cfg
+                .plugin
+                .channel_max_lanes
+                .clamp(1, yesno_plugin::ipc::MAX_LANES),
+            max_blocks: cfg
+                .plugin
+                .channel_max_blocks
+                .clamp(1, yesno_plugin::ipc::MAX_BATCH),
+        };
+        let peers: Arc<
+            std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>,
+        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let accept_peers = peers.clone();
+        let accept_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if accept_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let stream = match incoming {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "plugin channel accept failed");
+                        continue;
+                    }
+                };
+                let host = host.clone();
+                let peers = accept_peers.clone();
+                std::thread::spawn(move || serve_one(stream, host, limits, peers));
+            }
+        });
+
+        tracing::info!(
+            socket = %path.display(),
+            max_lanes = limits.max_lanes,
+            max_blocks = limits.max_blocks,
+            arena_bytes = limits.arena_bytes(),
+            "plugin channel listening"
+        );
+        Ok(Some(Channel {
+            path,
+            peers,
+            stop,
+            listener: Some(handle),
+        }))
+    }
+
+    /// Connections currently served.
+    pub fn peers(&self) -> usize {
+        self.peers.lock().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Push a notification to every live peer, dropping those that have gone.
+    ///
+    /// Best effort by design: a peer that has died is exactly the case the channel
+    /// handles by releasing its snapshots, so a failed write here is information
+    /// rather than an error to propagate.
+    pub fn notify(&self, frame: &Frame) {
+        let bytes = match frame.encode() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot encode a channel notification");
+                return;
+            }
+        };
+        let Ok(mut peers) = self.peers.lock() else {
+            return;
+        };
+        peers.retain(|p| match p.lock() {
+            Ok(mut s) => std::io::Write::write_all(&mut *s, &bytes).is_ok(),
+            Err(_) => false,
+        });
+    }
+
+    /// Stop accepting and close every connection.
+    ///
+    /// Closing is what releases the peers' snapshots, so this is also what lets the
+    /// database be dropped afterwards. It runs before the reader wait in teardown
+    /// for the same reason the in-process drain does.
+    pub fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        // Shutting each peer's socket unblocks its serving thread out of `read`,
+        // which is what a `stop` flag alone cannot do.
+        if let Ok(mut peers) = self.peers.lock() {
+            for p in peers.drain(..) {
+                if let Ok(s) = p.lock() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+        // And connect to our own listener once, so its blocking `accept` returns and
+        // the thread sees the flag.
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        if let Some(h) = self.listener.take() {
+            let _ = h.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Serve one connection until the peer goes away.
+fn serve_one(
+    stream: std::os::unix::net::UnixStream,
+    host: Host,
+    limits: Limits,
+    peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
+) {
+    let arena = match Arena::new(limits.arena_bytes()) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot create the channel arena");
+            return;
+        }
+    };
+    // The descriptor goes first, before any frame, so a peer has the region mapped
+    // before it can be told about a block inside it.
+    if let Err(e) = yesno_plugin::channel::send_fd(&stream, arena.as_fd()) {
+        tracing::warn!(error = %e, "cannot hand the arena to the peer");
+        return;
+    }
+    let mut session = Session::new(host, arena, limits);
+
+    let writer = match stream.try_clone() {
+        Ok(w) => Arc::new(std::sync::Mutex::new(w)),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot split the channel socket");
+            return;
+        }
+    };
+    if let Ok(mut p) = peers.lock() {
+        p.push(writer.clone());
+    }
+
+    let result = yesno_plugin::channel::serve_locked(&mut session, stream, &writer);
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "plugin channel connection ended with an error");
+    }
+    if let Ok(mut p) = peers.lock() {
+        p.retain(|q| !Arc::ptr_eq(q, &writer));
+    }
+    // `session` drops here, releasing every snapshot the peer held. That is the
+    // reclamation story: no pid, no timeout, no cooperation.
+    let (snapshots, handles) = session.outstanding();
+    if snapshots != 0 || handles != 0 {
+        tracing::debug!(
+            snapshots,
+            handles,
+            "channel peer left holding handles; released"
+        );
+    }
+}
+
+/// The two things that must be told when the database changes underneath.
+///
+/// Bundled because they always travel together and always in the same order --
+/// notify, act, notify -- so threading them separately through the replication path
+/// meant two parameters that could get out of step at any call site. It also keeps
+/// `one_pass` under clippy's argument limit, which was the signal that the threading
+/// had gone too far.
+#[derive(Clone, Copy, Default)]
+pub struct Listeners<'a> {
+    pub facility: Option<&'a Arc<Facility>>,
+    pub channel: Option<&'a Channel>,
+}
+
+impl Listeners<'_> {
+    /// Tell everyone the database is going away, and report whether the in-process
+    /// plugin actually let go.
+    ///
+    /// A channel peer is not asked to drain: closing its socket is what releases its
+    /// snapshots, and that happens whether it cooperates or not.
+    pub fn before_close(&self) {
+        if let Some(c) = self.channel {
+            c.notify(&Frame::Unavailable);
+        }
+        if let Some(f) = self.facility {
+            match f.before_close() {
+                Drained::Clean => {}
+                other => tracing::error!(
+                    library = f.library(),
+                    outcome = ?other,
+                    "the plugin did not drain; the reopen may fail until it releases"
+                ),
+            }
+        }
+    }
+
+    /// Tell everyone a different database is in the slot now.
+    pub fn after_replace(&self) {
+        let generation = self.facility.map(|f| {
+            let g = f.after_replace();
+            f.after_open(g);
+            g
+        });
+        if let Some(c) = self.channel {
+            // Two frames rather than one: a peer that only ever saw `Available`
+            // could not distinguish "back after a rebuild" from "back unchanged",
+            // and every handle it holds names the previous database.
+            if let Some(g) = generation {
+                c.notify(&Frame::GenerationChanged {
+                    old: g.saturating_sub(1),
+                    new: g,
+                });
+            }
+            c.notify(&Frame::Available {
+                generation: generation.unwrap_or(0),
+            });
+        }
+    }
+}

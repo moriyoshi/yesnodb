@@ -97,6 +97,7 @@ fn the_greeting_declares_the_arena_and_the_limits() {
             arena_bytes,
             max_lanes,
             max_handles,
+            max_blocks,
         } => {
             assert_eq!(protocol, 1);
             assert_eq!(generation, 1);
@@ -104,6 +105,7 @@ fn the_greeting_declares_the_arena_and_the_limits() {
             assert_eq!(shards, 1);
             assert_eq!(max_lanes, 4);
             assert_eq!(max_handles, 2);
+            assert_eq!(max_blocks, 1, "the batch cap is advertised, not guessed");
             assert_eq!(arena_bytes as usize, 2 * 4 * LANE_BYTES);
         }
         other => panic!("expected ServerHello, got {other:?}"),
@@ -668,5 +670,42 @@ fn a_session_without_an_arena_serves_payloads_in_the_frames() {
         first_array,
         Some(vec![7, 8, 9]),
         "and the bytes are the real payload, read out of the frame"
+    );
+}
+
+/// The arena descriptor survives the socket, and what arrives is the same memory.
+///
+/// Asserted by writing through the sender's mapping and reading through a mapping
+/// made from the *received* descriptor. A test that only checked the descriptor
+/// arrived would pass for a descriptor to the wrong thing.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_arena_descriptor_crosses_the_socket_and_names_the_same_memory() {
+    use yesno_plugin::channel::{recv_fd, send_fd};
+
+    let l = limits();
+    let mut arena = Arena::new(l.arena_bytes()).unwrap();
+    let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    send_fd(&tx, arena.as_fd()).unwrap();
+    let (got, version) = recv_fd(&rx).unwrap();
+    assert_eq!(version, 1, "the byte carries the protocol version");
+
+    // Write through the sender's mapping after the descriptor was sent.
+    arena.write_at_for_test(0, &[0xAB, 0xCD]);
+
+    let f = std::fs::File::from(got);
+    let view = unsafe { memmap2::Mmap::map(&f) }.unwrap();
+    assert_eq!(view.len(), l.arena_bytes(), "the whole region arrived");
+    assert_eq!(
+        &view[..2],
+        &[0xAB, 0xCD],
+        "the received descriptor must name the sender's memory, not a copy"
+    );
+
+    // And the seal travelled with it: a peer cannot resize what it received.
+    assert!(
+        f.set_len(0).is_err(),
+        "seals belong to the file, so they hold on the receiving side too"
     );
 }
