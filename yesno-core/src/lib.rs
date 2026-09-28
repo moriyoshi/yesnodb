@@ -168,6 +168,7 @@ pub use container::{Container, ContainerKind};
 // the struct with anything but its default. That is a hole in the API rather
 // than a widening of it; the type is already `#[non_exhaustive]`.
 pub use db::keystream::{KeySource, KeyStream};
+pub use db::lanes::KeyLanes;
 pub use db::{BackupLease, Db, DbOptions, Snapshot, SpaceAmpPolicy, WriteBatch};
 pub use error::{CodecError, Result};
 pub use set::{OrdSet, RangeSummary};

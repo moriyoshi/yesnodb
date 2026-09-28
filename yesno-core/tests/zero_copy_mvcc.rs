@@ -1322,3 +1322,160 @@ fn concurrent_opens_on_shared_shards_agree_with_serial_ones() {
         h.join().expect("a concurrent opener panicked or disagreed");
     }
 }
+
+/// Two lane handles on one snapshot pin **one** registry slot between them, and
+/// it lives until the last of them goes.
+///
+/// # Why the parent snapshot must be closed first
+///
+/// The obvious form of this test leaves the parent `Snapshot` alive while
+/// asserting that the slot stays pinned across the first handle's release. **That
+/// assertion cannot fail**, because the parent's own clone pins the slot by
+/// itself -- it would pass even if the handles pinned nothing at all. Dropping
+/// the parent before observing is what makes the handles the only thing holding
+/// the slot, which is the property actually under test.
+///
+/// # What it is guarding
+///
+/// `Snapshot::clone` refcounts the registry slot rather than taking a second one,
+/// so `live_readers()` reports **one** for any number of handles derived from one
+/// snapshot. Anything above this that needs to know how many leases are
+/// outstanding has to count them itself; this test is what pins that asymmetry in
+/// place so a later change cannot quietly make slots per-handle and invalidate
+/// the accounting built on top.
+#[test]
+fn lane_handles_share_one_slot_and_the_last_one_releases_it() {
+    let dir = tmpdir("lane-slot");
+    let _c = CleanDir(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut b = db.batch();
+    for key in 0..4u64 {
+        for c in 0..6u64 {
+            b.insert(key, c * 65536 + key);
+        }
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    assert_eq!(db.live_readers(), 0, "no readers before the snapshot");
+    let snap = db.snapshot().unwrap();
+    let version = snap.version();
+    let mut a = yesno_core::KeyLanes::new(&snap, &[0, 1]).unwrap();
+    let mut second = yesno_core::KeyLanes::new(&snap, &[2, 3]).unwrap();
+    assert_eq!(a.version(), version);
+    assert_eq!(second.version(), version);
+
+    // The precision that makes the rest meaningful.
+    drop(snap);
+    assert_eq!(
+        db.live_readers(),
+        1,
+        "two handles derived from one snapshot share one slot, and it is still pinned \
+         with the parent gone"
+    );
+
+    // Advance both while a writer and a checkpoint run, so the shared slot is
+    // exercised under exactly the contention it exists to survive.
+    let writer = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            for round in 0..4u64 {
+                let mut b = db.batch();
+                for key in 0..4u64 {
+                    b.insert(key, 40 * 65536 + round * 4 + key);
+                }
+                b.commit().unwrap();
+                db.checkpoint().unwrap();
+            }
+        });
+        let mut counts = Vec::new();
+        for lanes in [&mut a, &mut second] {
+            let mut n = 0;
+            while lanes.advance().unwrap().is_some() {
+                n += lanes.present();
+            }
+            counts.push(n);
+        }
+        w.join().unwrap();
+        counts
+    });
+    assert_eq!(
+        writer,
+        vec![12, 12],
+        "each handle reads its own two keys' six chunks at the pinned version, so the \
+         four rounds of writes published mid-scan are invisible"
+    );
+    assert_eq!(
+        a.version(),
+        version,
+        "the version cannot move under a handle"
+    );
+    assert_eq!(second.version(), version);
+
+    drop(a);
+    assert_eq!(
+        db.live_readers(),
+        1,
+        "releasing one handle must not release a slot the other still shares"
+    );
+    drop(second);
+    assert_eq!(
+        db.live_readers(),
+        0,
+        "and the last handle to go is what frees it"
+    );
+}
+
+/// A handle with **no lanes** still pins its version.
+///
+/// Separate from the test above because that one cannot fail for this reason: a
+/// handle with lanes pins the slot through its `KeyStream`s' own
+/// `Arc<ReaderSlot>`, so it would pass whether or not `KeyLanes` held a snapshot
+/// of its own. A zero-lane handle has no streams, so the held clone is the only
+/// thing left -- and the ABI above counts every handle as one outstanding lease
+/// regardless of how many keys it was given, which is a promise that has to hold
+/// at zero too.
+#[test]
+fn a_lane_handle_with_no_keys_still_pins_its_version() {
+    let dir = tmpdir("lane-zero");
+    let _c = CleanDir(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut b = db.batch();
+    b.insert(1, 7);
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let snap = db.snapshot().unwrap();
+    let version = snap.version();
+    let mut empty = yesno_core::KeyLanes::new(&snap, &[]).unwrap();
+    drop(snap);
+
+    assert_eq!(
+        db.live_readers(),
+        1,
+        "a zero-lane handle has no streams, so only its own snapshot clone can be \
+         holding the slot"
+    );
+    assert_eq!(empty.version(), version);
+    assert_eq!(
+        empty.advance().unwrap(),
+        None,
+        "and it is immediately exhausted"
+    );
+    drop(empty);
+    assert_eq!(db.live_readers(), 0);
+}

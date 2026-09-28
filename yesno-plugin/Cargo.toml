@@ -1,0 +1,10 @@
+[package]
+name = "yesno-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Host side of the yesnod plugin ABI: a function table over a live Db."
+
+[dependencies]
+yesno-core = { path = "../yesno-core" }

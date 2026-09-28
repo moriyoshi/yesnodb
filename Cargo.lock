@@ -7687,6 +7687,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yesno-plugin"
+version = "0.1.0"
+dependencies = [
+ "yesno-core",
+]
+
+[[package]]
 name = "yesno-server"
 version = "0.1.0"
 dependencies = [

@@ -43,6 +43,7 @@
 
 pub mod apply;
 pub mod keystream;
+pub mod lanes;
 pub mod manifest;
 pub mod memtable;
 pub(crate) mod readers;

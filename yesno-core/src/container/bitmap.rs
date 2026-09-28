@@ -178,6 +178,39 @@ impl BitmapContainer {
     ///
     /// The unaligned arm costs one 8 KiB copy per call, the price `buffer.rs`
     /// already names for unaligned word access. A wrong answer is not cheaper.
+    /// The payload as borrowed words, or `None` when it cannot be lent.
+    ///
+    /// The borrowing half of the crate-internal `words`, exposed because a zero-copy
+    /// consumer across an FFI boundary has to be **told** when a borrow is
+    /// impossible rather than silently charged the 8 KiB copy that `words`
+    /// performs. Through the page store it never answers `None` -- every slot is
+    /// 64-byte aligned -- so the `None` arm is reachable only through a
+    /// `from_custom_allocation` mapping of an imported `.roaring` file.
+    ///
+    /// Callers inside the crate should keep using `words`, which is total.
+    #[inline]
+    pub fn try_words(&self) -> Option<&[u64]> {
+        self.bits.try_words()
+    }
+
+    /// Copy the payload into `dst`, which must be [`BITMAP_WORDS`] long.
+    ///
+    /// The copying counterpart to [`Self::try_words`], and the pair exists so an
+    /// FFI consumer can do the right thing in both cases without this module
+    /// exposing `Cow` -- which would put an internal ownership decision into the
+    /// public API, and R1 turns a public type into a semver promise.
+    ///
+    /// Returns false and writes nothing when `dst` is the wrong length, rather
+    /// than panicking: the caller is across a C boundary where a panic has to be
+    /// caught to be reported at all.
+    pub fn copy_words_into(&self, dst: &mut [u64]) -> bool {
+        if dst.len() != BITMAP_WORDS {
+            return false;
+        }
+        dst.copy_from_slice(&self.words());
+        true
+    }
+
     #[inline]
     pub(crate) fn words(&self) -> Cow<'_, [u64]> {
         match self.bits.try_words() {

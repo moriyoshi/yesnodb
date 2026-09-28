@@ -166,11 +166,33 @@ lease the old snapshot believes is frozen.
 
 **The missing primitive is the inverse of the one the handoff names.** It asks that
 the host keep borrowed bytes alive for the lease duration; the engine does that
-already and for free. What is missing is a way for the host to **demand leases back**:
-lease accounting the host can query, a revocation signal, and a bounded wait with a
-defined outcome when the deadline passes. `evict_oldest_reader()` and
-`evicted_reader_count()` are the right shape for the snapshot half and can be built
-on; the retained-container half has no accounting at all today.
+already and for free. What is missing is a way for the host to know what is
+outstanding.
+
+**Superseded in part by [the design](./hosted-plugin-abi-design.md), 2026-09-28.**
+This section concluded that the host needs new accounting for retained containers,
+with revocation and a deadline. That was the wrong conclusion from a correct
+observation. The fix is not to account for bare containers but to **never hand one
+across the boundary**: every lease the ABI issues owns a `Snapshot` clone, and then
+reader slots and reclamation floors cover it with no new machinery. ( `live_readers()`
+counts such a lease but cannot attribute it: it is a bare `usize` over all slots, and
+an in-flight `do_get` holds one too. )
+
+The observation that forced it also turned out sharper than written here. A bare
+container held across a database replacement is not merely unaccounted, it is
+**unsafe**: `Allocator::new_slab_for` takes the first `Free` slab with no
+`punch_floor` filter, so an inherited slab is reused and re-initialized even though
+punching spares it, and the aliased bytes are overwritten in place.
+
+**And then corrected again, 2026-09-28, after a source review from the `haiiie` side.**
+Retracting the accounting requirement was half right. Memory safety does come free from
+reader slots -- but a `Snapshot` holds `Arc<DbInner>`, and `DbInner` holds the flock
+`File`, so a `Snapshot`-backed lease **pins the directory lock**. `lifecycle.rs` says so
+in the passage this document already quotes: a live `Snapshot` is invisible to the
+`Arc<Db>` refcount "while still pinning the lock". So accounting and a drain are
+required after all, for **reopen liveness** rather than for safety --
+`Db::open_replica` uses a non-blocking `try_lock` and answers `AlreadyOpen`. The design
+now carries a mandatory drain contract; see *The drain requirement* there.
 
 ## Design problem two: two documents disagree about rebootstrap, and the ABI depends on which is right
 
@@ -196,11 +218,18 @@ The difference decides the ABI:
   barrier must be mandatory and enforced before a byte is written.
 
 Both readings demand that the plugin drop and re-acquire on a generation bump. They
-disagree on whether the barrier may be advisory. **Resolve this before the table is
-frozen**, and fix whichever comment is wrong. My reading is that the code is right
-and `guard.rs`'s rationale is stale -- the slot is still needed, because a mapping of
-the old inode would otherwise serve stale data for ever, which is a better reason
-than the one written down.
+disagree on whether the barrier may be advisory.
+
+**Settled 2026-09-28, in favour of the code.** The only in-place truncation in
+`bootstrap_shard` is the **WAL**, and nothing maps the WAL -- there is no
+`MmapOptions` anywhere under `yesno-core/src/wal/`. The image is written beside and
+renamed, with the directory `fsync`ed after. So no `SIGBUS` is reachable from a held
+lease, the barrier may be advisory, and `guard.rs`'s rationale is wrong. The slot is
+still needed for a better reason: after the rename the live inode is orphaned, so a
+mapping of it would serve stale data for ever. A lease held across rebootstrap reads
+correct bytes from a superseded database, which a generation check catches -- and
+because rename orphans the inode rather than recycling it, such a lease is not even
+exposed to the slab-reuse hazard described above.
 
 ## The concrete missing primitives
 
@@ -221,9 +250,11 @@ Ordered by what blocks the design rather than by effort.
 5. **Status codes.** At minimum `UNAVAILABLE`, `SNAPSHOT_TOO_OLD`, `WRONG_ROLE` and
    `GENERATION_CHANGED` as distinct values. `SnapshotTooOld` already exists in the
    core and is currently flattened to a string.
-6. **Lease accounting and revocation with a deadline.** Per design problem one: a
-   retained container is invisible to both shutdown instruments. Needs a count the
-   host can read, a revoke signal, and a defined outcome on timeout.
+6. **A lease type that owns a `Snapshot`, plus a drain contract.** Rather than account
+   for bare containers, do not lend one -- a constraint on the ABI that reuses the
+   reader-slot machinery wholesale for safety. But a `Snapshot` pins the flock, so the
+   host also needs a lease count it can read and a mandatory drain point before reopen,
+   or `open_replica` fails `AlreadyOpen` for as long as a plugin holds one.
 7. **A generation counter on the database handle.** The term is per-request metadata
    and `Arc::ptr_eq` is in-process only; a plugin needs a scalar it can compare
    cheaply on every call and after every reopen.

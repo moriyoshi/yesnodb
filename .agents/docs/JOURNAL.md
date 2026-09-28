@@ -6465,3 +6465,314 @@ re-introducing the defect and watching `evacuated_chunks` stay 0. The measuremen
 crate is scratch under `.agents-workspace/tmp/evacpay/`; its construction is recorded
 next to `COMPACT_LIVE_FRACTION` and in `LTM/allocation-reclamation-and-fsck.md`, which
 is what survives the crate being deleted.
+
+## 2026-09-28 -- Designing the plugin facility, and retracting my own lease recommendation
+
+Design written to
+[`LTM/hosted-plugin-abi-design.md`](./LTM/hosted-plugin-abi-design.md): two versioned
+tables with a `{ version, size }` header, one `yesno_plugin_init` entry point, an
+opaque host-owned database handle with no `open` in the host table at all, a real
+status enum, snapshot-scoped multi-lane acquisition, borrowed chunk descriptors that
+carry the container kind and can decline to borrow, role and generation callbacks, and
+a host-driven listener the plugin owns. Three small additions to `yesno-core` and one
+new generation counter in `yesno-server`.
+
+**The design retracts a recommendation from my own assessment two entries ago, and the
+retraction is the useful part.** I had concluded that the host needs new lease
+accounting with revocation and a deadline, because a `Container` retained after its
+`KeyStream` drops holds no reader slot and `Db::live_readers()` cannot see it. The
+observation was right; the conclusion did not follow. **The fix is not to account for
+bare containers but to never lend one**: if every lease owns a `Snapshot` clone, then
+reader slots, reclamation floors and `live_readers()` all cover it with no new
+machinery at all. I reached for a mechanism before working out what the boundary should
+refuse to hand over -- the same order-of-operations error recorded three times already
+in this tree, arriving this time in design rather than in measurement.
+
+**And the observation was sharper than I wrote it.** A bare container held across a
+database replacement is not merely unaccounted, it is **unsafe**.
+`Allocator::adopt_live_at_open` marks emptied inherited slabs `Free` and `punch_floor`
+spares them from punching -- which is what preserves
+`reopening_does_not_disturb_a_container_from_the_previous_instance` -- but
+`Allocator::new_slab_for` selects the first `Free` slab **with no `punch_floor`
+filter**, re-initializes it with `Slab::new`, and allocates into it. The aliased bytes
+are overwritten in place through the same inode. The slab comment says so plainly
+( "Reuse would break that guarantee too, so it was already conditional" ) and I had
+read that comment while writing the assessment without following it to allocation.
+Punching was made safe; reuse was left conditional, and a plugin is the first consumer
+that would notice.
+
+**Three facts settled from source that the design rests on.** The flock is `flock` on a
+separate `LOCK` file held inside `DbInner`, and `MmapSegment` is `{ map, base }` with no
+descriptor -- so a leased mapping can never pin the lock and `AlreadyOpen` is not a
+failure mode here. `ExtentGuard`'s `Arc<MmapSegment>` keeps leased bytes addressable
+past the `Db`, so only *contents* are at risk, never the address space. And the
+rebootstrap disagreement is resolved in favour of the code: the only in-place
+truncation in `bootstrap_shard` is the WAL, and nothing maps the WAL -- no
+`MmapOptions` anywhere under `yesno-core/src/wal/`. The image is written beside and
+renamed. So no `SIGBUS` is reachable from a lease, the barrier may be advisory, and
+`guard.rs`'s stated rationale is wrong while its conclusion stands for a better reason:
+after the rename the old inode is orphaned, so a mapping of it serves stale data for
+ever.
+
+That last one is worth keeping as a pattern rather than a fact. **A comment can be
+wrong about the mechanism and right about the decision**, and the decision surviving is
+what makes the wrong mechanism hard to notice -- nobody revisits a justification for a
+thing that is working. I have still not edited `guard.rs`, because the claim it makes
+is about `SIGBUS` reachability under I6 and the phrasing belongs to whoever owns that
+invariant; it is filed rather than fixed.
+
+## 2026-09-28 -- I contradicted a sentence I had already quoted: the lease pins the flock
+
+A source review from the `haiiie` side corrected the plugin design, and the correction
+is right. `Snapshot` holds `Arc<DbInner>`; `DbInner` holds the flock `File` ( "Held for
+the lifetime of the `Db`; dropping it releases the file lock" ); so a `Snapshot`-backed
+lease **pins the directory lock** and `Db::open_replica`, which uses a non-blocking
+`try_lock`, answers `AlreadyOpen` until it drops. My design asserted the opposite: "the
+flock cannot be pinned by a lease... `CodecError::AlreadyOpen` is not a failure mode of
+this design."
+
+**The mechanics of the error, because they are more instructive than the fact.** I
+established correctly that a bare `Container` cannot pin the lock, by checking that
+`MmapSegment` is `{ map, base }` with no descriptor. Then I made the design's central
+decision -- a lease owns a `Snapshot` rather than a bare container -- and carried the
+"cannot pin the lock" conclusion across that decision without re-deriving it. The
+conclusion was true of the object I had examined and false of the object I had just
+chosen. **The decision itself created the pin, and the claim was checked before the
+decision existed.**
+
+Worse, I had already quoted the disproof. `lifecycle.rs` says a live `Snapshot` is
+invisible to the `Arc<Db>` refcount "while still pinning the lock", and my own
+assessment quotes that passage two documents earlier to make a different point about
+shutdown. So this is not a fact I failed to find; it is one I found, recorded, and then
+wrote past. Reading a sentence for one purpose does not bank it for another.
+
+**The correction also partly un-retracts my previous retraction, which is worth stating
+plainly so it stops oscillating.** The assessment said the host needs lease accounting
+and revocation with a deadline. I retracted that on the grounds that safety comes free
+from reader slots -- correct, and still correct. But accounting and drain are required
+anyway, for **reopen liveness** rather than for memory safety. Two requirements had the
+same name, I disproved one and dismissed both.
+
+The design now carries a mandatory drain contract, and the reason it has to be
+mandatory is a bound in the existing code that a plugin breaks. `close_for_rebuild`
+notes that an in-flight `do_get` holds a `Snapshot`, "so the lock may outlive this by
+the length of one read" -- self-limiting, so the retry succeeds on a later pass. A
+scoring lease has no such bound, and a plugin caching leases between requests, which is
+the obvious optimization, would hold the lock open indefinitely and surface as an
+unattributable `AlreadyOpen` seconds later in `open_if_needed`. So: `on_unavailable` is
+a synchronous drain point, a lease may not outlive its request in v1, and the host
+verifies with `live_readers()` rather than trusting, on the same principle
+`lifecycle.rs` already applies to shutdown.
+
+One thing the review did not say that follows from it: `evict_oldest_reader()` is the
+host's escalation against a misbehaving plugin, **and is not a repair**. Releasing the
+reader slot releases the reclamation floor, so any container the plugin still holds
+becomes exposed to the inherited-slab reuse hazard filed today. It buys the host's
+liveness at the cost of the offending plugin's correctness, which is the right way
+round and still not a substitute for the drain.
+
+Also worth recording while the ABI is unfrozen: `guard.rs` and `close_for_rebuild` both
+describe rebootstrap as *truncating* a mapped file, and `bootstrap_shard` renames. The
+rename makes the corruption hazard unreachable, but it is **incidental** -- adopted for
+crash safety, per its own comment, not for this -- so the design must not rest on it.
+The mandatory drain covers the case either way, which is the right reason to keep the
+drain mandatory even though `SIGBUS` is currently unreachable.
+
+## 2026-09-28 -- The escalation I invented made things worse in both directions
+
+Second correction from the `haiiie` source review, also right, and it removes a backstop
+I had assumed into existence. Verified:
+
+- `Db::evict_oldest_reader()` sets `reader_evicted[slot]` and nothing else. Its own doc
+  says "Does not free the slot."
+- So the slot stays non-`FREE`, and `live_readers()` -- which filters on exactly
+  `!= FREE` -- keeps counting it. The count does not fall.
+- The `Snapshot` is untouched, still holds `Arc<DbInner>`, so **the flock stays pinned**
+  and reopen is no closer.
+- But `evict_floor` *skips* evicted slots, by design and with a comment saying so:
+  "skipping it here is what actually returns the space". The reclamation floor **is**
+  released.
+
+**So eviction is strictly the worst of both for this purpose: it destroys the plugin's
+data safety without buying the host's liveness.** I had written the opposite -- that it
+"buys the host's liveness at the cost of the misbehaving plugin's correctness, which is
+the right way round". Both halves were wrong, and they were wrong in a way that made the
+sentence sound like a considered trade. That is the thing to notice: a claim of the form
+"X costs A to buy B" reads as analysis even when neither A nor B was checked.
+
+The consequence is a real design change rather than a wording fix. **There is no
+forcible remedy for a plugin that will not drain**, because only `ReaderSlot::drop`
+frees a slot. The design now says so, fails loudly instead of implying a repair, and
+names the v2 feature that would be one -- an interposed lease handle the host can
+invalidate without touching the reader slot, so the flock is released while the
+plugin's next call gets `GENERATION_CHANGED`. Naming it makes the absence a decision.
+
+The second half of the review is about attribution and is the better catch of the two.
+I had the host check `live_readers()` after `on_unavailable` and report a non-zero count
+as the plugin's fault. `live_readers()` is a bare `usize` over all reader slots with no
+identity, and an in-flight `do_get` holds one -- so that report is wrong whenever any
+other reader is live, which on a serving replica is most of the time. **A count is not
+an attribution.** The fix is that the facility mints every lease and therefore can keep
+its own counter, which is attributable by construction; `live_readers()` drops to a
+cross-check that has to be read alongside the server's own readers.
+
+Both corrections have the same origin as yesterday's frame error and today's flock
+error: I took a number or a mechanism that was true in one frame and used it to answer a
+question in another. `live_readers()` is the right instrument for "may I close this
+database" and the wrong one for "is the plugin holding something", and nothing about its
+signature says which. Three instances in two days is enough to state the rule plainly:
+**before citing an instrument, say what question it was built for.**
+
+## 2026-09-28 -- The lane lifetime I picked would have retained the whole scan
+
+Third correction from the `haiiie` side, answering the question I had asked them, and
+the answer is better than either option I offered.
+
+I had specified that a borrowed chunk pointer stays valid "while the owning
+`yesno_lanes` lives", on the grounds that it is simpler for a scorer. **It is simpler
+and it is unaffordable.** `KeyStream::next_chunk` yields containers one at a time, so
+handle-scoped validity obliges the host to retain every container it has visited for the
+whole scan -- memory growing with scan length to buy a guarantee nobody asked for. Their
+consumer keeps one container per lane for a single block, tiles all lanes together, and
+clears the block before advancing; the working set it actually wants is bounded and
+small.
+
+So iteration is now **block-scoped**: `block_advance` resolves every requested lane at
+the next prefix, `block_lane` hands out borrows valid until `block_release`, and the host
+retains at most one container per lane. A block is the next prefix at which *any*
+requested lane has data, and lanes with nothing there are reported present-but-absent so
+the caller's lane indices never shift.
+
+Two details of theirs that are better than my framing. `block_advance` resolves **all
+lanes or none**, because a failure on lane 7 must not leave a tiled accumulator holding
+lanes 0 to 6 -- an atomicity requirement I had not considered, and the reason this is one
+call rather than a loop the caller writes. And expanding array or run lanes into a
+uniform representation belongs in the **caller's** reused scratch, not in the host: the
+scorer knows its own tiling width and can size a buffer once, whereas a host expanding
+eagerly would allocate per chunk for callers that did not want it. So all three kinds are
+borrowed as stored, and the scratch path exists only for the payload that cannot be
+borrowed at all.
+
+**The instructive part is which question I asked.** I offered two lifetimes and asked
+which was sufficient. The useful answer was neither: the right unit was not a lifetime
+at all but a *scope* I had not proposed, and it came from reading what the consumer's
+loop actually holds. I had the consumer's requirements in the handoff and reasoned about
+the API in isolation anyway. **Asking "which of my two options" forecloses the answer
+"your options share a wrong assumption"** -- and the assumption here was that the caller
+iterates lanes independently, when it tiles them simultaneously and discards per block.
+
+One consequence for scope, recorded so it is not discovered late: this needs a **lockstep
+advance over N `KeyStream`s** in `yesno-core`, and nothing in the tree does it. `stream/`
+composes n-ary operators that combine streams into one answer, and `view/fold.rs` walks
+sets aligned but folds as it goes; neither exposes N aligned chunks to a caller. It is a
+small merge over `Prefix48` and it belongs in the core, tested against the existing
+`ChunkStream` laws, rather than improvised in the ABI layer.
+
+## 2026-09-28 -- Shared-snapshot concurrency, and a test that could not have failed
+
+Fifth and sixth corrections from the `haiiie` side, both on the concurrency section.
+
+**The answer to my question was yes, with a subtlety that sharpens my own earlier rule.**
+Two threads may hold two separate `yesno_lanes` from one `yesno_snapshot`: `Snapshot` is
+documented `Clone + Send + Sync + 'static`, `KeyStream::over` takes
+`slot: snap._slot.clone()` while giving each stream its own `idx` and `plan`, and
+`next_chunk` mutates only its own stream. Verified all three. So `lanes_acquire` gives
+each handle its own streams and its own `Snapshot` clone, and the handles are
+independent; one handle is never shared between threads.
+
+The subtlety is that **`live_readers()` undercounts leases**, not merely misattributes
+them. `Snapshot` clone is "refcounting the registry slot, not taking a second one", so N
+handles derived from one snapshot share **one** slot and read as **one**. A plugin
+holding ten leases and a plugin holding one are indistinguishable there. My drain rule
+said the facility's own counter was better "for attribution"; it is stronger than that --
+`live_readers()` cannot answer the question in either direction, over-counting what is
+the plugin's and under-counting how many leases exist. So `on_unavailable` must wait for
+every handle, not for the slot to fall.
+
+I had already quoted the sentence that proves the undercount. It is in the assessment,
+used to make a different point about pinning. **Third time this session I have cited a
+fact for one purpose and then reasoned past it for another** -- the flock, `live_readers`,
+and now the slot refcount. The pattern is not forgetting; it is that a sentence read as
+support for claim A does not get re-examined when it bears on claim B.
+
+**The second correction is the more useful one, and it is about a test I wrote.** I had
+specified: two handles, one shared snapshot, concurrent advances with a writer and
+checkpoint, release one handle then the other, assert the slot stayed pinned until the
+final release. **That assertion could not have failed.** The parent `yesno_snapshot` was
+still open, and its own `Snapshot` clone keeps the slot live by itself -- so the test
+would pass even if the handles pinned nothing at all. The fix is to close the parent after
+creating both handles and before asserting, at which point the slot must still be live
+after the first release and become `FREE` only after the second. That is the property
+actually under test: each handle carries its own clone rather than borrowing the parent's.
+
+That is the third test this session caught passing for a reason other than the one it
+claimed -- after the evacuation fixture whose single slab per class offered no candidates,
+and the punch-offset sabotage whose fixtures never spanned two output chunks. **The shape
+is always the same: the assertion is true, and something other than the mechanism under
+test is what makes it true.** Worth generalizing into the admission question this tree
+already asks of `e2e/scenarios/`: not only "would a change to the subject fail this?" but
+"what else in this fixture could be holding the assertion up?"
+
+It also produced a contract point I had not written down: a derived handle outliving its
+parent must stay **legal**. `snapshot_close` releases one clone and must not assert that
+no handle remains, or it forbids the natural pattern of opening a snapshot, fanning out,
+and letting workers own their views.
+
+## 2026-09-28 -- Plugin facility, first increment: the core primitive and the C table
+
+Authorized by the `haiiie` owner to implement from
+`LTM/hosted-plugin-abi-design.md`. This increment is the two layers the rest
+depends on, and stops short of the server wiring.
+
+**`yesno-core`: `KeyLanes` ( `db/lanes.rs` ).** N keys' chunk streams advanced in
+lockstep under one `Snapshot`, kept separate rather than combined. Nothing in the
+tree did this: `stream/`'s n-ary operators fold many streams into one answer, and
+`view/fold.rs` walks aligned but folds as it goes. A block is the next prefix any
+lane holds; a lane with nothing there reads absent so lane indices never shift; at
+most one `Container` per lane is retained. Built on `peek_prefix`, which exists
+precisely so an ordering decision costs no refcount bump.
+
+Three decisions worth recording. **The handle holds its own `Snapshot` clone**,
+which looks redundant because each `KeyStream` already holds an
+`Arc<ReaderSlot>` -- but a *zero-lane* handle has no streams, and the ABI counts
+every handle as one lease regardless of key count, so without the clone "this
+lease is outstanding" and "this version is pinned" could disagree. **A failed
+advance poisons the handle**: `next_chunk` cannot be un-advanced, so there is no
+state to roll back to, and what a caller must never see is a partly populated
+block -- tiling lanes 0..6 of a block whose lane 7 failed is a plausible wrong
+answer. **`release_block` drops payloads immediately** rather than letting them
+live to the next advance, because the C layer promises those pointers are dead at
+release and a promise about freed memory that leaves the memory valid holds until
+the day it matters.
+
+**`yesno-plugin`: the host table.** `include/yesno_plugin.h` is the contract --
+two versioned tables with a `{ version, size }` prefix, nine status codes, the
+block protocol, and the drain obligation written into `on_unavailable`'s comment.
+`src/table.rs` implements the host half over a live `Db`. It does not `dlopen`
+anything and knows nothing of roles-as-policy, listeners or replication, so the
+ABI is testable without a server while loading and lifecycle stay where the slot
+already is.
+
+The lease counter is the part that exists because of this week's corrections.
+`Db::live_readers()` cannot serve: it **over**-counts what is the plugin's, since
+any in-flight query holds a slot, and **under**-counts how many leases exist,
+since `Snapshot::clone` refcounts one slot so N handles read as one. A test pins
+exactly that asymmetry -- four leases outstanding, `live_readers()` reporting 1 --
+so a later change cannot quietly make slots per-handle and invalidate the
+accounting built on it. `evict_oldest_reader` is not called anywhere and the
+module header says why.
+
+**Two fixture errors, both mine, both the same shape as this session's others.**
+The kind-coverage test asked for a bitmap lane and got a *Run*: 5000 values
+inserted contiguously are one interval, not 1024 words. Stride 3 puts 5000
+intervals past `RUN_MAX_INTERVALS` = 2032 and produces the bitmap. And I started
+the gate, then kept editing, which would have had me report a verdict for a tree
+that no longer existed -- caught before reporting, gate restarted. **A gate result
+is only about the tree that was there when it started**, which is obvious and is
+exactly the kind of thing three hours of small edits erodes.
+
+Header and Rust are checked against each other rather than eyeballed: a test
+parses `yesno_plugin.h` and asserts every status, role and chunk-kind
+discriminant, the ABI version, and `yesno_chunk`'s size and alignment. A header
+and a `#[repr(C)]` struct are two implementations of one layout, and a drifted
+discriminant produces a plugin that misreads every status -- silently.

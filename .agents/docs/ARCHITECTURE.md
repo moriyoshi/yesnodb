@@ -120,6 +120,18 @@ yesno/
                                 #   Snapshot::key_expr puts in an Expr -- so a query over a key
                                 #   no longer materializes the key first. It answers the
                                 #   planner's three leaf statistics from the index alone.
+        lanes.rs                # KeyLanes: N keys' chunk streams advanced in lockstep under
+                                #   ONE snapshot, kept separate rather than combined. A block
+                                #   is the next prefix any lane holds; a lane with nothing
+                                #   there reads absent, so lane indices never shift. At most
+                                #   one Container per lane is retained, which is why the API
+                                #   is block-scoped. Distinct from stream/'s n-ary operators,
+                                #   which fold many streams into one answer, and from
+                                #   view/fold.rs, which walks aligned but folds as it goes.
+                                #   Holds its own Snapshot clone so the pin does not depend
+                                #   on the lane count. A failed advance poisons the handle:
+                                #   next_chunk cannot be un-advanced, and a partly populated
+                                #   block is a plausible wrong answer.
         manifest.rs             # MANIFEST: db uuid, shard count, term, and the vshard -> shard map
         readers.rs              # cross-process reader registry: a foreign reader's
                                 #   ( pid, version, ckpt_seq ), plus an appended identity
@@ -237,6 +249,15 @@ yesno/
                                 #   Bazel also emits its PIC static library for MySQL.
     include/yesno.h             #   ownership, threading, error-buffer, and seek contract
     tests/smoke.c               #   strict C11 ABI/runtime test against two durable databases
+  yesno-plugin/                 # Host side of the yesnod plugin ABI: a function table over a
+                                #   LIVE Db, for a plugin yesnod dlopens. Deliberately has no
+                                #   `open` -- the host owns the directory -- and no dlopen of
+                                #   its own, so the ABI is testable without a server while the
+                                #   loading and the role lifecycle stay in yesno-server.
+                                #   Counts the handles it mints, because Snapshot::clone
+                                #   refcounts one registry slot and Db::live_readers() therefore
+                                #   both over- and under-counts what a plugin holds.
+    include/yesno_plugin.h      #   the two tables, status codes, and the drain contract
   yesno-mysql/                  # MySQL 8.4 storage engine; embedded C ABI or remote Flight.
     CMakeLists.txt              #   accepts Bazel inputs or adjacent-source fallbacks
   MODULE.bazel                  # bzlmod: rules_rust ( fed by Cargo.lock ), rules_foreign_cc,
