@@ -348,6 +348,11 @@ pub struct PluginConfig {
     pub channel_max_handles: usize,
 
     /// Lanes one handle may hold. Bounds the arena with the two fields around it.
+    ///
+    /// The default is sized for a real query rather than for a round number: a
+    /// consumer's exact search opens one lane per dimension plus one per plane, 265
+    /// at 256 dimensions, and a limit below that makes an ordinary query
+    /// inexpressible. The arena is sparse, so the reservation is address space.
     pub channel_max_lanes: usize,
 
     /// Blocks one response may carry.
@@ -366,7 +371,7 @@ impl Default for PluginConfig {
             listen: String::new(),
             channel_socket: String::new(),
             channel_max_handles: 4,
-            channel_max_lanes: 256,
+            channel_max_lanes: 1024,
             channel_max_blocks: 16,
         }
     }

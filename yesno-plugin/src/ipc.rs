@@ -144,11 +144,29 @@ pub const HEADER_LEN: usize = 12;
 /// `4096 * 2`, bitmap `1024 * 8`, run `2032 * 4`.
 pub const LANE_BYTES: usize = 8192;
 
-/// Most lanes one handle may hold.
+/// Most lanes one frame may declare.
 ///
-/// Bounds the arena a peer can ask the server to reserve -- `256 * 8192` is 2 MiB --
-/// and bounds the key array a single frame can declare.
-pub const MAX_LANES: usize = 256;
+/// # Structural, not policy, and the difference is why this was wrong
+///
+/// This was 256, chosen to bound "the arena a peer can ask the server to reserve".
+/// That is a **policy** limit, and the server already advertises its own as
+/// `max_lanes` in [`Frame::ServerHello`] -- so the constant was doing nothing except
+/// refusing valid requests. A consumer found it by trying to open 265 lanes, 256
+/// query dimensions plus nine planes, which is one ordinary exact query and which a
+/// direct adapter could not express at all.
+///
+/// What a structural cap must actually bound is decode: a declared lane count
+/// causes one `Vec` reservation, at 8 bytes per key in a request and 5 bytes per
+/// descriptor in a response. [`MAX_PAYLOAD`] already bounds both -- 64 KiB holds
+/// 8190 keys or 13 104 descriptors -- so this is the second, tighter bound and
+/// wants only to be *a* bound, not a small one. 4096 matches
+/// `yesno_wire::MAX_VIEW_SETS`, which is the same kind of limit on the same kind of
+/// fan-out.
+///
+/// **A peer's real limit is the one in the greeting**, which is configuration and
+/// may be far lower. Exceeding that is a refusal it can read, rather than a
+/// protocol wall it cannot negotiate past.
+pub const MAX_LANES: usize = 4096;
 
 /// Largest frame payload. Requests and descriptors only; bulk goes through the arena.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
@@ -400,6 +418,18 @@ pub enum Frame {
     /// One request rather than one per key, for the reason the in-process ABI gives:
     /// acquiring lanes separately takes a snapshot each, and a checkpoint between
     /// two of them scores one block against two database states.
+    ///
+    /// # When a query needs more lanes than the server allows
+    ///
+    /// Acquire **several handles on the same snapshot**. That preserves both
+    /// properties a wide query needs: every handle reads the one pinned version, so
+    /// the split cannot straddle a checkpoint, and handles coexist up to the
+    /// advertised `max_handles`, so every lane is readable at once rather than in
+    /// passes. The arena gives each handle its own slice, so their payloads do not
+    /// alias.
+    ///
+    /// What is *not* safe is opening a second snapshot for the overflow, which is
+    /// the mistake this frame exists to prevent in the first place.
     LanesAcquire {
         snapshot: u64,
         keys: Vec<u64>,

@@ -709,3 +709,128 @@ fn the_arena_descriptor_crosses_the_socket_and_names_the_same_memory() {
         "seals belong to the file, so they hold on the receiving side too"
     );
 }
+
+/// A query wider than one handle splits across handles on **one** snapshot.
+///
+/// The shape is a consumer's: 256 query dimensions plus nine planes is 265 lanes in
+/// one logical open, which no single handle need hold. Splitting is safe only if
+/// both properties survive it -- every handle reads the one pinned version, and all
+/// of them coexist so every lane is readable at once rather than in passes. Opening
+/// a second *snapshot* for the overflow is the mistake the single-acquire frame
+/// exists to prevent, and this asserts the safe alternative actually works.
+#[test]
+fn a_wide_query_splits_across_handles_without_splitting_the_snapshot() {
+    let mut dir = std::env::temp_dir();
+    // Deliberately not "yesno-chan-wide-...": `setup( "wide" )` already builds that
+    // path, and two tests opening one directory is an `AlreadyOpen` that looks like
+    // a channel bug.
+    dir.push(format!("yesno-chan-widesplit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _c = Clean(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // 265 keys, each with one chunk, so every lane is present in one block.
+    let mut b = db.batch();
+    for k in 0..265u64 {
+        b.insert(k, k);
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    // Deliberately narrower than the query, so the split is exercised.
+    let l = Limits {
+        max_handles: 3,
+        max_lanes: 128,
+        max_blocks: 1,
+    };
+    let arena = Arena::new(l.arena_bytes()).unwrap();
+    let mut s = Session::new(host, arena, l);
+    greet(&mut s);
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+
+    // 265 lanes over three handles of at most 128, all on the one snapshot.
+    let groups: Vec<Vec<u64>> = (0..265u64)
+        .collect::<Vec<_>>()
+        .chunks(128)
+        .map(|c| c.to_vec())
+        .collect();
+    assert_eq!(groups.len(), 3, "265 lanes needs three handles of 128");
+
+    let mut handles = Vec::new();
+    let mut offsets = Vec::new();
+    for g in &groups {
+        match s.handle(Frame::LanesAcquire {
+            snapshot,
+            keys: g.clone(),
+        }) {
+            Frame::LanesAcquired { lanes, arena_off } => {
+                handles.push(lanes);
+                offsets.push(arena_off);
+            }
+            other => panic!("a split acquire must succeed, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        offsets.len(),
+        3,
+        "all three coexist, so every lane is readable at once"
+    );
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "and their arena slices do not alias");
+
+    // Every handle advances over the same pinned version.
+    let mut total_present = 0usize;
+    for h in &handles {
+        loop {
+            match s.handle(Frame::BlockAdvance { lanes: *h }) {
+                Frame::BlockDone => break,
+                Frame::Block { lanes: ls, .. } => {
+                    total_present += ls.iter().filter(|l| l.kind != LaneKind::Absent).count();
+                    s.handle(Frame::BlockRelease { lanes: *h });
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        total_present, 265,
+        "every requested lane produced its chunk, across the split"
+    );
+
+    // One snapshot the whole way: one registry slot, not three.
+    assert_eq!(s.outstanding().0, 1, "the split used a single snapshot");
+    for h in handles {
+        s.handle(Frame::LanesRelease { lanes: h });
+    }
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// A single acquire of a consumer-sized query is within the protocol's own cap.
+///
+/// The regression this pins: `MAX_LANES` was 256, so 265 lanes could not be
+/// expressed at all -- a policy number written into a structural cap.
+#[test]
+fn a_consumer_sized_lane_count_is_expressible() {
+    let keys: Vec<u64> = (0..265).collect();
+    assert!(
+        keys.len() <= yesno_plugin::ipc::MAX_LANES,
+        "256 dimensions plus nine planes must fit the protocol cap"
+    );
+    let f = Frame::LanesAcquire { snapshot: 1, keys };
+    let bytes = f.encode().expect("a real query must be encodable");
+    assert_eq!(Frame::decode(&bytes).unwrap().0, f);
+}

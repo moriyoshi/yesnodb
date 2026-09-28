@@ -725,6 +725,16 @@ The fix is a short-circuit, not a new policy, and it is worth doing on the waste
 
 Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `tests/allocation.rs`, which is a **lower** bound rather than a cap -- unusual for that file, and necessary because the failure mode is an optimization silently not happening. Its first version asserted `>= 800` and caught nothing, being below both the segmented figure ( 1 038 ) and the suppressed one ( 910 ); the floor is now 970.
 
+### Testing
+
+- [ ] **the-archive-sidecar-fails-with-enoent-under-load** ( *2026-09-28, seen once while two gates ran concurrently; not reproduced in isolation* ): `e2e/scenarios/pitr_retention.py` failed at `srv_archive_wait( archive, "base_generation", ... , 30000 )` with `No such file or directory ( os error 2 )`. **Not a timeout.** Reading the verb, that message comes from the `Ok( Err( error ) )` arm, which means the archive **sidecar task itself terminated with that error** and the verb reported it faithfully; a timeout would have said the sidecar stopped before the metric was reached.
+
+  **Conditions.** `scripts/gate.sh` and `scripts/gate-pg.sh` were running at the same time, the latter building Arrow and PostgreSQL under Docker, so the machine was heavily loaded on CPU and disk. The scenario passes in isolation in 17.1 s against its own 30 s budget, and passed in every earlier gate run today.
+
+  **Why it is filed rather than dismissed.** The failing path is the archiver, which nothing in that session's changes touches, so contention is the likely explanation -- but "likely" is not the same as shown, and an `ENOENT` escaping a background task is a different kind of event from a slow one. If the archiver assumes a file it is about to read cannot have been rotated or removed underneath it, load only makes that visible rather than causing it. The next occurrence should capture which path was missing, which the current message does not say.
+
+  **Immediate operational note**, independent of the cause: **do not run the two gates concurrently.** The rule requiring both does not say "at once", and a timing-sensitive scenario failing for want of CPU costs a re-run and reads as a real failure.
+
 ### Storage
 
 - [ ] **foreign-reader-liveness-is-unsound-across-pid-namespaces** ( *2026-09-28, found while exploring an out-of-process plugin; the failure direction is data loss, not space* ): `db::readers` decides a foreign reader's liveness with `kill( pid, 0 )` and the process start time from field 22 of `/proc/<pid>/stat`. **Both are relative to a PID namespace.** A reader in another container registers the pid it sees inside its own namespace; the writer probes that number in *its* namespace, reaching an unrelated process or none; the recorded start time then positively disagrees, the identity check refutes, and the reader is **declared dead**. Its reclamation floor is released and its extents are reused underneath it -- which the module's own header names as the unsafe direction ( "declaring a live reader dead and reclaiming extents underneath it" ).

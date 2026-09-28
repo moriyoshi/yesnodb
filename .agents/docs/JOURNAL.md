@@ -7308,3 +7308,51 @@ order notify-act-notify. They are now one `Listeners` value with `before_close` 
 `after_replace` on it, which removed a duplicated drain block I had left behind in
 `close_for_rebuild` as well. **An argument-count lint caught a cohesion problem**,
 which is not what it is for and is what it found.
+
+## 2026-09-28 -- A policy number written into a structural cap, found by a consumer
+
+`ipc::MAX_LANES` was 256, and a consumer review found it by trying to open 265
+lanes: 256 query dimensions plus nine planes, which is **one ordinary exact query**.
+A direct adapter could not express it at all.
+
+**The constant was two different limits wearing one name.** Its own doc said it
+bounded "the arena a peer can ask the server to reserve" -- which is *policy*, and
+which the server already advertises separately as `max_lanes` in the greeting. So
+the protocol cap was doing nothing except refusing valid requests. What a structural
+cap must bound is **decode**: a declared lane count causes one `Vec` reservation, 8
+bytes per key in a request and 5 per descriptor in a response, and `MAX_PAYLOAD`
+already bounds both at 8190 keys or 13 104 descriptors. The second bound wants only
+to be *a* bound, not a small one. Now 4096, matching `yesno_wire::MAX_VIEW_SETS`,
+which is the same kind of limit on the same kind of fan-out. The server's configured
+default moved from 256 to 1024, sized for a real query rather than a round number.
+
+**The general form is worth keeping.** A cap whose justification names a *resource*
+belongs to whoever owns that resource. I wrote an arena-size argument into a wire
+constant, where it became unnegotiable -- and the same file already had the right
+shape one field away, in a greeting that advertises the server's limits so a peer
+learns them rather than hitting them. **When two limits have the same units, check
+whether they have the same owner.**
+
+Also documented, because the consumer asked for it and the answer was already true:
+a query wider than one handle splits across **several handles on one snapshot**,
+which preserves both properties it needs -- every handle reads the one pinned
+version, so the split cannot straddle a checkpoint, and handles coexist up to
+`max_handles`, so every lane is readable at once rather than in passes. What is not
+safe is a second *snapshot* for the overflow, which is the mistake the single
+acquire exists to prevent. A test drives exactly their shape: 265 lanes over three
+handles of 128, asserting all 265 produce their chunk, that the arena slices do not
+alias, and that `outstanding()` reports **one** snapshot.
+
+One self-inflicted detour: my new test built `yesno-chan-wide-{pid}` while
+`setup( "wide" )` already builds that path, so two tests opened one directory and
+the failure read as `AlreadyOpen` from the channel. Tmpdir names have to be unique
+per test, and a collision in a shared helper's naming scheme does not look like what
+it is.
+
+**On the second half of the review, which I did not act on.** The channel covers
+snapshot and lane reads only; their `SetSnapshot` also needs `load`, `key_range`,
+`cardinality`, `contains` and `max`, and `SetStore` needs atomic write and flush.
+That is correct -- I built the hot path. The reads are mechanical, since `Snapshot`
+already exposes every one of them, and writes are a genuine design question that
+the in-process ABI also declined. They said explicitly that this was contract
+feedback and not a request, so it is recorded rather than built.
