@@ -681,13 +681,27 @@ fn encode_lane(c: &Container) -> (Lane, Vec<u8>) {
             )
         }
         Container::Run(r) => {
-            let s = r.as_flat();
+            // **Converted, not copied.** In memory a run is `( start, len_minus_1 )`
+            // pairs -- the Roaring spec's on-disk form, which is what makes the
+            // serialized bytes identical to it -- while the wire says
+            // `[ start, end ]`. Emitting the stored pairs gave a consumer following
+            // the contract a silently wrong set: a run of 1000..=5999 is
+            // `( 1000, 4999 )`, read as an inclusive range that is a thousand values
+            // short, and a run whose start exceeds its length reads as a reversed
+            // interval.
+            let flat = r.as_flat();
+            let mut bytes = Vec::with_capacity(flat.len() * 2);
+            for pair in flat.chunks_exact(2) {
+                let (start, len_minus_1) = (pair[0], pair[1]);
+                bytes.extend_from_slice(&start.to_le_bytes());
+                bytes.extend_from_slice(&(start + len_minus_1).to_le_bytes());
+            }
             (
                 Lane {
                     kind: LaneKind::Run,
-                    count: (s.len() / 2) as u32,
+                    count: (flat.len() / 2) as u32,
                 },
-                s.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bytes,
             )
         }
         Container::Bitmap(b) => {

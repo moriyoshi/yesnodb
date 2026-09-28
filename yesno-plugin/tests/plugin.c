@@ -40,6 +40,15 @@ static uint32_t g_counts[MAX_ROWS];
 static size_t g_rows;
 /* First value of the first array lane seen, to prove the payload is readable. */
 static int g_first_array_value = -1;
+/* The first run interval seen, after the scratch retry, as [ start, end ]. A run
+ * is never lent -- its stored form is ( start, len_minus_1 ) -- so reading one
+ * costs a conversion into caller memory, and this is where a C consumer's copy of
+ * that handshake lives. */
+static int g_first_run_start = -1;
+static int g_first_run_end = -1;
+/* Room for RUN_MAX_INTERVALS pairs; the host refuses a smaller buffer rather
+ * than truncating. */
+static uint16_t g_run_scratch[2032 * 2];
 
 /* A lease held across calls, so the host's drain check has something to catch.
  *
@@ -145,6 +154,8 @@ yesno_status yesno_test_scan(const uint64_t *keys, size_t n) {
 
   g_rows = 0;
   g_first_array_value = -1;
+  g_first_run_start = -1;
+  g_first_run_end = -1;
 
   st = g_host->snapshot_open(g_db, &snap);
   if (st != YESNO_OK) {
@@ -181,6 +192,23 @@ yesno_status yesno_test_scan(const uint64_t *keys, size_t n) {
         g_host->lanes_release(lanes);
         return st;
       }
+      /* A real kind with a NULL payload is the documented "ask again with
+       * scratch". Every run answers that way. */
+      if (chunk.data == NULL && chunk.kind != YESNO_CHUNK_ABSENT) {
+        st = g_host->block_lane_into(lanes, lane, g_run_scratch,
+                                     sizeof g_run_scratch, &chunk);
+        if (st != YESNO_OK) {
+          g_host->block_release(lanes);
+          g_host->lanes_release(lanes);
+          return st;
+        }
+      }
+      if (chunk.kind == YESNO_CHUNK_RUN && chunk.count > 0 &&
+          g_first_run_start < 0) {
+        const uint16_t *pairs = (const uint16_t *)chunk.data;
+        g_first_run_start = (int)pairs[0];
+        g_first_run_end = (int)pairs[1];
+      }
       if (g_rows < MAX_ROWS) {
         g_prefixes[g_rows] = prefix;
         g_kinds[g_rows] = chunk.kind;
@@ -205,6 +233,8 @@ uint64_t yesno_test_prefix(size_t i) { return i < g_rows ? g_prefixes[i] : 0; }
 uint32_t yesno_test_kind(size_t i) { return i < g_rows ? g_kinds[i] : 0xffffffffu; }
 uint32_t yesno_test_count(size_t i) { return i < g_rows ? g_counts[i] : 0; }
 int yesno_test_first_array_value(void) { return g_first_array_value; }
+int yesno_test_first_run_start(void) { return g_first_run_start; }
+int yesno_test_first_run_end(void) { return g_first_run_end; }
 uint64_t yesno_test_generation(void) { return g_generation; }
 int yesno_test_unavailable_calls(void) { return g_unavailable_calls; }
 int yesno_test_available_calls(void) { return g_available_calls; }

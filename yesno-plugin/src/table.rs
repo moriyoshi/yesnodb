@@ -356,10 +356,24 @@ unsafe extern "C" fn block_advance(
     })
 }
 
+/// The kind of a container, without describing its payload.
+///
+/// Needed where a payload cannot be lent but the caller must still be told what it
+/// is about to ask for with scratch.
+fn kind_of(c: &Container) -> ChunkKind {
+    match c {
+        Container::Array(_) => ChunkKind::Array,
+        Container::Bitmap(_) => ChunkKind::Bitmap,
+        Container::Run(_) => ChunkKind::Run,
+    }
+}
+
 /// Describe `c` without copying, or report that it cannot be lent.
 ///
-/// `None` means "kind is known, payload is not borrowable": only a bitmap from an
-/// unaligned imported mapping, where `BitmapContainer::try_words` answers `None`.
+/// `None` means "kind is known, payload is not borrowable". Two cases answer it: a
+/// bitmap from an unaligned imported mapping, where `BitmapContainer::try_words`
+/// answers `None`, and **every** run, whose stored form is not the wire form. The
+/// caller retries through `block_lane_into` with scratch.
 fn describe(prefix: u64, c: &Container) -> Option<Chunk> {
     let (kind, count, data) = match c {
         Container::Array(a) => {
@@ -370,17 +384,20 @@ fn describe(prefix: u64, c: &Container) -> Option<Chunk> {
                 s.as_ptr() as *const std::ffi::c_void,
             )
         }
-        Container::Run(r) => {
-            let s = r.as_flat();
-            // Intervals, not u16s: the header says `count` is pairs for a run,
-            // and handing the caller the flat length would have it read twice as
-            // many intervals as exist.
-            (
-                ChunkKind::Run,
-                s.len() / 2,
-                s.as_ptr() as *const std::ffi::c_void,
-            )
-        }
+        // **A run cannot be lent, and that is a deliberate cost.**
+        //
+        // In memory a run is `( start, len_minus_1 )` pairs, which is the Roaring
+        // spec's on-disk form and is what makes the serialized bytes identical to
+        // it. The wire says `[ start, end ]`, so the two differ by one addition per
+        // interval and there is nothing to hand out a pointer to.
+        //
+        // Lending the native slice instead is what this code did, and a consumer
+        // reading the documented contract got a **silently wrong set**: a run of
+        // 1000..=5999 is `( 1000, 4999 )`, read as an inclusive range that is a
+        // thousand values short, and a run whose start exceeds its length reads as
+        // a reversed interval. Not borrowable is the honest answer; `block_lane_into`
+        // converts into the caller's scratch.
+        Container::Run(_) => return None,
         Container::Bitmap(b) => {
             let w = b.try_words()?;
             (
@@ -416,10 +433,13 @@ unsafe extern "C" fn block_lane(lanes: *const LanesOpaque, lane: usize, out: *mu
             Some(c) => match describe(prefix, c) {
                 Some(d) => d,
                 // Kind is real, payload is not lendable. Null data with a real
-                // kind is the documented signal to retry with scratch.
+                // kind is the documented signal to retry with scratch. Two kinds
+                // reach here now -- an unaligned bitmap, and every run, which has to
+                // be converted from its stored form -- so the kind is taken from the
+                // container rather than assumed.
                 None => Chunk {
                     prefix,
-                    kind: ChunkKind::Bitmap as u32,
+                    kind: kind_of(c) as u32,
                     count: 0,
                     data: std::ptr::null(),
                 },
@@ -462,9 +482,48 @@ unsafe extern "C" fn block_lane_into(
             unsafe { *out = d };
             return Status::Ok;
         }
+        if let Container::Run(r) = c {
+            // `[ start, end ]` on the wire, `( start, len_minus_1 )` in memory: the
+            // conversion is why a run cannot be lent.
+            let flat = r.as_flat();
+            let intervals = flat.len() / 2;
+            let need = intervals * 4;
+            let misaligned = !(scratch as usize).is_multiple_of(std::mem::align_of::<u16>());
+            if scratch.is_null() || cap < need || misaligned {
+                // SAFETY: Checked non-null, one output slot.
+                unsafe {
+                    *out = Chunk {
+                        prefix,
+                        kind: ChunkKind::Run as u32,
+                        count: need as u32,
+                        data: std::ptr::null(),
+                    }
+                };
+                return Status::InvalidArgument;
+            }
+            // SAFETY: `scratch` is non-null, 2-byte aligned and at least `need`
+            // bytes by the checks above, so it is a valid `[u16]` of that length,
+            // and it is the caller's buffer so it cannot alias the container.
+            let dst = unsafe { std::slice::from_raw_parts_mut(scratch as *mut u16, intervals * 2) };
+            for i in 0..intervals {
+                let start = flat[i * 2];
+                dst[i * 2] = start;
+                dst[i * 2 + 1] = start + flat[i * 2 + 1];
+            }
+            // SAFETY: Checked non-null, one output slot.
+            unsafe {
+                *out = Chunk {
+                    prefix,
+                    kind: ChunkKind::Run as u32,
+                    count: intervals as u32,
+                    data: scratch as *const std::ffi::c_void,
+                }
+            };
+            return Status::Ok;
+        }
         let Container::Bitmap(b) = c else {
-            // `describe` only declines for a bitmap; anything else here is a bug
-            // in this file rather than in the caller.
+            // `describe` declines only for a bitmap or a run, and the run is handled
+            // above; anything else here is a bug in this file, not in the caller.
             return Status::Internal;
         };
         let need = yesno_core::BITMAP_WORDS * std::mem::size_of::<u64>();

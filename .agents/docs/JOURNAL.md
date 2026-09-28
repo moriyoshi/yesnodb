@@ -7571,3 +7571,65 @@ the socket exists while every request answers `UNAVAILABLE`. That is the documen
 unavailable state and a peer must handle it during a rebootstrap anyway, so it is
 left as is -- but **socket existence is not readiness**, and the test says so where
 someone would otherwise assume it.
+
+## 2026-09-29 -- a run reached both plugin transports in its stored form, not its documented one
+
+**The finding is the consumer's, not mine.** The peer implementing a scorer against
+`yesno_plugin.h` read the contract -- `YESNO_CHUNK_RUN`, "`count` [start, end]
+uint16_t pairs" -- and got a different set than the database holds. Nothing faulted.
+
+In memory a run is `( start, len_minus_1 )` pairs. That is the Roaring spec's
+on-disk form, and it is deliberate: byte-level identity with the `roaring` crate is
+what makes `O(container count)` import of a `.roaring` file legitimate, so the
+stored form is not free to change. Both plugin transports handed those stored pairs
+out unconverted under a header that promised ends.
+
+**Why it was invisible.** Read as `[ start, end ]`, a stored pair is still a
+well-formed ascending interval **whenever `start <= len_minus_1`** -- so a run near
+the chunk origin decodes to something plausible and merely short. The fixture that
+covered runs used `insert_range( 30, 3 * 65536, 3 * 65536 + 4096 )`: start 0, stored
+`( 0, 4096 )`, which reads as `[ 0, 4096 ]` and is **exactly right by accident**.
+A test asserting only the interval *count* could not see it either, and that is all
+the test asserted. The defect needed a nonzero start to exist and a decoded-contents
+assertion to be caught, and the fixture had neither.
+
+The second shape is worse and also unreachable from the old fixture: a run whose
+start exceeds its length, here `( 60000, 10 )`, decodes **reversed**. A consumer
+looping `for low in start..=end` gets an empty set from a lane holding eleven
+ordinals, silently.
+
+**The fix is in the encoders, both of them.** The published contract wins over the
+convenience of lending: `[ start, end ]` also makes a reversed interval
+unrepresentable, so a decoder can assert `start <= end` and have that mean
+something. `channel.rs::encode_lane` converts into the wire bytes it was already
+building, at no extra cost. The C ABI pays more -- `describe` now returns `None` for
+**every** run, so `block_lane` answers with a real kind and a NULL payload and the
+caller retries through `block_lane_into` with scratch. **A run can no longer be lent
+zero-copy**, and that is the real price of keeping the stored form spec-identical.
+The NULL-payload path already existed for unaligned imported bitmaps, so this added
+a second reason rather than a mechanism; `block_lane`'s null arm previously
+hardcoded `Bitmap` as the kind and now takes it from the container.
+
+**Four regression points, each verified to fail without the fix** by restoring the
+old behaviour and re-running: the arena transport, the inline transport,
+`block_lane_into` through the Rust table, and the C fixture across a real `dlopen`
+boundary. `tests/plugin.c` now performs the NULL-payload retry, which is the
+consumer's own handshake rather than a Rust-side imitation of it, and
+`load_c_plugin.rs`'s fixture run was moved off the chunk origin to
+`( 1000, 5000 )` so its start is load-bearing.
+
+**What this says about fixture construction.** The previous entry's lesson was that
+the verification boundary sat on the reachability boundary. This one is adjacent and
+distinct: the code here was *reached* by a test every run. The fixture simply sat on
+the one input where the wrong answer equals the right one. **A container fixture
+built at a chunk origin tests a degenerate case of anything that involves an
+offset**, and picking round numbers is exactly what makes an origin likely. The
+other half is that asserting a count is not asserting a payload -- the old run
+assertion was `( ChunkKind::Run, 1 )`, which the broken encoder satisfied perfectly.
+
+**Also corrected while here:** `insert_range` is inclusive of `hi`, documented as
+`[lo, hi]` in `db/mod.rs`. My first draft of the regression test assumed half-open
+and asserted a 5000-value set against a 5001-value database, which sent me looking
+for a bug in `RunContainer` that was not there. A probe under
+`.agents-workspace/tmp/` printing `as_flat()` settled it in one run; reading the
+container code a third time would not have.

@@ -66,7 +66,10 @@ fn fixture(tag: &str) -> (Clean, Arc<RwLock<Option<Arc<Db>>>>) {
     .unwrap();
     let mut b = db.batch();
     // key 10: chunks 0, 1, 5 as arrays starting at 7. key 20: chunk 1 as a
-    // bitmap ( scattered, past RUN_MAX_INTERVALS ). key 30: chunk 3 as one run.
+    // bitmap ( scattered, past RUN_MAX_INTERVALS ). key 30: chunk 3 as one run,
+    // deliberately **not** starting at the chunk origin: stored it is
+    // ( 1000, 5000 ), so a consumer handed the stored pair reads an end of 5000
+    // and silently loses four thousand ordinals.
     for c in [0u64, 1, 5] {
         for i in 0..3u64 {
             b.insert(10, c * 65536 + 7 + i);
@@ -75,7 +78,7 @@ fn fixture(tag: &str) -> (Clean, Arc<RwLock<Option<Arc<Db>>>>) {
     for i in 0..5000u64 {
         b.insert(20, 65536 + i * 3);
     }
-    b.insert_range(30, 3 * 65536, 3 * 65536 + 4096);
+    b.insert_range(30, 3 * 65536 + 1000, 3 * 65536 + 6000);
     b.commit().unwrap();
     db.checkpoint().unwrap();
     (clean, Arc::new(RwLock::new(Some(Arc::new(db)))))
@@ -181,6 +184,18 @@ fn the_c_plugin_completes_the_handshake_and_reads_through_the_host_table() {
         probe.call0::<i32>(b"yesno_test_first_array_value\0"),
         7,
         "the first array lane's first value, read from C through chunk.data"
+    );
+
+    // The run reached C as `[ start, end ]`, across a real dlopen boundary and
+    // through the NULL-payload retry. Reading the stored pair instead would give
+    // ( 1000, 5000 ): ascending, so nothing would fault, and wrong.
+    assert_eq!(
+        (
+            probe.call0::<i32>(b"yesno_test_first_run_start\0"),
+            probe.call0::<i32>(b"yesno_test_first_run_end\0"),
+        ),
+        (1000, 6000),
+        "a run converts to an inclusive end, not to its stored length"
     );
 
     // Every lease the plugin took is returned; it holds nothing between calls.

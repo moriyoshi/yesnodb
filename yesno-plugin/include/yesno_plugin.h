@@ -110,7 +110,12 @@ typedef enum yesno_role {
 typedef enum yesno_chunk_kind {
   YESNO_CHUNK_ARRAY = 0,  /* `count` uint16_t values, ascending */
   YESNO_CHUNK_BITMAP = 1, /* `count` uint64_t words; count is always 1024 */
-  YESNO_CHUNK_RUN = 2,    /* `count` [start, end] uint16_t pairs, ascending */
+  /* `count` [start, end] uint16_t pairs, ascending, both ends INCLUSIVE. Note
+   * that this is not how a run is stored -- in memory it is ( start,
+   * len_minus_1 ), the Roaring spec's on-disk form -- so a run is never lent and
+   * block_lane always answers it with a NULL payload. Read one through
+   * block_lane_into, which converts into your scratch. */
+  YESNO_CHUNK_RUN = 2,
   /* This lane holds nothing at this block. Reported rather than omitted, so the
    * caller's lane indices never shift under it. */
   YESNO_CHUNK_ABSENT = 3,
@@ -200,9 +205,12 @@ typedef struct yesno_host_api {
    * makes tiling every lane at once legal.
    *
    * `out->data` is NULL with a real `kind` when the payload cannot be lent
-   * without a copy. That happens only for a bitmap imported from an unaligned
-   * `.roaring` mapping. Being told is the point: the alternative is paying an
-   * 8 KiB copy per call without knowing. Use block_lane_into for those. */
+   * without a copy, and `out->count` is then 0. Two cases answer that way: a
+   * bitmap imported from an unaligned `.roaring` mapping, and EVERY run, whose
+   * stored ( start, len_minus_1 ) pairs are not the [ start, end ] above. Being
+   * told is the point: the alternative is paying an 8 KiB copy per call without
+   * knowing, or -- for a run -- reading a length as an end. Use block_lane_into
+   * for those. */
   yesno_status (*block_lane)(const yesno_lanes *lanes, size_t lane,
                              yesno_chunk *out);
 

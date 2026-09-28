@@ -115,6 +115,12 @@ fn each_container_kind_is_described_with_the_right_count() {
                 Status::Ok
             );
             assert_eq!(chunk.prefix, prefix, "every lane echoes the block prefix");
+            if chunk.kind == ChunkKind::Run as u32 {
+                assert!(
+                    chunk.data.is_null(),
+                    "a run must not be lent: the stored pairs are not the wire pairs"
+                );
+            }
             row.push((chunk.kind, chunk.count));
         }
         seen.push((prefix, row));
@@ -136,8 +142,13 @@ fn each_container_kind_is_described_with_the_right_count() {
                     absent
                 ]
             ),
-            // One contiguous range is one interval, not 2 u16s.
-            (3, vec![absent, absent, (ChunkKind::Run as u32, 1)]),
+            // A run is never lendable -- its stored `( start, len_minus_1 )` pairs
+            // are not the `[ start, end ]` the header promises -- so `block_lane`
+            // reports the kind with a zero count and a null payload, the documented
+            // signal to retry through `block_lane_into`. The interval count comes
+            // back from that call; see
+            // `a_persisted_run_with_a_nonzero_start_converts_to_start_end_pairs`.
+            (3, vec![absent, absent, (ChunkKind::Run as u32, 0)]),
             (5, vec![(ChunkKind::Array as u32, 3), absent, absent]),
         ]
     );
@@ -468,4 +479,137 @@ fn a_failed_acquire_counts_no_lease() {
 
     unsafe { (api.snapshot_close)(snap) };
     assert_eq!(host.leases(), 0);
+}
+
+/// A persisted run reaches the plugin as `[ start, end ]`, whatever its start.
+///
+/// The regression is a consumer reading the contract in `yesno_plugin.h` -- "`count`
+/// [start, end] uint16_t pairs" -- against a table that lent the *stored* pairs,
+/// which are `( start, len_minus_1 )`. Nothing faults; the plugin simply scores a
+/// different set. The two shapes here are the two ways it goes wrong:
+///
+/// * 1000..=6000 is stored `( 1000, 5000 )`, which reads as a range ending at 5000
+///   -- four thousand ordinals short, and still ascending, so no bounds check fires.
+/// * 60000..=60010 is stored `( 60000, 10 )`, which reads *reversed*.
+///
+/// Checkpointed on purpose: the defect is in how a persisted container is handed
+/// out, and a memtable read takes another path.
+#[test]
+fn a_persisted_run_with_a_nonzero_start_converts_to_start_end_pairs() {
+    let dir = tmpdir("runenc");
+    let _c = Clean(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut b = db.batch();
+    // `insert_range` is inclusive of `hi`.
+    b.insert_range(1, 1000, 6000);
+    b.insert_range(2, 60000, 60010);
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+    let want: [Vec<u64>; 2] = [(1000..=6000).collect(), (60000..=60010).collect()];
+
+    let slot = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    let api = host_api();
+    let mut h = host.clone();
+    let db_ptr = &mut h as *mut Host as *mut HostDb;
+
+    let mut snap: *mut SnapshotOpaque = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.snapshot_open)(db_ptr, &mut snap) },
+        Status::Ok
+    );
+    let keys = [1u64, 2];
+    let mut lanes: *mut LanesOpaque = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.lanes_acquire)(snap, keys.as_ptr(), keys.len(), &mut lanes) },
+        Status::Ok
+    );
+
+    let mut got: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+    loop {
+        let mut prefix = 0u64;
+        let mut done = 0u8;
+        assert_eq!(
+            unsafe { (api.block_advance)(lanes, &mut prefix, &mut done) },
+            Status::Ok
+        );
+        if done == 1 {
+            break;
+        }
+        for (lane, out) in got.iter_mut().enumerate() {
+            // A run answers `block_lane` with a null payload, so the caller is
+            // told to come back with scratch. Assert that handshake here too --
+            // it is the only thing standing between a consumer and the stored
+            // pairs.
+            let mut peek = Chunk {
+                prefix: 0,
+                kind: 99,
+                count: 0,
+                data: std::ptr::null(),
+            };
+            assert_eq!(
+                unsafe { (api.block_lane)(lanes, lane, &mut peek) },
+                Status::Ok
+            );
+            if peek.kind != ChunkKind::Run as u32 {
+                continue;
+            }
+            assert!(peek.data.is_null(), "a run is never lent");
+
+            let mut scratch = vec![0u16; 2 * 2048];
+            let mut chunk = Chunk {
+                prefix: 0,
+                kind: 99,
+                count: 0,
+                data: std::ptr::null(),
+            };
+            assert_eq!(
+                unsafe {
+                    (api.block_lane_into)(
+                        lanes,
+                        lane,
+                        scratch.as_mut_ptr() as *mut c_void,
+                        scratch.len() * 2,
+                        &mut chunk,
+                    )
+                },
+                Status::Ok
+            );
+            assert_eq!(chunk.kind, ChunkKind::Run as u32);
+            assert_eq!(
+                chunk.data as *const u16,
+                scratch.as_ptr(),
+                "a run must land in the caller's scratch, converted"
+            );
+            // SAFETY: the table reported `count` intervals written into `scratch`,
+            // which outlives this read.
+            let pairs = unsafe {
+                std::slice::from_raw_parts(chunk.data as *const u16, chunk.count as usize * 2)
+            };
+            for p in pairs.chunks_exact(2) {
+                let (start, end) = (p[0], p[1]);
+                assert!(
+                    start <= end,
+                    "a reversed interval means a length was sent where an end belongs"
+                );
+                for low in start..=end {
+                    out.push(prefix * 65536 + low as u64);
+                }
+            }
+        }
+        unsafe { (api.block_release)(lanes) };
+    }
+
+    assert_eq!(got[0], want[0], "key 1 must convert to its whole run");
+    assert_eq!(got[1], want[1], "key 2, whose start exceeds its length");
+
+    unsafe { (api.lanes_release)(lanes) };
+    unsafe { (api.snapshot_close)(snap) };
 }

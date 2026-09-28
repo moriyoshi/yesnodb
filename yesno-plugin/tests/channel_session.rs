@@ -1199,3 +1199,182 @@ fn a_wide_block_of_dense_lanes_is_served_in_both_transports() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A persisted run with a non-zero start decodes to exactly the ordinals it holds.
+///
+/// # The bug this pins
+///
+/// In memory a run is `( start, len_minus_1 )` pairs -- the Roaring spec's on-disk
+/// form -- while the wire says `[ start, end ]`. Both encoders emitted the stored
+/// pairs, so a consumer following the contract read a **silently wrong set**: the
+/// run `1000..=5999` is `( 1000, 4999 )`, which as an inclusive range is a thousand
+/// values short. A run whose start exceeds its length instead reads as a reversed
+/// interval and is caught -- which is why only the first shape is silent, and why
+/// the fixture has to use a non-zero start with a length below it.
+///
+/// Every earlier run in these tests started at a chunk boundary with a length that
+/// made `start + len_minus_1` look plausible, so none of them could see it.
+#[test]
+fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-chan-runenc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _c = Clean(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // The consumer's shape: one interval far from the chunk origin, plus a second
+    // key whose start exceeds its length so the reversed-interval case is covered.
+    // `insert_range` is inclusive of `hi`, so these are 1000..=6000 and
+    // 60000..=60010; both are stored run-encoded, as `( 1000, 5000 )` and
+    // `( 60000, 10 )`.
+    let mut b = db.batch();
+    b.insert_range(1, 1000, 6000);
+    b.insert_range(2, 60000, 60010);
+    b.commit().unwrap();
+    // Checkpointed, because the defect is in what a *persisted* container decodes
+    // to; a memtable read takes a different path.
+    db.checkpoint().unwrap();
+
+    let want1: Vec<u64> = (1000..=6000).collect();
+    let want2: Vec<u64> = (60000..=60010).collect();
+    let oracle = db.snapshot().unwrap();
+    assert_eq!(oracle.load(1).unwrap().iter().collect::<Vec<_>>(), want1);
+    assert_eq!(oracle.load(2).unwrap().iter().collect::<Vec<_>>(), want2);
+
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    let l = Limits {
+        max_handles: 1,
+        max_lanes: 2,
+        max_blocks: 1,
+    };
+
+    /// Rebuild a lane's ordinals from `[ start, end ]` pairs, the way a peer must.
+    fn from_pairs(prefix: u64, pairs: &[u16]) -> Vec<u64> {
+        let mut out = Vec::new();
+        for p in pairs.chunks_exact(2) {
+            let (start, end) = (p[0], p[1]);
+            assert!(
+                start <= end,
+                "a reversed interval means the encoder sent a length where an end belongs"
+            );
+            for low in start..=end {
+                out.push(prefix * 65536 + low as u64);
+            }
+        }
+        out
+    }
+
+    // --- through the arena ---
+    let arena = Arena::new(l.arena_bytes()).unwrap();
+    let mut s = Session::new(host.clone(), arena, l);
+    let view = {
+        let f = std::fs::File::from(s.arena_fd().unwrap().try_clone_to_owned().unwrap());
+        unsafe { memmap2::Mmap::map(&f) }.unwrap()
+    };
+    greet(&mut s);
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let (lanes, arena_off) = match s.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![1, 2],
+    }) {
+        Frame::LanesAcquired { lanes, arena_off } => (lanes, arena_off),
+        other => panic!("{other:?}"),
+    };
+    let mut got1 = Vec::new();
+    let mut got2 = Vec::new();
+    loop {
+        match s.handle(Frame::BlockAdvance { lanes }) {
+            Frame::BlockDone => break,
+            Frame::Block { prefix, lanes: ls } => {
+                for (i, lane) in ls.iter().enumerate() {
+                    if lane.kind != LaneKind::Run {
+                        continue;
+                    }
+                    let off = lane_offset(arena_off, i) as usize;
+                    let n = lane.kind.payload_bytes(lane.count);
+                    let pairs: Vec<u16> = view[off..off + n]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let vals = from_pairs(prefix, &pairs);
+                    if i == 0 {
+                        got1.extend(vals);
+                    } else {
+                        got2.extend(vals);
+                    }
+                }
+                s.handle(Frame::BlockRelease { lanes });
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        (got1.len(), got1.first().copied(), got1.last().copied()),
+        (want1.len(), want1.first().copied(), want1.last().copied()),
+        "arena: key 1 must decode to its whole run"
+    );
+    assert_eq!(got1, want1, "arena: key 1 contents");
+    assert_eq!(
+        (got2.len(), got2.first().copied(), got2.last().copied()),
+        (want2.len(), want2.first().copied(), want2.last().copied()),
+        "arena: key 2"
+    );
+    assert_eq!(got2, want2, "arena: key 2 contents");
+
+    // --- inline, which shares the encoder ---
+    let mut n = Session::new_inline(host, l);
+    greet(&mut n);
+    let snapshot = match n.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let lanes = match n.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![1, 2],
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    };
+    let mut inline1 = Vec::new();
+    let mut inline2 = Vec::new();
+    loop {
+        match n.handle(Frame::BlockAdvance { lanes }) {
+            Frame::BlockDone => break,
+            Frame::BlocksInline { blocks, payload } => {
+                let b = &blocks[0];
+                let mut at = 0usize;
+                for (i, lane) in b.lanes.iter().enumerate() {
+                    let n_bytes = lane.kind.payload_bytes(lane.count);
+                    if lane.kind == LaneKind::Run {
+                        let pairs: Vec<u16> = payload[at..at + n_bytes]
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        let vals = from_pairs(b.prefix, &pairs);
+                        if i == 0 {
+                            inline1.extend(vals);
+                        } else {
+                            inline2.extend(vals);
+                        }
+                    }
+                    at += n_bytes;
+                }
+                n.handle(Frame::BlockRelease { lanes });
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(inline1, want1, "inline: key 1 must decode to its whole run");
+    assert_eq!(inline2, want2, "inline: key 2 as well");
+}
