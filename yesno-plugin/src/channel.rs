@@ -1,0 +1,689 @@
+//! The server side of the out-of-process plugin channel.
+//!
+//! yesnod stays the only process that opens the database. A peer connects over a
+//! Unix socket, is handed a shared arena as a file descriptor, and asks for data.
+//! The protocol is [`crate::ipc`]; the reasoning behind its shape is in
+//! that module's header.
+//!
+//! # Protocol logic is separated from the socket, deliberately
+//!
+//! [`Session::handle`] takes a frame and answers a frame. It never reads or writes
+//! the socket, so every behaviour worth testing -- an unknown handle, a block
+//! advanced twice, a snapshot closed while lanes derived from it live -- is a
+//! function call in a test rather than a conversation through a file descriptor.
+//! [`serve_blocking`] is the thin loop that owns the socket, and there is almost
+//! nothing in it to get wrong.
+//!
+//! # The arena is sparse, which is what makes fixed slots affordable
+//!
+//! Each handle reserves `max_lanes * LANE_BYTES` regardless of how many lanes it
+//! asked for, so its offset is `index * slot` and there is no allocator. That looks
+//! wasteful -- a three-lane handle reserving two megabytes -- and is not: the arena
+//! is a `memfd`, so a page costs nothing until it is written. The reservation is
+//! address space, and the resident cost is the lanes actually used.
+//!
+//! # Liveness is the connection
+//!
+//! A `Session` owns the snapshots it opened. Dropping it drops them, and the socket
+//! closing is what drops it -- peer exit, crash, container stop, `SIGKILL`. So
+//! reclamation needs no cooperation from the peer and no pid, which is the property
+//! the in-process ABI cannot have, where only `ReaderSlot::drop` frees a lease.
+
+use std::collections::HashMap;
+
+use crate::ipc::{
+    Block as WireBlock, Frame, Kind, Lane, LaneKind, Role as WireRole, LANE_BYTES, MAX_LANES,
+};
+use yesno_core::{Container, KeyLanes, Snapshot};
+
+use crate::abi::{Role, Status};
+use crate::Host;
+
+/// How many concurrent lane handles one session may hold, and how wide each may be.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_handles: usize,
+    pub max_lanes: usize,
+    /// Blocks one response may carry, and therefore sub-slots per handle.
+    ///
+    /// The whole point of a batch is fewer notifications: measurement put the
+    /// per-block cost almost entirely in round trips rather than in the copy, so
+    /// this is the factor that moves it. One is the unbatched behaviour.
+    pub max_blocks: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_handles: 4,
+            max_lanes: MAX_LANES,
+            max_blocks: 1,
+        }
+    }
+}
+
+impl Limits {
+    /// Bytes one block of one handle reserves.
+    fn block_bytes(&self) -> usize {
+        self.max_lanes * LANE_BYTES
+    }
+
+    /// Bytes one handle reserves, across its whole batch.
+    fn slot_bytes(&self) -> usize {
+        self.max_blocks.max(1) * self.block_bytes()
+    }
+
+    /// Bytes the whole arena spans.
+    pub fn arena_bytes(&self) -> usize {
+        self.max_handles * self.slot_bytes()
+    }
+}
+
+/// The shared region, and the descriptor a peer maps.
+pub struct Arena {
+    map: memmap2::MmapMut,
+    /// Kept so it can be sent over the socket. Closed with the arena.
+    fd: std::os::fd::OwnedFd,
+}
+
+impl Arena {
+    /// Create an anonymous shared region of `bytes`, sized once and sealed.
+    ///
+    /// # Why a `memfd` and not POSIX or System V shared memory
+    ///
+    /// All three would work on one host. The differences decide it:
+    ///
+    /// - **It crosses a container boundary.** A `memfd` travels as a descriptor over
+    ///   the control socket, so it needs no shared filesystem and no shared
+    ///   namespace. POSIX `shm_open` lives in `/dev/shm`, which Docker gives each
+    ///   container privately ( and caps at 64 MiB by default ); System V segments
+    ///   live in the IPC namespace, which containers also get separately. Either
+    ///   would need a deployment to share something extra, and a deployment that
+    ///   forgot would fail at connect time rather than at review time.
+    /// - **It cannot leak.** The region is freed when the last descriptor closes and
+    ///   the last mapping goes. A POSIX segment outlives a crashed creator until
+    ///   `shm_unlink` or reboot, and a System V segment outlives it until `ipcrm` --
+    ///   both survivable with discipline ( unlink or `IPC_RMID` immediately after
+    ///   creation ), and both a discipline that a crash between two lines defeats.
+    /// - **It has no name to guess.** Only the peer we handed the descriptor to can
+    ///   reach it. A POSIX path exists in the filesystem for at least a moment, and
+    ///   a System V key is reachable by anything in the namespace.
+    ///
+    /// The one thing they have and this does not is portability: `memfd_create` is
+    /// Linux-only. If a non-Linux host is ever needed, POSIX `shm_open` with an
+    /// immediate `shm_unlink` is the fallback, and it gives up the size and
+    /// namespace properties above rather than correctness.
+    ///
+    /// # Sealing, which neither alternative offers
+    ///
+    /// `F_SEAL_SHRINK` is the point. A mapping whose file is truncated underneath it
+    /// raises `SIGBUS` on the next touch, and that is not catchable as a `Result` --
+    /// the same hazard invariant I6 states for the shard files, arriving here by a
+    /// different route. Sealing makes the size immutable for **both** sides, so a
+    /// bug on either end cannot produce it. `F_SEAL_GROW` pairs with it so the peer's
+    /// mapping length stays the whole region, and `F_SEAL_SEAL` stops anything
+    /// adding further seals later -- notably `F_SEAL_WRITE`, which would break the
+    /// host's own writes.
+    #[cfg(target_os = "linux")]
+    pub fn new(bytes: usize) -> std::io::Result<Arena> {
+        use std::os::fd::FromRawFd;
+        let name = c"yesno-plugin-arena";
+        // SAFETY: `name` is a valid NUL-terminated C string that outlives the call,
+        // and the flags are documented ones. ALLOW_SEALING is required at creation;
+        // a memfd made without it can never be sealed.
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh descriptor this call owns.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let file = std::fs::File::from(fd.try_clone()?);
+        file.set_len(bytes as u64)?;
+        // Sealed after sizing and before anyone else can hold it, which is the only
+        // moment both halves of that are true.
+        let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        // SAFETY: `fd` is a live memfd created with MFD_ALLOW_SEALING.
+        let rc = unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::F_ADD_SEALS,
+                seals,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is a memfd sized to `bytes` above, and nothing
+        // else has it yet.
+        let map = unsafe { memmap2::MmapOptions::new().len(bytes).map_mut(&file)? };
+        Ok(Arena { map, fd })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(_bytes: usize) -> std::io::Result<Arena> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the plugin channel's shared arena needs memfd_create, which is Linux-only",
+        ))
+    }
+
+    /// The descriptor to send to a peer.
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
+    fn write_at(&mut self, off: usize, bytes: &[u8]) {
+        let end = off + bytes.len();
+        // Bounds are the session's arithmetic, checked here rather than trusted: a
+        // slot offset is derived from a handle index the session assigned, so a
+        // failure means this file is wrong, not that a peer sent something.
+        debug_assert!(end <= self.map.len(), "a lane wrote past the arena");
+        if end <= self.map.len() {
+            self.map[off..end].copy_from_slice(bytes);
+        }
+    }
+}
+
+/// One acquired lanes handle.
+struct Handle {
+    lanes: KeyLanes,
+    /// Which fixed slot of the arena this handle owns.
+    index: usize,
+    arity: usize,
+    block_open: bool,
+    /// The snapshot id this came from, so closing that snapshot can refuse while
+    /// handles derived from it are live.
+    snapshot: u64,
+}
+
+/// One peer's conversation.
+pub struct Session {
+    host: Host,
+    /// `None` on a transport with no shared region, where payloads travel in the
+    /// frames instead. See [`Session::new_inline`].
+    arena: Option<Arena>,
+    limits: Limits,
+    snapshots: HashMap<u64, Snapshot>,
+    handles: HashMap<u64, Handle>,
+    /// Which arena slots are in use, by index.
+    slots: Vec<bool>,
+    next_id: u64,
+    greeted: bool,
+}
+
+impl Session {
+    pub fn new(host: Host, arena: Arena, limits: Limits) -> Session {
+        Session::with_arena(host, Some(arena), limits)
+    }
+
+    /// A session for a transport that cannot share memory.
+    ///
+    /// Payloads then travel inside the response frames. This is what makes the
+    /// channel portable: the protocol is bytes and makes no system calls, the
+    /// stream is whatever the platform offers, and **only the shared region is
+    /// platform-specific**. Where one cannot be had, this path still works and
+    /// costs a second copy and a smaller batch.
+    pub fn new_inline(host: Host, limits: Limits) -> Session {
+        Session::with_arena(host, None, limits)
+    }
+
+    fn with_arena(host: Host, arena: Option<Arena>, limits: Limits) -> Session {
+        Session {
+            host,
+            arena,
+            limits,
+            snapshots: HashMap::new(),
+            handles: HashMap::new(),
+            slots: vec![false; limits.max_handles],
+            // Ids start at 1 so zero is never a valid handle, which makes an
+            // uninitialised field in a peer fail immediately rather than address
+            // something.
+            next_id: 1,
+            greeted: false,
+        }
+    }
+
+    /// The greeting to send before any request is answered.
+    pub fn hello(&self) -> Frame {
+        Frame::ServerHello {
+            protocol: crate::ipc::VERSION as u32,
+            generation: self.host.generation(),
+            role: match self.host.role() {
+                Role::Leader => WireRole::Leader,
+                Role::Follower => WireRole::Follower,
+            },
+            shards: self.host.db().map(|d| d.shard_count() as u32).unwrap_or(0),
+            // Zero is the advertisement that there is no shared region, so a peer
+            // knows to expect inline payloads without a second negotiation field.
+            arena_bytes: match self.arena {
+                Some(_) => self.limits.arena_bytes() as u64,
+                None => 0,
+            },
+            max_lanes: self.limits.max_lanes as u32,
+            max_handles: self.limits.max_handles as u32,
+        }
+    }
+
+    /// Whether this session has a shared region at all.
+    pub fn has_arena(&self) -> bool {
+        self.arena.is_some()
+    }
+
+    /// The arena descriptor to send the peer, when there is one.
+    ///
+    /// The socket loop passes this with `SCM_RIGHTS` once, right after the greeting.
+    /// A peer maps it read-only and never writes: every byte in it is produced by
+    /// this side, so a writable mapping on the peer would let a bug there corrupt
+    /// what the next block reports.
+    pub fn arena_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.arena.as_ref().map(|a| a.as_fd())
+    }
+
+    /// Snapshots and handles this session is holding.
+    pub fn outstanding(&self) -> (usize, usize) {
+        (self.snapshots.len(), self.handles.len())
+    }
+
+    fn fault(status: Status, message: &str) -> Frame {
+        Frame::Fault {
+            status: status as u32,
+            message: message.to_string(),
+        }
+    }
+
+    /// Answer one request.
+    ///
+    /// A frame that is not a request is refused by its kind rather than interpreted:
+    /// the protocol puts requests, responses and notifications in separate
+    /// discriminant ranges precisely so this check is one comparison.
+    pub fn handle(&mut self, frame: Frame) -> Frame {
+        if frame.kind().direction() != crate::ipc::Direction::Request {
+            return Self::fault(
+                Status::InvalidArgument,
+                "only request frames are accepted here",
+            );
+        }
+        match frame {
+            Frame::ClientHello { protocol, .. } => {
+                if protocol != crate::ipc::VERSION as u32 {
+                    return Self::fault(Status::AbiMismatch, "unsupported protocol version");
+                }
+                self.greeted = true;
+                Frame::Done
+            }
+            _ if !self.greeted => Self::fault(
+                Status::InvalidArgument,
+                "the first frame must be ClientHello",
+            ),
+            Frame::SnapshotOpen => self.snapshot_open(),
+            Frame::SnapshotClose { snapshot } => self.snapshot_close(snapshot),
+            Frame::LanesAcquire { snapshot, keys } => self.lanes_acquire(snapshot, &keys),
+            Frame::LanesRelease { lanes } => self.lanes_release(lanes),
+            Frame::BlockAdvance { lanes } => self.block_advance(lanes),
+            Frame::BlockRelease { lanes } => self.block_release(lanes),
+            Frame::BlockAdvanceMany { lanes, max_blocks } => {
+                self.block_advance_many(lanes, max_blocks)
+            }
+            // Every request kind is handled above; the range check made this
+            // unreachable, and an unreachable arm is cheaper than a panic.
+            other => Self::fault(
+                Status::Internal,
+                &format!("unhandled request kind {:?}", other.kind()),
+            ),
+        }
+    }
+
+    fn snapshot_open(&mut self) -> Frame {
+        let Some(db) = self.host.db() else {
+            return Self::fault(Status::Unavailable, "no database is open");
+        };
+        let snap = match db.snapshot() {
+            Ok(s) => s,
+            Err(e) => return Self::fault(Status::from_core(&e), "cannot take a snapshot"),
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        let version = snap.version();
+        self.snapshots.insert(id, snap);
+        Frame::SnapshotOpened {
+            snapshot: id,
+            version,
+        }
+    }
+
+    fn snapshot_close(&mut self, id: u64) -> Frame {
+        if self.handles.values().any(|h| h.snapshot == id) {
+            // Refused rather than allowed-and-ignored. A peer closing a snapshot
+            // whose lanes it still holds has a bug, and the in-process ABI's answer
+            // -- derived handles keep the version alive -- is not available here
+            // because the session owns the snapshot, not the handle.
+            return Self::fault(
+                Status::InvalidArgument,
+                "lane handles derived from this snapshot are still open",
+            );
+        }
+        if self.snapshots.remove(&id).is_none() {
+            return Self::fault(Status::InvalidArgument, "no such snapshot");
+        }
+        Frame::Done
+    }
+
+    fn lanes_acquire(&mut self, snapshot: u64, keys: &[u64]) -> Frame {
+        if keys.len() > self.limits.max_lanes {
+            return Self::fault(Status::InvalidArgument, "too many lanes for this server");
+        }
+        let Some(snap) = self.snapshots.get(&snapshot) else {
+            return Self::fault(Status::InvalidArgument, "no such snapshot");
+        };
+        let Some(index) = self.slots.iter().position(|used| !used) else {
+            return Self::fault(Status::InvalidArgument, "no free arena slot");
+        };
+        let lanes = match KeyLanes::new(snap, keys) {
+            Ok(l) => l,
+            Err(e) => return Self::fault(Status::from_core(&e), "cannot open the lanes"),
+        };
+        self.slots[index] = true;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.handles.insert(
+            id,
+            Handle {
+                lanes,
+                index,
+                arity: keys.len(),
+                block_open: false,
+                snapshot,
+            },
+        );
+        Frame::LanesAcquired {
+            lanes: id,
+            arena_off: (index * self.limits.slot_bytes()) as u64,
+        }
+    }
+
+    fn lanes_release(&mut self, id: u64) -> Frame {
+        match self.handles.remove(&id) {
+            Some(h) => {
+                self.slots[h.index] = false;
+                Frame::Done
+            }
+            None => Self::fault(Status::InvalidArgument, "no such lane handle"),
+        }
+    }
+
+    fn block_advance(&mut self, id: u64) -> Frame {
+        let slot_bytes = self.limits.slot_bytes();
+        let Some(h) = self.handles.get_mut(&id) else {
+            return Self::fault(Status::InvalidArgument, "no such lane handle");
+        };
+        if h.block_open {
+            return Self::fault(
+                Status::BlockState,
+                "release the open block before advancing; its arena slice is still lent",
+            );
+        }
+        let advanced = match h.lanes.advance() {
+            Ok(a) => a,
+            Err(e) => return Self::fault(Status::from_core(&e), "cannot advance"),
+        };
+        let Some(prefix) = advanced else {
+            return Frame::BlockDone;
+        };
+        h.block_open = true;
+        let base = h.index * slot_bytes;
+        let arity = h.arity;
+        // Collected before touching the arena, because writing needs `&mut self`
+        // while the containers are borrowed from the handle.
+        let mut descs = Vec::with_capacity(arity);
+        for i in 0..arity {
+            match h.lanes.lane(i) {
+                None => descs.push((
+                    Lane {
+                        kind: LaneKind::Absent,
+                        count: 0,
+                    },
+                    Vec::new(),
+                )),
+                Some(c) => descs.push(encode_lane(c)),
+            }
+        }
+        match self.arena.as_mut() {
+            Some(arena) => {
+                for (i, (_, bytes)) in descs.iter().enumerate() {
+                    if !bytes.is_empty() {
+                        arena.write_at(base + i * LANE_BYTES, bytes);
+                    }
+                }
+                Frame::Block {
+                    prefix,
+                    lanes: descs.into_iter().map(|(l, _)| l).collect(),
+                }
+            }
+            None => {
+                let mut payload = Vec::new();
+                let mut lanes = Vec::with_capacity(descs.len());
+                for (l, bytes) in descs {
+                    payload.extend_from_slice(&bytes);
+                    lanes.push(l);
+                }
+                Frame::BlocksInline {
+                    blocks: vec![WireBlock { prefix, lanes }],
+                    payload,
+                }
+            }
+        }
+    }
+
+    /// Advance up to `want` blocks, releasing the previous batch implicitly.
+    ///
+    /// The implicit release is what makes a batch worth having: keeping a separate
+    /// round trip to say "done with the last one" would spend one notification per
+    /// batch restating what asking for the next batch already proves.
+    fn block_advance_many(&mut self, id: u64, want: u32) -> Frame {
+        let block_bytes = self.limits.block_bytes();
+        let slot_bytes = self.limits.slot_bytes();
+        let cap = self.limits.max_blocks.max(1).min(want.max(1) as usize);
+        let Some(h) = self.handles.get_mut(&id) else {
+            return Self::fault(Status::InvalidArgument, "no such lane handle");
+        };
+        h.block_open = false;
+        let base = h.index * slot_bytes;
+        let arity = h.arity;
+        let mut out: Vec<WireBlock> = Vec::with_capacity(cap);
+        // Payloads are collected before the arena is touched, because writing needs
+        // `&mut self` while the containers are borrowed from the handle.
+        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        for j in 0..cap {
+            let advanced = match h.lanes.advance() {
+                Ok(a) => a,
+                Err(e) => return Self::fault(Status::from_core(&e), "cannot advance"),
+            };
+            let Some(prefix) = advanced else { break };
+            let mut lanes = Vec::with_capacity(arity);
+            for i in 0..arity {
+                match h.lanes.lane(i) {
+                    None => lanes.push(Lane {
+                        kind: LaneKind::Absent,
+                        count: 0,
+                    }),
+                    Some(c) => {
+                        let (lane, bytes) = encode_lane(c);
+                        if !bytes.is_empty() {
+                            writes.push((base + j * block_bytes + i * LANE_BYTES, bytes));
+                        }
+                        lanes.push(lane);
+                    }
+                }
+            }
+            out.push(WireBlock { prefix, lanes });
+        }
+        // A batch that returned anything leaves the last block's payloads lent until
+        // the next request, which is what `block_open` records for the single-block
+        // path and what the implicit release handles here.
+        if !out.is_empty() {
+            if let Some(h) = self.handles.get_mut(&id) {
+                h.block_open = true;
+            }
+        }
+        match self.arena.as_mut() {
+            Some(arena) => {
+                for (off, bytes) in writes {
+                    arena.write_at(off, &bytes);
+                }
+                Frame::Blocks { blocks: out }
+            }
+            None => {
+                // Inline order is ( block, lane ), which is the order `writes` was
+                // built in, so concatenating it needs no sort and no offsets.
+                let mut payload = Vec::new();
+                for (_, bytes) in writes {
+                    payload.extend_from_slice(&bytes);
+                }
+                Frame::BlocksInline {
+                    blocks: out,
+                    payload,
+                }
+            }
+        }
+    }
+
+    fn block_release(&mut self, id: u64) -> Frame {
+        match self.handles.get_mut(&id) {
+            Some(h) => {
+                h.block_open = false;
+                h.lanes.release_block();
+                Frame::Done
+            }
+            None => Self::fault(Status::InvalidArgument, "no such lane handle"),
+        }
+    }
+}
+
+/// A lane's descriptor and the bytes to place in its arena slot.
+///
+/// Copies, and that is the honest cost of the process boundary: the in-process ABI
+/// lends the mapping's own bytes, and nothing can be lent across an address space
+/// that the peer does not already map. What the arena buys is that the copy is one
+/// `memcpy` into a page the peer already sees, rather than a write and a read
+/// through a socket.
+fn encode_lane(c: &Container) -> (Lane, Vec<u8>) {
+    match c {
+        Container::Array(a) => {
+            let s = a.as_slice();
+            (
+                Lane {
+                    kind: LaneKind::Array,
+                    count: s.len() as u32,
+                },
+                s.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+        }
+        Container::Run(r) => {
+            let s = r.as_flat();
+            (
+                Lane {
+                    kind: LaneKind::Run,
+                    count: (s.len() / 2) as u32,
+                },
+                s.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+        }
+        Container::Bitmap(b) => {
+            let mut words = vec![0u64; yesno_core::BITMAP_WORDS];
+            // `copy_words_into` rather than `try_words`, because the unaligned arm
+            // has to work too and a borrow here would only save a copy that the
+            // arena write makes anyway.
+            let ok = b.copy_words_into(&mut words);
+            debug_assert!(ok, "a bitmap payload is always BITMAP_WORDS long");
+            (
+                Lane {
+                    kind: LaneKind::Bitmap,
+                    count: yesno_core::BITMAP_WORDS as u32,
+                },
+                words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            )
+        }
+    }
+}
+
+/// Which request kinds a session will accept before `ClientHello`.
+///
+/// Exposed so a test can assert the greeting requirement without reaching into the
+/// session's private state.
+pub fn requires_greeting(kind: Kind) -> bool {
+    !matches!(kind, Kind::ClientHello)
+}
+
+/// Read one frame from `r`, growing `buf` until a whole frame is present.
+///
+/// `Ok( None )` on a clean end of stream, which is the peer having gone away -- the
+/// signal that the session may be dropped and its snapshots released.
+pub fn read_frame<R: std::io::Read>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<Frame>> {
+    loop {
+        match Frame::decode(buf) {
+            Ok((f, used)) => {
+                buf.drain(..used);
+                return Ok(Some(f));
+            }
+            Err(crate::ipc::IpcError::Truncated) => {}
+            Err(e) => {
+                return Err(<std::io::Error as InvalidData>::new_invalid(e));
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        let n = r.read(&mut chunk)?;
+        if n == 0 {
+            // A clean close with nothing buffered is the peer leaving. A clean close
+            // mid-frame is a peer that died between writes, which is the same
+            // outcome for us and not worth a different error.
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Serve one connection to completion, blocking.
+///
+/// Returns when the peer closes. The caller drops the session afterwards, which is
+/// what releases its snapshots -- so a peer that crashes mid-scan costs nothing
+/// beyond the work already done.
+///
+/// Blocking rather than async, and on purpose: every request touches the engine,
+/// which faults mmap pages and may read from disk, so this belongs on a blocking
+/// pool exactly as `do_get` does. An async signature would invite it onto a
+/// reactor thread.
+pub fn serve_blocking<S>(session: &mut Session, mut stream: S) -> std::io::Result<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let hello = session
+        .hello()
+        .encode()
+        .map_err(<std::io::Error as InvalidData>::new_invalid)?;
+    stream.write_all(&hello)?;
+    let mut buf = Vec::new();
+    while let Some(frame) = read_frame(&mut stream, &mut buf)? {
+        let reply = session.handle(frame);
+        let bytes = reply
+            .encode()
+            .map_err(<std::io::Error as InvalidData>::new_invalid)?;
+        stream.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+/// Turn a protocol error into an `io::Error`, so the loop has one error type.
+trait InvalidData {
+    fn new_invalid(e: crate::ipc::IpcError) -> std::io::Error;
+}
+
+impl InvalidData for std::io::Error {
+    fn new_invalid(e: crate::ipc::IpcError) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    }
+}

@@ -727,6 +727,17 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
 ### Storage
 
+- [ ] **foreign-reader-liveness-is-unsound-across-pid-namespaces** ( *2026-09-28, found while exploring an out-of-process plugin; the failure direction is data loss, not space* ): `db::readers` decides a foreign reader's liveness with `kill( pid, 0 )` and the process start time from field 22 of `/proc/<pid>/stat`. **Both are relative to a PID namespace.** A reader in another container registers the pid it sees inside its own namespace; the writer probes that number in *its* namespace, reaching an unrelated process or none; the recorded start time then positively disagrees, the identity check refutes, and the reader is **declared dead**. Its reclamation floor is released and its extents are reused underneath it -- which the module's own header names as the unsafe direction ( "declaring a live reader dead and reclaiming extents underneath it" ).
+
+  Sound today, because the only callers are in-process tests and the intended consumer was PostgreSQL backends forked on the same host, which share a namespace. It becomes reachable the moment a reader runs in a container.
+
+  **Zero-code mitigation**: share the PID namespace ( `docker --pid=container:...`, Kubernetes `shareProcessNamespace: true` ). Rejected as the primary answer because a deployment that forgets it fails *silently* in the data-losing direction.
+
+  **The fix worth making**: give each reader an advisory lock on its own slot region or a per-reader file, and decide liveness by whether the writer can take that lock. The kernel releases an `flock` when the holding process dies **regardless of namespace**, because the lock belongs to the open file description rather than to a pid. This also deletes the `/proc` dependency and the entire pid-reuse argument, so it is an improvement on a single host as well. The one new requirement is the filesystem: advisory locks are reliable on a local bind mount and are not to be trusted over NFS, which becomes a documented constraint on where the data directory may live.
+
+  Do not replace this with a heartbeat. `db::readers` rejects that explicitly and correctly: it would make correctness depend on a timer and would declare a merely slow reader dead.
+
+
 - [ ] **inherited-slab-reuse-can-overwrite-a-container-held-across-a-reopen** ( *2026-09-28, found while designing the plugin lease model; a latent gap in a guarantee that has a passing test* ): `Allocator::adopt_live_at_open` marks emptied inherited slabs `Free`, and `punch_floor` spares them from **punching** -- which is what preserves `zero_copy_mvcc::reopening_does_not_disturb_a_container_from_the_previous_instance`. But `Allocator::new_slab_for` picks the first `Free` slab **with no `punch_floor` filter**, re-initializes it with `Slab::new`, and allocates into it. So the bytes a cross-reopen `Container` aliases can be overwritten in place, through the same inode, with nothing to report it.
 
   **This is acknowledged, not unknown**: the `punch_floor` doc says "Reuse would break that guarantee too, so it was already conditional -- punching only makes it observable, by destroying the bytes promptly instead of waiting for an allocation to land on them." The fix confined punching and left reuse alone. So the guarantee the test asserts is real only until an allocation lands on that slab, and the test passes because its churn does not reach one.

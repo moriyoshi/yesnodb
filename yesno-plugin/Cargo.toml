@@ -14,9 +14,16 @@ yesno-core = { path = "../yesno-core" }
 # `loader::LoadedPlugin` -- but the type is what makes that a decision rather
 # than an omission.
 libloading = "0.8"
+# The IPC channel. memmap2 maps the arena; libc is memfd_create, fcntl sealing and
+# sendmsg, none of which has a dependency-free spelling. The protocol itself is
+# `ipc.rs` in this crate and pulls in neither.
+memmap2 = "0.9"
+libc = "0.2"
 
 [dev-dependencies]
 # The load test opens the fixture plugin a second time to read back what it
 # observed; dlopen refcounts the same image, so the statics are the ones the host
 # just drove.
 libloading = "0.8"
+# The scan test maps the arena as a peer would, through the descriptor.
+memmap2 = "0.9"

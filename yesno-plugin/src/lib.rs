@@ -43,6 +43,8 @@ use std::sync::{Arc, RwLock};
 use yesno_core::{Container, Db, KeyLanes, Snapshot};
 
 pub mod abi;
+pub mod channel;
+pub mod ipc;
 pub mod loader;
 pub mod table;
 

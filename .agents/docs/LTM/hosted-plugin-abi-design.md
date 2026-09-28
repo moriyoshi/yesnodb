@@ -5,6 +5,23 @@ what `yesno-c` and `yesnod` supply today and listed eleven missing primitives. T
 document is the design, and it **changes one of that document's recommendations**.
 Nothing here is built.
 
+## This is the narrow answer, not the general one
+
+**Read [`out-of-process-plugin-via-foreign-reader.md`](./out-of-process-plugin-via-foreign-reader.md)
+before building against this document.** Explored 2026-09-28, after this design was
+written and partly implemented: a peer in a *separate process* needs almost none of
+what follows, because `Db::open_reader` already maps the same file-backed data
+without the exclusive lock and registers itself so reclamation accounts for it. The
+process boundary also removes the three hardest constraints below -- the panic
+asymmetry, the prohibition on linking `yesno-core`, and the drain having no
+backstop.
+
+What this in-process design has that the out-of-process shape does not is
+**freshness**: a foreign reader replays no log and has no memtable, so it lags the
+writer by up to one checkpoint. That is the whole of its remaining advantage, and it
+is the test for whether to use it. **Treat in-process as the exception for
+consumers that cannot tolerate checkpoint lag**, not as the default.
+
 ## The one decision that shapes everything: a lease owns a `Snapshot`
 
 The assessment said the host needs new lease accounting because a `Container`

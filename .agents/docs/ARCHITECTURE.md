@@ -278,6 +278,22 @@ yesno/
     build.rs                    #   compiles tests/plugin.c into a .so so a test can dlopen it;
                                 #     a missing compiler is reported to the test, never skipped
     tests/plugin.c              #   the fixture plugin, in C so it CANNOT link yesno-core
+    src/ipc.rs                  #   the out-of-process channel's wire format. Lived in
+                                #     yesno-wire for a day and moved here 2026-09-28: that
+                                #     crate exists to share ONE definition between two
+                                #     first-party crates that cannot depend on each other,
+                                #     and this protocol's other side is a third-party peer
+                                #     outside the workspace. Has no dependencies of its own,
+                                #     so splitting it out later is a file move.
+    src/channel.rs              #   the channel server: a memfd arena, sealed against resize,
+                                #     and a Session that answers one frame with one frame so
+                                #     the protocol is testable without a socket. Payloads go
+                                #     through the arena at arena_off + i * LANE_BYTES, so no
+                                #     offset travels on the wire; Session::new_inline serves
+                                #     the same scan with payloads in the frames where no
+                                #     shared region can be had, which is what makes the
+                                #     channel portable. Liveness is the socket closing: the
+                                #     snapshot belongs to yesnod, keyed by the connection.
   yesno-mysql/                  # MySQL 8.4 storage engine; embedded C ABI or remote Flight.
     CMakeLists.txt              #   accepts Bazel inputs or adjacent-source fallbacks
   MODULE.bazel                  # bzlmod: rules_rust ( fed by Cargo.lock ), rules_foreign_cc,

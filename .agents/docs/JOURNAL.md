@@ -6952,3 +6952,319 @@ synchronous cases on separate libtest threads, which block rather than deadlock;
 and no task on that runtime takes the lock, so there is no waiter to deadlock
 against. An async mutex would force a runtime on the synchronous cases that do not
 want one.
+
+## 2026-09-28 -- The out-of-process plugin is mostly already built, and SHM is the wrong tool
+
+Asked to explore a shared-memory IPC plugin infrastructure so a third-party server
+could run in a separate process or container. Findings in
+[`LTM/out-of-process-plugin-via-foreign-reader.md`](./LTM/out-of-process-plugin-via-foreign-reader.md).
+The exploration mostly dissolved the question, which is the useful outcome.
+
+**There is no payload to ship, so there is nothing for shared memory to carry.**
+The data is file-backed. `Db::open_reader` already opens a directory read-only
+*without* the exclusive `flock`, registers the caller in a shared `READERS` file so
+the writer's reclamation accounts for it, and returns a `Db` whose `snapshot()`
+works -- which means `KeyLanes` works out of process with **no changes at all**. A
+peer maps the same shard files itself. I went looking for what would have to be
+built and found the mechanism, the reclamation integration, the pid-reuse argument
+and the tests already there, written for the PostgreSQL case.
+
+**And the process boundary removes the three properties I had spent this session
+arguing around.** The panic asymmetry disappears, because a peer that aborts takes
+only itself down. The prohibition on a plugin linking `yesno-core` disappears,
+because `OPENED_DIRS` is per-process state that is *correct* per-process -- which
+**removes the consumer's blocker outright**: they reported having to split the
+scorer from the embedded adapter before a safe cdylib could exist, and an
+out-of-process peer needs none of that. And the drain acquires the backstop it
+structurally lacks in-process, where only `ReaderSlot::drop` frees a lease and no
+host call can take one back.
+
+So the in-process ABI I just built is the narrower answer, not the general one. It
+earns its place only where checkpoint lag is unacceptable -- a foreign reader
+replays no log and has no memtable, so it lags by up to one checkpoint. That is the
+single thing the in-process shape has that the out-of-process shape does not, and
+it is the only place a data-plane IPC would be justified. I have recorded that the
+in-process design should say it is the exception rather than the default.
+
+**The container half of the question found a real defect.** Reader liveness is
+`kill( pid, 0 )` plus the start time from `/proc/<pid>/stat`, and both are
+PID-namespace-relative. Across containers the writer probes a number belonging to
+its own namespace, the recorded start time positively disagrees, the identity check
+refutes, and the reader is **declared dead** -- precisely the direction the
+registry's own header names as unsafe, after which its extents are reclaimed
+underneath a live reader. Sharing the PID namespace fixes it with no code and fails
+silently in the data-losing direction when a deployment forgets, which is a bad
+property for an operational requirement. The better fix is a per-slot advisory
+lock: the kernel releases an `flock` when the holder dies regardless of namespace,
+because the lock belongs to the open file description rather than to a pid. That
+also deletes the `/proc` dependency and the whole pid-reuse argument, so it is
+worth doing on a single host too.
+
+**One honest qualification on all of this.** `open_reader` is reached only from
+`tests/zero_copy_mvcc.rs` and `tests/durability.rs` -- it has **no production
+consumer**. So the correct claim is "built and tested and unexercised in
+production", not "proven". I nearly wrote the stronger version, and the difference
+matters to whoever decides to depend on it.
+
+## 2026-09-28 -- Conceiving the out-of-process payload, after a wrong turn worth naming
+
+Asked to support out-of-process communication starting from the payload format. My
+exploration had drifted into a **shared database** -- the peer calling
+`Db::open_reader` and mapping the extents itself -- and I had concluded there was
+"no payload to ship". Corrected: yesnod stays the only process that opens the
+directory, and a peer asks over a channel. So there is a payload, and it is a data
+protocol rather than a lifecycle one.
+
+**The wrong turn is instructive because the rejected shape looks cheaper.** It needs
+no protocol at all, which is exactly what made it attractive, and the cost is in
+three places none of which is code: a peer would need the data directory on a shared
+writable mount, which is a far larger trust surface than a socket; its reads would be
+capped at **checkpoint-visible** state, since a foreign reader replays no log and has
+no memtable; and two processes would be reading the database's files, which is the
+invariant the locking design exists to hold at one. "Needs no new code" is not the
+same as "costs nothing", and I had let the first stand in for the second.
+
+**The liveness observation that redirected it also improves the design.** Reader
+liveness can be taken from the Unix socket closing, so PID namespaces need not be
+shared -- and in the served shape it is stronger than that: the snapshot belongs to
+**yesnod, keyed by the connection**, so a closed socket lets yesnod drop the lease
+itself. That is the forcible reclamation the in-process ABI structurally cannot have,
+obtained with no pid, no namespace and no cooperation from the peer. A served peer
+registers nothing in `READERS`, so the PID-namespace defect I filed is not on this
+path; it stays real for the shared-database shape and for `yesno-pg`.
+
+It also retires the `flock`-per-slot fix I had proposed as better than namespace
+sharing. The socket is already there, it is namespace-independent, and it does not
+care whether the filesystem honours advisory locks -- which the `flock` proposal made
+a documented constraint on where the data directory may live.
+
+**Two payload decisions carry most of the design.**
+
+`LANE_BYTES` is 8192, and that is the **exact** maximum of the three container
+encodings rather than a chosen margin: array `4096 * 2`, bitmap `1024 * 8`, run
+`2032 * 4` -- 8192, 8192, 8128. So a handle's arena is `lanes * 8192`, sized by
+arithmetic with no allocator, no free list and no fragmentation. A count whose
+payload would exceed its slot is refused on decode, because with an exact bound
+exceeding it means the two sides disagree about the encoding rather than that a chunk
+is large.
+
+And **lane `i` always begins at `arena_off + i * LANE_BYTES`**, so no offset travels
+on the wire. A descriptor carries only kind and count, and the byte length follows
+from those, so there is no length field to contradict them either. Each field removed
+is a disagreement that can no longer happen -- which is the same reasoning as the
+in-process design's `block_release`, except that here release is load-bearing flow
+control for the arena rather than a diagnostic aid.
+
+Three discriminant ranges rather than two -- request, response, notification -- so a
+server receiving a notification or a peer receiving a request has a wiring mistake
+its kind byte reveals. Notifications may arrive where a response was expected,
+deliberately: a peer that learned of a replacement only on its next request would
+serve answers from a database that no longer exists.
+
+The codec lives in `yesno-wire` as a second format, which its header now says
+explicitly, along with the instruction to split the crate rather than accumulate a
+third. It is there for the crate's stated reason and no other: one definition
+compiled into both sides, from somewhere cheap enough for either to link. Sixteen
+tests, including that **every prefix of every frame answers `Truncated`** rather than
+panicking or half-decoding, and that arbitrary bytes across all 256 kind values never
+panic -- the same untrusted-input contract `SetExpr::decode` holds.
+
+Not built yet: the server side in yesnod, the memfd handshake, and the peer helper.
+The format is what was asked for and is what the rest has to agree with.
+
+## 2026-09-28 -- The IPC channel server, and what it costs against the in-process table
+
+Built the server side in `yesno-plugin/src/channel.rs`: a `memfd` arena, a
+`Session` that answers one frame with one frame, and a blocking socket loop.
+Measurement in
+[`LTM/plugin-shape-performance.md`](./LTM/plugin-shape-performance.md).
+
+**Protocol logic is separated from the socket, and that shaped the tests.**
+`Session::handle` takes a frame and returns a frame, so every behaviour worth
+checking -- an unknown handle, a block advanced twice, a snapshot closed under live
+lanes, an arena slot reused -- is a function call rather than a conversation through
+a descriptor. Twelve tests, none of which needs a socket. `serve_blocking` is thin
+enough that there is little left in it to get wrong.
+
+**Two design points the implementation forced.**
+
+The arena reserves `max_lanes * LANE_BYTES` per handle regardless of how many lanes
+were asked for, so a handle's offset is `index * slot` and there is no allocator.
+That looks wasteful and is not: a `memfd` page costs nothing until written, so the
+reservation is address space and the resident cost is the lanes actually used.
+
+Closing a snapshot with live lane handles is **refused** here, where the in-process
+ABI allows it. The difference is real rather than a choice: in-process a derived
+handle holds its own `Snapshot` clone, so the parent closing is safe and is the
+expected fan-out; over IPC the *session* owns the snapshot, so allowing the close
+would leave a handle reading a version nothing pins.
+
+**The measurement, three arms so the answer is attributable.** A is the in-process
+C table. B is the IPC protocol with no socket, isolating the copy. C is B through a
+real `UnixStream` pair, so `C - B` is the transport. Two arms would have produced
+one ratio that could be blamed on either, and it turns out to be almost entirely
+one of them:
+
+```text
+ 8 keys x 40 chunks, mixed     A 3.51 us/block   B 6.89 (1.96x)   C 36.16 (10.30x)
+                               copy 135 us       syscalls 1171 us over 86 trips
+64 keys x 20 chunks, mixed     A 34.80           B 72.92 (2.10x)  C 198.52 (5.70x)
+                               copy 762 us       syscalls 2512 us over 46 trips
+```
+
+**The copy is not the problem** -- 1.5x to 2.1x, and that is the whole charge for
+crossing an address space. **The round trips are**, at two per block and 10 to 55 us
+each. So the optimization is fewer round trips, not a faster copy: folding
+`BlockRelease` into the next `BlockAdvance` halves them, and returning K blocks per
+response divides them by K. At K = 16 the projection lands near 2.5x, which is the
+copy cost and nothing else -- reachable without touching the payload format.
+
+**And the caveat that matters more than any of the numbers.** These arms touch one
+byte per lane, deliberately, because reaching the data is where the shapes differ.
+A real scorer reads whole payloads, and that work is identical in both. The middle
+row moves 109 781 elements; at even one nanosecond each a scorer spends 110 us
+against arm A's 140 us of total access. **So the whole-query ratio will be far
+closer to 1 than 10x suggests**, and quoting 10x to a consumer choosing between the
+shapes would be handing them an access-overhead figure dressed as a query figure --
+the same error as this session's 40% shard-mutex ratio, which was true of its
+fixture and not of the consumer's. I have written the caveat into the document
+above the numbers rather than below them.
+
+## 2026-09-28 -- Batching answers the primitive question, and two harness bugs answered it wrongly first
+
+Built `BlockAdvanceMany` and swept the batch size against the in-process table.
+Numbers and construction in
+[`LTM/plugin-shape-performance.md`](./LTM/plugin-shape-performance.md). The question
+was which synchronization primitive an out-of-process peer should use -- socket,
+futex, or eventfd -- and the measurement made it moot.
+
+**The answer is the socket, batched, and no second primitive.** Not batching costs
+4.9x to 7.6x against in-process. Any `k >= 2` lands far below that, and the best `k`
+sits close to arm B, which is the copy alone with no transport at all. So after
+batching the residual is the copy -- which no notification primitive addresses --
+and a futex or an eventfd would optimize a term that batching already removed. Both
+were worth building against the unbatched arm; neither is against the batched one.
+
+Two properties survive the choice and are easy to lose in a shared-memory design.
+The socket must stay open regardless, because its closure is what lets yesnod drop
+the snapshot -- a futex gives no death signal. And the memory ordering currently
+comes from the socket: the server writes the arena then the socket, the peer reads
+the socket then the arena, and that syscall pair is the happens-before. Replacing it
+with a plain flag read would be fast and wrong in a way **arm B cannot catch**,
+because B is single-threaded and has ordering for free.
+
+**Two harness defects, each of which produced a confident wrong answer first.**
+
+The first batched run said batching made things *worse*, up to 13.5x. Arm D's arena
+is `k` times arm C's, and a `memfd` faults its pages on first touch: 1792 extra pages
+at 2.3 us each accounted for essentially the entire difference. The harness was
+timing `memfd` page faults and reporting them as the cost of batching. Hoisting setup
+out of the timer was not enough either, because the first scan still faulted every
+page it wrote; the fix was reusing contexts across reps with one untimed warm scan,
+which is also what a real peer does.
+
+Both bugs had the same shape: **the bigger configuration paid a one-time cost that
+the harness charged per iteration.** Neither was visible in the output. Both were
+found by refusing to accept a surprising result without a mundane explanation, and in
+both cases the arithmetic accounted for the whole surprise -- which is the check
+worth keeping, because it is cheap and it is decisive.
+
+**And a third conclusion retracted rather than fixed.** The 9-rep run showed an
+interior optimum in `k`, and I explained it by cache footprint: the arena a batch
+touches is `k * lanes * LANE_BYTES`, so past some size it exceeds cache and the win
+evaporates. Plausible, mechanistic, and **it did not reproduce** in either 25-rep
+run -- `k` of 4, 8, 16 and 32 each won some run. I had a story for one run's ordering
+and was about to publish it as a tuning rule. The data supports `k >= 4` and nothing
+finer.
+
+That is the third time this session I have had to separate "true of this fixture"
+from "true of the system", after the 40% shard-mutex ratio and the 10x access
+overhead. The pattern is now specific enough to state as a rule: **an ordering
+observed once is a hypothesis, and a mechanism that explains it is not evidence
+for it.** Having a good explanation made me more confident, not less, which is
+exactly backwards.
+
+The caveat above all the numbers is unchanged and is written above them in the
+document: these arms touch one byte per lane. A real scorer reads whole payloads and
+does identical work in both shapes, so the whole-query ratio will be far closer to 1
+than even the best figure here.
+
+## 2026-09-28 -- Sealing the arena, and what portability actually requires
+
+Two follow-ups from questions about the channel, both of which improved it.
+
+**"Are those figures from socket plus shared memory?"** They were, and the question
+exposed that I had never priced the alternative. Measured: shipping the same byte
+volume through a `UnixStream` costs 33, 151 and 475 us for the three shapes -- real,
+but small next to the shapes' difference, so **the arena is not primarily a bandwidth
+win**. The structural argument is much stronger and I did not have it before: one
+block's worst-case payload is `lanes * LANE_BYTES`, so an inlined frame at
+`MAX_PAYLOAD` = 64 KiB holds **eight lanes and one block**. Inlining therefore forces
+either a frame cap raised by orders of magnitude or blocks small enough to fit --
+which is the k = 1 configuration that costs 4.9x to 7.6x. The arena decouples batch
+size from frame size, and batch size is what removed the transport cost.
+
+**"What about SysV or POSIX SHM?"** Neither, and for specific reasons rather than
+taste: a `memfd` travels as a descriptor so it needs no shared filesystem and no
+shared namespace, where `/dev/shm` is per-container in Docker and capped at 64 MiB
+and System V segments live in the IPC namespace; it cannot leak, where both
+alternatives outlive a crashed creator absent an unlink or `IPC_RMID` that a crash
+between two lines defeats; and it has no name to guess.
+
+**That question also found a real defect in my own code.** `memfd` has a capability
+neither alternative offers -- sealing -- and I was not using it. A mapping whose file
+is truncated underneath it raises `SIGBUS` on the next touch, which is **the same
+hazard invariant I6 states for the shard files**, arriving at my arena by a different
+route. I had spent this session analysing that exact hazard for `bootstrap_shard` and
+did not notice it applied to the thing I had just built. Now sealed with
+`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL` immediately after sizing, with a test
+that the seal holds rather than trusting nothing will try.
+
+**Portability turned out to be a seam question, not a porting question.** The
+protocol is already portable -- bytes, no system calls, no platform types -- and the
+transport has exactly three jobs, of which only the shared region is hard. So
+`Session` now takes an `Option<Arena>`, and `new_inline` serves the same scan with
+payloads in the frames, advertised by `arena_bytes = 0`. A test asserts the inline
+path reports exactly what the arena path reports, and that the descriptors account
+for every payload byte.
+
+I wrote **no** macOS, FreeBSD or Windows backend, and that is the decision rather
+than the omission. This tree can compile and run only the Linux one, and a backend
+that cannot be tested is a claim rather than a capability -- which is the argument
+`stats.rs` was deleted on. The table of what each platform would use is in the
+document; the seam is what makes writing one later cheap.
+
+## 2026-09-28 -- The plugin protocol was in the wrong crate, on a rationale that did not apply
+
+Moved `plugin_ipc` out of `yesno-wire` and into `yesno-plugin` as `ipc.rs`, a day
+after putting it there. The user asked whether it belonged in `yesno-plugin`, and
+checking my own justification against `yesno-wire`'s showed it did not hold.
+
+**The rationale I borrowed was about a crate boundary that does not exist here.**
+`yesno-wire` exists so that one definition of a format is compiled into two
+**first-party** crates that cannot depend on each other: `yesno-flight` decodes,
+`yesno-pg` encodes, and under Bazel they resolve third-party crates through separate
+hubs. This protocol's two sides are yesnod and a third-party peer **outside this
+workspace**. There is no boundary for a shared definition to bridge, and exactly one
+first-party consumer. I had read the crate's stated purpose, matched on the phrase
+"cheap enough to link from anywhere", and not checked whether the situation it
+describes was mine.
+
+**And it put pressure where it did not belong.** `yesno-wire` must stay
+dependency-free, and that rule is load-bearing for `yesno-pg`. A second, unrelated
+format living there turns any future need of *this* protocol into a reason to weaken
+it -- a coupling between two consumers that have nothing to do with each other.
+
+**The tell was in something I wrote.** Adding the module made me write "It now holds
+two formats" into that crate's header, along with an instruction to split rather than
+accumulate if a third arrived. Having to explain why a crate holds two unrelated
+things is the argument for not putting the second one there, and I wrote the
+explanation instead of taking it. `yesno-wire`'s header now records the episode in
+one sentence, because the next person tempted by the same paragraph should see that
+it was tried.
+
+`ipc.rs` has **no dependencies of its own**, deliberately, so if an external Rust
+peer ever wants the codec without the engine, splitting it into its own crate is a
+file move rather than an untangling. That should wait for the consumer to exist --
+the same argument `stats.rs` was deleted on, applied before building rather than
+after.

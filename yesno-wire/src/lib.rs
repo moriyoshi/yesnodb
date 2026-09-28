@@ -19,6 +19,14 @@
 //! This crate must stay dependency-free. Its whole value is being cheap
 //! enough to link from anywhere.
 //!
+//! **One format, and it stays that way.** The out-of-process plugin protocol was
+//! briefly added here on the strength of the paragraph above, and moved out again
+//! on 2026-09-28: its two sides are yesnod and a third-party peer *outside this
+//! workspace*, so there is no first-party crate boundary for a shared definition to
+//! bridge, and the reasoning that justifies this crate did not actually apply. The
+//! cost of the mistake would have been pressure on the dependency-free rule from a
+//! direction unrelated to `yesno-pg`, which is the consumer that rule exists for.
+//!
 //! # This is a parser of untrusted bytes
 //!
 //! It holds the same contract as `yesno_core::container::codec::decode`: for
