@@ -439,3 +439,92 @@ fn a_peer_is_served_inline_when_the_host_has_no_arena() {
 
     channel.stop();
 }
+
+/// `plugin::wire` is what the daemon calls, and it must bind the configured socket.
+///
+/// # What this closes
+///
+/// Every piece of the channel worked and nothing called it: `Channel::start` and
+/// `Facility::load` were reachable only from `start_with_plugin`, which only tests
+/// used. An operator setting `plugin.channel_socket` got no listener, and a peer
+/// connecting got `ENOENT` -- with the commit log saying the channel was "wired into
+/// yesnod", which was true of the lifecycle functions and false of the daemon.
+///
+/// So this drives the same entry point `main.rs` does, and connects to prove the
+/// socket is real rather than merely configured.
+#[test]
+fn the_daemon_wiring_binds_the_configured_socket() {
+    let (_c, cfg, _host, sock) = setup("wire");
+    assert!(!sock.exists(), "nothing is bound before wiring");
+
+    // SAFETY: no library is configured, so nothing is loaded; only the channel starts.
+    let wiring = unsafe { yesno_server::plugin::wire(&cfg, Role::Leader) }
+        .expect("wiring a configured channel must succeed")
+        .expect("a configured channel must produce wiring");
+    assert!(
+        wiring.facility.is_none(),
+        "no library configured, so no in-process facility"
+    );
+    let channel = wiring.channel.expect("the channel must be started");
+    assert!(sock.exists(), "the configured socket must be bound");
+
+    // The slot it handed back is the one a startup path must fill. Empty for now,
+    // which is exactly why a peer would see UNAVAILABLE until the server fills it.
+    assert!(
+        wiring.slot.read().unwrap().is_none(),
+        "the slot is the caller's to fill"
+    );
+
+    // A peer can reach it, which is the property the gap denied.
+    let mut peer = Peer::connect(&sock);
+    match peer.read_frame() {
+        Frame::ServerHello { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(channel.peers(), 1);
+    channel.stop();
+    assert!(!sock.exists(), "and stopping removes it");
+}
+
+/// Neither shape configured means no wiring and no socket.
+#[test]
+fn the_daemon_wiring_is_absent_when_nothing_is_configured() {
+    let (_c, mut cfg, _host, sock) = setup("wire-off");
+    cfg.plugin.channel_socket = String::new();
+    // SAFETY: nothing is configured, so nothing is loaded.
+    let wiring = unsafe { yesno_server::plugin::wire(&cfg, Role::Leader) }.unwrap();
+    assert!(wiring.is_none(), "an unconfigured node wires nothing");
+    assert!(!sock.exists());
+}
+
+/// A plugin on a cold standby is refused rather than started.
+///
+/// A standby without `follower.serve_reads` never opens a database, so a channel on
+/// one would bind, accept peers, and answer `UNAVAILABLE` to every request for the
+/// life of the process -- which reads as a broken peer rather than a
+/// misconfiguration. Refusing at startup puts the error where the mistake is.
+#[test]
+fn a_plugin_on_a_cold_standby_is_refused() {
+    let (_c, mut cfg, _host, sock) = setup("wire-cold");
+    cfg.follower.serve_reads = false;
+    // SAFETY: the call refuses before loading anything.
+    let e = unsafe { yesno_server::plugin::wire(&cfg, Role::Follower) };
+    let msg = match e {
+        Err(m) => m,
+        Ok(_) => panic!("a plugin on a cold standby must be refused"),
+    };
+    assert!(
+        msg.contains("serve_reads"),
+        "the message must name what to change: {msg}"
+    );
+    assert!(!sock.exists(), "and nothing is bound on the way out");
+
+    // With reads enabled, the same configuration wires.
+    cfg.follower.serve_reads = true;
+    // SAFETY: as above.
+    let w = unsafe { yesno_server::plugin::wire(&cfg, Role::Follower) }
+        .unwrap()
+        .unwrap();
+    assert!(sock.exists());
+    w.channel.unwrap().stop();
+}

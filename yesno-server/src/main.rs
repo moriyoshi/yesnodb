@@ -258,7 +258,38 @@ async fn follow(
         "",
     );
     let event_sink = hub.map(|hub| hub.core_sink());
-    let node = match yesno_server::follower::start_with_events(cfg, event_sink) {
+    // Plugins, when configured. Built before the node starts so its `Host` reads the
+    // same slot the node fills -- see `plugin::wire`.
+    //
+    // SAFETY: `plugin.library`, when set, is loaded and run. That is the operator's
+    // configuration and this is the process that reads it, which is where the
+    // assertion belongs rather than inside a library call.
+    let wiring = match unsafe { yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Follower) }
+    {
+        Ok(w) => w,
+        Err(error) => {
+            publish_server(
+                hub,
+                pb::server_lifecycle_event::Operation::Start,
+                pb::EventPhase::Failed,
+                false,
+                &error,
+            );
+            eprintln!("yesnod: {error}");
+            return Outcome::Exit(std::process::ExitCode::FAILURE);
+        }
+    };
+    let (slot, facility, channel) = match wiring {
+        Some(w) => (Some(w.slot), w.facility, w.channel),
+        None => (None, None, None),
+    };
+    let node = match yesno_server::follower::start_with_wiring(
+        cfg,
+        event_sink,
+        facility,
+        channel.clone(),
+        slot,
+    ) {
         Ok(node) => node,
         Err(error) => {
             publish_server(
@@ -301,6 +332,9 @@ async fn follow(
                     &error.to_string(),
                 );
                 eprintln!("yesnod: cannot serve reads: {error}");
+                if let Some(c) = channel.as_ref() {
+                    c.stop();
+                }
                 node.stop().await;
                 return Outcome::Exit(std::process::ExitCode::FAILURE);
             }
@@ -368,6 +402,16 @@ async fn follow(
 
     if let Some(reads) = reads {
         reads.stop().await;
+    }
+    // Before the node stops, because closing the channel is what releases its peers'
+    // snapshots -- and those are registered readers, so a peer still attached would
+    // hold the database open past the point this process believes it let go.
+    if let Some(c) = channel.as_ref() {
+        let peers = c.peers();
+        if peers > 0 {
+            tracing::info!(peers, "closing plugin channel connections");
+        }
+        c.stop();
     }
     let halt_reason = node.status.halt_reason.lock().unwrap().clone();
     match &outcome {
@@ -439,7 +483,31 @@ async fn lead(
         "",
     );
     let event_sink = hub.map(|hub| hub.core_sink());
-    let running = match yesno_server::lifecycle::start_with_events(cfg, event_sink, adopted).await {
+    // SAFETY: as in `follow` -- the operator's configuration names the library, and
+    // this is the process that reads it.
+    let wiring = match unsafe { yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Leader) } {
+        Ok(w) => w,
+        Err(error) => {
+            publish_server(
+                hub,
+                pb::server_lifecycle_event::Operation::Start,
+                pb::EventPhase::Failed,
+                false,
+                &error,
+            );
+            eprintln!("yesnod: {error}");
+            return Outcome::Exit(std::process::ExitCode::FAILURE);
+        }
+    };
+    let (slot, facility, channel) = match wiring {
+        Some(w) => (Some(w.slot), w.facility, w.channel),
+        None => (None, None, None),
+    };
+    let running = match yesno_server::lifecycle::start_with_plugin(
+        cfg, event_sink, adopted, slot, facility, channel,
+    )
+    .await
+    {
         Ok(running) => running,
         Err(error) => {
             publish_server(

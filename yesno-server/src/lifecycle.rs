@@ -61,7 +61,7 @@ pub struct Running {
     /// Closing is what releases its peers' snapshots, so it belongs in the same
     /// place as the in-process drain and for the same reason -- except that here it
     /// needs no cooperation from anyone.
-    channel: Option<crate::plugin::Channel>,
+    channel: Option<Arc<crate::plugin::Channel>>,
     /// The slot the Flight service reads through.
     ///
     /// Held so teardown can **empty** it. The slot owns an `Arc<Db>`, so a slot
@@ -236,7 +236,7 @@ pub async fn start_with_plugin(
     adopted: Option<crate::metrics::Adopted>,
     slot: Option<crate::guard::DbSlot>,
     facility: crate::plugin::SharedFacility,
-    channel: Option<crate::plugin::Channel>,
+    channel: Option<Arc<crate::plugin::Channel>>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
     crate::tls::install_crypto_provider();
     let dir = cfg.data_dir().to_path_buf();
@@ -470,7 +470,7 @@ impl Running {
         // snapshot is a registered reader slot, so step 2 would otherwise wait out
         // the grace period on readers it cannot attribute. The difference is that
         // this needs no cooperation: closing the sockets is what releases them.
-        if let Some(c) = channel {
+        if let Some(c) = channel.as_ref() {
             let peers = c.peers();
             if peers > 0 {
                 tracing::info!(peers, "closing plugin channel connections");

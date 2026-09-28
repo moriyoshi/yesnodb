@@ -7481,3 +7481,43 @@ the peer cannot tell a protocol defect from a crash or a restart. It now answers
 The arena path was never affected, and the contrast is the clearest argument for
 the arena yet: a `Block` frame carries only descriptors, five bytes each, so two
 hundred lanes is under two kilobytes whatever the payloads are.
+
+## 2026-09-28 -- Closing the call-site gap: everything worked and nothing called it
+
+`plugin::wire` is now what `main.rs` calls, on both the leader and the follower
+path, so an operator who sets `plugin.channel_socket` gets a bound socket.
+
+**The gap is worth naming because it was invisible from inside the work.** Every
+piece existed and was tested: the protocol, the session, the arena, the loader, the
+facility, `Channel::start`, the lifecycle integration, notifications, teardown
+ordering. `Channel::start` and `Facility::load` were reachable only from
+`start_with_plugin`, which only tests called. So the feature was complete and
+unreachable, and I had told the consumer that a commit "wired the channel into
+yesnod" -- true of `lifecycle.rs` and `follower.rs`, false of the daemon. They would
+have started a configured yesnod and got `ENOENT` on connect.
+
+That is the second instance of the same shape today, after the inline path being a
+protocol property rather than a server property. **Both times the last call site was
+the one thing not tested, because every test supplied its own.** A test that
+constructs what it needs cannot notice that production never constructs it, and
+building bottom-up makes that the default. The new tests drive `plugin::wire`
+itself, which is the entry point `main.rs` uses, and connect a peer to prove the
+socket is real rather than configured.
+
+**One asymmetry removed on the way.** `Channel::stop` took `self`, so the leader
+held the channel by value in `Running` while the follower needed an `Arc` for its
+replication task. The handle is now behind a mutex and `stop` takes `&self`, so both
+paths hold an `Arc` and one helper serves both. An ownership difference that exists
+only because of a field is not a design.
+
+**And a configuration refused rather than started.** A plugin on a standby with
+`follower.serve_reads = false` now fails at startup naming the flag. A cold standby
+never opens a database, so the channel would have bound, accepted peers, and
+answered `UNAVAILABLE` to every request for the life of the process -- which reads as
+a broken peer rather than a misconfiguration. I had documented this hazard when I
+found it and left the code able to do it, which is a note rather than a fix.
+
+The follower also stops the channel at shutdown, before the node, because closing is
+what releases peers' snapshots and those are registered readers -- a peer still
+attached would hold the database open past the point the process believed it had let
+go.

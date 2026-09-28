@@ -250,15 +250,33 @@ pub fn start_with_channel(
     facility: crate::plugin::SharedFacility,
     channel: Option<Arc<crate::plugin::Channel>>,
 ) -> Result<FollowerNode, ConfigError> {
+    start_with_wiring(cfg, event_sink, facility, channel, None)
+}
+
+/// As [`start_with_channel`], reading through a slot the caller already built.
+///
+/// A plugin's `Host` must read the **same** slot this node fills, so a caller that
+/// has wired plugins passes its slot here. Without that the plugins would hold an
+/// empty slot for ever and every read would answer `UNAVAILABLE`, which looks like a
+/// broken peer rather than a wiring mistake.
+pub fn start_with_wiring(
+    cfg: &Config,
+    event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
+    facility: crate::plugin::SharedFacility,
+    channel: Option<Arc<crate::plugin::Channel>>,
+    slot_in: Option<DbSlot>,
+) -> Result<FollowerNode, ConfigError> {
     let dir = cfg.data_dir().to_path_buf();
     let status = Arc::new(FollowerStatus::default());
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
 
-    // Only a read-serving standby has one; a cold one never opens a database.
+    // Only a read-serving standby has one; a cold one never opens a database. A
+    // caller that wired plugins supplies the slot, because its `Host` reads through
+    // that one and not through a second.
     let slot: Option<DbSlot> = cfg
         .follower
         .serve_reads
-        .then(|| Arc::new(std::sync::RwLock::new(None)));
+        .then(|| slot_in.unwrap_or_else(|| Arc::new(std::sync::RwLock::new(None))));
 
     let cfg = cfg.clone();
     let st = status.clone();

@@ -267,7 +267,13 @@ pub struct Channel {
     /// one.
     peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    listener: Option<std::thread::JoinHandle<()>>,
+    /// Behind a mutex so [`Channel::stop`] takes `&self`.
+    ///
+    /// Both startup paths hold the channel in an `Arc` -- the follower's replication
+    /// task needs it to outlive the call, and the leader's `Running` needs it to
+    /// stop at teardown -- so a `stop( self )` would have forced one of them to be
+    /// different from the other for no reason but this field.
+    listener: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Channel {
@@ -331,7 +337,7 @@ impl Channel {
             path,
             peers,
             stop,
-            listener: Some(handle),
+            listener: std::sync::Mutex::new(Some(handle)),
         }))
     }
 
@@ -367,7 +373,7 @@ impl Channel {
     /// Closing is what releases the peers' snapshots, so this is also what lets the
     /// database be dropped afterwards. It runs before the reader wait in teardown
     /// for the same reason the in-process drain does.
-    pub fn stop(mut self) {
+    pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         // Shutting each peer's socket unblocks its serving thread out of `read`,
         // which is what a `stop` flag alone cannot do.
@@ -381,7 +387,8 @@ impl Channel {
         // And connect to our own listener once, so its blocking `accept` returns and
         // the thread sees the flag.
         let _ = std::os::unix::net::UnixStream::connect(&self.path);
-        if let Some(h) = self.listener.take() {
+        let handle = self.listener.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = handle {
             let _ = h.join();
         }
         let _ = std::fs::remove_file(&self.path);
@@ -524,4 +531,69 @@ impl Listeners<'_> {
             });
         }
     }
+}
+
+/// Everything a startup path needs to host plugins, built in one place.
+///
+/// # Why this exists rather than two call sites doing it
+///
+/// The pieces have an order that is easy to get wrong and impossible to see wrong.
+/// A `Host` reads the database through a slot, and it must be **the same** slot the
+/// server publishes -- build the facility against a slot the server does not use and
+/// everything starts, every callback fires, and every read answers `UNAVAILABLE` for
+/// ever. That failure already happened once on the leader path. One constructor
+/// means the ordering is stated once.
+pub struct Wiring {
+    /// The slot to hand the startup path, so it fills the one the plugins read.
+    pub slot: crate::guard::DbSlot,
+    pub facility: SharedFacility,
+    pub channel: Option<Arc<Channel>>,
+}
+
+/// Build the plugin wiring for `role`, or `None` when neither shape is configured.
+///
+/// # Safety
+///
+/// Loads and runs arbitrary code when `plugin.library` is set; see `PluginConfig`.
+/// The caller is asserting the operator's configuration is trusted, which is why
+/// this is called from the daemon's startup rather than from a library function.
+pub unsafe fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
+    if !cfg.plugin.enabled() && !cfg.plugin.channel_enabled() {
+        return Ok(None);
+    }
+
+    // **Refused rather than started.** A cold standby never opens a database, so a
+    // channel on one would bind its socket, accept peers, and answer `UNAVAILABLE`
+    // to every request for the life of the process -- which looks like a broken
+    // peer rather than a misconfiguration. `follower.serve_reads` is what makes a
+    // standby hold a database open at all.
+    if role == Role::Follower && !cfg.follower.serve_reads {
+        return Err(
+            "plugin.library or plugin.channel_socket is set on a follower with \
+             follower.serve_reads = false; a cold standby never opens a database, so \
+             every plugin read would answer UNAVAILABLE. Enable follower.serve_reads \
+             or remove the plugin configuration."
+                .to_string(),
+        );
+    }
+
+    // Empty: the startup path fills it with the database it opens, and the plugins
+    // read through the same one.
+    let slot: crate::guard::DbSlot = Arc::new(std::sync::RwLock::new(None));
+    let host = Host::new(slot.clone(), 1, role);
+
+    // SAFETY: the caller's assertion, restated on this function.
+    let facility = unsafe { Facility::load(cfg, slot.clone(), role) }
+        .map_err(|e| format!("cannot load the plugin library: {e}"))?
+        .map(Arc::new);
+
+    let channel = Channel::start(cfg, host)
+        .map_err(|e| format!("cannot start the plugin channel: {e}"))?
+        .map(Arc::new);
+
+    Ok(Some(Wiring {
+        slot,
+        facility,
+        channel,
+    }))
 }

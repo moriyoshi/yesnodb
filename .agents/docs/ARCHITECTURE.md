@@ -220,6 +220,12 @@ yesno/
                                 #   cooperation -- the property the in-process shape cannot
                                 #   have. Listeners bundles the two so the replication path
                                 #   threads one value, in the order notify-act-notify.
+                                #   plugin::wire is what main.rs calls: it builds the slot,
+                                #   the facility and the channel together, because a Host must
+                                #   read the SAME slot the startup path fills -- and it refuses
+                                #   a plugin on a standby without follower.serve_reads, which
+                                #   would bind and then answer UNAVAILABLE for the life of the
+                                #   process.
                                 #   Facility is the in-process one: when to load, and the
                                 #   ordering of the callbacks around a rebootstrap. The drain is
                                 #   why it exists -- a plugin's lease holds Arc<DbInner> and so
