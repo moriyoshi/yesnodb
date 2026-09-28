@@ -299,6 +299,7 @@ impl Channel {
         > = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let inline = cfg.plugin.channel_inline;
         let accept_peers = peers.clone();
         let accept_stop = stop.clone();
         let handle = std::thread::spawn(move || {
@@ -315,7 +316,7 @@ impl Channel {
                 };
                 let host = host.clone();
                 let peers = accept_peers.clone();
-                std::thread::spawn(move || serve_one(stream, host, limits, peers));
+                std::thread::spawn(move || serve_one(stream, host, limits, inline, peers));
             }
         });
 
@@ -392,22 +393,49 @@ fn serve_one(
     stream: std::os::unix::net::UnixStream,
     host: Host,
     limits: Limits,
+    inline: bool,
     peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
 ) {
-    let arena = match Arena::new(limits.arena_bytes()) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot create the channel arena");
-            return;
+    // # Why this falls back rather than failing
+    //
+    // `Session::new_inline` exists so a host with no shared memory can still serve,
+    // and until this function used it that was a property of the *protocol* and not
+    // of the running server -- which is a distinction a deployment document would
+    // have got wrong. `Arena::new` answers `Unsupported` off Linux, and can fail on
+    // Linux too: `memfd_create` needs a descriptor and the region needs backing
+    // memory, so fd exhaustion and `ENOSPC` reach here as well. A peer being refused
+    // a connection because the host could not allocate 2 MiB is a worse outcome than
+    // a slower scan.
+    let arena = if inline {
+        None
+    } else {
+        match Arena::new(limits.arena_bytes()) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot create the channel arena; serving payloads in the frames                      instead, which costs a copy and a smaller batch"
+                );
+                None
+            }
         }
     };
-    // The descriptor goes first, before any frame, so a peer has the region mapped
-    // before it can be told about a block inside it.
-    if let Err(e) = yesno_plugin::channel::send_fd(&stream, arena.as_fd()) {
-        tracing::warn!(error = %e, "cannot hand the arena to the peer");
-        return;
-    }
-    let mut session = Session::new(host, arena, limits);
+
+    let mut session = match arena {
+        Some(arena) => {
+            // The descriptor goes first, before any frame, so a peer has the region
+            // mapped before it can be told about a block inside it.
+            if let Err(e) = yesno_plugin::channel::send_fd(&stream, arena.as_fd()) {
+                tracing::warn!(error = %e, "cannot hand the arena to the peer");
+                return;
+            }
+            Session::new(host, arena, limits)
+        }
+        // No descriptor is sent, and the greeting's `arena_bytes = 0` is how the peer
+        // learns not to wait for one. A peer that blocked on `recv_fd` regardless
+        // would hang, which is why the zero is in the greeting rather than implied.
+        None => Session::new_inline(host, limits),
+    };
 
     let writer = match stream.try_clone() {
         Ok(w) => Arc::new(std::sync::Mutex::new(w)),

@@ -355,6 +355,17 @@ pub struct PluginConfig {
     /// inexpressible. The arena is sparse, so the reservation is address space.
     pub channel_max_lanes: usize,
 
+    /// Serve payloads inside the frames instead of through a shared arena.
+    ///
+    /// Normally left false: the arena is what decouples batch size from frame size,
+    /// and batch size is what keeps the channel's cost near an in-process plugin's.
+    /// Setting it true is for a host that cannot make a `memfd` at all, and it is
+    /// also how the inline path is exercised on a host that can.
+    ///
+    /// **The channel falls back to inline by itself when the arena cannot be
+    /// created**, so this is a way to choose it rather than the only way to get it.
+    pub channel_inline: bool,
+
     /// Blocks one response may carry.
     ///
     /// **This is the performance knob.** One round trip per block costs 4.9x to
@@ -373,6 +384,7 @@ impl Default for PluginConfig {
             channel_max_handles: 4,
             channel_max_lanes: 1024,
             channel_max_blocks: 16,
+            channel_inline: false,
         }
     }
 }

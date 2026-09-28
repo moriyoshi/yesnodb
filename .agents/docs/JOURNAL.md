@@ -7405,3 +7405,37 @@ connection-close reclamation does **not** solve, because a half-applied batch is
 released by dropping a snapshot. They have said an ambiguous post-commit disconnect
 must surface as indeterminate rather than be replayed, which is the right
 requirement and is exactly what makes this a design pass rather than more frames.
+
+## 2026-09-28 -- A protocol property is not a server property
+
+A consumer read the portability claim against the code and found the gap:
+`Session::new_inline` was implemented and tested, while
+`yesno-server::plugin::serve_one` called `Arena::new` unconditionally and returned
+on failure. So on a host without `memfd` the channel did not fall back to inline --
+it simply did not serve. I had written that the inline path "is what makes the
+channel portable", and that was true of the protocol and false of the running
+server.
+
+**The distinction is the lesson, not the fix.** I had built the seam, tested both
+sides of it, and documented the capability -- and never connected the one call site
+that decides whether a deployment gets it. Every ingredient of the claim was real
+and the claim was still wrong, which is the failure mode of describing a design
+rather than a system. A deployment document written from my paragraph would have
+promised something the binary refused.
+
+`serve_one` now falls back, `plugin.channel_inline` chooses it deliberately, and a
+test drives the inline path over a **real socket** rather than as a `Session` call,
+so the two claims are now one claim.
+
+**Fixing it properly widened it.** Off-Linux was the case the consumer raised, but
+`Arena::new` can fail on Linux too: `memfd_create` needs a descriptor and the region
+needs backing memory, so fd exhaustion and `ENOSPC` reach the same branch. A peer
+refused a connection because the host could not allocate 2 MiB is a worse outcome
+than a slower scan, so the fallback is right on every platform -- and that is also
+what made it testable, since a Linux-only tree cannot exercise a non-Linux branch.
+**A fallback reachable only on a platform you cannot test is not a fallback**, it is
+an untested branch with an optimistic comment.
+
+Their other two points stand as recorded and need nothing from here: `KeyRange` will
+request `MAX_PAGE` per page, which is exactly the advice the frame carries, and no
+lazy `Tree` iterator until measured need, which matches the filed entry.

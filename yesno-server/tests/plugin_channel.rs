@@ -299,3 +299,124 @@ fn an_unconfigured_channel_is_absent() {
     cfg.plugin.channel_socket = String::new();
     assert!(Channel::start(&cfg, host).unwrap().is_none());
 }
+
+/// A peer served inline: no descriptor, payloads in the frames, same answers.
+///
+/// # What this closes
+///
+/// `Session::new_inline` made the *protocol* portable, and until `serve_one` used it
+/// the running server still called `Arena::new` unconditionally and refused the
+/// connection when it failed. A deployment document would have read the protocol
+/// property as a server property. This drives the wired inline path over a real
+/// socket, so the two claims are the same claim.
+///
+/// It is reachable on Linux through configuration rather than only on a host without
+/// `memfd`, which is what makes it testable at all.
+#[test]
+fn a_peer_is_served_inline_when_the_host_has_no_arena() {
+    let (_c, mut cfg, host, sock) = setup("inline");
+    cfg.plugin.channel_inline = true;
+    let channel = Channel::start(&cfg, host).unwrap().unwrap();
+
+    // Connect *without* expecting a descriptor. A peer that blocked on recv_fd here
+    // would hang, which is why arena_bytes = 0 is in the greeting.
+    let mut sock_raw = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut buf = Vec::new();
+    let read_frame = |s: &mut std::os::unix::net::UnixStream, buf: &mut Vec<u8>| -> Frame {
+        loop {
+            match Frame::decode(buf) {
+                Ok((f, used)) => {
+                    buf.drain(..used);
+                    return f;
+                }
+                Err(yesno_plugin::ipc::IpcError::Truncated) => {}
+                Err(e) => panic!("{e}"),
+            }
+            let mut chunk = [0u8; 8192];
+            let n = s.read(&mut chunk).unwrap();
+            assert!(n > 0, "the server closed unexpectedly");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    };
+    let ask = |s: &mut std::os::unix::net::UnixStream, buf: &mut Vec<u8>, f: Frame| -> Frame {
+        s.write_all(&f.encode().unwrap()).unwrap();
+        read_frame(s, buf)
+    };
+
+    match read_frame(&mut sock_raw, &mut buf) {
+        Frame::ServerHello { arena_bytes, .. } => assert_eq!(
+            arena_bytes, 0,
+            "zero is how a peer learns there is no descriptor coming"
+        ),
+        other => panic!("{other:?}"),
+    }
+    ask(
+        &mut sock_raw,
+        &mut buf,
+        Frame::ClientHello {
+            protocol: 1,
+            name: "inline-peer".into(),
+        },
+    );
+    let snapshot = match ask(&mut sock_raw, &mut buf, Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let lanes = match ask(
+        &mut sock_raw,
+        &mut buf,
+        Frame::LanesAcquire {
+            snapshot,
+            keys: vec![10, 30],
+        },
+    ) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    };
+
+    let mut seen = Vec::new();
+    let mut first_array: Option<Vec<u16>> = None;
+    loop {
+        match ask(&mut sock_raw, &mut buf, Frame::BlockAdvance { lanes }) {
+            Frame::BlockDone => break,
+            Frame::BlocksInline { blocks, payload } => {
+                assert_eq!(blocks.len(), 1);
+                let b = &blocks[0];
+                let mut at = 0usize;
+                for l in &b.lanes {
+                    let n = l.kind.payload_bytes(l.count);
+                    if l.kind == LaneKind::Array && first_array.is_none() && n > 0 {
+                        first_array = Some(
+                            payload[at..at + n]
+                                .chunks_exact(2)
+                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                .collect(),
+                        );
+                    }
+                    at += n;
+                }
+                assert_eq!(at, payload.len(), "descriptors account for every byte");
+                seen.push((b.prefix, b.lanes.iter().map(|l| l.kind).collect::<Vec<_>>()));
+                ask(&mut sock_raw, &mut buf, Frame::BlockRelease { lanes });
+            }
+            other => panic!("expected an inline block, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (0, vec![LaneKind::Array, LaneKind::Absent]),
+            (1, vec![LaneKind::Array, LaneKind::Absent]),
+            (3, vec![LaneKind::Absent, LaneKind::Run]),
+            (5, vec![LaneKind::Array, LaneKind::Absent]),
+        ],
+        "the inline transport must report exactly what the arena transport reports"
+    );
+    assert_eq!(
+        first_array,
+        Some(vec![7, 8, 9]),
+        "and the payload arrived, read out of the frame"
+    );
+
+    channel.stop();
+}

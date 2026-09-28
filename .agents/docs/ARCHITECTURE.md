@@ -299,9 +299,12 @@ yesno/
                                 #     through the arena at arena_off + i * LANE_BYTES, so no
                                 #     offset travels on the wire; Session::new_inline serves
                                 #     the same scan with payloads in the frames where no
-                                #     shared region can be had, which is what makes the
-                                #     channel portable. Liveness is the socket closing: the
-                                #     snapshot belongs to yesnod, keyed by the connection.
+                                #     shared region can be had, and serve_one falls back to
+                                #     it when Arena::new fails -- off Linux, and on Linux
+                                #     under fd exhaustion or ENOSPC -- so the portability is
+                                #     the server's and not only the protocol's.
+                                #     Liveness is the socket closing: the snapshot belongs
+                                #     to yesnod, keyed by the connection.
   yesno-mysql/                  # MySQL 8.4 storage engine; embedded C ABI or remote Flight.
     CMakeLists.txt              #   accepts Bazel inputs or adjacent-source fallbacks
   MODULE.bazel                  # bzlmod: rules_rust ( fed by Cargo.lock ), rules_foreign_cc,

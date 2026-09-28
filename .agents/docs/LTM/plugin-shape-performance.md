@@ -147,7 +147,18 @@ The second is the only hard part, and it is now optional.
 
 **The portable path is no shared region at all.** `Session::new_inline` serves the
 same scan with payloads inside the response frames, advertised by `arena_bytes = 0`
-in the greeting so a peer needs no second negotiation field. It costs a second copy
+in the greeting so a peer needs no second negotiation field.
+
+**A protocol property is not a server property, and this document said so too
+loosely at first** ( corrected 2026-09-28, on a consumer's reading ). For a day
+`Session::new_inline` existed and was tested while `serve_one` still called
+`Arena::new` unconditionally and refused the connection when it failed -- so a
+non-Linux host would not have fallen back, it would simply not have served. The
+running server now falls back, with `plugin.channel_inline` to choose it
+deliberately, and a test drives the inline path over a real socket. The failure is
+not only a non-Linux one either: `memfd_create` needs a descriptor and the region
+needs backing memory, so fd exhaustion and `ENOSPC` reach the same branch on
+Linux. It costs a second copy
 and, more importantly, couples the batch to the frame size: at 64 lanes an inline
 batch is **two** blocks against the arena's sixty-four, because one block is 512 KiB
 against `MAX_INLINE_PAYLOAD` of 1 MiB. Since batch size is what removed the transport
