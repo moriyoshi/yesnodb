@@ -727,7 +727,7 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
 ### Storage
 
-- [x] **key-stream-open-holds-the-shard-mutex-across-the-whole-index-scan** ( **FIXED 2026-09-28**: the scan runs unlocked, and the shard-shared cost of a concurrent open roughly halved -- D/B **1.55-1.72x -> 1.24-1.41x** ) ( *raised by `haiiie` with a measurement, and they supplied the split that made it attributable* ): `build_plan_range` held `Mutex<ShardStore>` across the whole `tree.range` walk, so one key's open serialised every other open on that shard -- and key-only sharding puts all of a key's chunks in one shard, so a parallel query's workers all queue on the same mutexes.
+- [x] **key-stream-open-holds-the-shard-mutex-across-the-whole-index-scan** ( **FIXED 2026-09-28**: the scan runs unlocked. **How much that buys is a property of the fixture, not of the change** -- D/B **1.55-1.72x -> 1.24-1.41x** here, but only ~10% of the shared component in the consumer's own frame, and ~27% where sharing is concentrated; see *What the number actually depends on* below ) ( *raised by `haiiie` with a measurement, and they supplied the split that made it attributable* ): `build_plan_range` held `Mutex<ShardStore>` across the whole `tree.range` walk, so one key's open serialised every other open on that shard -- and key-only sharding puts all of a key's chunks in one shard, so a parallel query's workers all queue on the same mutexes.
 
   **The consumer's split, which is what made this actionable.** Four arms at 8 threads on their 1 048 576-doc fixture: serial 22 us per set of 23 opens; 8 threads on **disjoint** shards ~40 us, the parallelism floor ( bandwidth, scheduling, timer ); 8 threads sharing 4 shards ~190 us; their real interleaved shape ~80 us, 2.0x the disjoint floor. **Everything above the disjoint arm is shard-shared**, about half the cost in their shape. They stated plainly that "shard-shared" still bundles the mutex with any contended cache line, could not separate those from outside, and named the narrower hold as the direct test.
 
@@ -739,7 +739,23 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
   after     75.0-77.4      81.2-84.5    105.2-114.6   1.24-1.41        20-29%
 ```
 
-  So **about 40% of the shard-shared component was the lock hold**, and the rest is something else -- plausibly the `Arc` refcounts and shared cache lines the consumer named. A and B are unchanged, so nothing was traded for it.
+  So **about 40% of the shard-shared component was the lock hold** -- *in this fixture*. The rest is something else, plausibly the `Arc` refcounts and shared cache lines the consumer named. A and B are unchanged, so nothing was traded for it.
+
+  **What the number actually depends on** ( corrected 2026-09-28 from the consumer's paired rerun of `a710b28` -> `cfd0e88`, median of 9 rep-medians, us per set of 23 opens ). **The 40% above does not transfer, and their frame is the one that predicts a real workload:**
+
+```text
+                            before          after        reading
+  A serial               22-34 (bimodal)  22-34         not a change signal
+  B disjoint             43.8            44.6           floor, unchanged
+  C 8 threads / 4 shards 182.9-206.5     121.1-156.9    about -27%
+  D their real shape     80.1            77.1           ranges overlap
+```
+
+  D - B goes ~36 -> ~33 us: **roughly 10%, not 40%.** Their reading: "the lock matters in proportion to how concentrated the sharing is: C shows it plainly, while in D the threads spread over 32 shards and rarely meet on one mutex."
+
+  **Concentration is only half of it; the other half is hold duration, and that is what the frame mismatch was.** Their A is 22 us per 23 opens, mine 77 -- about 3.5x the per-open scan, because this fixture's keys carry 60 chunks each. A longer `tree.range` walk holds the mutex longer, so the same 32 shards and 8 threads collide far more here than there. Both D arms are at 32 shards; only the hold differs, and the ratio moved with it. **So a lock's share is hold duration times sharing concentration, and a benchmark fixes both** -- which is why the honest form of this result is two frames, not one headline. The change is kept on the soundness argument plus C, where the effect is unambiguous, not on a ratio.
+
+  They also checked a coupling I had not: `Tree` carries its own `node_size` while `PublishedNodes` copies `sb.node_size`, so a snapshot pinned to an older root could in principle read wrong-sized pages. Verified from source here: the only assignment to `sb.node_size` anywhere is in one superblock test, `Tree::range` never consults `self.node_size` for reading, and `ShardStore::node` already used the `sb` value -- so the copy changes nothing. It is in fact marginally safer than the old code, which re-read the field per `node()` call: a reader pinned to a snapshot should carry that snapshot's node size.
 
   **The fix and the invariant it rests on.** `ShardStore::published_nodes` returns a `PublishedNodes` reader holding an `Arc<SegmentedMmap>` clone and a copied `node_size`; the lock is held only to build it. Sound because `ShardStore::node` needs just those two things plus `pending_nodes` -- and `pending_nodes` holds pages "not yet reachable from any superblock" while a snapshot's root **is** a superblock root ( `ShardStore::tree` returns `self.sb.root` ), so a snapshot scan provably never consults it. `SegmentedMmap` needs no outer exclusion: its caches are each behind their own `Mutex`, and `Db::checkpoint` already clones this same `Arc` and drops the store lock to run its `fsync`s.
 
@@ -747,7 +763,7 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
   **A measurement caution worth keeping.** The first "before" number was a single run taken when the machine was quieter ( A = 51.5 us ), which made the change look like a 48% serial **regression** and a larger concurrent win than it is. Both vanished under a paired A/B at 77 us. **An unpaired before/after on a shared machine measures the machine.**
 
-- [ ] **evacuation-is-evaluated-only-where-sparsity-cannot-appear** ( *2026-09-28, found while trying to exercise `COMPACT_LIVE_FRACTION`; explains every `evacuated_chunks = 0` measured here and downstream* ): `Db::checkpoint` computes `Allocator::evacuation_candidates` **only on the dirty path**. A shard with no dirty work takes the clean branch, which flips the superblock and calls `reclaim_deferred` -- freeing slots, emptying slabs, punching them -- and then `continue`s, **skipping evacuation entirely**. So a slab becomes sparse on the path that cannot evacuate it.
+- [x] **evacuation-is-evaluated-only-where-sparsity-cannot-appear** ( **FIXED 2026-09-28**: the candidate set is computed above the idle branch and a non-empty one counts as work; a no-op at the default budget of 0, and worth **67% of allocated blocks** where it can now be reached -- see *The fix, and what it was worth* below ) ( *found while trying to exercise `COMPACT_LIVE_FRACTION`; explains every `evacuated_chunks = 0` measured here and downstream* ): `Db::checkpoint` computes `Allocator::evacuation_candidates` **only on the dirty path**. A shard with no dirty work takes the clean branch, which flips the superblock and calls `reclaim_deferred` -- freeing slots, emptying slabs, punching them -- and then `continue`s, **skipping evacuation entirely**. So a slab becomes sparse on the path that cannot evacuate it.
 
   **Measured, not reasoned.** A fixture keeping only 10% of its keys, so survivors are spread across every slab and each is genuinely partly live, evacuates **nothing** at thresholds of 0.40 / 0.50 / 0.60 / 0.70 / 0.90 and at `evacuate_per_checkpoint` of 0 / 2 / 4 / 8 / 16. Instrumenting the candidate walk shows it runs **twice** in the whole run -- the two dirty checkpoints -- and at both moments the slabs read `live_fraction` **1.00**. Add `RECLAIM_CKPT_DELAY` = 2: a delete's slots are not free until two checkpoints later, and in a delete-then-quiesce workload those are idle.
 
@@ -756,6 +772,21 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
   **The fix is a decision, not an obvious change, and nothing is broken today** because `EVACUATE_PER_CHECKPOINT` defaults to 0. The clean branch is **deliberately** gated on `deferred_count() > 0` so "a genuinely quiescent database stays silent", and evacuation writes far more than a superblock flip -- it rewrites live chunks. Evaluating it there unconditionally would make a quiescent database do write amplification in the background, which is precisely what that gate exists to prevent.
 
   The shape that keeps both properties: evaluate candidates on the clean path **at the moment the deferred queue drains**, since that is when sparsity appears, still bounded by `evacuate_per_checkpoint` -- which is 0 by default, so silence is preserved unless an operator asks for it. **Do not raise that default as part of this**; the two are separate, and its own doc still requires a measurement showing a benefit, which is only obtainable once candidates can be seen at all.
+
+  **The fix, and what it was worth.** `Db::checkpoint` now computes the candidate set *above* the idle branch and treats a non-empty one as work, so a shard that goes sparse while idle rebuilds and evacuates rather than `continue`ing. Simpler than the "at the moment the queue drains" shape proposed above and with the same property: `evacuating` is the candidate list truncated to `evacuate_per_checkpoint`, so at the default of 0 it is always empty, the clause never fires, and a quiescent database stays exactly as silent as before. The default was **not** raised, per the instruction above.
+
+  Measured paired, arms alternating in one process, medians of five reps. Construction: 220 keys x 10 chunks x 540 values, sized so one slab of a class fills and a second opens -- `evacuation_candidates` skips the active bump slab, so a fixture with one slab per class offers nothing however sparse it gets, which is why earlier attempts saw no candidates. Then three keys in four deleted, then eight idle checkpoints.
+
+```text
+ evac    fs blocks     allocated   extents   evacuated
+    0      3 121 152     8 388 608       256           0
+    2      1 032 192     8 388 608       230         390
+    8      1 032 192     8 388 608       230         390
+```
+
+  **67% fewer blocks actually allocated by the filesystem, for 390 chunks rewritten.** Note the identical `allocated` column: the slab count does not move, so the aged-state table that produced the original "evacuation does not pay" verdict **could not have seen this** -- it counts slabs, and the saving is a punched hole inside an unchanged count. That verdict also predates hole punching entirely, so it was measured with the cost present and the benefit absent.
+
+  Regression test `evacuation_is_reached_when_sparsity_appears_on_an_idle_shard` in `yesno-core/tests/invariants.rs` pins reachability; it fails with `evacuated_chunks = 0` on the old ordering, verified by re-introducing it.
 
 
 - [x] **slab-occupancy-is-not-persisted-so-inherited-slabs-are-dead-weight** ( **WITHDRAWN 2026-09-27, the same day it was filed: the premise was false** ): I filed this claiming a format change was needed to persist slab occupancy. **It was done on 2026-09-13.** `store/slabmeta.rs` writes each slab's occupancy into the `SLAB_META` region it reserves, `ShardStore::open` reads it back, and `Allocator::restore` falls back to `Opaque` only for a block that is **missing or torn**. The consumer confirmed it on real files: inherited slabs come back `InUse` **with their class**, which an `Opaque` slab could not report.

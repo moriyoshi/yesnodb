@@ -126,6 +126,35 @@ Evacuation was implemented, measured, and left disabled by default. The original
 
 The continuum model remains useful for reasoning about a policy if it is enabled, but it does not price index-node COW writes and does not describe default operation while `EVACUATE_PER_CHECKPOINT = 0`.
 
+#### The threshold was unreachable, and the old verdict was measured against a missing half
+
+Two separate things made "evacuation does not pay" look settled when it was not, found 2026-09-28.
+
+**It could not fire where it was needed.** A chunk is immutable, so modifying one supersedes its whole extent: under rewrite-churn a slab's slots are freed wholesale and slabs go **full to empty**, needing no evacuation at all. A slab only becomes *partly* live when some of the keys sharing it are deleted and the rest stay. That shape could not trigger evacuation, because `Db::checkpoint` evaluated candidates only on its dirty path, while the sparsity was created by `reclaim_deferred` on the idle path -- which `continue`d first. `RECLAIM_CKPT_DELAY = 2` guarantees the mismatch: a delete's slots come free two checkpoints later, and in delete-then-quiesce those are idle. Instrumenting showed the candidate walk running **twice in a whole run**, both times with every slab at `live_fraction` 1.00. Sweeping the threshold to 0.90 and the budget to 16 changed nothing, which is the signature of an unreachable trigger rather than a miscalibrated one.
+
+**And the cost/benefit was measured before hole punching existed.** Emptying a slab returned nothing to the filesystem then, so relocation was pure write cost with no saving to weigh against. Punching supplied the other half.
+
+The trigger was moved above the idle branch the same day: the candidate set is computed first and a non-empty one counts as work, so a shard that goes sparse while idle rebuilds and evacuates. With the budget at its default of zero the set is always empty, so this changes nothing by default -- it makes the knob able to work.
+
+Measured in the shape the policy exists for, paired, arms alternating in one process, medians of five reps. Construction: 220 keys x 10 chunks x 540 values per chunk, sized so one slab of a class fills and a second opens; then three keys in four deleted; then eight idle checkpoints.
+
+```text
+ evac    fs blocks     allocated   extents   evacuated
+    0      3 121 152     8 388 608       256           0
+    2      1 032 192     8 388 608       230         390
+    8      1 032 192     8 388 608       230         390
+```
+
+**A 67% reduction in blocks the filesystem has actually allocated, for 390 chunks rewritten.** The lesson for future measurement is in the third column: `allocated_bytes` is *identical* across arms. The slab count does not move, so every instrument that reads slabs or file length -- including the aged-state table that produced the original verdict -- sees nothing. Only `st_blocks` can observe this, because the saving is a punched hole inside a slab count that did not change.
+
+It terminates. An evacuated slab's slots sit in the deferred queue for `RECLAIM_CKPT_DELAY` checkpoints, during which it still reads partly live and is still offered with nothing left to relocate -- a few extra tree rebuilds, then `Free` and no longer a candidate. The relocated chunks land in a denser slab, so candidates strictly retire absent new deletes; the measurement converges at 390 and stays there from budget 2 to 8.
+
+The continuous-churn shape is unaffected, which is the regression check that matters once an idle database can do work: `aged_state.py` at 1 500 keys x 2 000 ordinals over 40 rounds is identical across budgets of 0, 2 and 8 -- amp 1.12x and 6.29 B/ordinal at 1% churn, 1.25x and 6.99 at 5%.
+
+Its slab occupancies are the best available argument for leaving the **threshold** alone. At 5% churn the partly-live slabs read 256/502 and 307/502, which is 0.51 and 0.61 live -- just *above* 0.40. The threshold is doing its job there, declining to relocate chunks in the one shape where relocating them was measured to buy nothing, and raising it to 0.70 would admit exactly those slabs.
+
+The default budget remains `0`. The benefit is established for one shape and the sweep showing no benefit stands for continuous churn, where there is genuinely nothing partly live to move. Raising it is a policy choice across both shapes and wants its own measurement.
+
 ### Fsck reconstruction
 
 `fsck::rebuild` walks chunk references and index node IDs, derives used slots and packed-page live totals, and distinguishes:

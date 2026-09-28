@@ -6254,3 +6254,214 @@ taken when the machine was quieter: A = 51.5 us against 77 after. That reads as 
 under a paired A/B at matched conditions. **An unpaired before/after on a shared
 machine measures the machine**, and the tell was that the "regression" appeared in
 an arm the change cannot touch -- a single thread has no contention to remove.
+
+## 2026-09-28 -- The 40% was my fixture's, not the change's: two frames, one lock
+
+**Correcting the preceding entry**, *2026-09-28 -- The shard mutex: narrowed, and
+about 40% of the contention was it*. The heading and its "roughly 40% of the shard-shared
+component was the lock hold" are true of the fixture I measured and **do not
+transfer to the consumer's**. `haiiie` re-ran the same pair ( `a710b28` ->
+`cfd0e88` ) paired, median of 9 rep-medians, us per set of 23 opens:
+
+```text
+                            before          after        reading
+  A serial               22-34 (bimodal)  22-34         not a change signal
+  B disjoint             43.8            44.6           floor, unchanged
+  C 8 threads / 4 shards 182.9-206.5     121.1-156.9    about -27%
+  D their real shape     80.1            77.1           ranges overlap
+```
+
+D - B goes ~36 -> ~33 us: **roughly 10%, not 40%**. Their reading is that the lock
+matters in proportion to how concentrated the sharing is -- C makes it plain, while
+D's threads spread over 32 shards and rarely meet on one mutex.
+
+**Concentration is half the story. The other half is hold duration, and that is
+what the frame mismatch was.** They flagged that our numbers are not comparable
+because their A is 22 us where mine is 77, and that gap is the explanation rather
+than a nuisance: 3.5x the per-open scan, because this fixture's keys carry 60
+chunks each. A longer `tree.range` walk holds the mutex longer. Both D arms run 32
+shards and 8 threads; only the hold differs, and the ratio moved with it.
+
+So: **a lock's share of a contended cost is hold duration times sharing
+concentration, and a benchmark fixes both.** Neither number is wrong. Mine
+describes long scans on a shared shard, theirs describes their workload, and
+theirs is the one that predicts what the change buys in production -- about
+nothing, for their shape. The change stays on the soundness argument plus C, where
+the effect is unambiguous and large.
+
+**The generalizable error is narrower than "measure it".** I did measure, paired,
+three runs, and reported a range -- the discipline was fine. What I published was
+a *ratio between two arms of my own fixture* under a sentence that read as a
+property of the code. A ratio's denominator is part of the claim; "40% of the
+shard-shared component" silently means "of the shard-shared component *as this
+fixture generates it*". This is the same shape as the earlier finding that a
+sweep's number is a hypothesis about a category, arrived at from the other
+direction: there I over-generalized a count, here a proportion.
+
+**They also closed a soundness hole I had not looked at.** `Tree` carries its own
+`node_size`, while `PublishedNodes` copies `sb.node_size` -- so a snapshot pinned
+to an older root could in principle read wrong-sized pages. Verified from source:
+the only assignment to `sb.node_size` anywhere in `yesno-core/src` is in one
+superblock test, `Tree::range` never consults `self.node_size` on the read path,
+and `ShardStore::node` already used the `sb` value, so the copy changes nothing.
+It is marginally *safer* than what it replaced, which re-read the field on every
+`node()` call: a reader pinned to a snapshot ought to carry that snapshot's node
+size, not the latest one. Worth noting that the review that found this was looking
+at a field neither the commit message nor my own soundness paragraph mentioned --
+I had enumerated what `node()` reads and stopped at `pending_nodes`, the
+interesting one, without asking whether the boring one could drift.
+
+## 2026-09-28 -- Assessing the hosted-plugin ABI: the engine is ready, the boundary is not
+
+`haiiie` handed over a proposed integration contract for running as a yesnod-loaded
+plugin against the live `Db` -- a versioned function-pointer table, snapshot-safe
+multi-lane reads, follower rebootstrap and role lifecycle, service registration.
+Full assessment in
+[`LTM/hosted-plugin-abi-assessment.md`](./LTM/hosted-plugin-abi-assessment.md); the
+eleven missing primitives are listed there. Three things worth recording here.
+
+**The shape of the answer was the opposite of what I expected.** I went in assuming
+the gap was engine capability and found it is almost entirely boundary surface.
+`Snapshot` is already a refcounted pin whose clones hold the version; `KeyStream`
+yields containers without materializing; `Container` clone is a refcount bump because
+`ExtentGuard` holds an `Arc<MmapSegment>` as the Arrow allocation owner, so a leased
+container keeps its own mapping alive however far it travels, with no lifetime and no
+dependence on the `Db`. That is the lease model the handoff asks to have built. What
+is missing is the C surface over it: `yesno-c` has no snapshot handle at all, and
+`yesno_cursor_open` does `set.iter().collect()` into a `Vec<u64>` -- eight bytes per
+document per lane -- while taking **its own** snapshot per cursor. The second half is
+the real finding: opening a block's lanes in a loop gives each lane a different
+version, so a checkpoint between two opens makes exact top-k score one block against
+two database states. **That is a correctness gap against their exactness oracle, and
+it reads as a performance complaint until you look at where the snapshot is taken.**
+
+**The handoff asks for the inverse of the primitive it needs.** It requires that the
+host keep borrowed bytes alive for the lease duration. The engine does that for free.
+The problem is getting them *back*: `lifecycle.rs` states there is no `Db::close()`,
+teardown is `Drop` on the last `Arc<DbInner>` with the `flock` inside it, and the two
+proof instruments -- `Arc::into_inner( db )` and `Db::live_readers()` -- between them
+cover `Arc<Db>` clones and `Snapshot`s. A `Container` retained after its `KeyStream`
+drops is **neither**: it holds no reader slot, so `live_readers()` cannot see it,
+while its `ExtentGuard` keeps the mapping alive. So the host can satisfy both halves
+of its shutdown proof while a plugin still holds mapped bytes. Lease accounting and
+revocation-with-deadline is a genuinely new primitive, and it is the one the handoff
+does not know it wants.
+
+**Two documents disagree about rebootstrap, and the ABI's strictness depends on
+which is right.** `guard.rs:54` justifies `DbSlot` on the grounds that
+"`bootstrap_shard` truncates the shard image, and truncating under a live mapping
+raises `SIGBUS`". `bootstrap_shard` does not: it writes `<shard>.yno.partial`,
+`set_len`s that, and renames it onto the image, with its own comment calling the
+rename "this operation's single commit point". Rename replaces a directory entry and
+the old inode survives for anyone holding it mapped, so a lease held across
+rebootstrap is **stale, not fatal** -- a wrong answer rather than a dead process, and
+therefore a barrier that may be advisory rather than one that must be enforced before
+a byte is written. **A stale rationale set the safety class of a primitive that does
+not exist yet**, which is the cost this tree's rule about load-bearing `//!` comments
+is trying to avoid, showing up in an ordinary `//` one. The slot is still needed; the
+honest reason is that a mapping of the old inode would otherwise serve stale data for
+ever, which is a better argument than the one written down. I have not edited
+`guard.rs` -- the comment is a claim about `SIGBUS` reachability and I would rather
+have it corrected by whoever owns I6's phrasing than guess.
+
+## 2026-09-28 -- Sent the ABI assessment to the wrong haiiie session, for the same reason as the 40%
+
+The entry above says "`haiiie` handed over a proposed integration contract" and I sent
+the finished assessment to `haiiie-a6`. **`haiiie-a6` did not write it.** It was typed
+into this session's pane by a different `haiiie` session; `haiiie-a6` is the peer this
+session had been corresponding with about the shard mutex, declined ownership, relayed
+the document onward, and said plainly that it has not reviewed the ABI questions and
+that its silence on them is not agreement. `LTM/hosted-plugin-abi-assessment.md` now
+records that, and records that nothing in it has been agreed by the contract's owner.
+
+**The tell was in the document I had just read.** The handoff refers to "the yesno
+session" in the third person and says only which tmux pane it was entered into -- a
+note written *about* my session by someone who was not in the conversation. I read
+that sentence, used it to date the request, and did not ask what it implied about who
+sent it. One correspondent plus one arriving document became one author.
+
+This is the same error as the 40%, which is why it is worth a second entry on one day.
+There I published a ratio whose denominator came from my own fixture under a sentence
+that read as a property of the code. Here I addressed a reply to whoever I had most
+recently been talking to. Both substitute the nearest available referent for the one
+actually in question, and both are invisible from inside because the nearest referent
+is always plausible. The earlier journal convention already had the fix: entry 4167
+names its source as "A haiiie session ( `haiiie-67` )", session and all. **Naming the
+specific session is not pedantry, it is what makes the claim checkable** -- had I
+written the session id, I would have had to go and find it.
+
+No harm beyond a misdirected message, because `haiiie-a6` routed it correctly. But the
+assessment's two contract-changing findings -- the per-cursor snapshot in
+`yesno_cursor_open`, and the lease direction being accounting and revocation rather
+than keeping bytes alive -- are now in flight to an owner this session has never
+spoken to, and should be treated as unacknowledged until that owner answers.
+
+## 2026-09-28 -- Evacuation was unreachable, and the verdict against it was missing half the trade
+
+Fixed `evacuation-is-evaluated-only-where-sparsity-cannot-appear`. `Db::checkpoint`
+now computes `Allocator::evacuation_candidates` **above** its idle branch and treats
+a non-empty set as work, so a shard that goes sparse while idle rebuilds and
+evacuates instead of `continue`ing past it. `evacuating` is the candidate list
+truncated to `evacuate_per_checkpoint`, which is 0 by default, so the new clause can
+never be what keeps a shard off the idle branch unless an operator asks for it: **at
+the default this change is a no-op**, and that is what made it safe to let an idle
+database do work at all.
+
+**Two things were wrong with "evacuation does not pay", and neither was arithmetic.**
+
+It could not fire where it was needed. A chunk is immutable, so under rewrite-churn a
+slab's slots free wholesale and slabs go full to empty, needing no evacuation; a slab
+goes *partly* live only when some of the keys sharing it are deleted and the rest
+stay. `RECLAIM_CKPT_DELAY` = 2 then guarantees the miss, because those two
+checkpoints are idle in a delete-then-quiesce workload, and the idle branch created
+the sparsity and returned before the trigger was consulted.
+
+And the trade was priced with one side absent: the old sweep predates hole punching,
+so emptying a slab returned nothing to the filesystem and relocation was cost without
+saving. Punching supplied the other half, and **nobody had measured the two together
+because they never coexisted until this session.**
+
+Measured paired, arms alternating in one process, medians of five reps. 220 keys x 10
+chunks x 540 values, three keys in four deleted, eight idle checkpoints:
+
+```text
+ evac    fs blocks     allocated   extents   evacuated
+    0      3 121 152     8 388 608       256           0
+    2      1 032 192     8 388 608       230         390
+    8      1 032 192     8 388 608       230         390
+```
+
+**67% fewer blocks actually allocated, for 390 chunks rewritten.** The instructive
+column is `allocated`, which is *identical*. The slab count does not move, so the
+aged-state table that produced the original verdict could not have seen this even had
+evacuation been reachable -- it counts slabs, and the whole saving is a punched hole
+inside an unchanged count. **An instrument that cannot see the benefit will report a
+policy as pure cost, indefinitely and with a straight face.** That is a sharper
+version of this tree's existing rule about measuring the right thing: the earlier
+lessons were about denominators and frames, this one is about an instrument whose
+resolution excludes the effect.
+
+Regression check on the shape that *can* be harmed: `aged_state.py` at 1 500 keys x
+2 000 ordinals over 40 rounds is identical across budgets 0, 2 and 8 -- amp 1.12x and
+6.29 B/ordinal at 1% churn, 1.25x and 6.99 at 5%. Its slabs also gave the best
+argument for leaving `COMPACT_LIVE_FRACTION` alone: at 5% churn the partly-live slabs
+read 256/502 and 307/502, which is 0.51 and 0.61 live, sitting just **above** 0.40.
+The threshold is declining exactly the relocations that were measured to buy nothing.
+Raising it to 0.70 would admit them. I did not raise it, and I did not raise the
+budget default either -- the TODO entry that specified this fix said not to, and a win
+in one shape is not a policy across both.
+
+**Two fixture traps, recorded because both cost a wrong answer first.**
+`evacuation_candidates` skips the active bump slab, so a fixture with a single slab
+per class offers no candidates however sparse that slab becomes -- my first attempt
+asserted correctly and failed for that reason, with the diagnostic showing 12/510 and
+146/1920 live and no candidates. The fixture has to fill one slab of a class and open
+a second. And the sparsity has to come from deleting *some* of the keys sharing a
+slab: deleting all of them empties it, which is the path that needs no evacuation.
+
+The regression test `evacuation_is_reached_when_sparsity_appears_on_an_idle_shard`
+pins reachability rather than policy, and I verified it fails on the old ordering by
+re-introducing the defect and watching `evacuated_chunks` stay 0. The measurement
+crate is scratch under `.agents-workspace/tmp/evacpay/`; its construction is recorded
+next to `COMPACT_LIVE_FRACTION` and in `LTM/allocation-reclamation-and-fsck.md`, which
+is what survives the crate being deleted.

@@ -373,10 +373,55 @@ pub const RECLAIM_CKPT_DELAY: u64 = 2;
 /// workload are idle.
 ///
 /// **So the threshold is not what excludes candidates; the trigger's placement
-/// is.** This constant is **unreachable, not miscalibrated**. Do not change it:
-/// its value is arbitrary within the flat part of its own curve until something
-/// can reach it. See `evacuation-is-evaluated-only-where-sparsity-cannot-appear`
-/// in `TODO.md`.
+/// is.** This constant was **unreachable, not miscalibrated**.
+///
+/// # Reachable since 2026-09-28, and it pays where it can now be reached
+///
+/// The placement was fixed the same day: `Db::checkpoint` computes the candidate
+/// set *above* its idle branch and treats a non-empty one as work, so a shard
+/// that goes sparse while idle rebuilds and evacuates instead of `continue`ing.
+/// With `EVACUATE_PER_CHECKPOINT` at its default of zero the set is always empty
+/// and nothing changes; the fix makes the knob able to work, it does not turn it
+/// on.
+///
+/// Measured in the delete-then-quiesce shape this constant exists for -- 220 keys
+/// x 10 chunks x 540 values, so one slab of a class fills and a second opens,
+/// then three keys in four deleted and eight idle checkpoints. Paired, arms
+/// alternating in one process, medians of five reps:
+///
+/// ```text
+///  evac    fs blocks     allocated   extents   evacuated
+///     0      3 121 152     8 388 608       256           0
+///     2      1 032 192     8 388 608       230         390
+///     8      1 032 192     8 388 608       230         390
+/// ```
+///
+/// **A 67% drop in blocks the filesystem has actually allocated, for 390 chunks
+/// rewritten.** `allocated_bytes` is identical across arms, which is the point:
+/// the slab *count* does not move, so any measurement reading slabs or file
+/// length sees nothing. Evacuation empties a slab and `reclaim_deferred` punches
+/// it, and only `st_blocks` can see that.
+///
+/// **This is why the older verdict has to be read with its date.** Evacuation was
+/// measured harmful, and that measurement was taken before hole punching existed:
+/// emptying a slab returned nothing to the filesystem then, so the copying was
+/// pure cost. Punching is what turned the copy into a saving, and the two arms of
+/// the trade were never both present until now. Do not resurrect the old
+/// conclusion without checking which of the two it was measured against.
+///
+/// The budget still bounds it: 2 and 8 are identical here because the candidates
+/// run out, not because the budget did.
+///
+/// **And the continuous-churn shape is unaffected, which is the regression check
+/// for making an idle database able to do work.** `aged_state.py` at 1 500 keys
+/// x 2 000 ordinals over 40 rounds is byte-for-byte identical across budgets of
+/// 0, 2 and 8 -- amp 1.12x and 6.29 B/ordinal at 1% churn, 1.25x and 6.99 at 5%.
+/// Its slabs are why, and they are also the best argument for leaving *this*
+/// number alone: at 5% churn the partly-live slabs read 256/502 and 307/502, or
+/// 0.51 and 0.61 live, sitting just **above** 0.40. So the threshold is doing
+/// exactly its job there -- declining to relocate chunks in the one shape where
+/// relocating them was measured to buy nothing. Raising it to 0.70 would admit
+/// precisely those slabs.
 pub const COMPACT_LIVE_FRACTION: f64 = 0.40;
 
 /// Slab and extent allocator.

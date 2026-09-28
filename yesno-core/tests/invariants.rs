@@ -777,3 +777,88 @@ fn i6_punching_returns_allocated_blocks_to_the_filesystem() {
         assert_eq!(snap.load(1234).unwrap().len(), added, "and the late write");
     }
 }
+
+/// Sparsity must be actionable on the checkpoint that creates it.
+///
+/// # Why this needs a delete-then-quiesce shape
+///
+/// A chunk is immutable, so rewriting one frees its whole extent and a slab's
+/// slots are released wholesale: slabs go full to empty, which needs no
+/// evacuation at all. A slab only becomes *partly* live when some of the keys
+/// sharing it are deleted and the rest stay. That is the only shape in which
+/// `COMPACT_LIVE_FRACTION` has anything to say.
+///
+/// And it is exactly the shape in which the trigger used to be unreachable.
+/// `RECLAIM_CKPT_DELAY` holds a delete's slots for two more checkpoints, which
+/// here are **idle** ones, and the idle branch of `Db::checkpoint` called
+/// `reclaim_deferred` -- creating the sparsity -- and then `continue`d before
+/// evacuation was consulted. The dirty path that could act on it only ran while
+/// new writes arrived, and found every slab at `live_fraction` 1.00.
+///
+/// So this asserts reachability, not policy: with a budget set, a shard that goes
+/// sparse while idle must still evacuate. It fails on the pre-2026-09-28
+/// ordering with `evacuated_chunks` stuck at 0 however many checkpoints run.
+#[test]
+fn evacuation_is_reached_when_sparsity_appears_on_an_idle_shard() {
+    let dir = tmpdir("evac-idle");
+    let _c = CleanDir(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            // Off by default, so the fixture has to ask for it. This is a test
+            // that the knob can work at all, not that it is on.
+            evacuate_per_checkpoint: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // **One slab of a class has to fill before any of it can be a candidate**:
+    // `evacuation_candidates` skips the active bump slab, so a fixture with a
+    // single slab per class offers nothing however sparse that slab becomes.
+    // These are arrays of 540 values, sized to land several thousand extents in
+    // one class and so fill a slab and open a second.
+    const KEYS: u64 = 220;
+    const CHUNKS: u64 = 10;
+    const PER_CHUNK: u64 = 540;
+    for group in 0..11u64 {
+        let mut b = db.batch();
+        for key in (group * KEYS / 11)..((group + 1) * KEYS / 11) {
+            for c in 0..CHUNKS {
+                let base = c * 65536;
+                for i in 0..PER_CHUNK {
+                    b.insert(key, base + i * 100);
+                }
+            }
+        }
+        b.commit().unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    // Three keys in four, so survivors spread thinly over every slab rather than
+    // emptying one outright.
+    let mut b = db.batch();
+    for key in (0..KEYS).filter(|k| k % 4 != 0) {
+        b.delete_key(key);
+    }
+    b.commit().unwrap();
+
+    // The delete's own checkpoint is dirty. Everything after it is idle, and the
+    // slots come free in there.
+    db.checkpoint().unwrap();
+    for _ in 0..6 {
+        db.checkpoint().unwrap();
+    }
+
+    assert!(
+        db.evacuated_chunks() > 0,
+        "a shard that went sparse while idle evacuated nothing: \
+         evacuated_chunks = {}, live fractions by class = {:?}",
+        db.evacuated_chunks(),
+        (0..11u8)
+            .map(|c| (c, db.live_fractions(c)))
+            .filter(|(_, v)| !v.is_empty())
+            .collect::<Vec<_>>(),
+    );
+}

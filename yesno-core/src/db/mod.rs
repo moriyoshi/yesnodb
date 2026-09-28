@@ -100,6 +100,29 @@ pub const VSHARDS: u32 = 256;
 /// uses uniform key sizes and round-robin churn; a skewed corpus may yet show a
 /// case for it. Do not raise this default without a measurement that shows a
 /// benefit — the sweep above is what a *non*-benefit looks like.
+///
+/// # A benefit was measured on 2026-09-28, and this default is still zero
+///
+/// Two things were wrong with the sweep above, and neither is its arithmetic.
+///
+/// First, **it cannot reach the case the policy is for.** A chunk is immutable,
+/// so slabs go full to empty under rewrite-churn and evacuation has nothing to
+/// relocate; a slab only goes *partly* live when some of the keys sharing it are
+/// deleted and the rest stay. Until 2026-09-28 that shape could not trigger
+/// evacuation at all, because the sparsity appeared on idle checkpoints and the
+/// trigger was evaluated only on dirty ones. See [`COMPACT_LIVE_FRACTION`] for
+/// the fix and the numbers.
+///
+/// Second, **it predates hole punching.** Emptying a slab used to return nothing
+/// to the filesystem, so relocation was cost without saving. In the shape the
+/// policy is for, it is now a **67% reduction in allocated blocks** for 390
+/// chunks rewritten — invisible to `allocated_bytes`, which does not move, and
+/// therefore invisible to this table, which counts slabs.
+///
+/// It is nonetheless still `0`, deliberately. The benefit is established for one
+/// shape; the cost in continuous-churn shapes is the sweep above, where the same
+/// relocations bought nothing. Raising the default is a policy choice across both
+/// and wants its own measurement, not an inference from the win in one.
 pub const EVACUATE_PER_CHECKPOINT: usize = 0;
 
 /// Which virtual shard a key belongs to.
@@ -2826,9 +2849,57 @@ impl Db {
             // this, a second checkpoint could interleave in that window.
             let _ckpt = shard.ckpt.lock().unwrap();
             let mut store = store_lock.lock().unwrap();
+
+            // Slabs sparse enough to be worth emptying. Capped per checkpoint:
+            // evacuation is extra write volume, and the whole point of the
+            // delta-sized checkpoint is not to reintroduce a whole-database
+            // rewrite under another name.
+            //
+            // **Computed above the idle branch, and that placement is the whole
+            // point.** It used to be computed below it, which made the threshold
+            // unreachable in exactly the workload that needs it: a chunk is
+            // immutable, so a slab only becomes *partly* live when some of the
+            // keys sharing it are deleted, and a delete's slots are not free
+            // until `RECLAIM_CKPT_DELAY` checkpoints later -- which in a
+            // delete-then-quiesce workload are idle ones. So `reclaim_deferred`
+            // created the sparsity on the branch below, which `continue`d before
+            // evacuation was ever consulted, while the dirty path that could act
+            // on it only ran when new writes arrived and found every slab at
+            // `live_fraction` 1.00. Instrumenting showed it consulted **twice**
+            // in a whole run. See `COMPACT_LIVE_FRACTION`.
+            let evacuating: std::collections::HashSet<u32> = store
+                .allocator()
+                .evacuation_candidates()
+                .into_iter()
+                .take(self.inner.evacuate_per_checkpoint)
+                .collect();
+
             // Deletions alone are still work: the tree must be rebuilt without
-            // them, even though they contribute nothing to write.
-            if dirty.is_empty() && deleted.is_empty() && store.superblock().checkpoint_cv >= w {
+            // them, even though they contribute nothing to write. So is sparsity:
+            // emptying a slab means rewriting the chunks still in it, and that is
+            // a tree rebuild whether or not anything else changed.
+            //
+            // `evacuating` is empty whenever the budget is zero, so with
+            // `EVACUATE_PER_CHECKPOINT` at its default this clause is never what
+            // keeps a shard off the idle branch and the behaviour here is
+            // unchanged.
+            //
+            // **It terminates, which is the thing to check before letting an
+            // idle database do work.** Evacuating a slab rewrites its chunks
+            // elsewhere and the slab's slots go to the deferred queue, so for
+            // `RECLAIM_CKPT_DELAY` checkpoints it still reads partly live and is
+            // still offered here, with nothing left to relocate -- a few extra
+            // tree rebuilds, bounded by that delay, after which the slab is
+            // `Free` and no longer a candidate. Candidates therefore strictly
+            // retire: the chunks land in a denser slab and nothing re-sparsifies
+            // them without new deletes. The measurement in
+            // `COMPACT_LIVE_FRACTION` converges at 390 relocations and stays
+            // there across budgets of 2 and 8.
+            if dirty.is_empty()
+                && deleted.is_empty()
+                && evacuating.is_empty()
+                && store.superblock().checkpoint_cv >= w
+            {
                 // **Nothing to write does not mean nothing to reclaim**, and
                 // returning here is what made the space-amplification bound
                 // lapse on an idle database: `enforce_space_amp` would evict the
@@ -2893,17 +2964,6 @@ impl Db {
             // The previous root, so unchanged leaves can be reused rather than
             // rewritten. `Tree` is two integers, so this is a copy.
             let prev_tree = store.tree();
-            // Slabs sparse enough to be worth emptying. Capped per checkpoint:
-            // evacuation is extra write volume, and the whole point of the
-            // delta-sized checkpoint is not to reintroduce a whole-database
-            // rewrite under another name.
-            let evacuating: std::collections::HashSet<u32> = store
-                .allocator()
-                .evacuation_candidates()
-                .into_iter()
-                .take(self.inner.evacuate_per_checkpoint)
-                .collect();
-
             let mut evacuated = 0u64;
             // Keys the new tree must not carry: rewritten ones ( which reappear
             // with new refs ) and deleted ones ( which do not ). Evacuated keys
