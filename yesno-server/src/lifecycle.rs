@@ -62,6 +62,12 @@ pub struct Running {
     /// place as the in-process drain and for the same reason -- except that here it
     /// needs no cooperation from anyone.
     channel: Option<Arc<crate::plugin::Channel>>,
+    /// The adopted metrics surface, when the caller bound the listener.
+    ///
+    /// Held so teardown can return it to `Starting`. A `Surface::Leader` holds an
+    /// `Arc<Db>` and the surface outlives the role, so without this the handle
+    /// outlives the database and every clean shutdown reports an unreleased lock.
+    metrics_surface: Option<crate::metrics::Shared>,
     /// The slot the Flight service reads through.
     ///
     /// Held so teardown can **empty** it. The slot owns an `Arc<Db>`, so a slot
@@ -317,9 +323,11 @@ pub async fn start_with_plugin(
     // than binding a second one. Binding here would mean the caller had to close
     // theirs first, and that gap is what the liveness probe kills the process
     // for. See `metrics::Surface`.
+    let mut metrics_surface = None;
     let (metrics, metrics_addr) = match adopted {
         Some(adopted) => {
             adopted.shared.set_leader(db.clone(), counters.clone());
+            metrics_surface = Some(adopted.shared.clone());
             (None, Some(adopted.addr))
         }
         None => match cfg.metrics_addr()? {
@@ -376,6 +384,7 @@ pub async fn start_with_plugin(
         facility,
         channel,
         slot,
+        metrics_surface,
     })
 }
 
@@ -413,6 +422,7 @@ impl Running {
             facility,
             channel,
             slot,
+            metrics_surface,
             ..
         } = self;
         drop(counters);
@@ -476,6 +486,15 @@ impl Running {
                 tracing::info!(peers, "closing plugin channel connections");
             }
             c.stop();
+        }
+
+        // 1b-ter. Return the adopted metrics surface to its roleless state.
+        //
+        // It outlives every role by design, so it must not outlive this one's
+        // database handle. Nothing else drops that clone, and leaving it alive is
+        // what made `Arc::into_inner` below answer `None` on every clean shutdown.
+        if let Some(surface) = metrics_surface {
+            surface.release();
         }
 
         // 1c. Empty the slot, which owns an `Arc<Db>`.

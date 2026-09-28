@@ -7521,3 +7521,53 @@ The follower also stops the channel at shutdown, before the node, because closin
 what releases peers' snapshots and those are registered readers -- a peer still
 attached would hold the database open past the point the process believed it had let
 go.
+
+## 2026-09-28 -- The first daemon smoke test, and the bug it found immediately
+
+`yesno-server/tests/daemon_smoke.rs` spawns the real `yesnod` with a config file.
+Until it existed **nothing in this repository executed either daemon binary** --
+`main.rs` is 742 lines, `bin/yesno.rs` is 2084, and every test assembled its own
+server from library calls, so the verification boundary sat exactly on the
+reachability boundary.
+
+**It failed on its first run, and the failure was a real pre-existing bug.** Every
+leader started by the binary exited **1** on a clean `SIGTERM`, logging "a task
+still holds a database handle at shutdown" and `lock_released=false`. The final
+checkpoint ran, so nothing was at risk -- but an init system reads a non-zero exit
+as a crash, and `Restart=on-failure` would have restarted a healthy shutdown.
+
+**Finding it took instrumentation rather than reading.** A refcount probe said
+`strong = 2` at `Arc::into_inner`, and probes at each teardown step showed one clone
+present from startup and released by nothing. Reproduction ruled out plugins, the
+control plane, the replication slot, metrics listeners and the maintenance ticker
+one at a time. The holder was `adopted.shared.set_leader( db.clone(), ... )`: the
+**adopted metrics surface**, which exists so a listener can survive a promotion
+without closing its port, and which therefore outlives every role -- and nothing
+returned it to `Surface::Starting`, so a leader's `Arc<Db>` outlived the leader.
+
+`Shared::release()` now does that, and `Running` holds the surface so teardown can.
+`Starting` was the right state rather than a new one: it already means "alive, no
+role" and `/healthz` already answers in it, which is exactly a process on its way
+out.
+
+**Why no existing test could see it.** `Adopted` is passed only by the binary;
+every test passes `None`, so every test took the branch that binds its own listener
+and drops it. The bug lived in the one branch tests never take, reachable only
+through the one file nothing ran. That is the same shape as the inline fallback
+earlier today -- a branch the test environment cannot enter -- and as the uncalled
+channel call site. **Three instances in one day of "the code is fine, the path to it
+is untested."**
+
+**Two smaller things the test forced, both improvements.** The daemon now logs
+`yesnod is ready` when it enters its supervision loop, distinct from `yesnod is
+serving` when the listeners bind: between those two it is reachable but has
+installed no signal handler, so a `SIGTERM` in that window **terminates** it rather
+than shutting it down, skipping the final checkpoint. My first test raced exactly
+that window and was killed by the signal it sent. An operator scripting a health
+check, or an init system with a readiness protocol, wants the later line.
+
+And the plugin socket is bound by `plugin::wire` **before** the database opens, so
+the socket exists while every request answers `UNAVAILABLE`. That is the documented
+unavailable state and a peer must handle it during a rebootstrap anyway, so it is
+left as is -- but **socket existence is not readiness**, and the test says so where
+someone would otherwise assume it.

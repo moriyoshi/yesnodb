@@ -361,6 +361,10 @@ async fn follow(
         "yesnod is following; send SIGUSR1 or use the control-plane endpoint to promote"
     );
 
+    // See the leader path: readiness is when signals are handled, not when listeners
+    // bind.
+    tracing::info!(role = "follower", "yesnod is ready");
+
     let outcome = tokio::select! {
         _ = yesno_server::lifecycle::terminated() => Outcome::Exit(std::process::ExitCode::SUCCESS),
         _ = promotion_requested() => {
@@ -557,6 +561,14 @@ async fn lead(
         true,
         "leader listeners running",
     );
+
+    // **Distinct from "yesnod is serving", which is logged when the listeners bind.**
+    // Between the two, the process is reachable but has installed no signal handler,
+    // so a `SIGTERM` in that window terminates it rather than shutting it down -- the
+    // final checkpoint and the lock release are skipped. An operator scripting a
+    // health check, or an init system with a readiness protocol, wants this line and
+    // not the earlier one.
+    tracing::info!(role = "leader", "yesnod is ready");
 
     let outcome = loop {
         tokio::select! {

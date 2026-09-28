@@ -209,6 +209,25 @@ impl Shared {
             role: "leader",
         });
     }
+
+    /// Return to the roleless `Surface::Starting`, releasing what the role held.
+    ///
+    /// # Why a shutting-down process must call this
+    ///
+    /// The surface **outlives every role** -- that is the whole point of adopting a
+    /// listener across a promotion -- so a role's handles must not outlive the role.
+    /// `Surface::Leader` holds an `Arc<Db>`, and nothing else drops it: a leader
+    /// that shut down without this left that clone alive for the life of the
+    /// process, so `Arc::into_inner` in `Running::shutdown` answered `None` and the
+    /// daemon reported "a task still holds a database handle" and exited non-zero on
+    /// **every clean shutdown**.
+    ///
+    /// That state is the right one rather than a new one: it already means "alive,
+    /// no role", `/healthz` already answers in it, and that is exactly a process on
+    /// its way out.
+    pub fn release(&self) {
+        *self.0.write().unwrap() = Surface::Starting;
+    }
 }
 
 /// A listener the caller already bound, handed to a role so it can take the
