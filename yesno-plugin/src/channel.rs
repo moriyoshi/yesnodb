@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use crate::ipc::{
     Block as WireBlock, Frame, Kind, Lane, LaneKind, Role as WireRole, LANE_BYTES, MAX_LANES,
+    MAX_PAGE,
 };
 use yesno_core::{Container, KeyLanes, Snapshot};
 
@@ -334,12 +335,79 @@ impl Session {
             Frame::BlockAdvanceMany { lanes, max_blocks } => {
                 self.block_advance_many(lanes, max_blocks)
             }
+            Frame::SnapshotCardinality { snapshot, key } => self.with_snapshot(snapshot, |s| {
+                s.cardinality(key).map(|value| Frame::Count { value })
+            }),
+            Frame::SnapshotContains {
+                snapshot,
+                key,
+                ordinal,
+            } => self.with_snapshot(snapshot, |s| {
+                s.contains(key, ordinal).map(|yes| Frame::Bool {
+                    value: u8::from(yes),
+                })
+            }),
+            Frame::SnapshotMax { snapshot, key } => self.with_snapshot(snapshot, |s| {
+                s.max(key).map(|m| Frame::Ordinal {
+                    present: u8::from(m.is_some()),
+                    value: m.unwrap_or(0),
+                })
+            }),
+            Frame::SnapshotLoad {
+                snapshot,
+                key,
+                after,
+                has_after,
+                limit,
+            } => {
+                let after = (has_after == 1).then_some(after);
+                let want = (limit as usize).clamp(1, MAX_PAGE);
+                self.with_snapshot(snapshot, |s| load_page(s, key, after, want))
+            }
+            Frame::SnapshotKeyRange {
+                snapshot,
+                lo,
+                hi,
+                limit,
+            } => {
+                let want = (limit as usize).clamp(1, MAX_PAGE);
+                self.with_snapshot(snapshot, |s| {
+                    // One extra, so "is there another page" is answered by what the
+                    // engine returned rather than by guessing from a full page.
+                    let mut keys = s.key_range(lo, hi)?;
+                    let more = keys.len() > want;
+                    keys.truncate(want);
+                    Ok(Frame::Keys {
+                        values: keys,
+                        more: u8::from(more),
+                    })
+                })
+            }
             // Every request kind is handled above; the range check made this
             // unreachable, and an unreachable arm is cheaper than a panic.
             other => Self::fault(
                 Status::Internal,
                 &format!("unhandled request kind {:?}", other.kind()),
             ),
+        }
+    }
+
+    /// Run `f` against a named snapshot, turning a core error into a fault.
+    ///
+    /// Shared by every read below so that "no such snapshot" and
+    /// `SNAPSHOT_TOO_OLD` are reported one way rather than five, and so adding a
+    /// sixth read cannot get the mapping wrong.
+    fn with_snapshot(
+        &self,
+        id: u64,
+        f: impl FnOnce(&Snapshot) -> yesno_core::Result<Frame>,
+    ) -> Frame {
+        let Some(snap) = self.snapshots.get(&id) else {
+            return Self::fault(Status::InvalidArgument, "no such snapshot");
+        };
+        match f(snap) {
+            Ok(frame) => frame,
+            Err(e) => Self::fault(Status::from_core(&e), "the read failed"),
         }
     }
 
@@ -857,4 +925,55 @@ where
         write_frame(&reply)?;
     }
     Ok(())
+}
+
+/// One page of a key's ordinals, resuming strictly above `after`.
+///
+/// # Why this walks chunks instead of calling `load`
+///
+/// `Snapshot::load` materializes the whole set, so paging with it would
+/// re-materialize the remainder for every page -- quadratic in the number of pages,
+/// which is the opposite of what paging is for. `key_stream` is lazy and can `seek`,
+/// so a page costs one seek plus the chunks it actually reads.
+///
+/// The `after` ordinal may sit in the middle of a chunk, so the chunk containing it
+/// is decoded and its ordinals at or below it are skipped. Only that first chunk
+/// pays that.
+fn load_page(
+    snap: &Snapshot,
+    key: u64,
+    after: Option<u64>,
+    want: usize,
+) -> yesno_core::Result<Frame> {
+    use yesno_core::ChunkStream;
+
+    let mut stream = snap.key_stream(key)?;
+    if let Some(a) = after {
+        let (prefix, _) = yesno_core::split(a);
+        stream.seek(prefix)?;
+    }
+    // One more than asked, so `more` is answered by what was found rather than
+    // inferred from the page being full -- a full page is not evidence of another.
+    let mut out: Vec<u64> = Vec::with_capacity(want.min(1024) + 1);
+    'outer: while out.len() <= want {
+        let Some((prefix, container)) = stream.next_chunk()? else {
+            break;
+        };
+        for low in container.iter() {
+            let ordinal = yesno_core::join(prefix, low);
+            if after.is_some_and(|a| ordinal <= a) {
+                continue;
+            }
+            out.push(ordinal);
+            if out.len() > want {
+                break 'outer;
+            }
+        }
+    }
+    let more = out.len() > want;
+    out.truncate(want);
+    Ok(Frame::Ordinals {
+        values: out,
+        more: u8::from(more),
+    })
 }

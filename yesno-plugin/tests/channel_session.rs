@@ -834,3 +834,224 @@ fn a_consumer_sized_lane_count_is_expressible() {
     let bytes = f.encode().expect("a real query must be encodable");
     assert_eq!(Frame::decode(&bytes).unwrap().0, f);
 }
+
+/// The five SetSnapshot reads, against `yesno-core` itself as the oracle.
+///
+/// Each answer is compared with what the same snapshot returns directly, so the
+/// channel cannot be self-consistently wrong.
+#[test]
+fn the_snapshot_reads_agree_with_the_engine() {
+    let (_c, host, mut s) = setup("reads");
+    greet(&mut s);
+    let db = host.db().unwrap();
+    let oracle = db.snapshot().unwrap();
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+
+    // cardinality
+    for key in [10u64, 20, 30, 999] {
+        let want = oracle.cardinality(key).unwrap();
+        assert_eq!(
+            s.handle(Frame::SnapshotCardinality { snapshot, key }),
+            Frame::Count { value: want },
+            "cardinality of {key}"
+        );
+    }
+
+    // contains, both answers and a key that holds nothing
+    for (key, ordinal) in [(10u64, 7u64), (10, 8), (10, 6), (999, 0)] {
+        let want = oracle.contains(key, ordinal).unwrap();
+        assert_eq!(
+            s.handle(Frame::SnapshotContains {
+                snapshot,
+                key,
+                ordinal
+            }),
+            Frame::Bool {
+                value: u8::from(want)
+            },
+            "contains({key}, {ordinal})"
+        );
+    }
+
+    // max, including the absent case
+    for key in [10u64, 20, 30, 999] {
+        let want = oracle.max(key).unwrap();
+        assert_eq!(
+            s.handle(Frame::SnapshotMax { snapshot, key }),
+            Frame::Ordinal {
+                present: u8::from(want.is_some()),
+                value: want.unwrap_or(0)
+            },
+            "max of {key}"
+        );
+    }
+
+    // key_range over the whole space
+    let want = oracle.key_range(0, u64::MAX).unwrap();
+    assert_eq!(
+        s.handle(Frame::SnapshotKeyRange {
+            snapshot,
+            lo: 0,
+            hi: u64::MAX,
+            limit: 1000
+        }),
+        Frame::Keys {
+            values: want.clone(),
+            more: 0
+        }
+    );
+    assert_eq!(want, vec![10, 20, 30], "the fixture's three keys");
+
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// Paging `load` reassembles exactly the set, at every page size.
+///
+/// Continuation is by value rather than by cursor, so the property to pin is that
+/// stitching pages together equals one materialized read -- no gaps at a chunk
+/// boundary, no duplicate at a resume point, and `more` telling the truth.
+#[test]
+fn paging_a_load_reassembles_the_whole_set() {
+    let (_c, host, mut s) = setup("load-page");
+    greet(&mut s);
+    let db = host.db().unwrap();
+    // key 20 spans one chunk with 5000 scattered ordinals; key 10 spans three
+    // chunks with three each. Both boundaries matter: within a chunk and across.
+    let oracle: Vec<u64> = db.snapshot().unwrap().load(20).unwrap().iter().collect();
+    let across: Vec<u64> = db.snapshot().unwrap().load(10).unwrap().iter().collect();
+    assert_eq!(oracle.len(), 5000);
+    assert_eq!(across.len(), 9, "three chunks of three");
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+
+    for (key, want) in [(20u64, &oracle), (10, &across)] {
+        for page in [1usize, 2, 7, 100, 4096] {
+            let mut got: Vec<u64> = Vec::new();
+            let mut after: Option<u64> = None;
+            let mut rounds = 0;
+            loop {
+                rounds += 1;
+                assert!(rounds < 20_000, "paging did not terminate");
+                let f = s.handle(Frame::SnapshotLoad {
+                    snapshot,
+                    key,
+                    after: after.unwrap_or(0),
+                    has_after: u8::from(after.is_some()),
+                    limit: page as u32,
+                });
+                match f {
+                    Frame::Ordinals { values, more } => {
+                        assert!(values.len() <= page, "a page must not exceed its limit");
+                        if let Some(&last) = values.last() {
+                            after = Some(last);
+                        }
+                        let empty = values.is_empty();
+                        got.extend(values);
+                        if more == 0 {
+                            assert!(!empty || got.is_empty(), "more=0 ends the walk");
+                            break;
+                        }
+                        assert!(!empty, "more=1 with an empty page would never terminate");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(
+                &got, want,
+                "key {key} paged at {page} must reassemble to the whole set"
+            );
+        }
+    }
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// A page is capped by the server, and `more` reports honestly at the boundary.
+#[test]
+fn a_page_is_capped_and_more_is_honest() {
+    let (_c, _h, mut s) = setup("page-cap");
+    greet(&mut s);
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    // Asking for more than MAX_PAGE gets MAX_PAGE, not a fault: the cap is the
+    // server's and a peer should not have to know it to make progress.
+    match s.handle(Frame::SnapshotLoad {
+        snapshot,
+        key: 20,
+        after: 0,
+        has_after: 0,
+        limit: u32::MAX,
+    }) {
+        Frame::Ordinals { values, more } => {
+            assert_eq!(values.len(), 4096, "clamped to MAX_PAGE");
+            assert_eq!(more, 1, "5000 ordinals do not fit one page");
+        }
+        other => panic!("{other:?}"),
+    }
+    // And a key that holds nothing is an empty page with more = 0, not a fault.
+    assert_eq!(
+        s.handle(Frame::SnapshotLoad {
+            snapshot,
+            key: 999,
+            after: 0,
+            has_after: 0,
+            limit: 10
+        }),
+        Frame::Ordinals {
+            values: vec![],
+            more: 0
+        }
+    );
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// A read against an unknown snapshot is refused, for every one of the five.
+#[test]
+fn every_read_refuses_an_unknown_snapshot() {
+    let (_c, _h, mut s) = setup("reads-unknown");
+    greet(&mut s);
+    for f in [
+        Frame::SnapshotCardinality {
+            snapshot: 99,
+            key: 1,
+        },
+        Frame::SnapshotContains {
+            snapshot: 99,
+            key: 1,
+            ordinal: 1,
+        },
+        Frame::SnapshotMax {
+            snapshot: 99,
+            key: 1,
+        },
+        Frame::SnapshotLoad {
+            snapshot: 99,
+            key: 1,
+            after: 0,
+            has_after: 0,
+            limit: 10,
+        },
+        Frame::SnapshotKeyRange {
+            snapshot: 99,
+            lo: 0,
+            hi: 10,
+            limit: 10,
+        },
+    ] {
+        let kind = f.kind();
+        let r = s.handle(f);
+        assert_eq!(
+            fault_status(&r),
+            Status::InvalidArgument as u32,
+            "{kind:?} must refuse an unknown snapshot"
+        );
+    }
+}

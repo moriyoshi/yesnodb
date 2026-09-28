@@ -7356,3 +7356,52 @@ That is correct -- I built the hot path. The reads are mechanical, since `Snapsh
 already exposes every one of them, and writes are a genuine design question that
 the in-process ABI also declined. They said explicitly that this was contract
 feedback and not a request, so it is recorded rather than built.
+
+## 2026-09-28 -- The five SetSnapshot reads, and where paging is honest versus quadratic
+
+The consumer chose the read-only shape -- yesnod as sole writer, ingest through the
+existing Flight `PUT_APPLY` plus control `Checkpoint` -- and asked for the five
+`SetSnapshot` reads on the existing channel snapshot handle. Landed:
+`SnapshotCardinality`, `SnapshotContains`, `SnapshotMax`, `SnapshotLoad`,
+`SnapshotKeyRange`, with `Count`, `Bool`, `Ordinal`, `Ordinals` and `Keys` answering.
+
+**Their wire objection was the whole design problem**: `load` and `key_range` are
+unbounded and a frame is 64 KiB. Both page, and **continuation is by value rather
+than by cursor** -- `after` for ordinals, a raised `lo` for keys. That is sound only
+because the snapshot pins the version: resuming from a value gives a consistent
+sequence with no server state to hold, leak, expire or invalidate. A cursor handle
+would have needed all four.
+
+**The two page implementations are not equally good, and saying so is the point.**
+`SnapshotLoad` walks `key_stream`, which is lazy and can `seek`, so a page costs one
+seek plus the chunks it reads; only the first chunk pays for skipping ordinals at or
+below `after`. `SnapshotKeyRange` cannot do that: `Snapshot::key_range` goes through
+`collect_keys`, which walks every shard into one `Vec` and sorts, so paging by
+narrowing `lo` re-walks the remaining range and is **quadratic in page count**. I
+had reached for `load` first and would have shipped the same shape for keys without
+noticing, because both look like "call the method and truncate".
+
+That is documented on the frame -- ask for a large limit once rather than many small
+pages -- and filed as `key-enumeration-materializes-so-paging-it-is-quadratic`. The
+fix is a lazy key iterator over the index, which `Tree::range` could support and
+nothing exposes; that is core work and should wait for a consumer that pages enough
+to feel it. **A documented bound is honest; an undocumented one is a trap**, and the
+difference cost one paragraph.
+
+`more` is answered by fetching one item beyond the limit rather than by inferring
+from a full page, because a full page is not evidence that another exists. The test
+stitches pages back together at limits of 1, 2, 7, 100 and 4096 for two keys -- one
+spanning a single chunk with 5000 scattered ordinals, one spanning three chunks with
+three each -- and compares against `Snapshot::load` directly. Both boundaries matter:
+resuming inside a chunk and resuming across one. Every read is also compared against
+the engine for cardinality, contains and max, including the absent cases, so the
+channel cannot be self-consistently wrong.
+
+**Writes stay out**, which is what they asked for and the cheaper shape. Worth
+recording why the in-process ABI declined them too: an atomic write plus flush across
+a process boundary needs transaction identity, a commit point the peer can be told
+about, and an answer for a peer that vanishes mid-transaction -- the one case
+connection-close reclamation does **not** solve, because a half-applied batch is not
+released by dropping a snapshot. They have said an ambiguous post-commit disconnect
+must surface as indeterminate rather than be replayed, which is the right
+requirement and is exactly what makes this a design pass rather than more frames.

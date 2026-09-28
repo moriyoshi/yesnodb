@@ -302,6 +302,12 @@ pub const MAX_INLINE_PAYLOAD: usize = 1024 * 1024;
 /// relationship between two constants rather than a property of any run.
 const _: () = assert!(MAX_INLINE_PAYLOAD > MAX_PAYLOAD);
 
+/// Most `u64` values one page of [`Frame::Ordinals`] or [`Frame::Keys`] may carry.
+///
+/// `4096 * 8` is 32 KiB, half of [`MAX_PAYLOAD`], so a page leaves room for the
+/// frame around it and for the cap to rise without the two colliding.
+pub const MAX_PAGE: usize = 4096;
+
 /// Most blocks one [`Frame::Blocks`] may carry.
 ///
 /// Bounds the arena a batched handle reserves -- `max_blocks * max_lanes *
@@ -346,6 +352,11 @@ pub enum Kind {
     BlockAdvance = 6,
     BlockRelease = 7,
     BlockAdvanceMany = 8,
+    SnapshotCardinality = 9,
+    SnapshotContains = 10,
+    SnapshotMax = 11,
+    SnapshotLoad = 12,
+    SnapshotKeyRange = 13,
     // responses, 64..127
     ServerHello = 64,
     SnapshotOpened = 65,
@@ -356,6 +367,11 @@ pub enum Kind {
     Fault = 70,
     Blocks = 71,
     BlocksInline = 72,
+    Count = 73,
+    Bool = 74,
+    Ordinal = 75,
+    Ordinals = 76,
+    Keys = 77,
     // notifications, 128..191
     Unavailable = 128,
     Available = 129,
@@ -374,6 +390,11 @@ impl Kind {
             6 => Kind::BlockAdvance,
             7 => Kind::BlockRelease,
             8 => Kind::BlockAdvanceMany,
+            9 => Kind::SnapshotCardinality,
+            10 => Kind::SnapshotContains,
+            11 => Kind::SnapshotMax,
+            12 => Kind::SnapshotLoad,
+            13 => Kind::SnapshotKeyRange,
             64 => Kind::ServerHello,
             65 => Kind::SnapshotOpened,
             66 => Kind::LanesAcquired,
@@ -383,6 +404,11 @@ impl Kind {
             70 => Kind::Fault,
             71 => Kind::Blocks,
             72 => Kind::BlocksInline,
+            73 => Kind::Count,
+            74 => Kind::Bool,
+            75 => Kind::Ordinal,
+            76 => Kind::Ordinals,
+            77 => Kind::Keys,
             128 => Kind::Unavailable,
             129 => Kind::Available,
             130 => Kind::GenerationChanged,
@@ -443,6 +469,57 @@ pub enum Frame {
     /// The arena slice for this handle may be overwritten. Flow control, not hygiene.
     BlockRelease {
         lanes: u64,
+    },
+    /// How many ordinals a key holds.
+    SnapshotCardinality {
+        snapshot: u64,
+        key: u64,
+    },
+    /// Whether a key holds an ordinal.
+    SnapshotContains {
+        snapshot: u64,
+        key: u64,
+        ordinal: u64,
+    },
+    /// The largest ordinal a key holds, if any.
+    SnapshotMax {
+        snapshot: u64,
+        key: u64,
+    },
+    /// One page of a key's ordinals, ascending.
+    ///
+    /// # Continuation is by value, not by cursor
+    ///
+    /// `after` resumes strictly above an ordinal the caller already has, so there is
+    /// no server-side cursor to leak, to expire, or to invalidate. That is sound
+    /// **because the snapshot pins the version**: resuming from a value gives a
+    /// consistent sequence with no state between calls, which a cursor handle would
+    /// have to hold and account for.
+    ///
+    /// A set is unbounded and a frame is not, which is why this pages at all. It is
+    /// not the hot path -- lanes are -- so the page travels in the frame rather than
+    /// the arena.
+    SnapshotLoad {
+        snapshot: u64,
+        key: u64,
+        /// Resume strictly above this ordinal when `has_after` is 1.
+        after: u64,
+        has_after: u8,
+        /// Capped at [`MAX_PAGE`] by the server whatever is asked.
+        limit: u32,
+    },
+    /// One page of the keys present in `[lo, hi)`, ascending.
+    ///
+    /// Continue by setting `lo` above the last key returned, for the same reason as
+    /// [`Frame::SnapshotLoad`]. **Each page costs a scan of the remaining range**,
+    /// because the engine's key enumeration materializes rather than streaming, so a
+    /// caller wanting many keys should ask for a large `limit` once rather than many
+    /// small pages.
+    SnapshotKeyRange {
+        snapshot: u64,
+        lo: u64,
+        hi: u64,
+        limit: u32,
     },
     /// Advance up to `max_blocks` at once, releasing the previous batch implicitly.
     ///
@@ -528,6 +605,29 @@ pub enum Frame {
         blocks: Vec<Block>,
         payload: Vec<u8>,
     },
+    /// A count.
+    Count {
+        value: u64,
+    },
+    /// A yes or no.
+    Bool {
+        value: u8,
+    },
+    /// An ordinal that may be absent, which is what `max` of an empty key is.
+    Ordinal {
+        present: u8,
+        value: u64,
+    },
+    /// One page of ordinals, ascending. `more` is 1 when another page follows.
+    Ordinals {
+        values: Vec<u64>,
+        more: u8,
+    },
+    /// One page of keys, ascending. `more` is 1 when another page follows.
+    Keys {
+        values: Vec<u64>,
+        more: u8,
+    },
     /// A request failed. `status` matches the in-process ABI's codes.
     Fault {
         status: u32,
@@ -564,6 +664,11 @@ impl Frame {
             Frame::BlockAdvance { .. } => Kind::BlockAdvance,
             Frame::BlockRelease { .. } => Kind::BlockRelease,
             Frame::BlockAdvanceMany { .. } => Kind::BlockAdvanceMany,
+            Frame::SnapshotCardinality { .. } => Kind::SnapshotCardinality,
+            Frame::SnapshotContains { .. } => Kind::SnapshotContains,
+            Frame::SnapshotMax { .. } => Kind::SnapshotMax,
+            Frame::SnapshotLoad { .. } => Kind::SnapshotLoad,
+            Frame::SnapshotKeyRange { .. } => Kind::SnapshotKeyRange,
             Frame::ServerHello { .. } => Kind::ServerHello,
             Frame::SnapshotOpened { .. } => Kind::SnapshotOpened,
             Frame::LanesAcquired { .. } => Kind::LanesAcquired,
@@ -573,6 +678,11 @@ impl Frame {
             Frame::Fault { .. } => Kind::Fault,
             Frame::Blocks { .. } => Kind::Blocks,
             Frame::BlocksInline { .. } => Kind::BlocksInline,
+            Frame::Count { .. } => Kind::Count,
+            Frame::Bool { .. } => Kind::Bool,
+            Frame::Ordinal { .. } => Kind::Ordinal,
+            Frame::Ordinals { .. } => Kind::Ordinals,
+            Frame::Keys { .. } => Kind::Keys,
             Frame::Unavailable => Kind::Unavailable,
             Frame::Available { .. } => Kind::Available,
             Frame::GenerationChanged { .. } => Kind::GenerationChanged,
@@ -692,6 +802,59 @@ impl Frame {
                 }
                 p.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 p.extend_from_slice(payload);
+            }
+            Frame::SnapshotCardinality { snapshot, key } | Frame::SnapshotMax { snapshot, key } => {
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&key.to_le_bytes());
+            }
+            Frame::SnapshotContains {
+                snapshot,
+                key,
+                ordinal,
+            } => {
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&key.to_le_bytes());
+                p.extend_from_slice(&ordinal.to_le_bytes());
+            }
+            Frame::SnapshotLoad {
+                snapshot,
+                key,
+                after,
+                has_after,
+                limit,
+            } => {
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&key.to_le_bytes());
+                p.extend_from_slice(&after.to_le_bytes());
+                p.push(*has_after);
+                p.extend_from_slice(&limit.to_le_bytes());
+            }
+            Frame::SnapshotKeyRange {
+                snapshot,
+                lo,
+                hi,
+                limit,
+            } => {
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&lo.to_le_bytes());
+                p.extend_from_slice(&hi.to_le_bytes());
+                p.extend_from_slice(&limit.to_le_bytes());
+            }
+            Frame::Count { value } => p.extend_from_slice(&value.to_le_bytes()),
+            Frame::Bool { value } => p.push(*value),
+            Frame::Ordinal { present, value } => {
+                p.push(*present);
+                p.extend_from_slice(&value.to_le_bytes());
+            }
+            Frame::Ordinals { values, more } | Frame::Keys { values, more } => {
+                if values.len() > MAX_PAGE {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for v in values {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+                p.push(*more);
             }
             Frame::Fault { status, message } => {
                 p.extend_from_slice(&status.to_le_bytes());
@@ -905,6 +1068,54 @@ impl Frame {
                     payload: r.take(len)?.to_vec(),
                 }
             }
+            Kind::SnapshotCardinality => Frame::SnapshotCardinality {
+                snapshot: r.u64()?,
+                key: r.u64()?,
+            },
+            Kind::SnapshotMax => Frame::SnapshotMax {
+                snapshot: r.u64()?,
+                key: r.u64()?,
+            },
+            Kind::SnapshotContains => Frame::SnapshotContains {
+                snapshot: r.u64()?,
+                key: r.u64()?,
+                ordinal: r.u64()?,
+            },
+            Kind::SnapshotLoad => Frame::SnapshotLoad {
+                snapshot: r.u64()?,
+                key: r.u64()?,
+                after: r.u64()?,
+                has_after: r.u8()?,
+                limit: r.u32()?,
+            },
+            Kind::SnapshotKeyRange => Frame::SnapshotKeyRange {
+                snapshot: r.u64()?,
+                lo: r.u64()?,
+                hi: r.u64()?,
+                limit: r.u32()?,
+            },
+            Kind::Count => Frame::Count { value: r.u64()? },
+            Kind::Bool => Frame::Bool { value: r.u8()? },
+            Kind::Ordinal => Frame::Ordinal {
+                present: r.u8()?,
+                value: r.u64()?,
+            },
+            Kind::Ordinals | Kind::Keys => {
+                let n = r.u32()? as usize;
+                if n > MAX_PAGE {
+                    return Err(IpcError::TooLarge);
+                }
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    values.push(r.u64()?);
+                }
+                let more = r.u8()?;
+                if matches!(kind, Kind::Ordinals) {
+                    Frame::Ordinals { values, more }
+                } else {
+                    Frame::Keys { values, more }
+                }
+            }
             Kind::BlockDone => Frame::BlockDone,
             Kind::Done => Frame::Done,
             Kind::Fault => Frame::Fault {
@@ -1020,6 +1231,57 @@ mod tests {
             Frame::LanesRelease { lanes: 3 },
             Frame::BlockAdvance { lanes: 3 },
             Frame::BlockRelease { lanes: 3 },
+            Frame::SnapshotCardinality {
+                snapshot: 7,
+                key: 10,
+            },
+            Frame::SnapshotContains {
+                snapshot: 7,
+                key: 10,
+                ordinal: 99,
+            },
+            Frame::SnapshotMax {
+                snapshot: 7,
+                key: 10,
+            },
+            Frame::SnapshotLoad {
+                snapshot: 7,
+                key: 10,
+                after: 0,
+                has_after: 0,
+                limit: 100,
+            },
+            Frame::SnapshotLoad {
+                snapshot: 7,
+                key: 10,
+                after: 1234,
+                has_after: 1,
+                limit: MAX_PAGE as u32,
+            },
+            Frame::SnapshotKeyRange {
+                snapshot: 7,
+                lo: 0,
+                hi: u64::MAX,
+                limit: 64,
+            },
+            Frame::Count { value: 5000 },
+            Frame::Bool { value: 1 },
+            Frame::Ordinal {
+                present: 0,
+                value: 0,
+            },
+            Frame::Ordinals {
+                values: vec![],
+                more: 0,
+            },
+            Frame::Ordinals {
+                values: vec![1, 2, 3],
+                more: 1,
+            },
+            Frame::Keys {
+                values: vec![10, 20, 30],
+                more: 0,
+            },
             Frame::BlockAdvanceMany {
                 lanes: 3,
                 max_blocks: 16,
@@ -1185,7 +1447,12 @@ mod tests {
                 | Kind::LanesRelease
                 | Kind::BlockAdvance
                 | Kind::BlockRelease
-                | Kind::BlockAdvanceMany => Direction::Request,
+                | Kind::BlockAdvanceMany
+                | Kind::SnapshotCardinality
+                | Kind::SnapshotContains
+                | Kind::SnapshotMax
+                | Kind::SnapshotLoad
+                | Kind::SnapshotKeyRange => Direction::Request,
                 Kind::ServerHello
                 | Kind::SnapshotOpened
                 | Kind::LanesAcquired
@@ -1194,7 +1461,12 @@ mod tests {
                 | Kind::Done
                 | Kind::Fault
                 | Kind::Blocks
-                | Kind::BlocksInline => Direction::Response,
+                | Kind::BlocksInline
+                | Kind::Count
+                | Kind::Bool
+                | Kind::Ordinal
+                | Kind::Ordinals
+                | Kind::Keys => Direction::Response,
                 Kind::Unavailable
                 | Kind::Available
                 | Kind::GenerationChanged
@@ -1505,5 +1777,52 @@ mod inline_tests {
             descriptors < MAX_PAYLOAD,
             "a full batch of descriptors fits the control cap with room to spare"
         );
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    /// A page beyond the cap is refused where the value was supplied, and on decode.
+    #[test]
+    fn a_page_beyond_the_cap_is_refused_in_both_directions() {
+        let values: Vec<u64> = (0..MAX_PAGE as u64 + 1).collect();
+        for f in [
+            Frame::Ordinals {
+                values: values.clone(),
+                more: 0,
+            },
+            Frame::Keys { values, more: 0 },
+        ] {
+            let kind = f.kind();
+            assert_eq!(f.encode(), Err(IpcError::TooLarge), "{kind:?}");
+        }
+
+        let mut p = Vec::new();
+        p.extend_from_slice(&((MAX_PAGE + 1) as u32).to_le_bytes());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&[VERSION, 0, Kind::Ordinals as u8, 0]);
+        bytes.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&p);
+        assert_eq!(Frame::decode(&bytes), Err(IpcError::TooLarge));
+    }
+
+    /// A full page of `u64`s fits the control cap with room to spare, which is why
+    /// `MAX_PAGE` is half of it rather than as large as it could be.
+    #[test]
+    fn a_full_page_fits_the_control_cap() {
+        let fits = MAX_PAGE * 8 + 16;
+        assert!(
+            fits < MAX_PAYLOAD,
+            "a full page plus its frame must fit MAX_PAYLOAD"
+        );
+        let f = Frame::Ordinals {
+            values: (0..MAX_PAGE as u64).collect(),
+            more: 1,
+        };
+        let bytes = f.encode().expect("a full page must be encodable");
+        assert_eq!(Frame::decode(&bytes).unwrap().0, f);
     }
 }

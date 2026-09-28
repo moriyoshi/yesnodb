@@ -727,6 +727,13 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
 ### Testing
 
+- [ ] **key-enumeration-materializes-so-paging-it-is-quadratic** ( *2026-09-28, exposed by adding the channel's paged `key_range`; bounded today by a documented contract rather than fixed* ): `Snapshot::key_range` calls `collect_keys`, which walks **every shard**, appends to one `Vec`, then sorts and dedups. So there is no way to ask for "the next N keys after K" without re-walking the remaining range, and the channel's `SnapshotKeyRange` pages by narrowing `lo` -- which makes paging a wide range **quadratic in the number of pages**.
+
+  Not a correctness problem and not currently a performance one: the consumer's use is bounded, the frame documents the cost, and a caller wanting many keys is told to ask for a large `limit` once rather than many small pages. `SnapshotLoad` does **not** have this shape, because `key_stream` is lazy and can `seek`, so a page there costs one seek plus the chunks it actually reads.
+
+  The fix, if paging wide key ranges ever matters: a lazy key iterator over the index, which the tree can support -- `Tree::range` already walks leaves with a cursor -- but which nothing exposes. That is core work with its own tests, not a channel change, and it should wait for a consumer that pages enough to feel it.
+
+
 - [ ] **the-archive-sidecar-fails-with-enoent-under-load** ( *2026-09-28, seen once while two gates ran concurrently; not reproduced in isolation* ): `e2e/scenarios/pitr_retention.py` failed at `srv_archive_wait( archive, "base_generation", ... , 30000 )` with `No such file or directory ( os error 2 )`. **Not a timeout.** Reading the verb, that message comes from the `Ok( Err( error ) )` arm, which means the archive **sidecar task itself terminated with that error** and the verb reported it faithfully; a timeout would have said the sidecar stopped before the metric was reached.
 
   **Conditions.** `scripts/gate.sh` and `scripts/gate-pg.sh` were running at the same time, the latter building Arrow and PostgreSQL under Docker, so the machine was heavily loaded on CPU and disk. The scenario passes in isolation in 17.1 s against its own 30 s budget, and passed in every earlier gate run today.
