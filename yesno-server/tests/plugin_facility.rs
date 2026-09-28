@@ -293,3 +293,102 @@ fn a_plugin_that_does_not_drain_is_reported_with_its_count() {
     );
     probe.set_drain(true);
 }
+
+/// A leader hosting a plugin announces on start and drains on shutdown.
+///
+/// # Why the drain has to happen before the reader wait
+///
+/// `Running::stop` waits for `Db::live_readers()` to fall, and a plugin's lease
+/// **is** a registered reader slot. A plugin still holding one would have that
+/// loop spin for the whole grace period and then warn about "readers" -- true,
+/// and useless, because the count cannot say whose they are. Draining first is
+/// what turns that into a message naming the library, and leaves the reader wait
+/// measuring what it was written to measure. This test pins the ordering by
+/// making the fixture hold a lease and asserting the shutdown still completes
+/// promptly rather than burning the grace period.
+///
+/// # Why the `std` guard is held across awaits here
+///
+/// `clippy::await_holding_lock` is correct in general: a task holding a
+/// non-async mutex across an await can deadlock another task that wants it. It
+/// cannot here, and the guard has to span the whole test. The fixture's
+/// observations live in process-global statics, so this case must exclude the
+/// synchronous ones for its entire duration -- and the only other holders are
+/// those synchronous tests, on separate libtest threads, which *block* rather
+/// than deadlock. No task on this runtime ever takes the lock, so there is no
+/// waiter to deadlock against. An async mutex would make the synchronous cases
+/// need a runtime they do not otherwise want.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leader_announces_on_start_and_drains_at_shutdown() {
+    let _serial = serial();
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-facility-leader-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _clean = Clean(dir.clone());
+
+    let mut cfg = Config::default();
+    cfg.server.data_dir = Some(dir.clone());
+    cfg.server.flight.listen = "127.0.0.1:0".into();
+    cfg.server.metrics.listen = "127.0.0.1:0".into();
+    cfg.server.shutdown_grace_secs = 5;
+    cfg.db.shards = 1;
+    cfg.plugin.library = fixture_path();
+    cfg.plugin.listen = "127.0.0.1:0".into();
+
+    let probe = Probe::open();
+    probe.set_drain(true);
+
+    // One slot, shared: the facility is built against it and the server fills it.
+    // Handing the server a facility without its slot is the failure this ordering
+    // exists to prevent -- everything starts, the plugin is announced, and every
+    // call answers UNAVAILABLE for ever.
+    let slot: Arc<RwLock<Option<Arc<Db>>>> = Arc::new(RwLock::new(None));
+    // SAFETY: the fixture is built from this workspace's own sources.
+    let facility = unsafe { Facility::load(&cfg, slot.clone(), Role::Leader) }
+        .unwrap()
+        .map(Arc::new);
+    assert!(facility.is_some());
+
+    let running =
+        yesno_server::lifecycle::start_with_plugin(&cfg, None, None, Some(slot), facility.clone())
+            .await
+            .expect("a leader with a plugin must start");
+
+    assert_eq!(
+        probe.get0::<i32>(b"yesno_test_serving\0"),
+        1,
+        "the plugin is asked to serve once the host's listener is up"
+    );
+    let f = facility.as_ref().unwrap();
+    assert_eq!(f.generation(), 1);
+
+    // Make the fixture hold a lease across shutdown, and check it is drained
+    // rather than waited out.
+    assert_eq!(probe.hold_lease(), Status::Ok);
+    assert_eq!(f.leases(), 1);
+
+    let began = std::time::Instant::now();
+    let teardown = running.shutdown().await;
+    let took = began.elapsed();
+
+    assert_eq!(
+        probe.get0::<i32>(b"yesno_test_serving\0"),
+        0,
+        "shutdown stops the plugin's listener"
+    );
+    assert_eq!(
+        f.leases(),
+        0,
+        "the drain released the lease the fixture was holding"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(4),
+        "shutdown must not burn the grace period waiting on a lease the drain could \
+         have released: took {took:?}"
+    );
+    assert!(
+        teardown.sole_owner,
+        "and the database lock must be released, which a retained lease would prevent"
+    );
+}

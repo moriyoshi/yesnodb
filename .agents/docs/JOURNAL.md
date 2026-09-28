@@ -6908,3 +6908,47 @@ Still absent: the leader path's slot is still built inline in `lifecycle.rs`, so
 leader cannot host a plugin yet; only the follower path is wired. And `gate-pg.sh`
 remains owed on `f1ffea1` and now on this, with `libloading` added to the
 resolution `crate_universe` reads.
+
+## 2026-09-28 -- Wiring the leader, and two bugs a weaker test would have shipped
+
+`lifecycle.rs` now has `start_with_plugin`, so a leader can host a plugin and not
+only a follower. The drain runs at step 1b of teardown, before the reader wait, and
+that ordering is the interesting part: **a plugin's lease *is* a registered reader
+slot**, so a plugin still holding one would have step 2 spin for the whole grace
+period and then warn about "readers" -- true, and useless, because
+`live_readers()` cannot say whose they are. Draining first turns that into a
+message naming the library, and leaves step 2 measuring what it was written to
+measure.
+
+**The test caught two real bugs, and it caught them only because it asserted access
+rather than announcement.**
+
+First, the facility was built against one slot and `start_with_plugin` created
+another internally, so the facility held a permanently empty slot. Everything
+*appeared* to work: the server started, `after_open` was announced, the plugin's
+callbacks arrived -- and every read would have answered `UNAVAILABLE` for ever. A
+test that checked "starts and announces" passes on this. What failed was
+`hold_lease`, which asked whether the plugin could actually reach a database. The
+fix makes the slot a parameter, and its doc now says plainly that passing only the
+facility fails in a way that looks like success.
+
+Second, with the slot shared, `Arc::into_inner( db )` at step 4 answered `None`,
+so the file lock was never released. The slot owns an `Arc<Db>`; dropping the
+Flight service used to be enough because the slot was built inline and nothing
+else held it. Now `Running` holds the slot and teardown empties it at step 1c.
+The failure mode this avoids is the existing "a task still holds a database handle
+at shutdown" error, with no way to tell that the task was the function reporting
+it.
+
+Both are the same shape and worth stating once: **a lifecycle that announces is
+not a lifecycle that works.** Every assertion about a plugin being wired has to go
+through data, because every callback fires identically against a slot with nothing
+in it.
+
+One deliberate lint suppression, with its reasoning in the test:
+`clippy::await_holding_lock` on the leader case. The guard must span the test,
+since the fixture's statics are process-global; the only other holders are the
+synchronous cases on separate libtest threads, which block rather than deadlock;
+and no task on that runtime takes the lock, so there is no waiter to deadlock
+against. An async mutex would force a runtime on the synchronous cases that do not
+want one.

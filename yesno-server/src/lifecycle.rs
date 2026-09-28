@@ -54,6 +54,15 @@ pub struct Running {
     counters: Arc<crate::maintenance::Counters>,
     db: Arc<Db>,
     grace: Duration,
+    /// The loaded plugin, drained before the readers are waited on.
+    facility: crate::plugin::SharedFacility,
+    /// The slot the Flight service reads through.
+    ///
+    /// Held so teardown can **empty** it. The slot owns an `Arc<Db>`, so a slot
+    /// still full at step 4 makes `Arc::into_inner` answer `None` and the lock is
+    /// never released -- and when the slot is shared with a caller or a plugin
+    /// facility, dropping the service is no longer enough to empty it.
+    slot: crate::guard::DbSlot,
 }
 
 /// What teardown observed, so a caller can assert on it rather than trust it.
@@ -197,6 +206,31 @@ pub async fn start_with_events(
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
     adopted: Option<crate::metrics::Adopted>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
+    start_with_plugin(cfg, event_sink, adopted, None, None).await
+}
+
+/// As [`start_with_events`], with a loaded plugin to notify.
+///
+/// The facility is passed in rather than loaded here for the same reason as on the
+/// follower: loading runs arbitrary code from the operator's configuration, so the
+/// `unsafe` belongs at the point that reads that configuration.
+///
+/// # `slot` is not optional decoration
+///
+/// A `Facility` reads the database through a slot, and it has to be **the same**
+/// slot this function publishes to the Flight service. Passing only the facility
+/// does not work and fails in a way that looks like success: the facility keeps
+/// the empty slot it was built with, `after_open` is still announced, the server
+/// still starts, and every plugin call answers `UNAVAILABLE` for ever. So a caller
+/// that wants a plugin creates the slot, builds the facility against it, and hands
+/// both here.
+pub async fn start_with_plugin(
+    cfg: &Config,
+    event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
+    adopted: Option<crate::metrics::Adopted>,
+    slot: Option<crate::guard::DbSlot>,
+    facility: crate::plugin::SharedFacility,
+) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
     crate::tls::install_crypto_provider();
     let dir = cfg.data_dir().to_path_buf();
     let opts = cfg.db.into();
@@ -238,7 +272,16 @@ pub async fn start_with_events(
     // tower layer cannot separate `do_action( "stats" )` from mutation actions,
     // which share a URI.
     let auth = Arc::new(crate::auth::Authenticator::new(&cfg.auth));
-    let service = crate::guard::GuardedFlight::new(crate::guard::slot_of(db.clone()));
+    // The caller's slot when it has one, so a facility built against it now sees
+    // the database. A leader's database is fixed for the life of the process, so
+    // this slot never changes afterwards -- but a plugin must not be given a
+    // different view from the one the Flight service serves, and an empty slot is
+    // a view of nothing that still lets everything appear to start.
+    let slot = slot.unwrap_or_else(|| Arc::new(std::sync::RwLock::new(None)));
+    if let Ok(mut g) = slot.write() {
+        *g = Some(db.clone());
+    }
+    let service = crate::guard::GuardedFlight::new(slot.clone());
     let service =
         FlightServiceServer::with_interceptor(service, crate::auth::interceptor(auth.clone()));
 
@@ -298,6 +341,12 @@ pub async fn start_with_events(
         "yesnod is serving"
     );
 
+    // Announced after the listener is up, so a plugin that starts serving on the
+    // callback is not answering queries before the host is.
+    if let Some(f) = facility.as_ref() {
+        f.after_open(f.generation());
+    }
+
     Ok(Running {
         flight_addr,
         metrics_addr,
@@ -312,6 +361,8 @@ pub async fn start_with_events(
         counters,
         db,
         grace: Duration::from_secs(cfg.server.shutdown_grace_secs),
+        facility,
+        slot,
     })
 }
 
@@ -346,6 +397,8 @@ impl Running {
             db,
             grace,
             counters,
+            facility,
+            slot,
             ..
         } = self;
         drop(counters);
@@ -375,6 +428,40 @@ impl Running {
             m.stop().await;
         }
         ticker.stop().await;
+
+        // 1b. Drain the plugin, before step 2 counts readers.
+        //
+        // **The ordering is what makes step 2's number mean anything.** A plugin's
+        // lease *is* a registered reader slot, so a plugin still holding one would
+        // have the loop below spin for the whole grace period and then warn about
+        // "readers" -- true, and useless, because `live_readers()` cannot say whose
+        // they are. Draining first turns that into a message naming the library and
+        // the count, and leaves step 2 measuring what it was written to measure.
+        if let Some(f) = facility.as_ref() {
+            match f.before_close() {
+                crate::plugin::Drained::Clean => {}
+                other => tracing::error!(
+                    library = f.library(),
+                    outcome = ?other,
+                    "the plugin did not drain at shutdown; the database lock will not be \
+                     released until it does, and no host-side call can take its leases back"
+                ),
+            }
+        }
+        drop(facility);
+
+        // 1c. Empty the slot, which owns an `Arc<Db>`.
+        //
+        // Dropping the Flight service used to be enough, because the slot was
+        // built inline here and nothing else held it. It is shared now -- with the
+        // caller and with the plugin facility -- so a full slot at step 4 would
+        // make `into_inner` answer `None` and the file lock would never be
+        // released, reported as "a task still holds a database handle" with no way
+        // to tell that the task was this function.
+        if let Ok(mut g) = slot.write() {
+            *g = None;
+        }
+        drop(slot);
 
         // 2. Drain the blocking readers.
         //
