@@ -428,6 +428,115 @@ The alternative, forwarding request bytes through the host, was considered and
 rejected for v1: it puts the host in the business of framing a protocol it does not
 own, and buys only a shared port.
 
+## Dynamic loading: what exists, and the four things that constrain it
+
+Explored 2026-09-28, before writing the loader.
+
+**Nothing exists.** `libloading` is absent from `Cargo.lock`, and `dlopen`,
+`libloading` and `plugin` appear nowhere in `yesno-server`. The `cdylib` build
+side is known territory -- `yesno-pg` and `yesno-c` both produce one -- but those
+are libraries *other* programs load, not loaders.
+
+### A Rust plugin must not link `yesno-core`, and this is not hygiene
+
+The engine keeps process-global state whose correctness argument is literally the
+word "process". `OPENED_DIRS` records every directory this process has opened, and
+it decides whether a freed slab may be hole-punched: its own comment says a
+`Container` "aliases this process's mapping and cannot cross a process boundary,
+so such a container exists only if *this process* opened this directory before".
+
+Two copies of the engine in one address space are two such sets, and **dlopen's
+default `RTLD_LOCAL` makes two copies the expected outcome** rather than a
+deduplicated one. The second copy answers "first open in this process" for a
+directory the host already opened, concludes every inherited slab is punchable,
+and zeroes bytes a host-side reader is holding. Nothing reports it.
+
+So the rule "the plugin never opens the directory" is load-bearing for an
+invariant two modules away from where it is written, and the requirement is now in
+the header. It cannot be enforced from the host: a Rust plugin linking `yesno-core`
+statically exports no C symbols to probe for. What removes the risk structurally is
+that the plugin needs no engine types at all, because everything it reads comes
+through the C header.
+
+### Panic and exception handling is asymmetric, and the host cannot contain the plugin
+
+The host half is containable and now is: every `yesno_host_api` function catches a
+panic originating inside it and answers `Internal`. Two defects were found while
+checking this and are fixed:
+
+- **A caught panic in `block_advance` did not poison the handle.** `guard` turned
+  it into a status while the lane loop was partway through -- streams advanced,
+  heads half refreshed -- and a retry would then produce a block with duplicated
+  or skipped chunks. That is precisely what the poison exists for, and only the
+  `Err` path set it. It is also what made the `AssertUnwindSafe` around `&mut`
+  state a promise nobody kept.
+- **Lease counting had a panic window.** Increment, build the handle, hand it out
+  leaves the count permanently high if anything in between fails; moving the
+  increment after construction underflows a `usize` when a partly built handle
+  drops. Replaced with an RAII `LeaseGuard` created before the handle and moved
+  into it, so the count tracks the guard's existence on every path. This matters
+  more than it looks: the count feeds the drain, and the drain is the one contract
+  with no backstop, so a stuck count is a server that can never reopen.
+
+The plugin half **cannot** be contained, and the header says so. The host calls
+the plugin's callbacks directly; a Rust `extern "C"` function that unwinds aborts
+the process, and a C++ exception escaping one is undefined. So a panic in a
+callback does not fail the callback, it takes the database down. There is no
+interposition possible, because by the time the host could observe the unwind it
+has already crossed. A plugin built with `panic = "abort"` cannot honour the
+contract at all, and one carrying its own Rust runtime has its own panic hook that
+the host can neither configure nor observe.
+
+### Three attachment facts about `yesno-server`
+
+- **The leader path discards its slot binding.** `lifecycle.rs` builds the flight
+  service with `GuardedFlight::new( slot_of( db.clone() ) )` inline, so there is no
+  named slot for a facility to share. A small refactor binds it first.
+- **On a follower a plugin has a database only if `follower.serve_reads` is
+  enabled.** The slot is `cfg.follower.serve_reads.then( ... )`, and the comment
+  is explicit: "a cold one never opens a database". Otherwise the slot is `None`
+  for the process's life and every plugin call answers `UNAVAILABLE` for ever, so
+  the configuration must refuse that combination rather than appear to work.
+- **The drain hooks attach where the hazard is already documented.**
+  `close_for_rebuild` is the function whose comment observes that an in-flight
+  `do_get`'s `Snapshot` means "the lock may outlive this by the length of one
+  read"; `on_unavailable` goes immediately before its `drop( taken )`, and the
+  lease check immediately after. `open_if_needed` is where the generation is
+  bumped and `on_available` called.
+
+### Where the loader should live, revising this document
+
+Put `dlopen` and version negotiation in **`yesno-plugin`**, not `yesno-server`.
+This document originally said loading belongs in the server "where the slot and
+the role already are"; that conflates *loading* with *lifecycle*. Only the
+lifecycle needs the server. Keeping the loader in `yesno-plugin` means the whole
+ABI including negotiation is testable without starting a server, which is the
+reason the crate exists, and leaves `yesno-server`'s dependency list untouched.
+The server decides *when* to load and owns the callbacks.
+
+### The test plugin should be written in C
+
+Following `yesno-c/gate.sh`, which compiles `tests/smoke.c` with `cc -std=c11
+-Wall -Wextra -Werror` against the built library and runs it. A C plugin built
+`-shared` is better than a Rust one for three reasons: it **cannot** accidentally
+link `yesno-core`, so the constraint above becomes structural rather than a
+promise; it proves the header is usable from C, which is the actual contract; and
+it avoids cargo's lack of ordering between a `cdylib` target and a test that wants
+its path.
+
+### Bazel, and why the deferred `gate-pg.sh` is owed
+
+`yesno-server` is not in the Bazel build at all -- no `BUILD.bazel`, no
+references. But `crate.from_cargo` reads the **root** `Cargo.toml` and
+`Cargo.lock`, so any dependency change reaches the `crates` hub. Adding
+`libloading` will require `CARGO_BAZEL_REPIN=1 bazel mod deps`.
+
+Note that this is **already outstanding**: adding `yesno-plugin` to
+`[workspace] members` changed what `crate_universe` resolves, and `gate-pg.sh`
+has not run since. That is exactly the class of breakage the rule about running
+both gates exists for -- a change that satisfies cargo failing Bazel through a
+stale lockfile resolution.
+
 ## What `yesno-core` must add
 
 Small, and none of it is new capability:

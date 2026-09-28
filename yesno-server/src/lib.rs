@@ -51,6 +51,7 @@ pub mod lifecycle;
 pub mod local_transport;
 pub mod maintenance;
 pub mod metrics;
+pub mod plugin;
 pub mod replication;
 pub mod snapshot;
 pub mod tls;

@@ -187,7 +187,17 @@ impl KeyLanes {
         Ok(())
     }
 
-    fn poison(&mut self) {
+    /// Mark this handle unusable.
+    ///
+    /// Public because a **caught panic** has to reach the same state an `Err`
+    /// does. An FFI layer that wraps `advance` in `catch_unwind` turns a panic
+    /// midway through the lane loop into a status code, at which point the
+    /// streams are partly advanced and the heads partly refreshed -- exactly the
+    /// position the poison exists for -- but nothing inside this type ran to set
+    /// it. Without this the caller retries and gets a block with duplicated or
+    /// skipped chunks, which is the silent wrong answer the whole mechanism is
+    /// meant to prevent.
+    pub fn poison(&mut self) {
         self.poisoned = true;
         self.prefix = None;
         for c in &mut self.current {
@@ -404,6 +414,33 @@ mod tests {
         // And the scan continues from where it was, rather than restarting.
         assert_eq!(lanes.advance().unwrap(), Some(1));
         assert_eq!(lanes.present(), 2);
+    }
+
+    /// A poisoned handle refuses everything, and says so the same way twice.
+    ///
+    /// The path that matters is a **caught panic** in the FFI layer, which turns
+    /// a panic midway through the lane loop into a status code while the streams
+    /// are partly advanced. That layer calls `poison` for exactly this reason, so
+    /// the behaviour it depends on is asserted here rather than only there.
+    #[test]
+    fn a_poisoned_handle_refuses_every_later_advance() {
+        let dir = tmpdir("poison");
+        let _c = Clean(dir.clone());
+        let db = ragged(&dir);
+        let snap = db.snapshot().unwrap();
+        let mut lanes = KeyLanes::new(&snap, &[10]).unwrap();
+
+        assert_eq!(lanes.advance().unwrap(), Some(0));
+        assert!(!lanes.poisoned());
+        lanes.poison();
+        assert!(lanes.poisoned());
+        assert_eq!(lanes.present(), 0, "poisoning clears the open block");
+        assert_eq!(lanes.prefix(), None);
+        assert!(lanes.advance().is_err(), "and every later advance fails");
+        assert!(
+            lanes.advance().is_err(),
+            "repeatably, rather than failing once and then appearing to recover"
+        );
     }
 
     /// Two handles on one snapshot are independent, and both read one version.

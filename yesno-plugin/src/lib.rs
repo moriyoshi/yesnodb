@@ -43,7 +43,28 @@ use std::sync::{Arc, RwLock};
 use yesno_core::{Container, Db, KeyLanes, Snapshot};
 
 pub mod abi;
+pub mod loader;
 pub mod table;
+
+/// Path to the C fixture plugin this crate's build script compiles.
+///
+/// `None` when no C compiler was available, in which case
+/// [`fixture_plugin_error`] says so. Exists so **other crates' tests** can load
+/// the same fixture -- a `cargo:rustc-env` from this crate's build script reaches
+/// only this crate's own compilation, so a `yesno-server` test cannot read it
+/// directly. Hidden rather than feature-gated because cargo unifies features
+/// across normal and dev dependencies, so a `fixture` feature would be on in
+/// production too.
+#[doc(hidden)]
+pub fn fixture_plugin_path() -> Option<&'static str> {
+    option_env!("YESNO_TEST_PLUGIN")
+}
+
+/// Why [`fixture_plugin_path`] is `None`, when it is.
+#[doc(hidden)]
+pub fn fixture_plugin_error() -> &'static str {
+    option_env!("YESNO_TEST_PLUGIN_ERROR").unwrap_or("no reason was recorded")
+}
 
 /// The slot a server keeps its database in. `None` during a rebootstrap.
 ///
@@ -110,22 +131,51 @@ impl Host {
     }
 }
 
+/// One outstanding lease, counted for as long as this lives.
+///
+/// # Why RAII and not a pair of `fetch_add` / `fetch_sub` calls
+///
+/// The obvious spelling increments, builds the handle, and hands it out, with the
+/// matching decrement in the handle's `Drop`. **That has a window.** A panic
+/// between the increment and the handle escaping leaves the count permanently
+/// high and the host's drain never completes; move the increment after
+/// construction instead and a panic during construction drops a handle whose
+/// `Drop` decrements a count that was never incremented, which underflows a
+/// `usize` into billions. Both failures are silent and both break the drain,
+/// which is the one contract with no backstop.
+///
+/// Creating the guard first and moving it into the handle removes the window
+/// rather than narrowing it: the count is incremented exactly when the guard
+/// exists and decremented exactly when it stops existing, whichever path is
+/// taken out of the function.
+pub struct LeaseGuard {
+    host: Host,
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.host.leases.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// What a plugin sees behind `yesno_snapshot`.
 pub struct SnapshotHandle {
     snap: Snapshot,
     host: Host,
+    _lease: LeaseGuard,
 }
 
-impl Drop for SnapshotHandle {
-    fn drop(&mut self) {
-        self.host.leases.fetch_sub(1, Ordering::AcqRel);
+impl Host {
+    /// Count one lease, released when the returned guard drops.
+    pub fn lease(&self) -> LeaseGuard {
+        self.leases.fetch_add(1, Ordering::AcqRel);
+        LeaseGuard { host: self.clone() }
     }
 }
 
 /// What a plugin sees behind `yesno_lanes`.
 pub struct LanesHandle {
     lanes: KeyLanes,
-    host: Host,
     /// Whether a block is open.
     ///
     /// Tracked here rather than in `KeyLanes` on purpose. The core type is a
@@ -135,16 +185,11 @@ pub struct LanesHandle {
     /// `YESNO_BLOCK_STATE` instead of reading freed memory. Putting it in the
     /// core would impose a protocol on Rust callers that do not need one.
     block_open: bool,
+    _lease: LeaseGuard,
 }
 
 impl LanesHandle {
     fn lane(&self, i: usize) -> Option<&Container> {
         self.lanes.lane(i)
-    }
-}
-
-impl Drop for LanesHandle {
-    fn drop(&mut self) {
-        self.host.leases.fetch_sub(1, Ordering::AcqRel);
     }
 }

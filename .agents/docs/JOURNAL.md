@@ -6776,3 +6776,135 @@ parses `yesno_plugin.h` and asserts every status, role and chunk-kind
 discriminant, the ABI version, and `yesno_chunk`'s size and alignment. A header
 and a `#[repr(C)]` struct are two implementations of one layout, and a drifted
 discriminant produces a plugin that misreads every status -- silently.
+
+## 2026-09-28 -- Exploring dynamic loading: two panic defects, and a linking rule that guards punching
+
+Explored what the plugin loader needs before writing it. `libloading` is absent
+from `Cargo.lock` and `dlopen` appears nowhere in `yesno-server`, so this is new
+code; the `cdylib` build side is known from `yesno-pg` and `yesno-c`, but those are
+loaded *by* other programs rather than loaders. Findings in
+[`LTM/hosted-plugin-abi-design.md`](./LTM/hosted-plugin-abi-design.md); three are
+worth repeating here.
+
+**A Rust plugin must not link `yesno-core`, and the reason is two modules away from
+where anyone would look.** `OPENED_DIRS` is process-global state that decides
+whether a freed slab may be hole-punched, and its comment says why: a `Container`
+"aliases this process's mapping and cannot cross a process boundary, so such a
+container exists only if *this process* opened this directory before". Two copies
+of the engine in one address space are two such sets -- and dlopen's default
+`RTLD_LOCAL` makes two copies the **expected** outcome, not a deduplicated one. The
+second copy would answer "first open in this process" for a directory the host had
+already opened, conclude every inherited slab is punchable, and zero bytes a
+host-side reader holds. Nothing reports it. So "the plugin never opens the
+directory" is not ownership hygiene; it protects a punching invariant. It also
+cannot be enforced from the host, since a statically linked Rust `yesno-core`
+exports no C symbols to probe for -- which is the argument for writing the test
+plugin in **C**, where the constraint is structural rather than promised.
+
+**The panic warning found two real defects in what I had just committed.** First, a
+caught panic in `block_advance` reported `Internal` and left the handle **usable**,
+with streams advanced and heads half refreshed -- so a retry would produce a block
+with duplicated or skipped chunks, which is exactly what the poison exists to
+prevent. Only the `Err` path set it. The `AssertUnwindSafe` around `&mut` state was
+therefore a promise nobody kept, which is the more general lesson: that wrapper is
+an assertion about post-panic state, and writing it does not make the assertion
+true. Second, lease counting had a window in both directions -- increment then
+build leaves the count permanently high if construction fails, and build then
+increment underflows a `usize` when a partly built handle drops and decrements
+something never incremented. Replaced with an RAII guard created before the handle
+and moved into it. That one matters out of proportion to its size, because the
+count feeds the drain and the drain has no backstop, so a stuck count is a server
+that can never reopen.
+
+**The plugin's panics cannot be contained by the host at all**, and the header now
+says so rather than leaving it implied by the host's own `catch_unwind`. The host
+calls the plugin's callbacks directly; a Rust `extern "C"` function that unwinds
+aborts the process and a C++ exception escaping one is undefined, so a panic in a
+callback does not fail the callback, it takes the database down. There is no
+interposition possible, because by the time the host could observe the unwind it
+has already crossed. Worth noting what made this checkable: the workspace sets no
+`[profile]` at all, so `panic = "unwind"` is in force and the host's guards are
+real -- had anything set `panic = "abort"` every `catch_unwind` in that file would
+have been decoration, and nothing would have said so.
+
+**And a gate obligation I had let slide.** `crate.from_cargo` reads the root
+`Cargo.toml` and `Cargo.lock`, so adding `yesno-plugin` to `[workspace] members`
+in `f1ffea1` already changed what `crate_universe` resolves -- and `gate-pg.sh`
+has not run since. Deferring it was the user's call, but this is precisely the
+class of breakage the both-gates rule exists for, and adding `libloading` will
+compound it. Recording it so the next session does not discover it as a mystery.
+
+## 2026-09-28 -- The loader, a C fixture plugin, and the server wiring
+
+Second increment. `yesno-plugin` gained `loader.rs` -- `dlopen`, the
+`yesno_plugin_init` call, and version plus table-size negotiation -- and
+`yesno-server` gained `plugin.rs`, the facility that decides *when* to load and
+orders the callbacks around a rebootstrap. `libloading` is the one new dependency.
+
+**The fixture plugin is written in C, and that is the load-bearing choice.** The
+consumer confirmed the hazard is real rather than theoretical: `haiiie-core` links
+`yesno-core` unconditionally, so they have to split the scorer from the embedded
+adapter before a safe cdylib exists. A C fixture **cannot** link `yesno-core`, so
+the header's requirement is structural in the one plugin this tree builds rather
+than a promise. It also proves the header is usable from C, which is the actual
+contract, and it sidesteps cargo having no ordering between a `cdylib` target and
+a test that wants its path -- a `build.rs` running `cc -shared` has one by
+construction.
+
+That build script does not fail the build when no compiler is present; it passes
+the reason through to the test, which fails with it. **A test that silently skips
+reports success for a surface nobody exercised**, and this session has already
+produced three tests that passed for the wrong reason without needing a fourth
+that passes for no reason.
+
+**What the fixture buys that a stubbed table could not.** The load test drives the
+whole handshake and then the C side calls *back* into the host table to scan three
+lanes, recording what it saw -- twelve rows, four blocks by three lanes with
+absence in place, and the first array value read through the borrowed pointer. It
+also closes the parent snapshot while its lanes handle is live, so the fan-out
+pattern the header describes is exercised rather than only described. And
+`yesno_test_double_advance` proves the block protocol is refused across the C
+boundary, not just from Rust.
+
+**The drain is the reason the facility exists**, and the test for it needed the
+fixture to misbehave on purpose. `yesno_test_set_drain( 0 )` makes
+`on_unavailable` return while still holding a snapshot, and `before_close` then
+answers `Drained::Outstanding( 1 )` and logs the library by name with the count.
+This is the path with no host-side remedy, so the only correct behaviour is to
+report attributably -- the alternative is an unattributable `AlreadyOpen` from
+`open_if_needed` seconds later with nothing connecting the two. Verification uses
+the facility's own counter, never `Db::live_readers()`, which over-counts what is
+the plugin's and under-counts how many leases exist.
+
+**A flakiness hazard half fixed, and the gate caught the other half.** The
+facility tests share the fixture's process-global statics while cargo runs them as
+threads in one process, so `set_drain( false )` in one case reaches another's drain
+and one case's listener fails another's "must not be serving" assertion. I saw
+that, serialized `yesno-server/tests/plugin_facility.rs` behind a mutex, wrote the
+reason down -- **and left the identical hazard in
+`yesno-plugin/tests/load_c_plugin.rs`**, which the gate then failed on: `Ok` where
+`Unavailable` was expected, and a lease count of 1 where 0 was, because
+`yesno_plugin_init` overwrites the fixture's `g_host` and `g_db` on every load so
+one case's scan ran against another case's database.
+
+**Diagnosing the class is not fixing it.** I had the correct general statement in
+front of me, in a comment I had just written, and applied it to one of the two
+suites that needed it. The tell was available without running anything: both
+suites load the same image, and only one had a guard. This is the same shape as
+`gate-clippy-saw-two-crates` in this journal, where a tool and its instructions
+were two implementations of one check and only the tool was repaired. Both now
+carry the guard, each naming the other, and both run clean three times over.
+
+**Wiring.** `close_for_rebuild` now drains the plugin *before* dropping the last
+`Arc<Db>`, in the function whose own comment already observed that an in-flight
+`do_get` can keep the lock alive "by the length of one read" -- the bound a
+scoring lease does not have. `open_if_needed` bumps the generation and announces
+it after a successful reopen, bumping first so a plugin racing the callback reads
+a generation that has already moved. `start_with_plugin` takes the facility rather
+than loading it, because loading runs arbitrary code and that `unsafe` belongs
+where the operator's configuration is read, not buried in a replication task.
+
+Still absent: the leader path's slot is still built inline in `lifecycle.rs`, so a
+leader cannot host a plugin yet; only the follower path is wired. And `gate-pg.sh`
+remains owed on `f1ffea1` and now on this, with `libloading` added to the
+resolution `crate_universe` reads.

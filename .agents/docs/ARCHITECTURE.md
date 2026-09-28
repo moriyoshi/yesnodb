@@ -212,6 +212,13 @@ yesno/
                                 #   EBS may publish a provisional lease whose materialization is
                                 #   explicitly deferred, but yesnod never launches ECS or EKS work;
                                 #   a core backup barrier excludes concurrent checkpoints.
+                                #   plugin.rs owns the plugin facility: when to load, and the
+                                #   ordering of the callbacks around a rebootstrap. The drain is
+                                #   why it exists -- a plugin's lease holds Arc<DbInner> and so
+                                #   the directory lock, and NO host call takes one back, so
+                                #   before_close drains and then verifies against the facility's
+                                #   own lease count rather than Db::live_readers(), which both
+                                #   over- and under-counts what a plugin holds.
                                 #   Outside default-members, so gate.sh's clippy misses it —
                                 #   run `cargo clippy -p yesno-server` explicitly.
                                 #   dist/ holds the deployment artifacts: systemd unit,
@@ -258,6 +265,19 @@ yesno/
                                 #   refcounts one registry slot and Db::live_readers() therefore
                                 #   both over- and under-counts what a plugin holds.
     include/yesno_plugin.h      #   the two tables, status codes, and the drain contract
+    src/abi.rs                  #   plain data: status codes, kinds, headers. A test parses the
+                                #     C header and asserts every discriminant agrees
+    src/table.rs                #   the extern "C" host table. Every entry catches its own
+                                #     panic; a caught panic in block_advance also POISONS the
+                                #     handle, since reporting and leaving it usable invites a
+                                #     retry over partly advanced streams
+    src/loader.rs               #   dlopen, yesno_plugin_init, version and table-size
+                                #     negotiation. The library is never unloaded: v1 has no hot
+                                #     unload, and dlclose while a plugin thread runs executes
+                                #     freed code
+    build.rs                    #   compiles tests/plugin.c into a .so so a test can dlopen it;
+                                #     a missing compiler is reported to the test, never skipped
+    tests/plugin.c              #   the fixture plugin, in C so it CANNOT link yesno-core
   yesno-mysql/                  # MySQL 8.4 storage engine; embedded C ABI or remote Flight.
     CMakeLists.txt              #   accepts Bazel inputs or adjacent-source fallbacks
   MODULE.bazel                  # bzlmod: rules_rust ( fed by Cargo.lock ), rules_foreign_cc,

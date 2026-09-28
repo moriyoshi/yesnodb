@@ -19,6 +19,45 @@
 extern "C" {
 #endif
 
+/* PANIC AND EXCEPTION CONTRACT. Read this before writing either side.
+ *
+ * Unwinding across this boundary is undefined, and the two directions have
+ * different failure modes and different owners.
+ *
+ * What the host guarantees. Every function in `yesno_host_api` catches a panic
+ * originating inside it and answers YESNO_INTERNAL. None of them unwinds into
+ * the plugin. Where a caught panic could have left host state half-modified,
+ * that state is poisoned rather than reported-and-reused -- a lane handle whose
+ * advance panicked refuses every later call instead of letting a retry produce a
+ * block with duplicated or skipped chunks.
+ *
+ * What the plugin must guarantee, and why it is not symmetric. The host calls
+ * `yesno_plugin_api`'s members directly. A Rust `extern "C"` function that
+ * unwinds **aborts the process**, and a C++ exception escaping one is undefined
+ * -- so a panic or a throw inside a callback does not fail that callback, it
+ * takes the whole database down with it. The plugin must catch everything at
+ * each callback's edge and return a status. Do not rely on the host to contain
+ * it: there is no interposition, and there cannot be one, because by the time
+ * the host could observe the unwind it has already crossed the boundary.
+ *
+ * Two consequences worth stating. A plugin built with `panic = "abort"` cannot
+ * honour this at all, since it has no unwinding to catch. And a plugin that
+ * links its own copy of a Rust runtime has its own panic hook and its own
+ * abort behaviour, neither of which the host can configure or observe.
+ *
+ * A HARD REQUIREMENT ABOUT LINKING. A Rust plugin must NOT link yesno-core.
+ * The engine keeps process-global state whose correctness argument is literally
+ * "this process": the set of directories this process has opened decides whether
+ * a freed slab may be hole-punched, because a Container aliasing an earlier
+ * instance's mapping cannot cross a process boundary. Two copies of the engine
+ * in one address space are two such sets, and dlopen's default RTLD_LOCAL makes
+ * two copies the expected outcome rather than a deduplicated one -- so the
+ * second copy would answer "first open in this process" for a directory the host
+ * had already opened and consider the host's live extents punchable. Nothing
+ * reports this; the bytes simply go to zero underneath a reader. The plugin needs
+ * no engine types, because everything it reads comes through this header.
+ */
+
 /* Every table begins with this, and these two fields never move.
  *
  * `size` is how a reader knows which trailing members exist. A host built later

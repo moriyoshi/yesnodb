@@ -415,3 +415,57 @@ fn scratch_is_only_used_when_a_borrow_is_impossible() {
     unsafe { (api.lanes_release)(lanes) };
     unsafe { (api.snapshot_close)(snap) };
 }
+
+/// A call that fails before producing a handle must not leave a lease counted.
+///
+/// This is what the RAII guard buys. The obvious spelling -- increment, build,
+/// hand out -- leaves the count permanently high if anything between the
+/// increment and the return fails, and the drain that count feeds is the one
+/// contract with no host-side backstop, so a stuck count is a server that can
+/// never reopen.
+#[test]
+fn a_failed_acquire_counts_no_lease() {
+    let (_c, slot, host) = fixture("failpath");
+    let api = host_api();
+    let mut h = host.clone();
+    let db_ptr = &mut h as *mut Host as *mut HostDb;
+    assert_eq!(host.leases(), 0);
+
+    // Bad arguments, refused before any handle exists.
+    let mut snap: *mut SnapshotOpaque = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.snapshot_open)(std::ptr::null_mut(), &mut snap) },
+        Status::InvalidArgument
+    );
+    assert_eq!(host.leases(), 0, "a refused call counts nothing");
+
+    // A real snapshot, then a lanes_acquire refused for a null key array.
+    assert_eq!(
+        unsafe { (api.snapshot_open)(db_ptr, &mut snap) },
+        Status::Ok
+    );
+    assert_eq!(host.leases(), 1);
+    let mut lanes: *mut LanesOpaque = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.lanes_acquire)(snap, std::ptr::null(), 3, &mut lanes) },
+        Status::InvalidArgument
+    );
+    assert!(lanes.is_null());
+    assert_eq!(host.leases(), 1, "still just the snapshot");
+
+    // And an unavailable database, which fails after the argument checks.
+    slot.write().unwrap().take();
+    let mut snap2: *mut SnapshotOpaque = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.snapshot_open)(db_ptr, &mut snap2) },
+        Status::Unavailable
+    );
+    assert_eq!(
+        host.leases(),
+        1,
+        "a failure after the checks counts nothing either"
+    );
+
+    unsafe { (api.snapshot_close)(snap) };
+    assert_eq!(host.leases(), 0);
+}

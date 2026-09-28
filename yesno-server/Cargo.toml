@@ -29,6 +29,7 @@ path = "src/bin/yesno-snapshot-agent.rs"
 
 [dependencies]
 yesno-core.workspace = true
+yesno-plugin = { path = "../yesno-plugin" }
 yesno-flight = { workspace = true, features = ["server"] }
 arrow-array.workspace = true
 arrow-flight = "59.2"
@@ -140,6 +141,8 @@ tonic-prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+# The facility test reads back the C fixture plugin's own statics.
+libloading = "0.8"
 tempfile = "3"
 proptest.workspace = true
 # EBS volume and snapshot lifecycle operations are part of EC2's Query API.

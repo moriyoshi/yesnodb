@@ -15,7 +15,6 @@
 //! the host that will be attributed to the database.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::Ordering;
 
 use yesno_core::{Container, KeyLanes};
 
@@ -58,6 +57,22 @@ pub struct HostApi {
         *mut Chunk,
     ) -> Status,
     pub block_release: unsafe extern "C" fn(*mut LanesOpaque),
+}
+
+/// The callbacks a plugin provides, laid out exactly as `yesno_plugin_api`.
+///
+/// Read, never written, by this crate. Only the prefix declared here is touched,
+/// and only after `header.size` says it exists -- which is what makes a plugin
+/// built against a later header usable rather than a mismatch.
+#[repr(C)]
+pub struct PluginApi {
+    pub header: AbiHeader,
+    pub on_unavailable: unsafe extern "C" fn() -> Status,
+    pub on_available: unsafe extern "C" fn(u64) -> Status,
+    pub on_generation_change: unsafe extern "C" fn(u64, u64) -> Status,
+    pub on_role_change: unsafe extern "C" fn(Role, Role) -> Status,
+    pub serve_start: unsafe extern "C" fn(*const std::ffi::c_char) -> Status,
+    pub serve_stop: unsafe extern "C" fn() -> Status,
 }
 
 /// The table this build publishes.
@@ -175,10 +190,14 @@ unsafe extern "C" fn snapshot_open(db: *mut HostDb, out: *mut *mut SnapshotOpaqu
             Ok(s) => s,
             Err(e) => return Status::from_core(&e),
         };
-        // Counted before the handle escapes, so a lease is never outstanding
-        // without having been counted.
-        host.leases.fetch_add(1, Ordering::AcqRel);
-        let handle = Box::new(SnapshotHandle { snap, host });
+        // The guard is created first and moved in, so the count and the handle's
+        // existence cannot get out of step on any path out of here.
+        let lease = host.lease();
+        let handle = Box::new(SnapshotHandle {
+            snap,
+            host,
+            _lease: lease,
+        });
         // SAFETY: Ownership transfers to the caller, released by snapshot_close.
         unsafe { *out = Box::into_raw(handle) as *mut SnapshotOpaque };
         Status::Ok
@@ -243,12 +262,11 @@ unsafe extern "C" fn lanes_acquire(
             Ok(l) => l,
             Err(e) => return Status::from_core(&e),
         };
-        let host = handle.host.clone();
-        host.leases.fetch_add(1, Ordering::AcqRel);
+        let lease = handle.host.lease();
         let boxed = Box::new(LanesHandle {
             lanes,
-            host,
             block_open: false,
+            _lease: lease,
         });
         // SAFETY: Ownership transfers to the caller, released by lanes_release.
         unsafe { *out = Box::into_raw(boxed) as *mut LanesOpaque };
@@ -300,7 +318,22 @@ unsafe extern "C" fn block_advance(
             // descriptors, and there is no way to detect that afterwards.
             return Status::BlockState;
         }
-        match handle.lanes.advance() {
+        // **A caught panic has to poison, not merely report.** `guard` above turns
+        // a panic into `Internal`, and at that point the lane loop is partway
+        // through: streams advanced, heads half refreshed, no prefix published.
+        // Returning a code and leaving the handle usable invites a retry that
+        // duplicates or skips chunks. This is also what makes the
+        // `AssertUnwindSafe` around `&mut` state honest rather than a promise
+        // nobody kept.
+        let advanced = catch_unwind(AssertUnwindSafe(|| handle.lanes.advance()));
+        let advanced = match advanced {
+            Ok(r) => r,
+            Err(_) => {
+                handle.lanes.poison();
+                return Status::Internal;
+            }
+        };
+        match advanced {
             Ok(Some(p)) => {
                 handle.block_open = true;
                 // SAFETY: Both checked non-null, one slot each.

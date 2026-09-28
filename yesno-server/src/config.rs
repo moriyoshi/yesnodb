@@ -313,6 +313,36 @@ impl ClientTls {
     }
 }
 
+/// A plugin yesnod loads into its own process.
+///
+/// # This is as trusted as the server binary
+///
+/// `dlopen` runs the library's initializers before returning, and once loaded it
+/// shares the address space: it can corrupt the heap, and if it lets a panic or an
+/// exception escape a callback the process aborts. Naming one here is an operator
+/// decision of the same weight as naming the data directory, not a sandboxed
+/// extension point.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginConfig {
+    /// Absolute path to the shared library. Empty disables the facility.
+    pub library: String,
+    /// Address handed to the plugin's `serve_start`.
+    ///
+    /// The host does not bind this; the plugin owns its listener and the host owns
+    /// when it runs. Empty means the plugin is loaded and its callbacks are
+    /// delivered, but it is never asked to serve -- which is what a node that
+    /// should score without answering queries wants.
+    pub listen: String,
+}
+
+impl PluginConfig {
+    /// Whether a library is configured at all.
+    pub fn enabled(&self) -> bool {
+        !self.library.trim().is_empty()
+    }
+}
+
 /// What a `role = "follower"` node needs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -788,6 +818,7 @@ pub struct Config {
     pub db: DbConfig,
     pub auth: AuthConfig,
     pub follower: FollowerConfig,
+    pub plugin: PluginConfig,
 }
 
 /// The command line. Deliberately **not** a flag per config key: a flag for

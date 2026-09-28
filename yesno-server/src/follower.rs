@@ -220,6 +220,20 @@ pub fn start_with_events(
     cfg: &Config,
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
 ) -> Result<FollowerNode, ConfigError> {
+    start_with_plugin(cfg, event_sink, None)
+}
+
+/// As [`start_with_events`], with a loaded plugin to notify.
+///
+/// The facility is passed in rather than loaded here, deliberately: loading runs
+/// arbitrary code and is the caller's trust decision, so the `unsafe` belongs at
+/// the point that reads the operator's configuration rather than buried in a
+/// replication task.
+pub fn start_with_plugin(
+    cfg: &Config,
+    event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
+    facility: crate::plugin::SharedFacility,
+) -> Result<FollowerNode, ConfigError> {
     let dir = cfg.data_dir().to_path_buf();
     let status = Arc::new(FollowerStatus::default());
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
@@ -269,7 +283,17 @@ pub fn start_with_events(
                 },
             };
 
-            match one_pass(&cfg, &dir, c, &st, db_slot.as_ref(), event_sink.as_ref()).await {
+            match one_pass(
+                &cfg,
+                &dir,
+                c,
+                &st,
+                db_slot.as_ref(),
+                event_sink.as_ref(),
+                facility.as_ref(),
+            )
+            .await
+            {
                 Ok(moved) => {
                     st.passes.fetch_add(1, Ordering::Relaxed);
                     backoff = Duration::from_millis(250);
@@ -319,6 +343,7 @@ async fn one_pass(
     st: &Arc<FollowerStatus>,
     slot: Option<&DbSlot>,
     event_sink: Option<&Arc<dyn yesno_core::events::CoreEventSink>>,
+    facility: Option<&Arc<crate::plugin::Facility>>,
 ) -> Result<u64, ()> {
     // The shard count comes from the leader, not from the config: it is a
     // property of the database, and a standby that guessed would bootstrap
@@ -380,7 +405,7 @@ async fn one_pass(
         .filter(|s| !dir.join(format!("shard-{s:04}.yno")).exists() || f.cursor(*s).is_none())
         .collect();
     if !needs_bootstrap.is_empty() {
-        close_for_rebuild(slot, st);
+        close_for_rebuild(slot, st, facility);
         for shard in &needs_bootstrap {
             match f.bootstrap_shard(client, *shard).await {
                 Ok(off) => tracing::info!(shard, replay_from = off, "bootstrapped"),
@@ -404,7 +429,7 @@ async fn one_pass(
         // holds `len`, `base` and `synced` in memory — and the failure is a log
         // that decodes to the first foreign byte and then silently stops.
         if let Some(slot) = slot {
-            let db = open_if_needed(slot, cfg, dir, st, event_sink)?;
+            let db = open_if_needed(slot, cfg, dir, st, event_sink, facility)?;
             match f.apply_shard_into(client, &db, shard, budget).await {
                 Ok(c) => {
                     moved += c.bytes;
@@ -415,7 +440,7 @@ async fn one_pass(
                     if matches!(react(shard, &e), Reaction::Rebootstrap) {
                         tracing::warn!(shard, error = %e, "re-bootstrapping: the leader reclaimed the required WAL generation");
                         st.rebootstraps.fetch_add(1, Ordering::Relaxed);
-                        close_for_rebuild(Some(slot), st);
+                        close_for_rebuild(Some(slot), st, facility);
                         let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.wal")));
                         let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.yno")));
                         // The next pass finds no image and runs phase one.
@@ -446,7 +471,7 @@ async fn one_pass(
                 if matches!(react(shard, &e), Reaction::Rebootstrap) {
                     tracing::warn!(shard, error = %e, "re-bootstrapping: the leader reclaimed the required WAL generation");
                     st.rebootstraps.fetch_add(1, Ordering::Relaxed);
-                    close_for_rebuild(slot, st);
+                    close_for_rebuild(slot, st, facility);
                     let _ = std::fs::remove_file(dir.join(format!("shard-{shard:04}.wal")));
                     match f.bootstrap_shard(client, shard).await {
                         Ok(off) => {
@@ -473,7 +498,31 @@ async fn one_pass(
 }
 
 /// Put the database away, so a truncating bootstrap is safe.
-fn close_for_rebuild(slot: Option<&DbSlot>, st: &Arc<FollowerStatus>) {
+///
+/// # The plugin drains first, and it is not optional
+///
+/// The comment below observes that an in-flight `do_get`'s `Snapshot` can keep the
+/// directory lock alive "by the length of one read" -- self-limiting, so the reopen
+/// succeeds on a later pass. A plugin's lease has no such bound: it lives as long
+/// as the plugin chooses, and nothing on this side can take it back. So the
+/// facility is told before the drop and then *asked whether it complied*; a
+/// non-zero count is logged against the library by name, because the alternative
+/// is an unattributable `AlreadyOpen` from `open_if_needed` seconds later.
+fn close_for_rebuild(
+    slot: Option<&DbSlot>,
+    st: &Arc<FollowerStatus>,
+    facility: Option<&Arc<crate::plugin::Facility>>,
+) {
+    if let Some(f) = facility {
+        match f.before_close() {
+            crate::plugin::Drained::Clean => {}
+            other => tracing::error!(
+                library = f.library(),
+                outcome = ?other,
+                "the plugin did not drain; the rebuild will proceed but the reopen may                  fail until it releases"
+            ),
+        }
+    }
     let Some(slot) = slot else { return };
     let taken = slot.write().map(|mut g| g.take()).unwrap_or(None);
     if taken.is_some() {
@@ -500,6 +549,7 @@ fn open_if_needed(
     dir: &std::path::Path,
     st: &Arc<FollowerStatus>,
     event_sink: Option<&Arc<dyn yesno_core::events::CoreEventSink>>,
+    facility: Option<&Arc<crate::plugin::Facility>>,
 ) -> Result<Arc<yesno_core::Db>, ()> {
     if let Ok(g) = slot.read() {
         if let Some(db) = g.as_ref() {
@@ -527,6 +577,14 @@ fn open_if_needed(
             }
             st.serving.store(true, Ordering::Release);
             tracing::info!(term = db.term(), "serving reads from the replica");
+            // The database in the slot is a different one, so every handle the
+            // plugin derived from the previous instance is stale. Bumping first
+            // and announcing second means a plugin that races the callback still
+            // reads a generation that has already moved.
+            if let Some(f) = facility {
+                let generation = f.after_replace();
+                f.after_open(generation);
+            }
             Ok(db)
         }
         Err(e) => {
