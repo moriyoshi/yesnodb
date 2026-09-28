@@ -601,6 +601,21 @@ pub enum Frame {
     /// A server offers this when it advertised `arena_bytes == 0`. It costs a copy
     /// into the frame and a copy out, against the arena's one, and it caps the batch
     /// by [`MAX_INLINE_PAYLOAD`] rather than by the arena.
+    ///
+    /// # The cap bounds width times depth, not depth alone
+    ///
+    /// A block's worst case is `lanes * LANE_BYTES`, so `lanes * blocks` must fit
+    /// [`MAX_INLINE_PAYLOAD`] -- 128 lane-blocks at the current constants. An inline
+    /// server therefore advertises a `max_lanes` it can actually encode, which may be
+    /// far below what its configuration asked for, and a peer needing more lanes
+    /// splits across handles on one snapshot exactly as it would against any other
+    /// advertised limit.
+    ///
+    /// **This bit once**, before the limits were derived from capacity: a server
+    /// configured for 1024 lanes advertised them, a peer legally asked for 265, and
+    /// one block of bitmap lanes was 2 MiB against a 1 MiB cap -- so the encoder
+    /// refused a frame the server had promised and the connection died. The arena
+    /// path never had this shape, because a `Block` frame carries only descriptors.
     BlocksInline {
         blocks: Vec<Block>,
         payload: Vec<u8>,

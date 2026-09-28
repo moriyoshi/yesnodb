@@ -7439,3 +7439,45 @@ an untested branch with an optimistic comment.
 Their other two points stand as recorded and need nothing from here: `KeyRange` will
 request `MAX_PAGE` per page, which is exactly the advice the frame carries, and no
 lazy `Tree` iterator until measured need, which matches the filed entry.
+
+## 2026-09-28 -- Inline advertised a width it could not encode, and my test could not see it
+
+A consumer implementing the peer found it: with `channel_inline`, the server
+advertised `channel_max_lanes` straight from configuration -- 1024 by default --
+while one inline block of bitmap lanes is `lanes * 8192`. A legal 265-lane request
+is 2 170 880 bytes against `MAX_INLINE_PAYLOAD` of 1 MiB, so `Frame::encode`
+refused a frame **the server had just promised was legal**, and `serve_locked`
+turned that into an `io::Error` that ended the connection. Not even
+`max_blocks = 1` helps, because the overflowing unit is one block.
+
+**Two different mistakes, and the second is the one worth keeping.**
+
+The limit was policy where capacity was the real constraint -- the mirror of the
+`MAX_LANES` error two commits earlier, where a capacity argument had been written
+into a policy constant. Same confusion, opposite direction, three days of the same
+file. The fix derives the inline limits from what a frame can hold, at session
+construction rather than in the greeting, so that what is advertised, what
+`lanes_acquire` enforces and what can be encoded are one number that cannot drift.
+The bound is on `lanes * blocks`, not on either alone: 128 lane-blocks at the
+current constants.
+
+And **my inline test could not have caught it**, which is the more instructive half.
+It used two sparse lanes, so its frames were a few hundred bytes and never
+approached the cap. Payload size only bites when lanes are *dense*, and nothing in
+the fixture made them so. That is the fourth test this session that passed for a
+reason unrelated to the property it named -- after the single-slab evacuation
+fixture, the punch-offset sabotage, and the shared-slot test whose parent snapshot
+held the assertion up. The shape is always the same: the assertion is true, and
+something other than the mechanism under test is what makes it true. The new
+fixture uses 200 bitmap lanes and asserts the advertised width times depth fits an
+inline frame; disabling the clamp makes it fail on exactly the 1024 the consumer
+saw.
+
+Separately, **an unencodable reply no longer kills the connection.** A frame this
+side cannot encode is our bug, and a closed socket is the worst way to report it --
+the peer cannot tell a protocol defect from a crash or a restart. It now answers a
+`Fault` carrying the encoder's message, which is a status a peer can log.
+
+The arena path was never affected, and the contrast is the clearest argument for
+the arena yet: a `Block` frame carries only descriptors, five bytes each, so two
+hundred lanes is under two kilobytes whatever the payloads are.

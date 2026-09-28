@@ -1055,3 +1055,147 @@ fn every_read_refuses_an_unknown_snapshot() {
         );
     }
 }
+
+/// A wide block of **dense** lanes, in both transports.
+///
+/// # What the earlier inline test missed
+///
+/// It used two sparse lanes, so its frames were a few hundred bytes and it never
+/// approached `MAX_INLINE_PAYLOAD`. That is a test passing for a reason unrelated to
+/// the property: inline mode advertised 1024 lanes while one block of bitmap lanes
+/// at that width is 8 MiB against a 1 MiB cap, so `Frame::encode` refused and the
+/// connection died -- for a configuration the server itself called legal. Payload
+/// size only bites when the lanes are **dense**, so the fixture has to make them so.
+///
+/// The arena path is unaffected and is checked alongside, because a `Block` frame
+/// carries only descriptors: the contrast is the argument for the arena.
+#[test]
+fn a_wide_block_of_dense_lanes_is_served_in_both_transports() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-chan-dense-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _c = Clean(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // 200 keys, each a bitmap in chunk 0: scattered past RUN_MAX_INTERVALS so the
+    // container is 8 KiB, which is the worst case the frame has to hold.
+    const KEYS: u64 = 200;
+    let mut b = db.batch();
+    for k in 0..KEYS {
+        for i in 0..5000u64 {
+            b.insert(k, i * 3);
+        }
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+    let keys: Vec<u64> = (0..KEYS).collect();
+
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    // Deliberately configured wider than inline can carry, which is the case that
+    // produced a dead connection.
+    let wide = Limits {
+        max_handles: 4,
+        max_lanes: 1024,
+        max_blocks: 16,
+    };
+
+    // --- inline ---
+    let mut inline = Session::new_inline(host.clone(), wide);
+    let advertised = match inline.hello() {
+        Frame::ServerHello {
+            max_lanes,
+            max_blocks,
+            arena_bytes,
+            ..
+        } => {
+            assert_eq!(arena_bytes, 0);
+            assert!(
+                max_lanes as usize <= Session::INLINE_MAX_LANES,
+                "inline must not advertise more lanes than one frame can hold: {max_lanes}"
+            );
+            assert!(max_blocks >= 1);
+            assert!(
+                max_lanes as usize * max_blocks as usize * 8192 <= 1024 * 1024,
+                "the advertised width and depth together must fit MAX_INLINE_PAYLOAD"
+            );
+            max_lanes as usize
+        }
+        other => panic!("{other:?}"),
+    };
+    greet(&mut inline);
+    let snapshot = match inline.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    // A request at the advertised width must be served, not refused and not fatal.
+    let lanes = match inline.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: keys[..advertised].to_vec(),
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("a request at the advertised width must succeed: {other:?}"),
+    };
+    match inline.handle(Frame::BlockAdvance { lanes }) {
+        Frame::BlocksInline { blocks, payload } => {
+            assert_eq!(blocks[0].lanes.len(), advertised);
+            assert_eq!(
+                payload.len(),
+                advertised * 8192,
+                "every lane is a full bitmap, which is the worst case"
+            );
+            // And it round trips, which is what the connection actually needs.
+            let f = Frame::BlocksInline { blocks, payload };
+            let bytes = f
+                .encode()
+                .expect("a block at the advertised width must encode");
+            assert_eq!(Frame::decode(&bytes).unwrap().0, f);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Wider than advertised is a refusal the peer can read, never a dead socket.
+    let too_wide = inline.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: keys.clone(),
+    });
+    assert_eq!(fault_status(&too_wide), Status::InvalidArgument as u32);
+
+    // --- arena, same width, unaffected ---
+    let arena = Arena::new(wide.arena_bytes()).unwrap();
+    let mut shared = Session::new(host, arena, wide);
+    greet(&mut shared);
+    let snapshot = match shared.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let lanes = match shared.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: keys.clone(),
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("the arena carries the full width: {other:?}"),
+    };
+    match shared.handle(Frame::BlockAdvance { lanes }) {
+        Frame::Block { lanes: ls, .. } => {
+            assert_eq!(ls.len(), KEYS as usize, "all 200 lanes in one block");
+            let bytes = Frame::Block {
+                prefix: 0,
+                lanes: ls,
+            }
+            .encode()
+            .expect("descriptors are small whatever the payloads are");
+            assert!(
+                bytes.len() < 2048,
+                "a 200-lane Block frame is descriptors only: {} bytes",
+                bytes.len()
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}

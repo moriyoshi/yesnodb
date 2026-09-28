@@ -316,6 +316,11 @@ fn an_unconfigured_channel_is_absent() {
 fn a_peer_is_served_inline_when_the_host_has_no_arena() {
     let (_c, mut cfg, host, sock) = setup("inline");
     cfg.plugin.channel_inline = true;
+    // Configured wider than an inline frame can carry, deliberately: the server must
+    // advertise what it can actually encode rather than what the file says, and the
+    // greeting is checked below. Left at the default before, this test could not see
+    // the difference.
+    cfg.plugin.channel_max_lanes = 1024;
     let channel = Channel::start(&cfg, host).unwrap().unwrap();
 
     // Connect *without* expecting a descriptor. A peer that blocked on recv_fd here
@@ -344,10 +349,24 @@ fn a_peer_is_served_inline_when_the_host_has_no_arena() {
     };
 
     match read_frame(&mut sock_raw, &mut buf) {
-        Frame::ServerHello { arena_bytes, .. } => assert_eq!(
-            arena_bytes, 0,
-            "zero is how a peer learns there is no descriptor coming"
-        ),
+        Frame::ServerHello {
+            arena_bytes,
+            max_lanes,
+            max_blocks,
+            ..
+        } => {
+            assert_eq!(
+                arena_bytes, 0,
+                "zero is how a peer learns there is no descriptor coming"
+            );
+            // The configuration asked for 1024. An inline frame cannot hold that
+            // many dense lanes, so the greeting must say what it can encode.
+            assert!(
+                max_lanes as usize * max_blocks as usize * 8192 <= 1024 * 1024,
+                "advertised width times depth must fit an inline frame, got \
+                 {max_lanes} lanes by {max_blocks} blocks"
+            );
+        }
         other => panic!("{other:?}"),
     }
     ask(

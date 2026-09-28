@@ -32,8 +32,8 @@
 use std::collections::HashMap;
 
 use crate::ipc::{
-    Block as WireBlock, Frame, Kind, Lane, LaneKind, Role as WireRole, LANE_BYTES, MAX_LANES,
-    MAX_PAGE,
+    Block as WireBlock, Frame, Kind, Lane, LaneKind, Role as WireRole, LANE_BYTES,
+    MAX_INLINE_PAYLOAD, MAX_LANES, MAX_PAGE,
 };
 use yesno_core::{Container, KeyLanes, Snapshot};
 
@@ -237,7 +237,31 @@ impl Session {
         Session::with_arena(host, None, limits)
     }
 
-    fn with_arena(host: Host, arena: Option<Arena>, limits: Limits) -> Session {
+    /// Most lanes one inline block can carry.
+    ///
+    /// An inline block puts every present lane's payload in the frame, so the worst
+    /// case is `lanes * LANE_BYTES` and it must fit [`MAX_INLINE_PAYLOAD`]. With the
+    /// arena this does not arise: a `Block` frame carries only descriptors, five
+    /// bytes each, so a thousand lanes is five kilobytes.
+    pub const INLINE_MAX_LANES: usize = MAX_INLINE_PAYLOAD / LANE_BYTES;
+
+    fn with_arena(host: Host, arena: Option<Arena>, mut limits: Limits) -> Session {
+        // **Inline capacity is a property of the transport, so the advertised limits
+        // have to come from it.** Configuration alone produced a greeting that
+        // promised more than the frame could hold: at the default 1024 lanes, one
+        // block of bitmap lanes is 8 MiB against a 1 MiB cap, so `Frame::encode`
+        // refused and the connection died -- for a configuration the server itself
+        // advertised as legal.
+        //
+        // Clamped here rather than only in the greeting, so that what is advertised,
+        // what `lanes_acquire` enforces, and what can actually be encoded are one
+        // number and cannot drift apart.
+        if arena.is_none() {
+            limits.max_lanes = limits.max_lanes.clamp(1, Self::INLINE_MAX_LANES);
+            // Whatever is left of the budget after the lanes, at least one block.
+            let per_batch = Self::INLINE_MAX_LANES / limits.max_lanes.max(1);
+            limits.max_blocks = limits.max_blocks.clamp(1, per_batch.max(1));
+        }
         Session {
             host,
             arena,
@@ -909,9 +933,19 @@ where
     R: std::io::Read,
 {
     let write_frame = |f: &Frame| -> std::io::Result<()> {
-        let bytes = f
+        // A reply this side cannot encode is **our** bug, and killing the connection
+        // is the worst way to report it: the peer sees a closed socket and cannot
+        // tell a protocol defect from a crash or a restart. Answer a fault instead,
+        // which is a status it can log and act on.
+        let bytes = match f.encode() {
+            Ok(b) => b,
+            Err(e) => Frame::Fault {
+                status: crate::abi::Status::Internal as u32,
+                message: format!("the server could not encode its reply: {e}"),
+            }
             .encode()
-            .map_err(<std::io::Error as InvalidData>::new_invalid)?;
+            .map_err(<std::io::Error as InvalidData>::new_invalid)?,
+        };
         let mut w = writer
             .lock()
             .map_err(|_| std::io::Error::other("the channel writer lock was poisoned"))?;
