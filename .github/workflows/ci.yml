@@ -261,31 +261,11 @@ jobs:
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Direct and transitive dependency counts
-        # The README sells `yesno-core` as five dependencies and no async
-        # runtime; the design asks for a pinned count that PRs may not raise.
-        # Counted with `-e normal`, so a dev-dependency ( roaring, proptest,
-        # criterion ) does not move the number the claim is about.
-        #
-        # Do not raise these to make a PR pass. Dependency creep into the
-        # core is what kills a "lean core" over eighteen months, one justified
-        # crate at a time.
-        run: |
-          set -euo pipefail
-          direct=$(cargo tree -p yesno-core --depth 1 -e normal | tail -n +2 | wc -l)
-          total=$(cargo tree -p yesno-core -e normal | wc -l)
-          echo "direct=$direct total=$total"
-          [ "$direct" -le 5 ]  || { echo "direct dependencies grew past 5"; exit 1; }
-          [ "$total"  -le 36 ] || { echo "transitive tree grew past 36 lines"; exit 1; }
-      - name: No async runtime or gRPC in the core
-        # The two network crates depend on core and never the reverse. This is
-        # what keeps that true.
-        run: |
-          set -euo pipefail
-          if cargo tree -p yesno-core -e normal | grep -E 'tokio|tonic|prost|arrow-flight'; then
-            echo "an async or gRPC crate reached yesno-core"
-            exit 1
-          fi
-          echo "clean"
+        # The limits, the reasoning and the async/gRPC exclusion all live in the
+        # script, which `scripts/gate.sh` runs as well. It used to be this
+        # pipeline and nothing local, so `libc` entering the core on 2026-09-27
+        # made this job red for 25 commits with no local gate able to report it.
+        run: ./scripts/check-lean-core.sh
 
   python-client:
     name: python client (lint, types, Flight interoperability)

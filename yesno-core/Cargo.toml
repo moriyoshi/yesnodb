@@ -20,7 +20,6 @@ bytemuck.workspace = true
 thiserror.workspace = true
 crc32c.workspace = true
 memmap2.workspace = true
-libc.workspace = true
 tracing = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true, optional = true }
 cranelift-frontend = { workspace = true, optional = true }

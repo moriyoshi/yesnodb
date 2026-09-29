@@ -77,6 +77,48 @@ use arrow_buffer::Buffer;
 use crate::error::{CodecError, Result};
 use crate::store::SLAB_SIZE;
 
+// `fallocate`, declared here rather than through the `libc` crate.
+//
+// **This is a dependency-budget decision, not a style one.** `yesno-core`
+// promises five direct dependencies -- README.md sells that, and the "lean core"
+// CI job fails if the count grows -- and the limits are calibrated to exactly
+// this tree: 5 direct, 36 transitive lines. Taking `libc` directly for this one
+// call put both at 6 and 37, so the job was red from 2026-09-27 until this was
+// noticed. `libc` is still *in* the tree, transitively under `memmap2`; the
+// budget is about what the core reaches for on its own. `db::readers` declares
+// `kill` the same way and for the same reason.
+//
+// # The signature, and why 32-bit must not compile
+//
+// `off_t` is the hazard. On 64-bit Linux it is `i64`, which is what these
+// arguments are. On a 32-bit target without large-file support it is 32 bits,
+// and glibc redirects `fallocate` to `fallocate64` under
+// `_FILE_OFFSET_BITS=64` -- so a hand declaration taking `i64` there would pass
+// arguments the callee reads at the wrong width and punch a hole at the wrong
+// offset. That is silent data loss, so the assertion below makes such a target a
+// **compile error** rather than a wrong answer. The `libc` crate is what
+// normally insulates a caller from this; declaring the symbol ourselves means
+// owning it, and the honest way to own it is to refuse the case we have not
+// thought through. Every target this crate is built for is 64-bit.
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    std::mem::size_of::<usize>() == 8,
+    "punch() hand-declares fallocate with 64-bit off_t; a 32-bit Linux target \
+     needs fallocate64 or the libc crate before this can be trusted"
+);
+
+/// Keep the file length; the punched range becomes a hole, not a truncation.
+#[cfg(target_os = "linux")]
+const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+/// Deallocate the range. Reads back as zeroes. Requires `KEEP_SIZE`.
+#[cfg(target_os = "linux")]
+const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+}
+
 /// Bytes per mmap segment. A multiple of [`SLAB_SIZE`] so no extent straddles a
 /// segment boundary.
 ///
@@ -564,11 +606,11 @@ impl SegmentedMmap {
             // and writes no memory. `self.file` outlives the call, and the mode
             // keeps the file length so no mapped page is withdrawn.
             let rc = unsafe {
-                libc::fallocate(
+                fallocate(
                     self.file.as_raw_fd(),
-                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                    cell as libc::off_t,
-                    len as libc::off_t,
+                    FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+                    cell as i64,
+                    len as i64,
                 )
             };
             if rc != 0 {

@@ -7633,3 +7633,80 @@ and asserted a 5000-value set against a 5001-value database, which sent me looki
 for a bug in `RunContainer` that was not there. A probe under
 `.agents-workspace/tmp/` printing `as_flat()` settled it in one run; reading the
 container code a third time would not have.
+
+## 2026-09-29 -- the lean-core dependency guard was red for 25 commits, because only CI could see it
+
+**Found while looking for something else.** Picking up
+`foreign-reader-liveness-is-unsound-across-pid-namespaces`, I read
+`db/readers.rs` to see what FFI was already available and hit this comment next
+to its hand-declared `kill`:
+
+> Declared here rather than taking a `libc` dependency. `yesno-core` has five
+> direct dependencies and a CI job that fails if it gains a sixth.
+
+`yesno-core/Cargo.toml` had `libc.workspace = true`. Measured:
+
+```text
+  direct = 6  (limit 5)      total = 37 lines  (limit 36)
+```
+
+`d160f06` ( 2026-09-27, hole punching ) added it for a single `fallocate` call
+in `store/segment.rs`. **25 commits have landed since**, so the `lean core`
+job has been failing on `main` for two days.
+
+**The reason nobody saw it is the whole finding.** The check exists only as an
+inline pipeline in `.github/workflows/ci.yml`. `scripts/gate.sh` -- the gate this
+tree's rules require before reporting a change done, the one that is run dozens
+of times a day -- **had no equivalent**. So the local gate went green on every
+one of those 25 commits while CI went red, and a green local gate is what people
+act on. This is the filed `nothing-compares-gate-sh-to-ci-yml` item arriving as
+an actual failure rather than a hypothetical, and it is the same shape as
+`gate-clippy-saw-two-crates` ( 2026-09-06 ): **a check with two implementations
+decays to the weakest one that anybody runs.**
+
+**The direction of the fix was not mine to choose.** The CI comment says "Do not
+raise these to make a PR pass", and the measurement says the limits were not
+arbitrary: dropping the direct dependency returns the counts to **exactly** 5 and
+36, the boundary. They were calibrated to this tree with no slack, which is
+evidence they are the intended values rather than a stale guess. So `fallocate`
+is now hand-declared in `store/segment.rs`, beside `db::readers`'s `kill` and for
+the reason that comment already gives. `libc` remains in the tree transitively
+under `memmap2`; the budget is about what the core reaches for on its own behalf.
+
+**Owning a signature means owning its hazard, and `off_t` is the hazard.** On
+64-bit Linux it is `i64`, which is what the declaration takes. On 32-bit without
+large-file support it is 32 bits and glibc redirects `fallocate` to
+`fallocate64`, so the same declaration would pass arguments the callee reads at
+the wrong width and punch a hole **at the wrong offset** -- silent data loss, in
+the one function whose entire job is destroying bytes. A
+`const _: () = assert!( size_of::<usize>() == 8 )` makes such a target a compile
+error instead. The `libc` crate is what normally insulates a caller from this;
+declining the crate means declining the insulation, and the honest way to do that
+is to refuse the case rather than hope for it. Every target this crate is built
+for is 64-bit ( CI builds `x86_64-unknown-linux-gnu` only ).
+
+**Verified rather than assumed.** `i6_punching_returns_allocated_blocks_to_the_filesystem`
+is by its own doc "the only test in the tree that can fail if punching stops
+happening", and it passes through the hand declaration. It also has teeth:
+setting `FALLOC_FL_PUNCH_HOLE` to a wrong value reddens it, so it is checking the
+syscall's effect and not merely that the code compiles.
+
+**The repair is one implementation with two callers**, not a second copy in
+`gate.sh`. `scripts/check-lean-core.sh` now holds the limits, the reasoning, and
+the async/gRPC exclusion; `gate.sh` runs it as a step and `ci.yml` invokes the
+same script. CI's separate `No async runtime or gRPC in the core` step was
+**deleted** rather than left alongside -- keeping it would have re-created the
+split this entry is about, one directory away. `EXPECT_STEPS` 16 -> 17 and
+`EXPECT_STEPS_DEEP` 22 -> 23.
+
+**What to take from it.** A budget that only CI enforces is a budget the local
+workflow is free to break, and it will, because the local workflow is the one
+with the feedback loop. When a check is cheap enough to run locally -- this one
+is two `cargo tree` invocations -- putting it anywhere *except* the local gate
+chooses a slower and less reliable signal on purpose. The counts being exactly at
+their limits afterwards is also worth noticing: a guard with no slack reports the
+first entry that crosses it, which is why this was recoverable at all rather than
+being discovered at 8 direct dependencies with no way to tell which were intended.
+
+**Still open**: `foreign-reader-liveness-is-unsound-across-pid-namespaces`, which
+is what I had actually sat down to fix.

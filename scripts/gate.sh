@@ -65,7 +65,12 @@ steps_run=0
 # are the last things before `verdict`, so it reached the end and the mismatch
 # was additions rather than an early exit. Both new steps are unconditional and
 # so count in both modes.
-EXPECT_STEPS=16
+# **Raised 16 -> 17 and 22 -> 23 on 2026-09-29** for "lean core: yesno-core's
+# dependency budget", which existed only in ci.yml and was therefore invisible to
+# every local gate run. Diagnosed before raising, as the paragraph above demands:
+# the step is a new unconditional addition next to the other policy checks, so it
+# counts in both modes.
+EXPECT_STEPS=17
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -112,7 +117,7 @@ EXPECT_STEPS=16
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=22
+EXPECT_STEPS_DEEP=23
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -274,6 +279,14 @@ step "the image entrypoint parses as POSIX sh"
 # It is the image's ENTRYPOINT and it is not covered by any Rust test. A syntax
 # error is a container that exits immediately with nothing useful on stderr.
 check sh -n dist/entrypoint.sh
+
+step "lean core: yesno-core's dependency budget"
+# The counts are calibrated to an exact tree ( 5 direct, 36 transitive lines ), so
+# a single new entry trips this. It lived only in ci.yml until 2026-09-29, which
+# is why adding `libc` to the core for one `fallocate` call on 2026-09-27 went
+# unnoticed through 25 commits: CI was red and no local run could see it. One
+# implementation, two callers -- ci.yml invokes the same script.
+check ./scripts/check-lean-core.sh
 
 step "policy R1: no Arrow types in yesno-core's public API"
 # The baseline started at six on 2026-08-25 and reached **empty** on 2026-08-28,
