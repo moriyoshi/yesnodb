@@ -8056,3 +8056,59 @@ The checker runs in both files, so it enforces its own presence on both sides.
 land in both -- see `nothing-compares-gate-sh-to-ci-yml`, filed the same day",
 which would have dangled once this item was removed. It now names the checker
 instead, which is a better answer to the same question.
+
+## 2026-09-29 -- the plugin channel is configurable without a config file
+
+Phase 0 of `LTM/operator-hosted-plugin-container-plan.md`, and the reason it is
+Phase 0: **the operator writes no `yesnod.toml` when `spec.config.secretName` is
+set**, which is the mTLS production path. `config_source` returns
+`ConfigSource::Secret` and generates nothing, so there was no way to hand such a
+deployment a `[plugin]` section -- the channel was configurable everywhere except
+the configuration a real cluster uses.
+
+Five overrides now exist on `Cli`, with `YESNOD_PLUGIN_CHANNEL_*` variables:
+socket, the three limits, and inline. This is additive rather than new mechanism;
+`config.rs` already documents and implements
+`defaults < file < YESNOD_* environment < command line` through `clap`'s `env`
+feature. The environment tier is the one that matters here, because a Pod sets
+variables far more naturally than it rewrites an argv.
+
+**`channel_inline` is `Option<bool>`, not `bool`, and that distinction is the only
+real design content.** A plain flag resolves to `false` when absent, so every
+start without it would silently overwrite a file that had asked for `true` -- and
+`channel_inline = true` is what a host that cannot create a `memfd` sets
+deliberately, so the silent overwrite would undo exactly the setting someone
+thought about. **An override has to be able to say nothing**, and `bool` has no way
+to. `an_absent_inline_flag_leaves_the_file_alone` pins it, and it reddens when
+`resolve` is changed to `unwrap_or(false)`, which is what a plain `bool` would
+compile to.
+
+**`Config::resolve` had no tests.** The precedence chain is documented in a
+module-level comment as one of the file's organising ideas, and nothing exercised
+it -- four flags were being merged over a file on the strength of the code reading
+correctly. It now has four tests. The one for the environment tier asserts through
+`Cli::command()` rather than by exporting variables: `clap` reads the real
+process environment, tests share one process, and a test that set
+`YESNOD_PLUGIN_CHANNEL_INLINE` would change the answer for whatever ran beside it.
+Checking that the argument *carries* the variable is race-free and catches the
+failure that matters, which is a flag silently losing its `env` and breaking the
+deployment path while every command-line test stays green.
+
+**Two things deliberately not added.** No path pre-validation in
+`--check-config`: a bind failure is already fatal and names itself
+( "cannot start the plugin channel: ..." ), `--check-config` is contractually a
+step that opens nothing, and a pre-check would reject a setup whose socket
+directory is created between validation and start. And **no `--plugin-library`**
+-- the in-process `cdylib` is out of the picture as of today, so the channel is
+the only half that gets an override.
+
+`docs/operations.md` gains an operator-facing section under the precedence
+paragraph, stating the two things that are not guessable: the socket is bound
+before the database opens so **its existence is not readiness**, and the three
+limits multiply into one per-connection region rather than acting independently.
+
+Still open in Phase 0: **a minimal channel peer binary.** Nothing in the tree
+speaks the protocol over a real socket -- the channel's tests call
+`Session::handle` directly, which is deliberate and is why protocol behaviour is
+testable without a descriptor, but it means the socket path itself is unexercised.
+That is the same shape as the daemon call-site gap found earlier today.

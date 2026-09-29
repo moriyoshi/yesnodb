@@ -56,6 +56,43 @@ Validate a configuration without opening the database or taking its lock:
 Configuration precedence is built-in defaults, configuration file,
 `YESNOD_*` environment variables, then command-line flags.
 
+### The out-of-process plugin channel
+
+A plugin peer runs as its own process and reaches `yesnod` over a Unix socket. It
+never opens the database: the snapshots it reads belong to `yesnod` and are keyed
+by its connection, so closing the socket is what releases them. A peer therefore
+needs no access to the data directory, cannot corrupt the daemon, and cannot keep
+space pinned after it exits or is killed.
+
+The channel is off until a socket path is set. These are settable from the
+configuration file, the environment, or the command line, which matters where the
+configuration file is supplied by something else -- an orchestrator that mounts it
+from a secret cannot also edit it, and the socket path is chosen by whoever places
+the peer beside the daemon:
+
+| flag | variable | meaning |
+|---|---|---|
+| `--plugin-channel-socket` | `YESNOD_PLUGIN_CHANNEL_SOCKET` | socket path; empty disables the channel |
+| `--plugin-channel-max-handles` | `YESNOD_PLUGIN_CHANNEL_MAX_HANDLES` | concurrent lane handles per connection |
+| `--plugin-channel-max-lanes` | `YESNOD_PLUGIN_CHANNEL_MAX_LANES` | lanes one handle may hold |
+| `--plugin-channel-max-blocks` | `YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS` | blocks one response may carry |
+| `--plugin-channel-inline` | `YESNOD_PLUGIN_CHANNEL_INLINE` | serve payloads in the frames, not a shared region |
+
+Two things an operator should know before setting them.
+
+**The socket is bound before the database opens, so its existence is not
+readiness.** A peer can connect immediately and will be told the database is
+unavailable until startup finishes, and again for the duration of a rebootstrap. A
+peer that treats the first such answer as fatal will restart on every start. Wait
+for the daemon to log that it is ready, not for the socket to appear.
+
+**The three limits together size a shared region, per connection.** It is sparse,
+so the reservation is address space and the cost is the pages actually used -- but
+the product of the three is what bounds it, and raising all three at once raises
+it multiplicatively. Leave them alone unless a peer reports a limit it cannot work
+within. A failure to bind the socket is fatal and says so, rather than leaving the
+channel quietly absent.
+
 ## Logging and tracing
 
 `yesnod` writes structured tracing output to standard error. The default filter

@@ -909,6 +909,46 @@ pub struct Cli {
     )]
     pub log: String,
 
+    /// Unix socket path for the out-of-process plugin channel. Empty disables it.
+    ///
+    /// # Why this is reachable without a config file
+    ///
+    /// A deployment that supplies `yesnod.toml` itself -- the Kubernetes operator
+    /// does whenever `spec.config.secretName` is set, which is the mTLS production
+    /// path -- has no way to be handed a `[plugin]` section by anything else. The
+    /// socket path is chosen by whoever places the peer beside the daemon, not by
+    /// whoever wrote the config, so it has to be settable from the outside or the
+    /// channel is available exactly where it is least useful.
+    #[arg(long, value_name = "PATH", env = "YESNOD_PLUGIN_CHANNEL_SOCKET")]
+    pub plugin_channel_socket: Option<String>,
+
+    /// Lane handles one channel connection may hold at once.
+    #[arg(long, value_name = "N", env = "YESNOD_PLUGIN_CHANNEL_MAX_HANDLES")]
+    pub plugin_channel_max_handles: Option<usize>,
+
+    /// Lanes one handle may hold. Bounds the arena with the two around it.
+    #[arg(long, value_name = "N", env = "YESNOD_PLUGIN_CHANNEL_MAX_LANES")]
+    pub plugin_channel_max_lanes: Option<usize>,
+
+    /// Blocks one channel response may carry.
+    #[arg(long, value_name = "N", env = "YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS")]
+    pub plugin_channel_max_blocks: Option<usize>,
+
+    /// Serve channel payloads inside the frames instead of through a shared arena.
+    ///
+    /// `Option<bool>` rather than a plain flag, and that is the point: a bare
+    /// `bool` is `false` when absent, which would override a config file that had
+    /// asked for `true` every time the flag was not passed. An override has to be
+    /// able to say nothing.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        env = "YESNOD_PLUGIN_CHANNEL_INLINE",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub plugin_channel_inline: Option<bool>,
+
     /// Resolve and validate the configuration, print it, and exit. Opens no
     /// database and takes no lock.
     #[arg(long)]
@@ -1014,6 +1054,21 @@ impl Config {
         }
         if let Some(path) = &cli.control_journal_dir {
             cfg.server.control.journal_dir = path.clone();
+        }
+        if let Some(path) = &cli.plugin_channel_socket {
+            cfg.plugin.channel_socket = path.clone();
+        }
+        if let Some(n) = cli.plugin_channel_max_handles {
+            cfg.plugin.channel_max_handles = n;
+        }
+        if let Some(n) = cli.plugin_channel_max_lanes {
+            cfg.plugin.channel_max_lanes = n;
+        }
+        if let Some(n) = cli.plugin_channel_max_blocks {
+            cfg.plugin.channel_max_blocks = n;
+        }
+        if let Some(inline) = cli.plugin_channel_inline {
+            cfg.plugin.channel_inline = inline;
         }
         cfg.validate_with(cli.insecure, cli.insecure_replication)?;
         Ok(cfg)
@@ -2261,5 +2316,165 @@ interval_secs = 5
              image's entrypoint dispatcher in `dist/entrypoint.sh` distinguishes \
              a binary name from yesnod's argv by exactly this property"
         );
+    }
+
+    /// A scratch `yesnod.toml`, named per test so parallel runs cannot collide.
+    fn config_file(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "yesnod-cfg-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("yesnod.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The channel's socket and limits are settable from the command line.
+    ///
+    /// The point is not that `clap` works. It is that a deployment which supplies
+    /// its own `yesnod.toml` can still be told where the plugin peer's socket goes:
+    /// the operator writes no config when `spec.config.secretName` is set, so
+    /// without this the channel is configurable everywhere except the one place
+    /// that matters.
+    #[test]
+    fn plugin_channel_flags_override_the_file() {
+        use clap::Parser as _;
+
+        let file = config_file(
+            "override",
+            "[plugin]\nchannel_socket = \"/from/file.sock\"\nchannel_max_lanes = 7\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--insecure",
+            "--data-dir",
+            "/tmp/yesnod-cfg-test",
+            "--config",
+            file.to_str().unwrap(),
+            "--plugin-channel-socket",
+            "/run/yesno/plugin.sock",
+            "--plugin-channel-max-handles",
+            "3",
+            "--plugin-channel-max-lanes",
+            "265",
+            "--plugin-channel-max-blocks",
+            "8",
+        ]);
+        let cfg = Config::resolve(&cli).unwrap();
+        assert_eq!(cfg.plugin.channel_socket, "/run/yesno/plugin.sock");
+        assert_eq!(cfg.plugin.channel_max_handles, 3);
+        assert_eq!(cfg.plugin.channel_max_lanes, 265);
+        assert_eq!(cfg.plugin.channel_max_blocks, 8);
+        assert!(cfg.plugin.channel_enabled());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// An absent `--plugin-channel-inline` must not clear a file that asked for it.
+    ///
+    /// **This is the whole reason the field is `Option<bool>` and not `bool`.** A
+    /// plain flag resolves to `false` when absent, so every start without the flag
+    /// would silently overwrite `channel_inline = true` and move the payload back
+    /// onto the arena -- on a host that cannot make a `memfd`, that is the
+    /// configuration the operator set precisely to avoid. An override has to be
+    /// able to say nothing, and `bool` cannot.
+    #[test]
+    fn an_absent_inline_flag_leaves_the_file_alone() {
+        use clap::Parser as _;
+
+        let file = config_file(
+            "inline-keep",
+            "[plugin]\nchannel_socket = \"/s.sock\"\nchannel_inline = true\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--insecure",
+            "--data-dir",
+            "/tmp/yesnod-cfg-test",
+            "--config",
+            file.to_str().unwrap(),
+        ]);
+        assert!(
+            cli.plugin_channel_inline.is_none(),
+            "the flag was not passed, so it must carry no opinion"
+        );
+        let cfg = Config::resolve(&cli).unwrap();
+        assert!(
+            cfg.plugin.channel_inline,
+            "an unpassed flag overwrote the file's choice"
+        );
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// And it can still be turned off explicitly, which is what makes it an
+    /// override rather than a one-way door.
+    #[test]
+    fn inline_can_be_turned_off_from_the_command_line() {
+        use clap::Parser as _;
+
+        let file = config_file(
+            "inline-off",
+            "[plugin]\nchannel_socket = \"/s.sock\"\nchannel_inline = true\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--insecure",
+            "--data-dir",
+            "/tmp/yesnod-cfg-test",
+            "--config",
+            file.to_str().unwrap(),
+            "--plugin-channel-inline=false",
+        ]);
+        let cfg = Config::resolve(&cli).unwrap();
+        assert!(!cfg.plugin.channel_inline);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Every channel flag carries its `YESNOD_*` variable.
+    ///
+    /// Asserted through the command definition rather than by setting variables in
+    /// the process: `clap`'s `env` feature reads the real environment, tests share
+    /// one process, and a test that exported `YESNOD_PLUGIN_CHANNEL_INLINE` would
+    /// change the answer for whatever ran beside it. This checks the wiring without
+    /// the race.
+    ///
+    /// The environment tier is the one the Kubernetes operator uses -- a Pod sets
+    /// variables far more naturally than it rewrites an argv -- so a flag that
+    /// silently lost its `env` would break the deployment path while every
+    /// command-line test kept passing.
+    #[test]
+    fn every_plugin_channel_flag_has_an_environment_variable() {
+        use clap::CommandFactory as _;
+
+        let want = [
+            ("plugin-channel-socket", "YESNOD_PLUGIN_CHANNEL_SOCKET"),
+            (
+                "plugin-channel-max-handles",
+                "YESNOD_PLUGIN_CHANNEL_MAX_HANDLES",
+            ),
+            (
+                "plugin-channel-max-lanes",
+                "YESNOD_PLUGIN_CHANNEL_MAX_LANES",
+            ),
+            (
+                "plugin-channel-max-blocks",
+                "YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS",
+            ),
+            ("plugin-channel-inline", "YESNOD_PLUGIN_CHANNEL_INLINE"),
+        ];
+        let command = Cli::command();
+        for (flag, variable) in want {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("no --{flag}"));
+            assert_eq!(
+                arg.get_env().and_then(|e| e.to_str()),
+                Some(variable),
+                "--{flag} lost its environment variable"
+            );
+        }
     }
 }
