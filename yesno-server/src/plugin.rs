@@ -178,10 +178,13 @@ struct Ucred {
 // dependency added for them.
 const SOL_SOCKET: i32 = 1;
 const SO_PEERCRED: i32 = 17;
+const SHUT_RDWR: i32 = 2;
 
 extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
+    #[link_name = "shutdown"]
+    fn libc_shutdown(fd: i32, how: i32) -> i32;
     #[link_name = "getsockopt"]
     fn libc_getsockopt(
         fd: i32,
@@ -192,12 +195,93 @@ extern "C" {
     ) -> i32;
 }
 
+/// One admitted connection, counted for as long as this lives.
+///
+/// # Why a counter and not `peers.len()`
+///
+/// Admission used to read `peers.len()` and spawn, but a connection registers
+/// itself in `peers` only after its arena is built and its descriptor sent -- so
+/// several connects arriving together all saw room, all spawned, and all allocated
+/// an arena before any of them appeared in the list. The cap held only when peers
+/// arrived one at a time, which is exactly how a test that waits for each to
+/// register would drive it.
+///
+/// The count is incremented **before** the thread is spawned and decremented when
+/// it exits, whatever path it takes out, which is the same RAII argument the
+/// removed lease guard used: increment-then-build leaves the count permanently
+/// high if anything in between fails, and build-then-increment lets the failure
+/// decrement a count that was never incremented.
+struct AdmissionSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Take a slot if one is free. `None` means the channel is full.
+///
+/// A compare-and-swap rather than load-then-store: two accept loops do not exist
+/// today, but a check and a separate increment is the same shape as the bug this
+/// replaces, and the loop costs nothing on an uncontended counter.
+fn admit(live: &Arc<std::sync::atomic::AtomicUsize>, max: usize) -> Option<AdmissionSlot> {
+    let mut seen = live.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if seen >= max {
+            return None;
+        }
+        match live.compare_exchange_weak(
+            seen,
+            seen + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(AdmissionSlot(live.clone())),
+            Err(actual) => seen = actual,
+        }
+    }
+}
+
+/// One connected peer: a writer other threads serialise on, and a hangup that
+/// never waits for it.
+///
+/// **The split is the point.** Frame writes must be mutually exclusive or a
+/// notification interleaves inside a response, so the writer is behind a mutex.
+/// But `disconnect_peers` used to take that same mutex to call `shutdown`, and a
+/// peer that stops reading blocks its serving thread inside `write_all` while
+/// holding it -- so the disconnect that exists to reclaim the database waited on
+/// the very peer it was trying to hang up. `shutdown` takes `&self`, so a second
+/// descriptor for the same socket needs no lock and cannot be blocked: it
+/// interrupts the stalled write rather than queueing behind it.
+pub(crate) struct PeerHandle {
+    writer: std::sync::Mutex<std::os::unix::net::UnixStream>,
+    hangup: std::os::unix::net::UnixStream,
+}
+
+impl PeerHandle {
+    fn hang_up(&self) {
+        let _ = self.hangup.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// How long a notification write may block before its peer is disconnected.
 ///
 /// Short on purpose. A notification is tens of bytes, so a peer that cannot accept
 /// one inside this window is not merely busy -- it has stopped reading, and the
 /// frames behind it would queue without bound.
 const NOTIFY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long **any** write to a peer may block before the connection is abandoned.
+///
+/// Set once on the socket at accept, so it covers ordinary responses and not only
+/// notifications. Bounding notifications alone left the hole this closes: a peer
+/// that stops reading stalls its serving thread inside a response `write_all`,
+/// and everything that wants that peer's writer queues behind it.
+///
+/// Longer than the notification bound because a response can be a megabyte of
+/// inline payload to a peer that is merely slow, and disconnecting that peer would
+/// be wrong.
+const PEER_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The out-of-process channel: a Unix socket yesnod serves peers on.
 ///
@@ -224,7 +308,7 @@ pub struct Channel {
     /// connection and held only for one frame, and frames are the unit of the
     /// protocol, so a notification can interleave with responses but never inside
     /// one.
-    peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
+    peers: Arc<std::sync::Mutex<Vec<Arc<PeerHandle>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// Behind a mutex so [`Channel::stop`] takes `&self`.
     ///
@@ -233,6 +317,17 @@ pub struct Channel {
     /// stop at teardown -- so a `stop( self )` would have forced one of them to be
     /// different from the other for no reason but this field.
     listener: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Connections past accept, whether or not they have registered yet.
+    admitted: Arc<std::sync::atomic::AtomicUsize>,
+    /// A second descriptor for the listening socket, used only to wake `accept`.
+    ///
+    /// **This is what removes the pathname from teardown.** `stop` used to connect
+    /// to its own configured path so the blocking `accept` would return -- which
+    /// trusts the directory entry to still be ours. If anything else can write the
+    /// parent directory and swaps the path, that connect wakes a **different**
+    /// listener, this one never returns, and the join hangs. Shutting our own
+    /// descriptor cannot be redirected: it names the socket, not a name.
+    wake: std::os::unix::net::UnixListener,
     /// The generation counter a peer reads in the greeting.
     ///
     /// **Held here because the in-process facility used to own it.** When a
@@ -262,6 +357,10 @@ impl Channel {
         }
         let policy = AccessPolicy::from_config(cfg);
         let max_peers = cfg.plugin.channel_max_peers.max(1);
+        // Counted at admission rather than derived from `peers`, which a
+        // connection joins only once it is fully set up; see `AdmissionSlot`.
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_admitted = admitted.clone();
 
         let limits = Limits {
             max_handles: cfg.plugin.channel_max_handles.max(1),
@@ -275,9 +374,8 @@ impl Channel {
                 .clamp(1, yesno_plugin::ipc::MAX_BATCH),
             max_snapshots: cfg.plugin.channel_max_snapshots.max(1),
         };
-        let peers: Arc<
-            std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>,
-        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peers: Arc<std::sync::Mutex<Vec<Arc<PeerHandle>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let inline = cfg.plugin.channel_inline;
@@ -286,6 +384,7 @@ impl Channel {
         // The accept loop takes the `Host`; the channel keeps a clone so it can
         // bump the generation on a rebootstrap. Both share one `Arc<AtomicU64>`.
         let kept = host.clone();
+        let wake = listener.try_clone()?;
         let handle = std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 if accept_stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -305,10 +404,8 @@ impl Channel {
                 if !policy.admits(&stream) {
                     continue;
                 }
-                let live = accept_peers.lock().map(|p| p.len()).unwrap_or(0);
-                if live >= max_peers {
+                let Some(slot) = admit(&accept_admitted, max_peers) else {
                     tracing::warn!(
-                        live,
                         max_peers,
                         "refusing a plugin channel peer: the connection limit is reached"
                     );
@@ -316,10 +413,10 @@ impl Channel {
                     // connection that appears to succeed and never answers.
                     drop(stream);
                     continue;
-                }
+                };
                 let host = host.clone();
                 let peers = accept_peers.clone();
-                std::thread::spawn(move || serve_one(stream, host, limits, inline, peers));
+                std::thread::spawn(move || serve_one(stream, host, limits, inline, peers, slot));
             }
         });
 
@@ -336,6 +433,8 @@ impl Channel {
             stop,
             listener: std::sync::Mutex::new(Some(handle)),
             host: kept,
+            wake,
+            admitted,
         }))
     }
 
@@ -345,6 +444,18 @@ impl Channel {
     /// field for why it lives on the channel now.
     pub fn bump_generation(&self) -> u64 {
         self.host.bump_generation()
+    }
+
+    /// Connections occupying an admission slot.
+    ///
+    /// **Not the same number as [`Channel::peers`], and the difference matters.**
+    /// A connection takes a slot at accept and releases it when its thread exits,
+    /// while it joins the peer registry only once its arena is built and leaves it
+    /// just before the thread ends. So `admitted` is at least `peers`, and the cap
+    /// is enforced on this one -- enforcing it on the registry was the bug, because
+    /// several connections could be past accept and not yet registered.
+    pub fn admitted(&self) -> usize {
+        self.admitted.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Connections currently served.
@@ -385,7 +496,7 @@ impl Channel {
     }
 
     /// The live peers, cloned so writes happen with the lock released.
-    fn peer_snapshot(&self) -> Option<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>> {
+    fn peer_snapshot(&self) -> Option<Vec<Arc<PeerHandle>>> {
         self.peers.lock().ok().map(|p| p.clone())
     }
 
@@ -398,24 +509,27 @@ impl Channel {
     /// no resynchronisation point, so the connection is unusable whatever happens
     /// next. Dropping it is the honest outcome, and a peer reconnects and is told
     /// the current generation in its greeting.
-    fn write_frame(
-        peer: &Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
-        bytes: &[u8],
-    ) -> bool {
-        let Ok(mut stream) = peer.lock() else {
+    fn write_frame(peer: &Arc<PeerHandle>, bytes: &[u8]) -> bool {
+        let Ok(mut stream) = peer.writer.lock() else {
             return false;
         };
+        // Tightened for a notification and restored afterwards: the connection
+        // already carries `PEER_WRITE_TIMEOUT` from accept, which is sized for a
+        // large response to a merely slow peer, and a notification is tens of bytes
+        // and should not wait that long behind one.
         if stream
             .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT))
             .is_err()
         {
             return false;
         }
-        std::io::Write::write_all(&mut *stream, bytes).is_ok()
+        let ok = std::io::Write::write_all(&mut *stream, bytes).is_ok();
+        let _ = stream.set_write_timeout(Some(PEER_WRITE_TIMEOUT));
+        ok
     }
 
     /// Forget these peers and shut their sockets, which ends their serving threads.
-    fn drop_peers(&self, dead: &[Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>]) {
+    fn drop_peers(&self, dead: &[Arc<PeerHandle>]) {
         if dead.is_empty() {
             return;
         }
@@ -423,9 +537,7 @@ impl Channel {
             peers.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(d, p)));
         }
         for peer in dead {
-            if let Ok(s) = peer.lock() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
+            peer.hang_up();
         }
     }
 
@@ -458,9 +570,9 @@ impl Channel {
         let taken: Vec<_> = peers.drain(..).collect();
         drop(peers);
         for peer in &taken {
-            if let Ok(s) = peer.lock() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
+            // Never takes the writer lock; see `PeerHandle`. A peer stalled inside
+            // a response write is exactly the one this must be able to hang up.
+            peer.hang_up();
         }
         taken.len()
     }
@@ -477,14 +589,32 @@ impl Channel {
         // [`Channel::disconnect_peers`], which does exactly this for a rebootstrap;
         // the only difference is that this one also stops the listener.
         self.disconnect_peers();
-        // And connect to our own listener once, so its blocking `accept` returns and
-        // the thread sees the flag.
-        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        // Wake the blocking `accept` by shutting our own listening descriptor,
+        // rather than connecting to the path; see the `wake` field.
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: `shutdown` takes a descriptor and an integer and writes no
+            // memory. `self.wake` outlives the call.
+            unsafe { libc_shutdown(self.wake.as_raw_fd(), SHUT_RDWR) };
+        }
         let handle = self.listener.lock().ok().and_then(|mut g| g.take());
         if let Some(h) = handle {
             let _ = h.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        // Removed only while it is still a socket. That does not make the path
+        // safe -- a replacement swapped in by anything that can write the parent
+        // directory would also be a socket -- and the real boundary is a private
+        // parent, which `operations.md` states. It does stop the ordinary mistake
+        // of deleting a regular file somebody put there.
+        if std::fs::symlink_metadata(&self.path)
+            .map(|m| {
+                use std::os::unix::fs::FileTypeExt as _;
+                m.file_type().is_socket()
+            })
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -494,7 +624,10 @@ fn serve_one(
     host: Host,
     limits: Limits,
     inline: bool,
-    peers: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>>,
+    peers: Arc<std::sync::Mutex<Vec<Arc<PeerHandle>>>>,
+    // Held for the connection's life; dropping it frees the admission slot,
+    // whichever way this function returns.
+    _admission: AdmissionSlot,
 ) {
     // # Why this falls back rather than failing
     //
@@ -537,23 +670,37 @@ fn serve_one(
         None => Session::new_inline(host, limits),
     };
 
-    let writer = match stream.try_clone() {
-        Ok(w) => Arc::new(std::sync::Mutex::new(w)),
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot split the channel socket");
+    // Two more descriptors for one socket: one the writes serialise on, one that
+    // only ever calls `shutdown` and therefore never waits for them.
+    let (writer, hangup) = match (stream.try_clone(), stream.try_clone()) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => {
+            tracing::warn!("cannot split the channel socket");
             return;
         }
     };
+    // **Every** write to this peer is bounded from here on, responses included.
+    // Bounding only notifications left a peer that stops reading stalling its own
+    // serving thread inside a response, with everything that wants its writer
+    // queued behind that.
+    if let Err(e) = writer.set_write_timeout(Some(PEER_WRITE_TIMEOUT)) {
+        tracing::warn!(error = %e, "cannot bound writes to the channel peer");
+        return;
+    }
+    let peer = Arc::new(PeerHandle {
+        writer: std::sync::Mutex::new(writer),
+        hangup,
+    });
     if let Ok(mut p) = peers.lock() {
-        p.push(writer.clone());
+        p.push(peer.clone());
     }
 
-    let result = yesno_plugin::channel::serve_locked(&mut session, stream, &writer);
+    let result = yesno_plugin::channel::serve_locked(&mut session, stream, &peer.writer);
     if let Err(e) = result {
         tracing::warn!(error = %e, "plugin channel connection ended with an error");
     }
     if let Ok(mut p) = peers.lock() {
-        p.retain(|q| !Arc::ptr_eq(q, &writer));
+        p.retain(|q| !Arc::ptr_eq(q, &peer));
     }
     // `session` drops here, releasing every snapshot the peer held. That is the
     // reclamation story: no pid, no timeout, no cooperation.
@@ -742,5 +889,46 @@ mod tests {
         };
         assert!(policy.permits(1000));
         assert!(!policy.permits(1234));
+    }
+
+    /// Hanging up never waits for the peer's writer.
+    ///
+    /// **This is the structural half of re-review item 2, and the half a test can
+    /// pin.** `disconnect_peers` used to call `shutdown` through the writer mutex,
+    /// so a peer stalled inside a response `write_all` -- which holds that mutex --
+    /// blocked the very hang-up meant to reclaim its snapshots.
+    ///
+    /// The stall is simulated by simply holding the writer lock, which is what a
+    /// blocked `write_all` does. Run on another thread with a deadline rather than
+    /// inline, because the failure mode is a **hang**: inline, a regression would
+    /// deadlock the test process instead of failing it, and this session has
+    /// already spent two timeouts learning that a hang reads as a slow test.
+    ///
+    /// The other half -- that ordinary responses are bounded -- is by construction:
+    /// the timeout is set on the socket once at accept, so it covers every write
+    /// rather than only the notification path. Reproducing *that* needs a peer that
+    /// fills its receive buffer, which is not deterministic at this level, and a
+    /// test which cannot fail would be worse than saying so here.
+    #[test]
+    fn hanging_up_does_not_wait_for_the_writer() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = Arc::new(PeerHandle {
+            writer: std::sync::Mutex::new(a.try_clone().unwrap()),
+            hangup: a,
+        });
+        let held = peer.writer.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hanging = peer.clone();
+        std::thread::spawn(move || {
+            hanging.hang_up();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "hang_up waited on the writer lock; a peer stalled mid-response would \
+             block the disconnect that exists to take its snapshots back"
+        );
+        drop(held);
     }
 }

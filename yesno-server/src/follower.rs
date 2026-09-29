@@ -536,9 +536,24 @@ fn close_for_rebuild(
     st: &Arc<FollowerStatus>,
     listeners: crate::plugin::Listeners<'_>,
 ) {
-    listeners.before_close();
-    let Some(slot) = slot else { return };
+    // **The slot is emptied before the peers are told, and the order is the fix.**
+    // Disconnecting first left a gap: the listener stays up by design, so a peer
+    // connecting between the disconnect and the take was admitted, read a database
+    // that still existed through the slot, opened a snapshot against it, and held
+    // its lock -- reintroducing the `AlreadyOpen` this whole path exists to avoid,
+    // on a connection that arrived microseconds too early.
+    //
+    // Emptying first closes it without a new flag or a quiesce protocol: `Host::db`
+    // reads the slot on every call, so from this line on every peer, already
+    // connected or newly admitted, is answered `UNAVAILABLE` and **cannot acquire a
+    // snapshot at all**. What remains outstanding is what was taken before this
+    // line, and that is exactly what `before_close` disconnects.
+    let Some(slot) = slot else {
+        listeners.before_close();
+        return;
+    };
     let taken = slot.write().map(|mut g| g.take()).unwrap_or(None);
+    listeners.before_close();
     if taken.is_some() {
         tracing::warn!(
             "closing the database to rebuild it; reads are unavailable until it reopens"

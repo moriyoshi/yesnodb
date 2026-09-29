@@ -69,7 +69,15 @@ impl Peer {
     }
 }
 
-fn setup(tag: &str) -> (Clean, Config, Host, std::path::PathBuf) {
+fn setup(
+    tag: &str,
+) -> (
+    Clean,
+    Config,
+    Host,
+    std::path::PathBuf,
+    yesno_server::guard::DbSlot,
+) {
     let mut dir = std::env::temp_dir();
     dir.push(format!("yesno-chanwire-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -103,14 +111,14 @@ fn setup(tag: &str) -> (Clean, Config, Host, std::path::PathBuf) {
     cfg.plugin.channel_max_blocks = 4;
 
     let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
-    let host = Host::new(slot, 1, Role::Leader);
-    (clean, cfg, host, sock)
+    let host = Host::new(slot.clone(), 1, Role::Leader);
+    (clean, cfg, host, sock, slot)
 }
 
 /// A peer connects, is handed the arena, and reads a scan out of it.
 #[test]
 fn a_peer_scans_through_the_socket_and_the_arena() {
-    let (_c, cfg, host, sock) = setup("scan");
+    let (_c, cfg, host, sock, _slot) = setup("scan");
     let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
 
     let mut peer = Peer::connect(&sock);
@@ -201,7 +209,7 @@ fn a_peer_scans_through_the_socket_and_the_arena() {
 /// that no longer exists between polls, which is why these are pushed.
 #[test]
 fn a_connected_peer_is_told_about_availability_without_asking() {
-    let (_c, cfg, host, sock) = setup("notify");
+    let (_c, cfg, host, sock, _slot) = setup("notify");
     let channel = Channel::start(&cfg, host).unwrap().unwrap();
     let mut peer = Peer::connect(&sock);
     assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
@@ -227,7 +235,7 @@ fn a_connected_peer_is_told_about_availability_without_asking() {
 /// returns zero, and the session drops. Nothing polls and no pid is consulted.
 #[test]
 fn a_vanished_peer_releases_its_snapshots() {
-    let (_c, cfg, host, sock) = setup("vanish");
+    let (_c, cfg, host, sock, _slot) = setup("vanish");
     let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
     let db = host.db().unwrap();
     assert_eq!(db.live_readers(), 0);
@@ -266,7 +274,7 @@ fn a_vanished_peer_releases_its_snapshots() {
 /// Stopping the channel closes live connections, which is what lets the database go.
 #[test]
 fn stopping_the_channel_releases_a_well_behaved_peer_too() {
-    let (_c, cfg, host, sock) = setup("stop");
+    let (_c, cfg, host, sock, _slot) = setup("stop");
     let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
     let db = host.db().unwrap();
 
@@ -295,7 +303,7 @@ fn stopping_the_channel_releases_a_well_behaved_peer_too() {
 /// An unconfigured channel binds nothing.
 #[test]
 fn an_unconfigured_channel_is_absent() {
-    let (_c, mut cfg, host, _sock) = setup("off");
+    let (_c, mut cfg, host, _sock, _slot) = setup("off");
     cfg.plugin.channel_socket = String::new();
     assert!(Channel::start(&cfg, host).unwrap().is_none());
 }
@@ -314,7 +322,7 @@ fn an_unconfigured_channel_is_absent() {
 /// `memfd`, which is what makes it testable at all.
 #[test]
 fn a_peer_is_served_inline_when_the_host_has_no_arena() {
-    let (_c, mut cfg, host, sock) = setup("inline");
+    let (_c, mut cfg, host, sock, _slot) = setup("inline");
     cfg.plugin.channel_inline = true;
     // Configured wider than an inline frame can carry, deliberately: the server must
     // advertise what it can actually encode rather than what the file says, and the
@@ -454,7 +462,7 @@ fn a_peer_is_served_inline_when_the_host_has_no_arena() {
 /// socket is real rather than merely configured.
 #[test]
 fn the_daemon_wiring_binds_the_configured_socket() {
-    let (_c, cfg, _host, sock) = setup("wire");
+    let (_c, cfg, _host, sock, _slot) = setup("wire");
     assert!(!sock.exists(), "nothing is bound before wiring");
 
     let wiring = yesno_server::plugin::wire(&cfg, Role::Leader)
@@ -484,7 +492,7 @@ fn the_daemon_wiring_binds_the_configured_socket() {
 /// Neither shape configured means no wiring and no socket.
 #[test]
 fn the_daemon_wiring_is_absent_when_nothing_is_configured() {
-    let (_c, mut cfg, _host, sock) = setup("wire-off");
+    let (_c, mut cfg, _host, sock, _slot) = setup("wire-off");
     cfg.plugin.channel_socket = String::new();
     // SAFETY: nothing is configured, so nothing is loaded.
     let wiring = yesno_server::plugin::wire(&cfg, Role::Leader).unwrap();
@@ -500,7 +508,7 @@ fn the_daemon_wiring_is_absent_when_nothing_is_configured() {
 /// misconfiguration. Refusing at startup puts the error where the mistake is.
 #[test]
 fn a_plugin_on_a_cold_standby_is_refused() {
-    let (_c, mut cfg, _host, sock) = setup("wire-cold");
+    let (_c, mut cfg, _host, sock, _slot) = setup("wire-cold");
     cfg.follower.serve_reads = false;
     // SAFETY: the call refuses before loading anything.
     let e = yesno_server::plugin::wire(&cfg, Role::Follower);
@@ -539,7 +547,7 @@ fn a_plugin_on_a_cold_standby_is_refused() {
 /// reconnects on its own and learns the new generation from its greeting.
 #[test]
 fn a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement() {
-    let (_c, cfg, host, sock) = setup("revoke");
+    let (_c, cfg, host, sock, _slot) = setup("revoke");
     let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
     let db = host.db().unwrap();
 
@@ -591,7 +599,7 @@ fn a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement() {
 /// carry on. Nobody observes the split, because both sides look healthy.
 #[test]
 fn a_second_channel_refuses_to_take_over_a_live_socket() {
-    let (_c, cfg, host, sock) = setup("clobber");
+    let (_c, cfg, host, sock, _slot) = setup("clobber");
     let first = Channel::start(&cfg, host.clone()).unwrap().unwrap();
     assert!(sock.exists());
 
@@ -638,7 +646,7 @@ fn a_second_channel_refuses_to_take_over_a_live_socket() {
 #[test]
 fn the_channel_socket_takes_the_configured_mode() {
     use std::os::unix::fs::PermissionsExt as _;
-    let (_c, mut cfg, host, sock) = setup("mode");
+    let (_c, mut cfg, host, sock, _slot) = setup("mode");
     cfg.plugin.channel_socket_mode = "0600".into();
     let channel = Channel::start(&cfg, host).unwrap().unwrap();
     let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
@@ -652,7 +660,7 @@ fn the_channel_socket_takes_the_configured_mode() {
 /// uncapped accept loop lets one peer multiply those by reconnecting.
 #[test]
 fn peers_past_the_configured_limit_are_refused() {
-    let (_c, mut cfg, host, sock) = setup("cap");
+    let (_c, mut cfg, host, sock, _slot) = setup("cap");
     cfg.plugin.channel_max_peers = 2;
     let channel = Channel::start(&cfg, host).unwrap().unwrap();
 
@@ -667,6 +675,7 @@ fn peers_past_the_configured_limit_are_refused() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(channel.peers(), 2, "both peers are being served");
+    assert_eq!(channel.admitted(), 2, "and both hold an admission slot");
 
     // The third connects -- the listener still accepts -- but is closed without a
     // greeting, which is what a refusal looks like from the peer's side.
@@ -680,14 +689,17 @@ fn peers_past_the_configured_limit_are_refused() {
         0,
         "a refused peer must see EOF at once, not a connection that never answers"
     );
-    assert_eq!(channel.peers(), 2, "and it was never counted");
+    assert_eq!(channel.admitted(), 2, "and it was never counted");
 
-    // Room reopens when one leaves.
+    // Room reopens when one leaves. Waited on the **admission** count, not the
+    // registry: a connection leaves the registry just before its thread ends and
+    // releases its slot, so waiting on `peers` can race ahead of the capacity.
     admitted.pop();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while channel.peers() > 1 && std::time::Instant::now() < deadline {
+    while channel.admitted() > 1 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert_eq!(channel.admitted(), 1, "the slot came back");
     let mut p = Peer::connect(&sock);
     assert!(
         matches!(p.read_frame(), Frame::ServerHello { .. }),
@@ -695,5 +707,98 @@ fn peers_past_the_configured_limit_are_refused() {
     );
     drop(p);
     drop(admitted);
+    channel.stop();
+}
+
+/// A peer that arrives during the cutover cannot reach the old database.
+///
+/// **Item 1 of the re-review.** Disconnecting the registered peers and *then*
+/// taking the slot leaves a gap, because the listener stays up by design: a
+/// connection arriving in between is admitted, finds the database still in the
+/// slot, opens a snapshot and holds its lock -- reintroducing the `AlreadyOpen`
+/// the disconnect exists to prevent, on a peer that arrived microseconds early.
+///
+/// **This pins the invariant the fix rests on, not the call order itself**, and
+/// the distinction is worth stating: it asserts that once the slot is empty every
+/// peer is refused a snapshot, whether already connected or just arrived. Nothing
+/// here would catch someone reversing the two statements in `close_for_rebuild`
+/// again, because that function is private to the follower and driving it needs a
+/// replication harness. Reading it is the only check on the order -- so the
+/// comment there carries the argument, and this carries the property that makes
+/// the argument sound.
+#[test]
+fn a_peer_arriving_during_a_cutover_cannot_open_a_snapshot() {
+    let (_c, cfg, host, sock, slot) = setup("cutover");
+    let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+
+    // What `close_for_rebuild` now does first.
+    let taken = slot.write().unwrap().take();
+    assert!(taken.is_some(), "the fixture had a database to take");
+
+    let mut late = Peer::connect(&sock);
+    assert!(matches!(late.read_frame(), Frame::ServerHello { .. }));
+    late.ask(Frame::ClientHello {
+        protocol: 1,
+        name: "late".into(),
+    });
+    match late.ask(Frame::SnapshotOpen) {
+        Frame::Fault { status, .. } => assert_eq!(
+            status,
+            yesno_plugin::abi::Status::Unavailable as u32,
+            "a peer admitted after the cutover must be told the database is gone"
+        ),
+        other => panic!("it must not get a snapshot against the old database: {other:?}"),
+    }
+    drop(late);
+    channel.stop();
+    drop(taken);
+}
+
+/// The cap holds when peers arrive together, not only one at a time.
+///
+/// **Item 3 of the re-review, and the reason it names the old test.** Admission
+/// read `peers.len()`, which a connection joins only after its arena is built --
+/// so simultaneous connects all saw room and all allocated. A test that waits for
+/// each peer to register before opening the next cannot reach that, which is
+/// exactly what the existing one does. This one races them deliberately.
+#[test]
+fn simultaneous_connects_cannot_exceed_the_peer_cap() {
+    let (_c, mut cfg, host, sock, _slot) = setup("caprace");
+    cfg.plugin.channel_max_peers = 3;
+    let channel = Channel::start(&cfg, host).unwrap().unwrap();
+
+    let gate = Arc::new(std::sync::Barrier::new(12));
+    let threads: Vec<_> = (0..12)
+        .map(|_| {
+            let sock = sock.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                std::os::unix::net::UnixStream::connect(&sock).ok()
+            })
+        })
+        .collect();
+    let held: Vec<_> = threads
+        .into_iter()
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+
+    // Whatever the interleaving, the channel never admitted more than the cap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut worst = 0usize;
+    while std::time::Instant::now() < deadline {
+        worst = worst.max(channel.admitted());
+        assert!(
+            channel.admitted() <= 3,
+            "admitted {} with a cap of 3: the check and the spawn are not atomic",
+            channel.admitted()
+        );
+        if channel.peers() == 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(worst <= 3, "peak admitted was {worst}");
+    drop(held);
     channel.stop();
 }

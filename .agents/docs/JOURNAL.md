@@ -8351,3 +8351,89 @@ index walk with ascending memtable keys is exactly where an off-by-one hides.
 can catch a wrong `SO_PEERCRED` number or `struct ucred` layout -- they all connect
 as the same user, so they pass whether the credential is read correctly or the
 check is broken in the permissive direction.
+
+## 2026-09-29 -- the re-review, and a test of mine that could not fail
+
+Codex re-reviewed at clean 8370c99 and found four residual items plus a pathname
+hazard. All four verified; **one had its mechanism partly wrong, which changed the
+fix**, and one of my own new tests turned out to have no teeth.
+
+**Item 1, the cutover race: real, but not by the route given.** The report said a
+`serve_one` thread still initializing could open a snapshot against the old `Db`.
+It cannot: registration happens *before* `serve_locked`, so a thread that has not
+registered has not handled a frame and has no snapshot. The genuine hole is the
+other half -- the listener stays up by design, so a **new** connection admitted
+between `disconnect_peers` returning and the slot being emptied finds the database
+still there, opens a snapshot, and holds its lock.
+
+That distinction decided the fix. Quiescing admission, as suggested, would need a
+flag, a barrier and an accounting pass over in-flight sessions. **Reversing two
+statements does it instead**: `close_for_rebuild` now empties the slot *before*
+telling the peers. `Host::db` reads the slot on every call, so from that line on
+every peer, connected or newly admitted, is answered `UNAVAILABLE` and cannot
+acquire a snapshot at all; what remains outstanding is exactly what was taken
+before it, which is what the disconnect releases. Checking the claimed mechanism
+against the code was worth more than acting on the report as written.
+
+**Item 2: confirmed.** The 2-second bound lived inside `notify`, so ordinary
+responses still used an unbounded `write_all` while holding the peer's writer
+lock -- and `disconnect_peers` took that same lock to call `shutdown`, so a peer
+stalled mid-response blocked the hang-up meant to reclaim its snapshots. Two
+changes: the timeout is now set on the socket **once at accept**, covering every
+write; and `PeerHandle` keeps a second descriptor for the same socket used only
+for `shutdown`, which takes `&self` and therefore never queues behind a write.
+
+**Item 3: confirmed, and the report was right about my test.** Admission read
+`peers.len()`, which a connection joins only after its arena is built, so
+simultaneous connects all saw room. `peers_past_the_configured_limit_are_refused`
+could not reach it because it waits for each peer to register before opening the
+next -- a test shaped exactly like the assumption it was meant to check. An atomic
+slot taken before the spawn and released on thread exit replaces it, and
+`simultaneous_connects_cannot_exceed_the_peer_cap` races twelve connects at a cap
+of three: against the old check it admits **nine**.
+
+`Channel::admitted` is now exposed beside `Channel::peers` because they are
+genuinely different numbers, and conflating them is what the bug was.
+
+**Item 4: confirmed, and it failed open**, which is the direction that matters.
+`socket_mode` answered `None` on an unparseable value and the socket took the
+umask, so `channel_socket_mode = "O600"` with a letter O gave a permissive path to
+the whole database and a configuration file claiming the opposite. Now refused in
+`validate_with`, so `--check-config` catches it before the daemon opens anything.
+
+**The pathname hazard, fixed by removing the dependency.** `stop` connected to its
+own configured path to wake `accept`, which trusts the directory entry to still be
+ours; it now shuts down its own listening descriptor instead, which names the
+socket rather than a name and cannot be redirected. The unlink is conditional on
+the path still being a socket -- that does not make it safe, since a replacement
+would also be a socket, and `operations.md` already says the parent directory is
+the real boundary. It does stop the ordinary case of deleting a regular file.
+
+# The test I wrote that could not fail
+
+`a_peer_that_stops_reading_does_not_block_the_hangup` was my first attempt at item
+2: connect a peer, never read, push notifications, assert the disconnect is
+prompt. **It passed with the fix reverted.** It never created the condition -- the
+peer was making no requests, so no serving thread was inside a response write and
+the writer lock was never held. It asserted a timing property that was already
+true for an unrelated reason.
+
+I deleted it rather than keep it. A test that cannot fail is worse than no test
+because it reads as coverage, and this one would have sat under a heading naming
+the finding it did not check. What replaced it is a unit test that holds the
+writer lock -- which is exactly what a blocked `write_all` does -- and asserts
+`hang_up` completes anyway, on another thread with a deadline so a regression
+**fails** rather than deadlocking the test process. Against the lock-taking version
+it fails in five seconds with the message that explains why.
+
+The other half of item 2, that ordinary responses are bounded, is by construction
+and has **no** test: reproducing it needs a peer whose receive buffer is full,
+which is not deterministic at this level. Saying so is better than another test
+shaped like the first one.
+
+**And one honest limit on item 1's test.** `a_peer_arriving_during_a_cutover_cannot_open_a_snapshot`
+pins the invariant -- empty slot, no snapshot -- and **not** the statement order in
+`close_for_rebuild`, which is private to the follower and needs a replication
+harness to drive. Reversing those two lines again would not redden anything. The
+comment there carries the argument; the test carries the property that makes the
+argument sound.

@@ -427,12 +427,36 @@ impl Default for PluginConfig {
 
 impl PluginConfig {
     /// [`PluginConfig::channel_socket_mode`], parsed. `None` leaves the umask.
+    ///
+    /// Only ever called after [`PluginConfig::validate_socket_mode`] has accepted
+    /// it, so an unparseable value cannot reach here and silently become `None`.
     pub fn socket_mode(&self) -> Option<u32> {
         let text = self.channel_socket_mode.trim();
         if text.is_empty() {
             return None;
         }
         parse_socket_mode(text).ok()
+    }
+
+    /// Refuse an unparseable mode rather than falling back to the umask.
+    ///
+    /// **A misspelling used to fail open.** `socket_mode` answered `None`, the
+    /// socket took whatever the umask gave, and the operator who wrote
+    /// `channel_socket_mode = "O600"` -- letter O -- had a world-readable path to
+    /// the whole database and a configuration file saying otherwise. A security
+    /// setting that silently does nothing is worse than one that is absent,
+    /// because the absent one is visible.
+    pub fn validate_socket_mode(&self) -> Result<(), ConfigError> {
+        let text = self.channel_socket_mode.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        parse_socket_mode(text).map(|_| ()).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "plugin.channel_socket_mode '{text}' is not a permission mode: {e}. \
+                 Leave it empty for the umask, or write it as octal such as \"0600\"."
+            ))
+        })
     }
 
     /// Whether the out-of-process channel is configured.
@@ -1246,6 +1270,7 @@ impl Config {
                     .into(),
             ));
         }
+        self.plugin.validate_socket_mode()?;
         let snapshot = &self.server.snapshot;
         if snapshot.lease_ttl_secs == 0 {
             return Err(ConfigError::Invalid(
@@ -2516,5 +2541,56 @@ interval_secs = 5
                 "--{flag} lost its environment variable"
             );
         }
+    }
+
+    /// A socket mode that does not parse is refused, not quietly ignored.
+    ///
+    /// **It used to fail open.** `socket_mode` answered `None` and the socket took
+    /// whatever the umask gave, so an operator who wrote `"O600"` with a letter O
+    /// had a permissive path to the whole database and a configuration file saying
+    /// the opposite. A security setting that silently does nothing is worse than an
+    /// absent one, because the absent one is visible.
+    #[test]
+    fn an_unparseable_channel_socket_mode_is_refused() {
+        use clap::Parser as _;
+
+        let file = config_file(
+            "badmode",
+            "[plugin]\nchannel_socket = \"/s.sock\"\nchannel_socket_mode = \"O600\"\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--insecure",
+            "--data-dir",
+            "/tmp/yesnod-cfg-test",
+            "--config",
+            file.to_str().unwrap(),
+        ]);
+        let e = match Config::resolve(&cli) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("a mode that does not parse must not fall back to the umask"),
+        };
+        assert!(
+            e.contains("channel_socket_mode"),
+            "the error must name the key: {e}"
+        );
+
+        // And a good one still resolves, so the check is not simply refusing.
+        let ok = config_file(
+            "goodmode",
+            "[plugin]\nchannel_socket = \"/s.sock\"\nchannel_socket_mode = \"0600\"\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--insecure",
+            "--data-dir",
+            "/tmp/yesnod-cfg-test",
+            "--config",
+            ok.to_str().unwrap(),
+        ]);
+        let cfg = Config::resolve(&cli).unwrap();
+        assert_eq!(cfg.plugin.socket_mode(), Some(0o600));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+        let _ = std::fs::remove_dir_all(ok.parent().unwrap());
     }
 }
