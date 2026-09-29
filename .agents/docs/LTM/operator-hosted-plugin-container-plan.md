@@ -51,8 +51,8 @@ naming a library fails to parse rather than being quietly ignored.
 
 ## Phase 0: the socket path must be settable outside the config file
 
-**The flag and environment half of this is DONE ( 2026-09-29 ).** The peer binary
-half is not; see the end of this section.
+**DONE ( 2026-09-29 ), both halves.** The flags and environment landed first, then
+`yesno-plugin/src/bin/yesno-channel-peer.rs` with `tests/peer_process.rs`.
 
 **This is the only change needed outside the operator, and it is the one that
 decides whether the feature works in production.**
@@ -105,12 +105,24 @@ notifications and liveness-by-socket-close are all exercised today. Two earlier
 `JOURNAL` entries say so explicitly ( "Only a real socket round trip showed it" ),
 so this was a claim I had already contradicted before making it.
 
-What is genuinely missing is narrower and still worth closing: **a peer in a
-separate process**. Everything above happens inside one test binary, so nothing
-covers a peer that is killed rather than dropped, an arena mapped across a real
-process boundary, or a peer built without linking `yesno-core` -- which is the
-property the deleted C fixture used to prove for the in-process ABI. And there is
-no standalone example a third party can copy.
+What was genuinely missing is narrower, and is now closed:
+`yesno-plugin/src/bin/yesno-channel-peer.rs` is a peer in its own process, and
+`tests/peer_process.rs` runs it against a socket this crate serves itself. It
+covers an arena **mapped by another process** and a peer that is **killed** --
+`SIGKILL` runs no destructor, so only the kernel closing the descriptor can
+release the snapshot, which is the whole liveness argument and had never been made
+against a process that could not cooperate.
+
+One property is still unproven and is recorded rather than claimed: that a peer
+needs nothing but the protocol. This one is a Rust binary in the workspace and
+does link `yesno-core`. `ipc.rs` has **no imports at all**, so the dependency is
+incidental, and showing it properly means splitting that module into its own
+crate -- the file move `ARCHITECTURE.md` already anticipates. The deleted C
+fixture proved the equivalent for the in-process ABI and nothing replaced it.
+
+The binary is not yet in the unified image; `scripts/check-image-binaries.py`
+covers `yesno-server`, `yesno-server-utils` and `yesno-operator` only, so adding
+it is Phase 3's job along with the e2e arm that needs it.
 
 A small binary that greets, opens a snapshot, acquires lanes for a key, walks
 blocks and reports the cardinality over HTTP is enough. It doubles as the worked

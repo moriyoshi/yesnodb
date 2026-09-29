@@ -8478,3 +8478,56 @@ rebootstrap ) and claiming a `Container` could not be aliased after reuse
 ( acknowledged in a comment I had read ). All three are the same move: checking a
 property on the path in front of me and stating it of every path. The cost is not
 the error, which a review catches; it is that a peer acted on two of them.
+
+## 2026-09-29 -- a peer in its own process, which is the only way the liveness claim can be tested
+
+Phase 0 of `LTM/operator-hosted-plugin-container-plan.md` is now complete:
+`yesno-plugin/src/bin/yesno-channel-peer.rs` and `tests/peer_process.rs`.
+
+This came directly out of correcting myself an hour earlier. Having found that
+the socket, the `SCM_RIGHTS` handoff and the arena mapping *were* already covered,
+the remaining gap was much narrower than I had been claiming -- and sharper.
+
+**The killed peer is the test worth having.** Liveness on this channel is "the
+socket closed", and every existing test drops its peer, which runs `Drop`, flushes
+buffers and closes politely. A peer that exits cleanly proves almost nothing about
+a design whose premise is that **no cooperation is needed**. `SIGKILL` runs no
+code at all, so when `a_killed_peer_releases_its_snapshot` sees `live_readers()`
+fall to zero, nothing inside the peer can have caused it: the kernel closed the
+descriptor, the server's read returned zero, the session dropped. That argument
+has been in the module headers since the channel was written and had never been
+made against a process that could not cooperate.
+
+The test waits for the peer to print `holding` before killing it, so the signal
+lands on a peer that is demonstrably holding a snapshot rather than one still
+starting -- otherwise it would pass by arriving too early, which is the way this
+kind of test usually rots.
+
+**The other half is the arena across a real boundary**, mapped by a process that
+did not create the `memfd`. The fixture's run has a **non-zero start** ( stored
+`( 1000, 4096 )` ) so the `[ start, end ]` contract is exercised rather than
+assumed, and the expected `cardinality 4106` discriminates: decoding the second
+word as a length gives 5106, and dropping the inclusive `+ 1` gives 4105. Both
+checked by sabotage.
+
+**What the binary is really for.** A protocol document says what the bytes are;
+this says what to do with them in the order that works, including the two things
+easiest to get wrong -- the descriptor arrives **before** any frame, so reading a
+frame first eats the handoff byte and desynchronises everything after it; and
+`UNAVAILABLE` is "not yet", pushed asynchronously, so a peer that treats one as
+the answer to its request will misread every reply after a rebootstrap. Both are
+in the code with the reason attached, which is the artefact a consumer asks for
+and the one a specification cannot be.
+
+**One property is recorded as unproven rather than claimed.** The old C fixture
+proved that an in-process plugin could not link `yesno-core`, because C cannot.
+Nothing replaced it: this peer is a Rust binary in the workspace and does link it.
+`ipc.rs` has **no imports at all**, so the dependency is incidental rather than
+structural, and demonstrating that means splitting the module into its own crate
+-- the file move `ARCHITECTURE.md` already anticipates. Writing "a peer needs only
+the protocol" without that split would be the same shape of claim I corrected
+twice today.
+
+The binary is deliberately **not** in the unified image yet:
+`check-image-binaries.py` governs `yesno-server`, `yesno-server-utils` and
+`yesno-operator`, so adding it belongs with the operator e2e arm that needs it.
