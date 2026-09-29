@@ -70,7 +70,7 @@ steps_run=0
 # every local gate run. Diagnosed before raising, as the paragraph above demands:
 # the step is a new unconditional addition next to the other policy checks, so it
 # counts in both modes.
-EXPECT_STEPS=17
+EXPECT_STEPS=18
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -117,7 +117,7 @@ EXPECT_STEPS=17
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=23
+EXPECT_STEPS_DEEP=24
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -279,6 +279,15 @@ step "the image entrypoint parses as POSIX sh"
 # It is the image's ENTRYPOINT and it is not covered by any Rust test. A syntax
 # error is a container that exits immediately with nothing useful on stderr.
 check sh -n dist/entrypoint.sh
+
+step "gate.sh and ci.yml have not drifted"
+# Four instances of the same drift before this existed: clippy losing
+# `--workspace` here, three checks that were here and not in CI, and -- the
+# other direction -- the lean-core budget that was in CI and not here, which let
+# 25 commits land on a red CI while every local run stayed green. `ci.yml` has
+# carried a written warning about this since the first instance; a warning is
+# not a mechanism. Its baseline is empty and the two files agree today.
+check python3 scripts/check-gate-parity.py
 
 step "lean core: yesno-core's dependency budget"
 # The counts are calibrated to an exact tree ( 5 direct, 36 transitive lines ), so

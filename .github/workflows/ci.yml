@@ -260,6 +260,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: gate.sh and ci.yml have not drifted
+        # The check that keeps this job and the local gate in step, and the
+        # reason it is in both files rather than one: a check only CI runs is a
+        # check the local workflow is free to break, and it will, because the
+        # local workflow is the one with the feedback loop.
+        run: python3 scripts/check-gate-parity.py
+
       - name: Direct and transitive dependency counts
         # The limits, the reasoning and the async/gRPC exclusion all live in the
         # script, which `scripts/gate.sh` runs as well. It used to be this

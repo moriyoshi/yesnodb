@@ -7991,3 +7991,68 @@ population buying something with it.
 `aged_state.py` shows nothing either way at its gate-sized corpus -- 3 slabs and
 `amp 1.00x` in every row -- so it is not the instrument for this, and the number
 above is not in it.
+
+## 2026-09-29 -- the gate/CI comparison is automated, and it found the two files already agree
+
+Closes `nothing-compares-gate-sh-to-ci-yml`, filed 2026-09-17 as the third
+instance and removed from `TODO.md` with this entry. Today's lean-core discovery
+was the fourth, so the item was overdue and I expected to be freezing a mess.
+
+**The surprise is that there is no mess.** Run properly, `scripts/gate.sh` and
+`.github/workflows/ci.yml` agree on **all 12 shared scripts** and on every
+canonical command. The three gate-only checks found by hand in September had each
+been repaired; what was never done was automating the comparison, so nothing kept
+them in step afterwards. `scripts/check-gate-parity.py` therefore starts with an
+**empty baseline**, where `check-r1.py` and `check-docs-selfcontained.py` each
+took months to get to zero. That is worth having caught at the moment it is true,
+because a baseline written a month from now would have encoded whatever had
+drifted by then as acceptable.
+
+**What it compares, and the granularity question, which is the real content.**
+My first attempt diffed the two files' full command sets. That is the obvious
+design and it is wrong: the two files spell the same check differently
+everywhere -- `check env RUSTDOCFLAGS=... \` across a continuation here against an
+inline `run:` there, `bash -c 'cd x && ...'` against `(cd x && ...)`,
+`out=$( ... ) || { ... }` wrapping, and host-specific `--target` triples
+( `aarch64` locally, `x86_64` in CI ). The first run reported nine differences of
+which **one looked real** -- `cargo doc` seemingly missing `RUSTDOCFLAGS="-D
+warnings"` locally -- and that one was a false positive too: the flag is there,
+on a continuation line my line-based extractor had split. I nearly reported a
+drift that did not exist.
+
+So the checker works at the two granularities the four instances actually took:
+
+* **Scripts**, compared exactly. Instances 2, 3 and 4 were a `scripts/*.py`
+  present on one side and absent on the other, and that admits no ambiguity.
+* **Canonical commands** -- clippy, fmt, doc, the workspace test -- compared by
+  their **flags**. Instance 1 was `cargo clippy` losing `--workspace`, which no
+  script-level check could see: the command was in both files and one was missing
+  a word.
+
+It deliberately does not diff everything else. **A check that cries wolf gets a
+bigger baseline every time somebody is in a hurry, and then gets ignored** --
+which is the failure mode of the very thing being fixed, arriving one level up.
+Narrow and exact beats broad and approximate for a gate whose only asset is that
+people believe it.
+
+**Verified against the history rather than against invented cases.** All three
+historical shapes were re-created and each is caught with a precise message: a
+check removed from CI, a check removed from `gate.sh`, and `--workspace` removed
+from the local clippy. The empty baseline is also self-enforcing -- an entry that
+stops applying is itself a failure, so the list can only shrink.
+
+**PyYAML was dropped after measuring what it bought.** The natural reading of
+`ci.yml` is to parse it, and I wrote it that way first. Scanning it as text with
+a leading `run:` stripped gives **identical** answers -- same twelve scripts,
+same four canonical flag sets -- so the library bought nothing, and a check that
+must run everywhere should not need one the CI image is never asked to install.
+Measured, not assumed; the alternative was adding a `pip install` step to CI that
+the local gate would not have needed, which is itself a small new asymmetry.
+
+The checker runs in both files, so it enforces its own presence on both sides.
+`EXPECT_STEPS` 17 -> 18, `EXPECT_STEPS_DEEP` 23 -> 24.
+
+**One cross-reference repaired.** The `--all-features` backlog item ended "must
+land in both -- see `nothing-compares-gate-sh-to-ci-yml`, filed the same day",
+which would have dangled once this item was removed. It now names the checker
+instead, which is a better answer to the same question.
