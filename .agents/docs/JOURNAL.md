@@ -8437,3 +8437,44 @@ pins the invariant -- empty slot, no snapshot -- and **not** the statement order
 harness to drive. Reversing those two lines again would not redden anything. The
 comment there carries the argument; the test carries the property that makes the
 argument sound.
+
+## 2026-09-29 -- correction: the channel protocol *is* exercised over a real socket
+
+Three times today -- in `LTM/operator-hosted-plugin-container-plan.md`, in the
+journal entry for the plugin-channel flags, and twice in messages to the peer
+session -- I wrote that nothing in the tree speaks the channel protocol over a
+real socket, and that the channel's tests only call `Session::handle` directly.
+**That is false.**
+
+`yesno-server/tests/plugin_channel.rs` has a `Peer` that connects a real
+`UnixStream`, receives the arena descriptor through a real `SCM_RIGHTS` `recv_fd`,
+`mmap`s it, and exchanges encoded frames over the wire. Sixteen tests drive it.
+The socket, the descriptor handoff, the arena mapping, the notification push and
+liveness-by-socket-close are all covered.
+
+**I had already written the opposite, earlier in the same session.** Two entries
+above say "Only a real socket round trip showed it" and "drives the inline path
+over a **real socket** rather than as a `Session` call". So this was not a gap in
+knowledge; it was a claim I made about a file I had read, edited and extended, by
+generalising from `yesno-plugin`'s *unit* tests -- which do call `Session::handle`
+directly, deliberately -- to the whole tree. The true sentence was one directory
+away and I had written it myself.
+
+**What is actually missing**, and it is worth closing for its own reasons: a peer
+in a **separate process**. Everything above runs inside one test binary, so
+nothing covers a peer that is killed rather than dropped, an arena mapped across a
+real process boundary, or a peer that does not link `yesno-core` -- the property
+the deleted C fixture proved for the in-process ABI and which nothing replaced.
+And there is still no standalone example a third party can copy, which is the
+artefact a consumer actually asks for.
+
+The plan's Phase 0 is corrected to say that, and the peer session has been told,
+because I gave them the wrong version twice and they may have been about to build
+something on it.
+
+**The pattern, since it is the third instance today.** The earlier two were
+claiming the channel needed no drain contract ( true at shutdown, false at
+rebootstrap ) and claiming a `Container` could not be aliased after reuse
+( acknowledged in a comment I had read ). All three are the same move: checking a
+property on the path in front of me and stating it of every path. The cost is not
+the error, which a review catches; it is that a peer acted on two of them.

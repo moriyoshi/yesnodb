@@ -93,12 +93,24 @@ plumbing.
 `--check-config` "opens nothing" by contract, so it stays usable as a validation
 step with these added.
 
-Phase 0 also needs **a minimal channel peer binary, because there is none.** The
-channel's own tests drive `Session::handle` as a function call -- deliberately, so
-that protocol behaviour is testable without a file descriptor -- which means
-nothing in the tree has ever spoken the protocol over a real socket. That gap is
-invisible until an e2e arm needs it, and it is the same shape as the daemon
-call-site gap found on 2026-09-29: the code is exercised, the path to it is not.
+Phase 0 also needs **a minimal channel peer binary**, and the reason is narrower
+than an earlier draft of this document claimed.
+
+**Corrected 2026-09-29.** That draft said "nothing in the tree has ever spoken the
+protocol over a real socket", which is **false**. `yesno-server`'s
+`tests/plugin_channel.rs` connects a real `UnixStream`, receives the arena
+descriptor through a real `SCM_RIGHTS` `recv_fd`, maps it, and exchanges encoded
+frames -- so the socket, the descriptor handoff, the arena mapping, the
+notifications and liveness-by-socket-close are all exercised today. Two earlier
+`JOURNAL` entries say so explicitly ( "Only a real socket round trip showed it" ),
+so this was a claim I had already contradicted before making it.
+
+What is genuinely missing is narrower and still worth closing: **a peer in a
+separate process**. Everything above happens inside one test binary, so nothing
+covers a peer that is killed rather than dropped, an arena mapped across a real
+process boundary, or a peer built without linking `yesno-core` -- which is the
+property the deleted C fixture used to prove for the in-process ABI. And there is
+no standalone example a third party can copy.
 
 A small binary that greets, opens a snapshot, acquires lanes for a key, walks
 blocks and reports the cardinality over HTTP is enough. It doubles as the worked
