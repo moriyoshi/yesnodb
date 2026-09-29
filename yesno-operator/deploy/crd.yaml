@@ -117,6 +117,166 @@ spec:
                   type: string
                 description: Node selector copied to the managed Pod template.
                 type: object
+              plugin:
+                description: An out-of-process plugin peer, run beside `yesnod` in the same Pod.
+                nullable: true
+                properties:
+                  args:
+                    description: |-
+                      Command arguments for the peer.
+
+                      The socket path is **not** passed here by the operator; a peer that wants
+                      it on its command line should name `/run/yesno/plugin.sock` itself, which
+                      is a stable contract. `YESNO_PLUGIN_CHANNEL_SOCKET` is set in the
+                      container's environment either way.
+                    items:
+                      type: string
+                    type: array
+                  channel:
+                    default: {}
+                    description: Channel limits handed to `yesnod`.
+                    properties:
+                      allowUids:
+                        description: Unix uids allowed to connect, beyond `yesnod`'s own and root.
+                        items:
+                          format: int64
+                          type: integer
+                        type: array
+                      inline:
+                        description: Serve payloads inside the frames rather than through a shared region.
+                        nullable: true
+                        type: boolean
+                      maxBlocks:
+                        description: Blocks one response may carry.
+                        format: int64
+                        maximum: 64.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      maxHandles:
+                        description: Lane handles one connection may hold at once.
+                        format: int64
+                        maximum: 4096.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      maxLanes:
+                        description: Lanes one handle may hold.
+                        format: int64
+                        maximum: 4096.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      maxPeers:
+                        description: Connections served at once. Further ones are refused, not queued.
+                        format: int64
+                        maximum: 4096.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      maxSnapshots:
+                        description: |-
+                          Snapshots one connection may hold open.
+
+                          Bounds a shared resource, not just the peer's own: every snapshot claims
+                          one of the database's 4096 reader slots and pins the reclamation floor.
+                        format: int64
+                        maximum: 4096.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      socketMode:
+                        description: Permission bits for the socket, such as `"0600"`.
+                        nullable: true
+                        type: string
+                    type: object
+                  env:
+                    additionalProperties:
+                      type: string
+                    description: Extra environment for the peer, merged with what the operator sets.
+                    type: object
+                  image:
+                    description: Container image for the peer.
+                    type: string
+                  imagePullPolicy:
+                    description: Kubernetes image pull policy. Defaults to `IfNotPresent`.
+                    nullable: true
+                    type: string
+                  ports:
+                    description: |-
+                      Ports the peer serves, if it serves any.
+
+                      Declared so a Service or a probe can name them. The operator creates no
+                      Service for these; that is deliberate and separable.
+                    items:
+                      description: One port a plugin peer serves.
+                      properties:
+                        containerPort:
+                          format: int32
+                          maximum: 65535.0
+                          minimum: 1.0
+                          type: integer
+                        name:
+                          type: string
+                      required:
+                      - containerPort
+                      - name
+                      type: object
+                    type: array
+                  resources:
+                    description: Container CPU and memory requests and limits for the peer.
+                    nullable: true
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                          This field depends on the DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                              type: string
+                            request:
+                              description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                      limits:
+                        additionalProperties:
+                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          x-kubernetes-int-or-string: true
+                        description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                      requests:
+                        additionalProperties:
+                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          x-kubernetes-int-or-string: true
+                        description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                    type: object
+                  runAsUser:
+                    description: |-
+                      Unix uid the peer runs as. Defaults to `yesnod`'s own, 10001.
+
+                      **Another uid works but is not free.** The socket lands at the umask,
+                      owned by `yesnod`, and the channel gates connections on `SO_PEERCRED`, so
+                      a foreign uid must appear in `channel.allowUids` **and** needs a socket
+                      mode that admits it. The reconciler refuses the combination that cannot
+                      work rather than producing a Pod whose two containers cannot talk.
+                    format: int64
+                    maximum: 65535.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                required:
+                - image
+                type: object
               podLabels:
                 additionalProperties:
                   type: string

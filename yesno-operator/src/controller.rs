@@ -1282,6 +1282,16 @@ fn validate(cluster: &YesnoCluster) -> Option<String> {
     if cluster.spec.shutdown_grace_secs == 0 || cluster.spec.shutdown_grace_secs > 3600 {
         return Some("spec.shutdownGraceSecs must be between 1 and 3600".into());
     }
+    if let Some(plugin) = cluster.spec.plugin.as_ref() {
+        // Refused here rather than left to the Pod, because the failure it
+        // prevents is silent: a peer whose uid the channel will not admit connects
+        // successfully and is dropped, so the Pod looks healthy and cannot talk to
+        // itself. A rejected spec with the field name in it is the cheaper
+        // outcome.
+        if let Some(reason) = crate::resources::plugin_spec_error(plugin) {
+            return Some(reason);
+        }
+    }
 
     match (
         cluster.spec.storage.existing_claim.as_deref(),
@@ -1589,6 +1599,7 @@ mod tests {
                 pod_labels: BTreeMap::new(),
                 node_selector: BTreeMap::new(),
                 shutdown_grace_secs: 30,
+                plugin: None,
             },
         );
         cluster.metadata.namespace = Some("default".into());
@@ -1825,6 +1836,36 @@ mod tests {
         assert_eq!(rendered.conditions[0].status, "True");
         assert_eq!(rendered.conditions[1].type_, SNAPSHOT_CONDITION);
         assert_eq!(rendered.conditions[1].status, "False");
+    }
+
+    /// A plugin spec the channel would silently refuse is rejected here.
+    ///
+    /// The point is that `plugin_spec_error` is **called**. Validation nothing
+    /// invokes is worse than none, because it reads as protection; this asserts
+    /// the reconciler's own entry point reaches it.
+    #[test]
+    fn validation_refuses_a_plugin_uid_the_channel_would_drop() {
+        let mut c = cluster();
+        c.spec.plugin = Some(crate::api::PluginSpec {
+            image: "peer:1".into(),
+            image_pull_policy: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            resources: None,
+            ports: Vec::new(),
+            run_as_user: Some(2000),
+            channel: crate::api::PluginChannelSpec::default(),
+        });
+        assert!(
+            validate(&c).is_some_and(|m| m.contains("allowUids")),
+            "a foreign uid with no allow list must be refused by validate itself"
+        );
+
+        c.spec.plugin.as_mut().unwrap().channel.allow_uids = vec![2000];
+        assert!(
+            validate(&c).is_none(),
+            "and allowed, it is a supported configuration"
+        );
     }
 
     #[test]

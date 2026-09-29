@@ -112,6 +112,138 @@ pub struct YesnoClusterSpec {
     #[serde(default = "default_shutdown_grace_secs")]
     #[schemars(with = "i64", range(min = 1, max = 3600))]
     pub shutdown_grace_secs: u64,
+
+    /// An out-of-process plugin peer, run beside `yesnod` in the same Pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginSpec>,
+}
+
+/// A plugin peer container and the channel it reaches `yesnod` through.
+///
+/// # There is no field for an in-process library, deliberately
+///
+/// `yesnod` once loaded a `cdylib` named in its configuration. That shared the
+/// address space -- it could corrupt the heap, and a panic escaping a callback
+/// aborted the process -- so naming one was a decision of the same weight as
+/// naming the data directory, which is not what a line in a namespaced custom
+/// resource is. The ABI was removed on 2026-09-29 and nothing here reaches it.
+/// A peer is a separate process: it cannot corrupt `yesnod` or take it down, and
+/// its snapshots are released when its socket closes.
+///
+/// # There is no field for the socket path either
+///
+/// It is an internal contract between two containers the operator itself writes,
+/// so a field for it is a way to get it wrong with nothing to gain. The path is
+/// always `/run/yesno/plugin.sock` on an `emptyDir` shared by both containers --
+/// which is also what makes it writable despite `readOnlyRootFilesystem`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSpec {
+    /// Container image for the peer.
+    pub image: String,
+
+    /// Kubernetes image pull policy. Defaults to `IfNotPresent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_policy: Option<String>,
+
+    /// Command arguments for the peer.
+    ///
+    /// The socket path is **not** passed here by the operator; a peer that wants
+    /// it on its command line should name `/run/yesno/plugin.sock` itself, which
+    /// is a stable contract. `YESNO_PLUGIN_CHANNEL_SOCKET` is set in the
+    /// container's environment either way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+
+    /// Extra environment for the peer, merged with what the operator sets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+
+    /// Container CPU and memory requests and limits for the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirements>,
+
+    /// Ports the peer serves, if it serves any.
+    ///
+    /// Declared so a Service or a probe can name them. The operator creates no
+    /// Service for these; that is deliberate and separable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PluginPort>,
+
+    /// Unix uid the peer runs as. Defaults to `yesnod`'s own, 10001.
+    ///
+    /// **Another uid works but is not free.** The socket lands at the umask,
+    /// owned by `yesnod`, and the channel gates connections on `SO_PEERCRED`, so
+    /// a foreign uid must appear in `channel.allowUids` **and** needs a socket
+    /// mode that admits it. The reconciler refuses the combination that cannot
+    /// work rather than producing a Pod whose two containers cannot talk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 65535))]
+    pub run_as_user: Option<u32>,
+
+    /// Channel limits handed to `yesnod`.
+    #[serde(default)]
+    pub channel: PluginChannelSpec,
+}
+
+/// One port a plugin peer serves.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginPort {
+    pub name: String,
+    #[schemars(with = "i32", range(min = 1, max = 65535))]
+    pub container_port: i32,
+}
+
+/// What `yesnod` will allow the peer, written into its configuration.
+///
+/// Every field is optional and omitting one leaves `yesnod`'s own default. The
+/// three limits **multiply** into one shared region per connection, so raising
+/// all of them at once raises it multiplicatively; leave them alone unless a peer
+/// reports a limit it cannot work within.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginChannelSpec {
+    /// Lane handles one connection may hold at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 4096))]
+    pub max_handles: Option<usize>,
+
+    /// Lanes one handle may hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 4096))]
+    pub max_lanes: Option<usize>,
+
+    /// Blocks one response may carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 64))]
+    pub max_blocks: Option<usize>,
+
+    /// Connections served at once. Further ones are refused, not queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 4096))]
+    pub max_peers: Option<usize>,
+
+    /// Snapshots one connection may hold open.
+    ///
+    /// Bounds a shared resource, not just the peer's own: every snapshot claims
+    /// one of the database's 4096 reader slots and pins the reclamation floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<i64>", range(min = 1, max = 4096))]
+    pub max_snapshots: Option<usize>,
+
+    /// Serve payloads inside the frames rather than through a shared region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<bool>,
+
+    /// Permission bits for the socket, such as `"0600"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_mode: Option<String>,
+
+    /// Unix uids allowed to connect, beyond `yesnod`'s own and root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<i64>")]
+    pub allow_uids: Vec<u32>,
 }
 
 /// Server-owned base-snapshot provider policy.

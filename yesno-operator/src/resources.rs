@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, HTTPGetAction,
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSpec,
-    PodTemplateSpec, Probe, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec,
-    Volume, VolumeMount,
+    Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
+    EnvVar, HTTPGetAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Probe, SecretVolumeSource,
+    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -22,6 +22,16 @@ pub(crate) const ROLE_LABEL: &str = "yesnodb.io/role";
 const CONFIG_PATH: &str = "/etc/yesno/yesnod.toml";
 const DATA_PATH: &str = "/var/lib/yesno";
 const TLS_PATH: &str = "/etc/yesno/tls";
+/// Where the plugin socket lives, in both containers.
+///
+/// Operator-owned and not settable through the CRD: it is a contract between two
+/// containers this file writes, so a field for it would be a way to get it wrong
+/// with nothing to gain. An `emptyDir` is mounted here, which is also what makes
+/// the path writable while `readOnlyRootFilesystem` stays true.
+const PLUGIN_RUN_PATH: &str = "/run/yesno";
+const PLUGIN_SOCKET_PATH: &str = "/run/yesno/plugin.sock";
+/// The uid both containers run as unless the plugin asks for another.
+const RUN_AS_UID: i64 = 10001;
 const CA_PATH: &str = "/etc/yesno/ca/ca.crt";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +205,172 @@ fn role_labels(
     result
 }
 
+/// The environment that tells `yesnod` about the channel.
+///
+/// Set on the `yesnod` container **always**, not only when the operator generates
+/// the configuration file. A cluster using `config.secretName` gets no generated
+/// `[plugin]` section -- the operator writes no file at all -- so the environment
+/// is the mechanism and the generated section is belt-and-braces. One code path
+/// rather than two is the point: the mTLS path is the one a real deployment uses,
+/// and it is the one a config-file-only approach would have missed.
+fn plugin_channel_env(plugin: &crate::api::PluginSpec) -> Vec<EnvVar> {
+    let mut env = vec![EnvVar {
+        name: "YESNOD_PLUGIN_CHANNEL_SOCKET".into(),
+        value: Some(PLUGIN_SOCKET_PATH.into()),
+        ..Default::default()
+    }];
+    let c = &plugin.channel;
+    for (name, value) in [
+        ("YESNOD_PLUGIN_CHANNEL_MAX_HANDLES", c.max_handles),
+        ("YESNOD_PLUGIN_CHANNEL_MAX_LANES", c.max_lanes),
+        ("YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS", c.max_blocks),
+    ] {
+        if let Some(v) = value {
+            env.push(EnvVar {
+                name: name.into(),
+                value: Some(v.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    if let Some(inline) = c.inline {
+        env.push(EnvVar {
+            name: "YESNOD_PLUGIN_CHANNEL_INLINE".into(),
+            value: Some(inline.to_string()),
+            ..Default::default()
+        });
+    }
+    env
+}
+
+/// The plugin peer container.
+///
+/// # What it deliberately does not mount
+///
+/// The data volume. A peer never opens the database: its snapshots belong to
+/// `yesnod` and are keyed by its connection, so it needs the socket and nothing
+/// else. That is the structural difference from an in-process plugin, and leaving
+/// the mount out by accident would be indistinguishable from leaving it out on
+/// purpose -- so `the_plugin_sidecar_cannot_reach_the_data_volume` asserts it.
+///
+/// The hardening is copied from the `yesnod` container rather than relaxed. A peer
+/// is less trusted than the daemon, not more.
+fn plugin_container(cluster: &YesnoCluster, plugin: &crate::api::PluginSpec) -> Container {
+    let uid = plugin.run_as_user.map_or(RUN_AS_UID, i64::from);
+    let mut env = plugin_channel_env(plugin);
+    for (name, value) in &plugin.env {
+        env.push(EnvVar {
+            name: name.clone(),
+            value: Some(value.clone()),
+            ..Default::default()
+        });
+    }
+    Container {
+        name: "plugin".into(),
+        image: Some(plugin.image.clone()),
+        image_pull_policy: Some(
+            plugin
+                .image_pull_policy
+                .clone()
+                .or_else(|| cluster.spec.image_pull_policy.clone())
+                .unwrap_or_else(|| "IfNotPresent".into()),
+        ),
+        args: (!plugin.args.is_empty()).then(|| plugin.args.clone()),
+        env: (!env.is_empty()).then_some(env),
+        ports: (!plugin.ports.is_empty()).then(|| {
+            plugin
+                .ports
+                .iter()
+                .map(|p| ContainerPort {
+                    container_port: p.container_port,
+                    name: Some(p.name.clone()),
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                })
+                .collect()
+        }),
+        resources: plugin.resources.clone(),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".into()]),
+                ..Default::default()
+            }),
+            read_only_root_filesystem: Some(true),
+            run_as_group: Some(uid),
+            run_as_non_root: Some(true),
+            run_as_user: Some(uid),
+            ..Default::default()
+        }),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "plugin-run".into(),
+            mount_path: PLUGIN_RUN_PATH.into(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+/// Why a plugin spec cannot be honoured, if it cannot.
+///
+/// Only the combination that **cannot work** is refused. A peer running as a
+/// foreign uid is fine -- the channel gates on `SO_PEERCRED` and
+/// `channel.allowUids` widens it -- but a foreign uid with no allow list produces
+/// a Pod whose two containers cannot talk, and that failure surfaces as a peer
+/// that connects and is silently dropped rather than as a rejected spec.
+pub(crate) fn plugin_spec_error(plugin: &crate::api::PluginSpec) -> Option<String> {
+    let uid = plugin.run_as_user.unwrap_or(RUN_AS_UID as u32);
+    if uid != RUN_AS_UID as u32 && !plugin.channel.allow_uids.contains(&uid) {
+        return Some(format!(
+            "plugin.runAsUser is {uid}, which yesnod will refuse on SO_PEERCRED: add {uid} to \
+             plugin.channel.allowUids, or drop runAsUser to share yesnod's own uid"
+        ));
+    }
+    if plugin.image.trim().is_empty() {
+        return Some("plugin.image is empty".into());
+    }
+    None
+}
+
+/// The `[plugin]` section of a generated configuration, or nothing.
+///
+/// **Belt-and-braces, not the mechanism.** The environment variables the
+/// reconciler sets on the `yesnod` container are what actually configure the
+/// channel, because a cluster using `config.secretName` gets no generated file
+/// for this to appear in. Writing it anyway means the generated configuration is
+/// self-describing -- an operator reading the ConfigMap sees the channel -- and
+/// costs one string.
+///
+/// Only the fields that have no environment flag are written here: the socket
+/// mode and the allowed uids. Duplicating the limits would give two sources for
+/// one value, with the environment winning, which is the sort of thing that reads
+/// as a bug the first time someone edits the ConfigMap and nothing changes.
+fn plugin_section(cluster: &YesnoCluster) -> String {
+    let Some(plugin) = cluster.spec.plugin.as_ref() else {
+        return String::new();
+    };
+    let mut body = format!("\n[plugin]\nchannel_socket = \"{PLUGIN_SOCKET_PATH}\"\n");
+    if let Some(mode) = plugin.channel.socket_mode.as_ref() {
+        body.push_str(&format!("channel_socket_mode = \"{mode}\"\n"));
+    }
+    if !plugin.channel.allow_uids.is_empty() {
+        let list: Vec<String> = plugin
+            .channel
+            .allow_uids
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        body.push_str(&format!("channel_allow_uids = [{}]\n", list.join(", ")));
+    }
+    if let Some(n) = plugin.channel.max_peers {
+        body.push_str(&format!("channel_max_peers = {n}\n"));
+    }
+    if let Some(n) = plugin.channel.max_snapshots {
+        body.push_str(&format!("channel_max_snapshots = {n}\n"));
+    }
+    body
+}
+
 pub(crate) fn config_source(
     cluster: &YesnoCluster,
     instance: i32,
@@ -212,6 +388,7 @@ pub(crate) fn config_source(
 
     let name = format!("{}-config", instance_name(cluster, instance));
     let snapshot = snapshot_section(cluster, volume_id);
+    let plugin = plugin_section(cluster);
     if let Some(tls) = tls {
         return secure_config_source(cluster, instance, role, name, tls, &snapshot);
     }
@@ -231,12 +408,13 @@ pub(crate) fn config_source(
          [db]\nshards = {}\n\n\
          [[auth.rule]]\nprincipal = \"all\"\naddress = \"0.0.0.0/0\"\ncapability = \"control-read\"\naction = \"allow\"\n\n\
          [[auth.rule]]\nprincipal = \"all\"\naddress = \"0.0.0.0/0\"\ncapability = \"control-admin\"\naction = \"allow\"\n\n\
-         [[auth.rule]]\nprincipal = \"all\"\naddress = \"0.0.0.0/0\"\ncapability = \"replication\"\naction = \"allow\"\n{}",
+         [[auth.rule]]\nprincipal = \"all\"\naddress = \"0.0.0.0/0\"\ncapability = \"replication\"\naction = \"allow\"\n{}{}",
         role.as_str(),
         cluster.spec.shutdown_grace_secs,
         snapshot,
         cluster.spec.shards,
-        follower
+        follower,
+        plugin
     );
     ConfigSource::Generated {
         name,
@@ -667,6 +845,16 @@ pub(crate) fn deployment(
                             },
                         ]),
                         resources: cluster.spec.resources.clone(),
+                        // `yesnod` is told about the channel through the
+                        // environment rather than only the generated config,
+                        // because a cluster using `config.secretName` gets no
+                        // generated config at all.
+                        env: cluster
+                            .spec
+                            .plugin
+                            .as_ref()
+                            .map(plugin_channel_env)
+                            .filter(|e| !e.is_empty()),
                         readiness_probe: Some(probe("/readyz")),
                         liveness_probe: Some(probe("/healthz")),
                         security_context: Some(SecurityContext {
@@ -695,6 +883,13 @@ pub(crate) fn deployment(
                                     ..Default::default()
                                 },
                             ];
+                            if cluster.spec.plugin.is_some() {
+                                mounts.push(VolumeMount {
+                                    name: "plugin-run".into(),
+                                    mount_path: PLUGIN_RUN_PATH.into(),
+                                    ..Default::default()
+                                });
+                            }
                             if tls_mount.is_some() {
                                 mounts.extend([
                                     VolumeMount {
@@ -714,7 +909,16 @@ pub(crate) fn deployment(
                             mounts
                         }),
                         ..Default::default()
-                    }],
+                    }]
+                    .into_iter()
+                    .chain(
+                        cluster
+                            .spec
+                            .plugin
+                            .as_ref()
+                            .map(|p| plugin_container(cluster, p)),
+                    )
+                    .collect(),
                     enable_service_links: Some(false),
                     node_selector: (!cluster.spec.node_selector.is_empty())
                         .then(|| cluster.spec.node_selector.clone()),
@@ -747,6 +951,16 @@ pub(crate) fn deployment(
                                 ..Default::default()
                             },
                         ];
+                        if cluster.spec.plugin.is_some() {
+                            // `emptyDir`, not a host path: the socket exists for
+                            // the life of the Pod and is shared by exactly the two
+                            // containers in it.
+                            volumes.push(Volume {
+                                name: "plugin-run".into(),
+                                empty_dir: Some(EmptyDirVolumeSource::default()),
+                                ..Default::default()
+                            });
+                        }
                         if let Some(tls) = tls_mount {
                             volumes.extend([
                                 Volume {
@@ -788,7 +1002,10 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    use crate::api::{ConfigSpec, SnapshotSpec, StorageSpec, YesnoClusterSpec};
+    use crate::api::{
+        ConfigSpec, PluginChannelSpec, PluginPort, PluginSpec, SnapshotSpec, StorageSpec,
+        YesnoClusterSpec,
+    };
 
     fn cluster() -> YesnoCluster {
         let mut cluster = YesnoCluster::new(
@@ -813,6 +1030,7 @@ mod tests {
                 pod_labels: BTreeMap::new(),
                 node_selector: BTreeMap::new(),
                 shutdown_grace_secs: 30,
+                plugin: None,
             },
         );
         cluster.metadata.namespace = Some("data".into());
@@ -1191,5 +1409,210 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.len() <= 48);
         assert!(!a.contains('.'));
+    }
+
+    fn with_plugin(plugin: PluginSpec) -> YesnoCluster {
+        let mut c = cluster();
+        c.spec.plugin = Some(plugin);
+        c
+    }
+
+    fn peer() -> PluginSpec {
+        PluginSpec {
+            image: "ghcr.io/example/peer:1".into(),
+            image_pull_policy: None,
+            args: vec!["--serve".into()],
+            env: BTreeMap::from([("PEER_LOG".into(), "info".into())]),
+            resources: None,
+            ports: vec![PluginPort {
+                name: "search".into(),
+                container_port: 8080,
+            }],
+            run_as_user: None,
+            channel: PluginChannelSpec {
+                max_lanes: Some(265),
+                max_peers: Some(2),
+                socket_mode: Some("0600".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// No plugin, no sidecar and no shared volume.
+    ///
+    /// The absence matters as much as the presence: every existing cluster must
+    /// produce the Pod it produced before this field existed.
+    #[test]
+    fn a_cluster_without_a_plugin_is_unchanged() {
+        let c = cluster();
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.containers.len(), 1, "only yesnod");
+        assert!(
+            pod.volumes.unwrap().iter().all(|v| v.name != "plugin-run"),
+            "and no socket volume"
+        );
+        assert!(
+            pod.containers[0].env.is_none(),
+            "and no channel environment"
+        );
+    }
+
+    /// The sidecar appears, shares the socket volume, and is told where it is.
+    #[test]
+    fn a_plugin_becomes_a_sidecar_sharing_one_socket() {
+        let c = with_plugin(peer());
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.containers.len(), 2, "yesnod and the peer");
+        let plugin = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "plugin")
+            .expect("a plugin container");
+
+        // Both containers mount the same emptyDir, which is the whole mechanism.
+        for container in &pod.containers {
+            let mounts = container.volume_mounts.as_ref().unwrap();
+            assert!(
+                mounts
+                    .iter()
+                    .any(|m| m.name == "plugin-run" && m.mount_path == "/run/yesno"),
+                "{} must mount the socket directory",
+                container.name
+            );
+        }
+        assert!(pod
+            .volumes
+            .unwrap()
+            .iter()
+            .any(|v| v.name == "plugin-run" && v.empty_dir.is_some()));
+
+        // And both are told the path, including yesnod -- which is what makes this
+        // work when the configuration comes from a Secret the operator cannot edit.
+        for container in &pod.containers {
+            let env = container
+                .env
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must carry the channel environment", container.name));
+            let socket = env
+                .iter()
+                .find(|e| e.name == "YESNOD_PLUGIN_CHANNEL_SOCKET")
+                .unwrap_or_else(|| panic!("{} missing the socket variable", container.name));
+            assert_eq!(socket.value.as_deref(), Some("/run/yesno/plugin.sock"));
+        }
+        let env = plugin.env.as_ref().unwrap();
+        assert!(
+            env.iter()
+                .any(|e| e.name == "YESNOD_PLUGIN_CHANNEL_MAX_LANES"
+                    && e.value.as_deref() == Some("265")),
+            "channel limits reach the peer too"
+        );
+        assert!(
+            env.iter().any(|e| e.name == "PEER_LOG"),
+            "and the spec's own environment is merged, not replaced"
+        );
+        assert_eq!(plugin.args.as_deref(), Some(&["--serve".to_string()][..]));
+        assert_eq!(plugin.ports.as_ref().unwrap()[0].container_port, 8080);
+    }
+
+    /// The peer cannot reach the database directory.
+    ///
+    /// **This is the structural security property of the out-of-process channel**,
+    /// and it is the one thing an accidental extra mount would silently discard:
+    /// a peer never opens the database, its snapshots belong to `yesnod` and are
+    /// keyed by its connection, so the socket is all it needs. Left to chance,
+    /// "no data mount" is indistinguishable from "nobody added one yet".
+    #[test]
+    fn the_plugin_sidecar_cannot_reach_the_data_volume() {
+        let c = with_plugin(peer());
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let plugin = pod.containers.iter().find(|c| c.name == "plugin").unwrap();
+        let mounts = plugin.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1, "exactly one mount: {mounts:?}");
+        for forbidden in ["data", "config", "tls", "ca"] {
+            assert!(
+                mounts.iter().all(|m| m.name != forbidden),
+                "the peer must not mount {forbidden}"
+            );
+        }
+    }
+
+    /// The peer is hardened exactly as `yesnod` is, not less.
+    #[test]
+    fn the_plugin_sidecar_is_hardened_like_the_daemon() {
+        let c = with_plugin(peer());
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let plugin = pod.containers.iter().find(|c| c.name == "plugin").unwrap();
+        let sc = plugin.security_context.as_ref().unwrap();
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(
+            sc.run_as_user,
+            Some(10001),
+            "shares yesnod's uid by default"
+        );
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop.as_deref(),
+            Some(&["ALL".to_string()][..])
+        );
+    }
+
+    /// A foreign uid is accepted with an allow list and refused without one.
+    ///
+    /// Refusing the *combination* rather than the uid: the channel gates on
+    /// `SO_PEERCRED`, so a peer whose uid is not allowed connects and is dropped
+    /// silently -- a Pod that looks healthy and cannot talk to itself. That is
+    /// worth a rejected spec.
+    #[test]
+    fn a_foreign_uid_needs_an_allow_list() {
+        let mut p = peer();
+        p.run_as_user = Some(2000);
+        assert!(
+            plugin_spec_error(&p).is_some_and(|m| m.contains("allowUids") && m.contains("2000")),
+            "a foreign uid with no allow list must be refused, and say which field"
+        );
+
+        p.channel.allow_uids = vec![2000];
+        assert!(
+            plugin_spec_error(&p).is_none(),
+            "with the uid allowed it is a supported configuration"
+        );
+        let c = with_plugin(p);
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let plugin = pod.containers.iter().find(|c| c.name == "plugin").unwrap();
+        let sc = plugin.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_user, Some(2000));
+        assert_eq!(sc.run_as_group, Some(2000));
+    }
+
+    /// The generated configuration describes the channel too.
+    #[test]
+    fn the_generated_config_carries_the_plugin_section() {
+        let c = with_plugin(peer());
+        let body = match config_source(&c, 0, InstanceRole::Leader, None, None, None) {
+            ConfigSource::Generated { body, .. } => body,
+            other => panic!("expected generated config, got {other:?}"),
+        };
+        assert!(body.contains("[plugin]"));
+        assert!(body.contains("channel_socket = \"/run/yesno/plugin.sock\""));
+        assert!(body.contains("channel_socket_mode = \"0600\""));
+        assert!(body.contains("channel_max_peers = 2"));
+        // The limits that have environment flags are deliberately not duplicated
+        // here: two sources for one value, with the environment winning, reads as
+        // a bug the first time somebody edits the ConfigMap and nothing changes.
+        assert!(
+            !body.contains("channel_max_lanes"),
+            "limits with a flag belong to the environment alone"
+        );
     }
 }

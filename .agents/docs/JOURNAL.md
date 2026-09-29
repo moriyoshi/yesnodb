@@ -8531,3 +8531,68 @@ twice today.
 The binary is deliberately **not** in the unified image yet:
 `check-image-binaries.py` governs `yesno-server`, `yesno-server-utils` and
 `yesno-operator`, so adding it belongs with the operator e2e arm that needs it.
+
+## 2026-09-30 -- the operator can run a plugin peer beside yesnod
+
+Phase 1 of `LTM/operator-hosted-plugin-container-plan.md`: `spec.plugin` on the
+CRD, a sidecar in the instance Pod, a shared `emptyDir` for the socket, and the
+channel configuration reaching `yesnod` through the environment.
+
+**Three fields deliberately absent, and the absences are the design.** There is
+no `library`: the in-process ABI was removed on 2026-09-29, and a line in a
+namespaced custom resource was never the right weight for a decision that loads
+arbitrary code into the daemon. There is no socket path: it is a contract between
+two containers this operator itself writes, so a field for it is a way to get it
+wrong with nothing to gain. And there is no `Service` -- `ports` are declared so
+one can name them, and creating it is separable work.
+
+**The channel is configured through the environment, not the generated file.** A
+cluster using `config.secretName` gets no generated configuration at all, and that
+is the mTLS path a real deployment uses -- so a config-file-only approach would
+have worked everywhere except where it matters. The generated `[plugin]` section
+is written anyway, for an operator reading the ConfigMap, but only for the four
+fields that have no `YESNOD_*` flag. Duplicating the limits would give two sources
+for one value with the environment winning, which reads as a bug the first time
+somebody edits the ConfigMap and nothing changes.
+
+# Three things the implementation caught that the design did not
+
+**`plugin_spec_error` was dead code, and clippy said so.** Validation that nothing
+calls is worse than no validation, because it reads as protection; it is now
+reached from the reconciler's `validate`, and
+`validation_refuses_a_plugin_uid_the_channel_would_drop` asserts that entry point
+rather than the function. This is the same shape as the `put_packed_many` review
+in the sibling consumer earlier the same day: an API with no caller is a claim, not
+a feature.
+
+**The plan's own premise had gone stale in a day.** It said a plugin running as a
+non-10001 uid was impossible, because the channel applied no socket mode, and that
+the operator should therefore reject such a spec. Both halves stopped being true
+when `channel_socket_mode` and `channel_allow_uids` landed on 2026-09-29. A
+foreign uid is now *accepted* with an allow list, and only the combination that
+cannot work is refused -- because that failure is **silent**: the peer connects,
+`SO_PEERCRED` refuses it, and the Pod looks healthy while its two containers
+cannot talk. Reading a design document written yesterday as current is exactly the
+hazard the `and_shape.py` correction in `AGENTS.md` warns about, at one day's
+remove instead of eleven.
+
+**The checked-in CRD is a real gate.** `checked_in_crd_matches_the_rust_api`
+failed until `deploy/crd.yaml` was regenerated, 373 -> 533 lines. A schema this
+size is not something anyone would notice by eye, and the operator serves it to
+the API server -- so a drift here is a cluster that rejects a field the reconciler
+reads.
+
+**Two tests pin properties that are true today by accident otherwise.**
+`the_plugin_sidecar_cannot_reach_the_data_volume` asserts the peer mounts exactly
+one volume and none of `data`, `config`, `tls`, `ca` -- a peer never opens the
+database, its snapshots belong to `yesnod` and are keyed by its connection, and
+that structural property is the whole reason the out-of-process shape is
+preferable. Left implicit, "no data mount" is indistinguishable from "nobody has
+added one yet". And `a_cluster_without_a_plugin_is_unchanged` asserts that every
+existing cluster produces the Pod it produced before this field existed: one
+container, no socket volume, no channel environment.
+
+**Note on the tree.** Another session is working in this checkout concurrently --
+an LTM entry on KV attention set operations, its JSON companion, an INDEX row, and
+a `docs/operations/` directory splitting the operator guide. None of it is in this
+commit, which stages five paths explicitly rather than using `git add -A`.

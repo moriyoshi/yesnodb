@@ -133,6 +133,22 @@ changes in the same commit.
 
 ## Phase 1: `spec.plugin` and the sidecar
 
+**DONE 2026-09-30.** `PluginSpec` in `api.rs`, the sidecar and shared `emptyDir`
+in `resources.rs`, the generated `[plugin]` section, `plugin_spec_error` wired
+into the reconciler's `validate`, and seven tests. The checked-in CRD was
+regenerated ( 373 -> 533 lines ); a test asserts it matches the Rust API, which
+is what caught it.
+
+Two things the implementation settled that the sketch left open. The Service is
+**not** built -- `ports` are declared so a Service or probe can name them, and
+creating one is separable. And the limits that have `YESNOD_*` flags are written
+**only** to the environment, not also to the generated `[plugin]` section:
+duplicating them would give two sources for one value with the environment
+winning, which reads as a bug the first time somebody edits the ConfigMap and
+nothing changes. Only `socket_mode`, `allow_uids`, `max_peers` and
+`max_snapshots` -- which have no flags -- appear in the file.
+
+
 ```yaml
 spec:
   plugin:
@@ -165,13 +181,21 @@ rather than relaxed: `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL
 `readOnlyRootFilesystem: true`, `runAsNonRoot: true`, `runAsUser`/`runAsGroup`
 10001, and the Pod's `seccompProfile: RuntimeDefault`.
 
-**It must run as UID 10001, and that is a requirement rather than a default.**
-The plugin channel does not set a socket mode -- `unix_socket_mode` exists in the
-config but the channel's `start` never applies one -- so the socket lands at the
-process umask and owned by `yesnod`. Same-UID is what makes it reachable. If a
-plugin image insists on another UID, that needs a socket-mode option on the
-channel first; the plan is to reject the spec with a clear message rather than
-produce a Pod whose containers cannot talk.
+**It runs as UID 10001 by default, and this paragraph is corrected.**
+
+The original said a different UID was impossible because the channel applied no
+socket mode, and that the operator should therefore reject such a spec. **Both
+halves are now out of date**: `channel_socket_mode` is applied after bind, and
+`channel_allow_uids` gates connections on `SO_PEERCRED`, both added 2026-09-29
+after a security review. So a plugin running as another user is expressible --
+allow its uid, and set a mode that admits it.
+
+The default stays same-UID, because it is the configuration that needs no
+thought: the socket lands at the umask owned by `yesnod`, and a peer sharing its
+uid can open it with nothing further set. A spec naming another `runAsUser` is
+therefore **accepted** and must set `channel.allowUids`; the reconciler refuses
+only the combination that cannot work -- a foreign uid with no allow list -- and
+says which field to set.
 
 Generated config gains a `[plugin]` section; the `secretName` path relies on
 Phase 0's environment variables. The reconciler should set the environment in
