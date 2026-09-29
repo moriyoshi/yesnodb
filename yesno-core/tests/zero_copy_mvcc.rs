@@ -1479,3 +1479,91 @@ fn a_lane_handle_with_no_keys_still_pins_its_version() {
     drop(empty);
     assert_eq!(db.live_readers(), 0);
 }
+
+/// Dense chunks across `chunks` prefixes: each is a bitmap, so 8 KiB apiece and
+/// a known number of them fills a 2 MiB slab.
+fn dense_chunks(chunks: u64, per: u64) -> Vec<u64> {
+    (0..chunks)
+        .flat_map(|c| (0..per).map(move |i| c * 65_536 + i * 13))
+        .collect()
+}
+
+/// The reopen guarantee, at a size that actually reaches slab **reuse**.
+///
+/// `reopening_does_not_disturb_a_container_from_the_previous_instance` above
+/// asserts the same property and passed throughout the period this was broken,
+/// because its churn -- four rounds of 4 000 ordinals -- never empties a 2 MiB
+/// slab and never makes the allocator reach for a free one. The guarantee held
+/// only until an allocation happened to land on the held container's bytes.
+///
+/// `punch_floor` spares inherited slabs from *punching* for exactly this reason,
+/// and `take_punchable_ranges` filters by it while calling those same slabs
+/// "Reusable, never returnable" -- so one of the two ways to destroy the bytes
+/// was gated and the other was not. `new_slab_for` now skips them too.
+///
+/// Measured before the fix: the held container read **1 502 360** ordinals where
+/// it had written 1 500 000, having picked up another key's data through the
+/// recycled slab. No error, no checksum failure -- the container was already
+/// decoded and aliasing the mapping, so nothing re-verifies it. That is the
+/// silent-wrong-answer class, which is why this is fixed rather than documented.
+///
+/// Three opens in one process is the shape that matters: the first open of a
+/// directory in a process sets the floor to zero, since no container from a
+/// previous instance can exist there, so a single-open daemon is unaffected by
+/// either the bug or the fix.
+#[test]
+fn slab_reuse_after_a_reopen_does_not_overwrite_a_held_container() {
+    let dir = tmpdir("slabreuse");
+    let _c = CleanDir(dir.clone());
+    let opts = || DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+    // 300 bitmap chunks is about 2.4 MiB, so more than one slab.
+    let original = dense_chunks(300, 5_000);
+
+    {
+        let db = Db::open_with(&dir, opts()).unwrap();
+        db.insert_many(9, &original).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // Second open: these slabs are inherited, so a container taken here is the
+    // one the guarantee is about.
+    let held = {
+        let db = Db::open_with(&dir, opts()).unwrap();
+        let snap = db.snapshot().unwrap();
+        snap.load(9).unwrap()
+    };
+    assert_eq!(
+        held.iter().collect::<Vec<_>>(),
+        original,
+        "read back intact"
+    );
+
+    // Third open: empty those slabs, then allocate hard enough that the
+    // allocator must reach for a free one.
+    let db2 = Db::open_with(&dir, opts()).unwrap();
+    let mut b = db2.batch();
+    b.delete_key(9);
+    b.commit().unwrap();
+    for _ in 0..6 {
+        db2.checkpoint().unwrap();
+    }
+    for round in 0..8u64 {
+        db2.insert_many(200 + round, &dense_chunks(60, 5_000))
+            .unwrap();
+        db2.checkpoint().unwrap();
+    }
+
+    let after: Vec<u64> = held.iter().collect();
+    assert_eq!(
+        after.len(),
+        original.len(),
+        "the held container changed size, so an allocation landed on its bytes"
+    );
+    assert_eq!(
+        after, original,
+        "slab reuse overwrote a container held across a reopen"
+    );
+}

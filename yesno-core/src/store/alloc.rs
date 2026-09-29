@@ -605,10 +605,45 @@ impl Allocator {
     /// The scan is linear in slab count. It runs once per slab exhausted, not
     /// per allocation, so it is far off the hot path.
     fn new_slab_for(&mut self, class: u8) -> u32 {
+        // Inherited slabs are skipped, for the reason `punch_floor` gives: a
+        // `Container` that outlived a previous instance may still alias their
+        // bytes, and this instance's reclamation gates cannot see it.
+        //
+        // **Reuse and punching are two ways to destroy the same bytes**, and only
+        // punching was gated. `take_punchable_ranges` filters by this floor and
+        // its comment called the same slabs "Reusable, never returnable", so the
+        // guarantee that
+        // `zero_copy_mvcc::reopening_does_not_disturb_a_container_from_the_previous_instance`
+        // asserts was true only until an allocation happened to land on one. It
+        // was reachable: emptying ~2.4 MiB under one key and then allocating
+        // returned a held container **1 502 360 ordinals where it had 1 500 000**
+        // -- another key's data, read through the recycled slab, with no error
+        // anywhere. A silent wrong answer is the one outcome the storage layer is
+        // built to make impossible, which is what decided this against narrowing
+        // the guarantee instead.
+        //
+        // # The cost, and why it is smaller than it looks
+        //
+        // Space inherited at open is now neither punched nor reused, so it is
+        // stranded for the life of the instance. That sounds like it penalises
+        // exactly the long-running server this allocator is for, and it does not:
+        // `Db::open_with` calls `allow_punching_inherited_slabs` on the **first**
+        // open of a directory in a process, which sets this floor to zero -- no
+        // container from a previous instance can exist in a process that has not
+        // opened the directory before. A daemon opens once and strands nothing.
+        //
+        // What pays is a process that reopens the same directory: a CLI run
+        // twice, an in-process compaction, the tests. There the stranded amount
+        // is bounded by what was free at that open, and there the guarantee is
+        // the thing being bought.
+        let floor = self.punch_floor as usize;
         if let Some(id) = self
             .slabs
             .iter()
-            .position(|s| matches!(s.state, SlabState::Free))
+            .enumerate()
+            .skip(floor)
+            .find(|(_, s)| matches!(s.state, SlabState::Free))
+            .map(|(i, _)| i)
         {
             // Re-initialize: a slab emptied by `free_now` keeps the geometry of
             // its previous class, and `Slab::free()` from restored metadata has
@@ -1180,6 +1215,48 @@ mod tests {
         assert_eq!(a.owning_class(taken), Some(new));
     }
 
+    /// An inherited slab is not handed back out while the floor stands.
+    ///
+    /// The unit-level counterpart of
+    /// `zero_copy_mvcc::slab_reuse_after_a_reopen_does_not_overwrite_a_held_container`.
+    /// Reuse and punching are two ways to destroy the same bytes and only
+    /// punching was gated, so a `Container` that outlived a previous instance
+    /// could have an allocation land on it -- measured as a held container
+    /// reading 1 502 360 ordinals where it had 1 500 000, with no error anywhere.
+    ///
+    /// Both halves are asserted, because "never reuse" would be a space leak
+    /// rather than a fix: with the floor lifted, as on the first open of a
+    /// directory in a process, the same slab must come straight back.
+    #[test]
+    fn an_inherited_slab_is_not_reused_while_the_punch_floor_stands() {
+        let mut a = Allocator::new();
+        let cells: Vec<u64> = (0..4).map(|_| a.alloc(9).unwrap()).collect();
+        let inherited = slab_of(cells[0]);
+
+        a.adopt_live_at_open(&BTreeMap::new());
+        assert!(matches!(a.slabs[inherited as usize].state, SlabState::Free));
+
+        assert_ne!(
+            slab_of(a.alloc(10).unwrap()),
+            inherited,
+            "an inherited slab may still be aliased by a container from the \
+             previous instance, so it must not be allocated into"
+        );
+
+        // And the space is not lost for ever: the floor is what withholds it,
+        // and a first open in a process lifts it.
+        let mut b = Allocator::new();
+        let cells: Vec<u64> = (0..4).map(|_| b.alloc(9).unwrap()).collect();
+        let inherited = slab_of(cells[0]);
+        b.adopt_live_at_open(&BTreeMap::new());
+        b.allow_punching_inherited_slabs();
+        assert_eq!(
+            slab_of(b.alloc(10).unwrap()),
+            inherited,
+            "with no floor there is nothing to protect, so the slab is reused"
+        );
+    }
+
     /// The same obligation as the test above, for the **open-time** path.
     ///
     /// `retire_from_active` has two call sites and they are reached by different
@@ -1207,6 +1284,17 @@ mod tests {
             matches!(a.slabs[slab as usize].state, SlabState::Free),
             "the slab should have been emptied by the adopt"
         );
+        // `adopt_live_at_open` raises `punch_floor` over everything it just
+        // inherited, and `new_slab_for` now refuses to reuse below that floor --
+        // so without this the reuse below cannot happen and the retirement this
+        // test is about becomes unobservable. `Db::open_with` makes exactly this
+        // call on the first open of a directory in a process, where no container
+        // from a previous instance can exist, so this is the real path rather
+        // than a contrivance to keep the assertions reachable.
+        //
+        // The no-reuse behaviour itself is asserted by
+        // `an_inherited_slab_is_not_reused_while_the_punch_floor_stands`.
+        a.allow_punching_inherited_slabs();
 
         let taken = a.alloc(new).unwrap();
         assert_eq!(

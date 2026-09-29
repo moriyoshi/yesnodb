@@ -7885,3 +7885,109 @@ What the writer *observes* in that scenario is a slot whose pid is positively
 refuted, and that is forgeable with the existing `forge` helper. The test asserts
 the forgery actually refutes before relying on it, so it cannot pass by failing to
 set up.
+
+## 2026-09-29 -- slab reuse really did overwrite a held container, and the cost of stopping it was mis-estimated
+
+Closes `inherited-slab-reuse-can-overwrite-a-container-held-across-a-reopen`,
+filed 2026-09-28 and removed from `TODO.md` with this entry. It was filed as a
+**latent** gap wanting a decision rather than a patch. It is not latent, the
+decision was easier than the entry expected, and the entry's estimate of what the
+fix costs was wrong in the direction that mattered.
+
+**It reproduces, and the failure is a silent wrong answer.** A container held
+across a reopen, after ~2.4 MiB was emptied under one key and then reallocated,
+read **1 502 360 ordinals where it had written 1 500 000** -- another key's data,
+through the recycled slab. No error, no checksum failure: the container is
+already decoded and aliasing the mapping, so nothing re-verifies it. That is the
+one outcome the storage layer exists to make impossible, and it is a different
+argument from the one the entry weighed.
+
+**Why the existing test could not see it.**
+`reopening_does_not_disturb_a_container_from_the_previous_instance` asserts
+exactly this property and passed the whole time. Its churn is four rounds of
+4 000 ordinals, which never empties a 2 MiB slab and so never makes the allocator
+reach for a free one. The guarantee held only until an allocation happened to
+land on the bytes -- which is what the entry said, and reading it as "latent"
+rather than "reachable with a bigger fixture" is what left it unproven for a day.
+**Establishing reachability took one scratch crate and about ten minutes**, and it
+converted a decision about documentation into a decision about corruption.
+
+**One of the two ways to destroy the bytes was gated and the other was not.**
+`punch_floor` spares inherited slabs from punching, `take_punchable_ranges`
+filters by it -- and that filter's own comment calls those slabs "Reusable, never
+returnable". So reuse was a deliberate carve-out, not an oversight, resting on
+the `punch_floor` doc's "Reuse would break that guarantee too, so it was already
+conditional". `new_slab_for` now skips slabs below the floor, which makes the
+three consumers of "inherited slab" agree.
+
+**The entry said this "permanently strands inherited free space in a long-lived
+process", and that is exactly backwards.** `Db::open_with` calls
+`allow_punching_inherited_slabs` on the **first** open of a directory in a
+process, setting the floor to **zero** -- no container from a previous instance
+can exist in a process that never opened the directory before. A long-lived
+daemon opens once, has no floor, and strands nothing; it is unaffected by the bug
+and by the fix alike. What pays is a process that **reopens** the same directory:
+a CLI run twice, an in-process compaction, the tests. That is precisely the
+population the guarantee is for, so the cost lands on the beneficiary, and it is
+bounded by what was free at that open rather than growing without limit.
+
+Getting that backwards is what made the entry propose narrowing the guarantee as
+"honest and cheap and probably right". It would have been neither, once the
+failure is known to be silent corruption rather than a refusal -- and the
+alternative it was weighed against turns out to cost nothing for the deployment
+shape the allocator is designed around. **The premise that made the trade look
+hard was a claim about who pays, and nobody had checked it.**
+
+`slab_reuse_after_a_reopen_does_not_overwrite_a_held_container` is the fixture at
+a size that reaches reuse; it reddens on the unfixed code with exactly the
+1 502 360 / 1 500 000 mismatch, verified by reverting. The older, smaller test is
+kept: it is cheap, it covers the same property at a size the gate runs
+constantly, and there is now one test that fails for each of the two ways this
+can break.
+
+**One existing unit test needed its setup extended, and it was not weakened.**
+`a_slab_emptied_at_open_is_no_longer_the_bump_slab_of_its_old_class` reddened,
+on its middle assertion "the freed slab should be the one reused". That
+assertion is **instrumental**, not the subject: the test is about
+`retire_from_active` being called at the open-time site, and it demonstrates
+that by having a second class take the emptied slab and then checking the first
+class does not bump back into it. Refusing inherited reuse removes the step the
+demonstration stands on.
+
+All three assertions are kept. What was added is one call to
+`allow_punching_inherited_slabs`, which is what `Db::open_with` does on the first
+open of a directory in a process -- the real path, not a contrivance, and the
+one state in which reuse is legitimate. The subject the test guards is still
+live under the fix: a stale `active[old]` pointing at a `Free` slab would bump
+into space the allocator considers free whether or not another class took it
+first, so removing the retirement call still reddens it.
+
+`an_inherited_slab_is_not_reused_while_the_punch_floor_stands` is the new
+unit-level counterpart, and it asserts **both** directions -- refused while the
+floor stands, reused as soon as it is lifted. One without the other would be
+satisfied by an allocator that had simply stopped reusing anything, which is a
+space leak wearing a fix's clothes.
+
+**The cost, measured rather than asserted.** A probe under
+`.agents-workspace/tmp/` replaced the whole working set once per cycle
+( 120 dense chunks under one key, deleted and rewritten ) and reported allocated
+blocks of the shard files, which is the real number -- apparent size is 1 GiB in
+every arm because the file is sparse.
+
+```text
+  20 cycles, allocated blocks           before      after
+  each cycle its own Db ( reopen )      1.9 MiB    19.3 MiB
+  one Db held across all cycles         1.9 MiB     1.9 MiB
+```
+
+So the reopening shape pays about **one working set stranded per reopen**, and
+the daemon shape pays **nothing at all** -- the two arms are identical to the
+tenth of a MiB, which is the claim about `allow_punching_inherited_slabs` being
+tested rather than reasoned about. The 10x in the first row is real and is the
+honest headline for a process that reopens in a loop while churning; it is also
+the population that was being handed silently wrong data, so it is the
+population buying something with it.
+
+`aged_state.py` shows nothing either way at its gate-sized corpus -- 3 slabs and
+`amp 1.00x` in every row -- so it is not the instrument for this, and the number
+above is not in it.
