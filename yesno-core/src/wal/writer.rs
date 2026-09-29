@@ -103,7 +103,7 @@ impl WalWriter {
     /// module note for why the file outranks the caller here.
     pub fn open(path: impl AsRef<Path>, base_if_empty: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let sealed = discover_generations(&path)?;
+        let sealed = discover_generations_stable(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -507,7 +507,58 @@ fn generation_base(path: &Path, candidate: &Path) -> Option<u64> {
     suffix.parse().ok()
 }
 
-fn discover_generations(path: &Path) -> Result<Vec<Generation>> {
+/// The sealed generations beside `path`, or `None` if the directory changed
+/// while being listed.
+///
+/// # Why a vanished entry is not an error
+///
+/// Listing a directory and then stat-ing each entry is two steps, and a
+/// generation can be recycled between them -- `read_dir` returns a name that
+/// `metadata` then cannot find. That is `ENOENT` on a file the caller never
+/// named, and it says nothing except "the directory is being written to", which
+/// is the normal condition here: the archiver reads these bounds while the server
+/// rotates.
+///
+/// **It used to be a hard error, and it escaped the very retry that exists for
+/// this.** [`catalog`] reads this list on both sides of opening the active file
+/// and retries when the two disagree, precisely so that rollover cannot be
+/// observed half-done; it even tolerates `NotFound` on the active file. But the
+/// `metadata` call here returned `Err` straight through that loop, so a rotation
+/// landing in the microsecond between the listing and the stat killed the read
+/// instead of being retried. The window is small, which is why it only ever
+/// appeared under load: the archive sidecar died with a bare
+/// "No such file or directory ( os error 2 )" in `pitr_retention.py`
+/// ( 2026-09-28 ) and `archive.py` ( 2026-09-29 ), both times while a whole gate
+/// ran beside it.
+///
+/// Returning `None` rather than skipping the entry is the load-bearing part.
+/// Skipping would yield a list with a hole in it, and the contiguity check below
+/// would then reject it as `WAL generations are not contiguous` -- turning a
+/// transient race into a *different* hard error that reads like corruption. The
+/// directory changed, so the answer is to look again.
+///
+/// Only `NotFound` is tolerated. Every other `io::Error` is still fatal: a
+/// permission failure or an I/O error is not a race and retrying it eight times
+/// would only delay the report.
+/// [`discover_generations`], retried until the directory holds still.
+///
+/// For callers that are not already inside [`catalog`]'s compare-and-retry loop.
+/// A rotation landing between the listing and a stat is transient by
+/// construction, so looking again is the whole remedy; the bound stops a
+/// pathologically busy directory from spinning, and shares `catalog`'s wording
+/// because it is the same condition.
+fn discover_generations_stable(path: &Path) -> Result<Vec<Generation>> {
+    for _ in 0..8 {
+        if let Some(generations) = discover_generations(path)? {
+            return Ok(generations);
+        }
+    }
+    Err(CodecError::Invariant(
+        "WAL generations changed continuously while inspected",
+    ))
+}
+
+fn discover_generations(path: &Path) -> Result<Option<Vec<Generation>>> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut generations = Vec::new();
     for entry in std::fs::read_dir(parent).map_err(io_err)? {
@@ -516,8 +567,13 @@ fn discover_generations(path: &Path) -> Result<Vec<Generation>> {
         let Some(base) = generation_base(path, &entry_path) else {
             continue;
         };
+        let len = match entry.metadata() {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_err(error)),
+        };
         generations.push(Generation {
-            len: entry.metadata().map_err(io_err)?.len(),
+            len,
             path: entry_path,
             base,
         });
@@ -529,7 +585,7 @@ fn discover_generations(path: &Path) -> Result<Vec<Generation>> {
     {
         return Err(CodecError::Invariant("WAL generations are not contiguous"));
     }
-    Ok(generations)
+    Ok(Some(generations))
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -544,7 +600,9 @@ fn catalog(path: &Path, base_if_empty: u64) -> Result<(Vec<Generation>, u64, u64
     // the active file; if it changed, the descriptor and list describe
     // different instants and must not be combined into bogus bounds.
     for _ in 0..8 {
-        let sealed = discover_generations(path)?;
+        let Some(sealed) = discover_generations(path)? else {
+            continue;
+        };
         let mut active = match File::open(path) {
             Ok(file) => Some(file),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -562,7 +620,7 @@ fn catalog(path: &Path, base_if_empty: u64) -> Result<(Vec<Generation>, u64, u64
                 .and_then(Record::peek_lsn)
                 .unwrap_or(base_if_empty)
         };
-        if discover_generations(path)? != sealed {
+        if discover_generations(path)?.as_ref() != Some(&sealed) {
             continue;
         }
         if sealed
@@ -632,7 +690,7 @@ pub fn read_log_range(
 /// Remove every sealed generation belonging to `path`.
 pub fn remove_log_generations(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
-    let generations = discover_generations(path)?;
+    let generations = discover_generations_stable(path)?;
     for generation in generations {
         std::fs::remove_file(generation.path).map_err(io_err)?;
     }

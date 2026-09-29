@@ -1161,3 +1161,70 @@ fn readers_are_correct_while_a_checkpoint_syncs() {
     assert!(r > 50, "the readers must have swept repeatedly, got {r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Reading WAL bounds while generations rotate must not fail on a vanished file.
+///
+/// `catalog` is built to tolerate rollover: it reads the sealed-generation list
+/// on both sides of opening the active file and retries when the two disagree,
+/// and it already treats a missing *active* file as "length zero" rather than an
+/// error. Its helper did not extend that to the sealed list. Listing a directory
+/// and stat-ing each entry are two steps, so a generation recycled between them
+/// made `DirEntry::metadata` return `ENOENT`, which went straight out through the
+/// retry loop as `write-ahead log not found`.
+///
+/// The window is microseconds, which is why it only ever appeared under load,
+/// and why this test churns rather than sequences: there is no deterministic
+/// hook between the `read_dir` and the `metadata`. A stress test is the honest
+/// shape here, and it reddens reliably on the unfixed code -- verified by
+/// restoring it, where the reader thread reports the missing-file error within
+/// the first few hundred iterations.
+///
+/// The assertion is on the **error kind**, not on success. Under this much churn
+/// `catalog` may legitimately exhaust its eight attempts and say the generations
+/// changed continuously; that is a true statement about a directory being
+/// rewritten in a tight loop. What must never happen is the read failing because
+/// a file it merely *listed* went away.
+#[test]
+fn reading_wal_bounds_while_generations_rotate_never_reports_a_missing_file() {
+    let dir = tmpdir("walrotate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _clean = CleanDir(dir.clone());
+    let active = dir.join("shard-0000.wal");
+    std::fs::write(&active, b"").unwrap();
+    // 20 digits, which is what `generation_base` requires of a sealed name.
+    let sealed = dir.join("shard-0000.wal.00000000000000000000");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = {
+        let sealed = sealed.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let body = vec![0u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::fs::write(&sealed, &body);
+                let _ = std::fs::remove_file(&sealed);
+            }
+        })
+    };
+
+    let mut missing = 0usize;
+    let mut other: Option<String> = None;
+    for _ in 0..4000 {
+        if let Err(error) = yesno_core::wal::log_bounds(&active, 0) {
+            let text = format!("{error}");
+            if text.contains("not found") {
+                missing += 1;
+            } else if other.is_none() {
+                other = Some(text);
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    churn.join().unwrap();
+
+    assert_eq!(
+        missing, 0,
+        "a generation recycled between the listing and the stat must be retried, \
+         not reported as a missing log ( other error seen: {other:?} )"
+    );
+}
