@@ -457,14 +457,9 @@ fn the_daemon_wiring_binds_the_configured_socket() {
     let (_c, cfg, _host, sock) = setup("wire");
     assert!(!sock.exists(), "nothing is bound before wiring");
 
-    // SAFETY: no library is configured, so nothing is loaded; only the channel starts.
-    let wiring = unsafe { yesno_server::plugin::wire(&cfg, Role::Leader) }
+    let wiring = yesno_server::plugin::wire(&cfg, Role::Leader)
         .expect("wiring a configured channel must succeed")
         .expect("a configured channel must produce wiring");
-    assert!(
-        wiring.facility.is_none(),
-        "no library configured, so no in-process facility"
-    );
     let channel = wiring.channel.expect("the channel must be started");
     assert!(sock.exists(), "the configured socket must be bound");
 
@@ -492,7 +487,7 @@ fn the_daemon_wiring_is_absent_when_nothing_is_configured() {
     let (_c, mut cfg, _host, sock) = setup("wire-off");
     cfg.plugin.channel_socket = String::new();
     // SAFETY: nothing is configured, so nothing is loaded.
-    let wiring = unsafe { yesno_server::plugin::wire(&cfg, Role::Leader) }.unwrap();
+    let wiring = yesno_server::plugin::wire(&cfg, Role::Leader).unwrap();
     assert!(wiring.is_none(), "an unconfigured node wires nothing");
     assert!(!sock.exists());
 }
@@ -508,7 +503,7 @@ fn a_plugin_on_a_cold_standby_is_refused() {
     let (_c, mut cfg, _host, sock) = setup("wire-cold");
     cfg.follower.serve_reads = false;
     // SAFETY: the call refuses before loading anything.
-    let e = unsafe { yesno_server::plugin::wire(&cfg, Role::Follower) };
+    let e = yesno_server::plugin::wire(&cfg, Role::Follower);
     let msg = match e {
         Err(m) => m,
         Ok(_) => panic!("a plugin on a cold standby must be refused"),
@@ -522,9 +517,65 @@ fn a_plugin_on_a_cold_standby_is_refused() {
     // With reads enabled, the same configuration wires.
     cfg.follower.serve_reads = true;
     // SAFETY: as above.
-    let w = unsafe { yesno_server::plugin::wire(&cfg, Role::Follower) }
+    let w = yesno_server::plugin::wire(&cfg, Role::Follower)
         .unwrap()
         .unwrap();
     assert!(sock.exists());
     w.channel.unwrap().stop();
+}
+
+/// A rebootstrap takes a peer's snapshots back, rather than asking for them.
+///
+/// **This is the bug a security review found on 2026-09-29** ( item 1 ).
+/// `Listeners::before_close` announced `Unavailable` and stopped there, so a peer
+/// holding a `Snapshot` -- which holds `Arc<DbInner>`, which holds the directory
+/// lock -- kept that lock alive for as long as it felt like. The follower then
+/// dropped its `Arc<Db>` and `open_if_needed` failed `AlreadyOpen`, surfacing
+/// seconds later as an error naming nothing.
+///
+/// The peer here is deliberately **silent**: it opens a snapshot and then never
+/// reads another byte, which is exactly the case an announcement cannot reach. The
+/// listener must stay up throughout, because the contract is that a peer
+/// reconnects on its own and learns the new generation from its greeting.
+#[test]
+fn a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement() {
+    let (_c, cfg, host, sock) = setup("revoke");
+    let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+    let db = host.db().unwrap();
+
+    let mut peer = Peer::connect(&sock);
+    assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
+    peer.ask(Frame::ClientHello {
+        protocol: 1,
+        name: "silent".into(),
+    });
+    peer.ask(Frame::SnapshotOpen);
+    assert_eq!(db.live_readers(), 1, "the peer's snapshot is registered");
+
+    // What a follower does before dropping its database to rebuild it.
+    yesno_server::plugin::Listeners {
+        channel: Some(&channel),
+    }
+    .before_close();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.live_readers() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        db.live_readers(),
+        0,
+        "announcing a close does not release a snapshot; disconnecting does, and a \
+         reopen cannot wait on a peer's goodwill"
+    );
+    assert!(
+        sock.exists(),
+        "the listener stays up: a peer must be able to reconnect after the rebuild"
+    );
+    // And it can.
+    let mut again = Peer::connect(&sock);
+    assert!(matches!(again.read_frame(), Frame::ServerHello { .. }));
+
+    drop(peer);
+    channel.stop();
 }

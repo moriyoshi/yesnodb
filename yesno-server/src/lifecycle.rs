@@ -54,12 +54,10 @@ pub struct Running {
     counters: Arc<crate::maintenance::Counters>,
     db: Arc<Db>,
     grace: Duration,
-    /// The loaded plugin, drained before the readers are waited on.
-    facility: crate::plugin::SharedFacility,
     /// The out-of-process channel, closed before the readers are waited on.
     ///
-    /// Closing is what releases its peers' snapshots, so it belongs in the same
-    /// place as the in-process drain and for the same reason -- except that here it
+    /// Closing is what releases its peers' snapshots, so it has to happen before
+    /// step 2 counts readers -- and, unlike the in-process drain this replaced, it
     /// needs no cooperation from anyone.
     channel: Option<Arc<crate::plugin::Channel>>,
     /// The adopted metrics surface, when the caller bound the listener.
@@ -72,8 +70,8 @@ pub struct Running {
     ///
     /// Held so teardown can **empty** it. The slot owns an `Arc<Db>`, so a slot
     /// still full at step 4 makes `Arc::into_inner` answer `None` and the lock is
-    /// never released -- and when the slot is shared with a caller or a plugin
-    /// facility, dropping the service is no longer enough to empty it.
+    /// never released -- and when the slot is shared with a caller, dropping the
+    /// service is no longer enough to empty it.
     slot: crate::guard::DbSlot,
 }
 
@@ -218,30 +216,23 @@ pub async fn start_with_events(
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
     adopted: Option<crate::metrics::Adopted>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
-    start_with_plugin(cfg, event_sink, adopted, None, None, None).await
+    start_with_plugin(cfg, event_sink, adopted, None, None).await
 }
 
-/// As [`start_with_events`], with a loaded plugin to notify.
-///
-/// The facility is passed in rather than loaded here for the same reason as on the
-/// follower: loading runs arbitrary code from the operator's configuration, so the
-/// `unsafe` belongs at the point that reads that configuration.
 ///
 /// # `slot` is not optional decoration
 ///
-/// A `Facility` reads the database through a slot, and it has to be **the same**
-/// slot this function publishes to the Flight service. Passing only the facility
-/// does not work and fails in a way that looks like success: the facility keeps
-/// the empty slot it was built with, `after_open` is still announced, the server
-/// still starts, and every plugin call answers `UNAVAILABLE` for ever. So a caller
-/// that wants a plugin creates the slot, builds the facility against it, and hands
-/// both here.
+/// The channel's `Host` reads the database through a slot, and it has to be **the
+/// same** slot this function publishes to the Flight service. Passing only the
+/// channel does not work and fails in a way that looks like success: the `Host`
+/// keeps the empty slot it was built with, the server still starts, and every peer
+/// request answers `UNAVAILABLE` for ever. So a caller that wants a channel creates
+/// the slot, builds the channel against it, and hands both here.
 pub async fn start_with_plugin(
     cfg: &Config,
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
     adopted: Option<crate::metrics::Adopted>,
     slot: Option<crate::guard::DbSlot>,
-    facility: crate::plugin::SharedFacility,
     channel: Option<Arc<crate::plugin::Channel>>,
 ) -> Result<Running, Box<dyn std::error::Error + Send + Sync>> {
     crate::tls::install_crypto_provider();
@@ -356,11 +347,6 @@ pub async fn start_with_plugin(
         "yesnod is serving"
     );
 
-    // Announced after the listener is up, so a plugin that starts serving on the
-    // callback is not answering queries before the host is.
-    if let Some(f) = facility.as_ref() {
-        f.after_open(f.generation());
-    }
     // Channel peers connect on their own schedule, so the greeting they receive on
     // connect already carries the generation. This tells the ones already attached.
     if let Some(c) = channel.as_ref() {
@@ -381,7 +367,6 @@ pub async fn start_with_plugin(
         counters,
         db,
         grace: Duration::from_secs(cfg.server.shutdown_grace_secs),
-        facility,
         channel,
         slot,
         metrics_surface,
@@ -419,7 +404,6 @@ impl Running {
             db,
             grace,
             counters,
-            facility,
             channel,
             slot,
             metrics_surface,
@@ -453,28 +437,7 @@ impl Running {
         }
         ticker.stop().await;
 
-        // 1b. Drain the plugin, before step 2 counts readers.
-        //
-        // **The ordering is what makes step 2's number mean anything.** A plugin's
-        // lease *is* a registered reader slot, so a plugin still holding one would
-        // have the loop below spin for the whole grace period and then warn about
-        // "readers" -- true, and useless, because `live_readers()` cannot say whose
-        // they are. Draining first turns that into a message naming the library and
-        // the count, and leaves step 2 measuring what it was written to measure.
-        if let Some(f) = facility.as_ref() {
-            match f.before_close() {
-                crate::plugin::Drained::Clean => {}
-                other => tracing::error!(
-                    library = f.library(),
-                    outcome = ?other,
-                    "the plugin did not drain at shutdown; the database lock will not be \
-                     released until it does, and no host-side call can take its leases back"
-                ),
-            }
-        }
-        drop(facility);
-
-        // 1b-bis. Close the channel, which releases its peers' snapshots.
+        // 1b. Close the channel, which releases its peers' snapshots.
         //
         // Same position and the same reason as the drain above -- a channel peer's
         // snapshot is a registered reader slot, so step 2 would otherwise wait out

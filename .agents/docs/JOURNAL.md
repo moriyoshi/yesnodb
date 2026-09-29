@@ -8112,3 +8112,158 @@ speaks the protocol over a real socket -- the channel's tests call
 `Session::handle` directly, which is deliberate and is why protocol behaviour is
 testable without a descriptor, but it means the socket path itself is unexercised.
 That is the same shape as the daemon call-site gap found earlier today.
+
+## 2026-09-29 -- the in-process cdylib plugin ABI is gone
+
+Removed on the maintainer's instruction, the out-of-process channel being the
+plugin story. I had raised that `yesno_plugin.h` is a **published** contract and
+that a consumer might hold it; the instruction was repeated, so it is their call
+and this is the record rather than an objection.
+
+**The header is preserved in full** at `LTM/removed-cdylib-plugin-abi.md`, with an
+inventory of everything deleted. That follows the `stats.rs` precedent: a header is
+the one artefact that cannot be reconstructed from behaviour, and the Rust source
+can be had from `git show <commit>^:<path>`. Worth telling the `haiiie` peer; their
+own validation ran on arena and inline, which are both channel transports, so they
+are very probably unaffected.
+
+Gone: `include/yesno_plugin.h`, `src/table.rs`, `src/loader.rs`, `build.rs`,
+`tests/plugin.c`, `tests/host_table.rs`, `tests/load_c_plugin.rs`,
+`yesno-server/tests/plugin_facility.rs`, the `Facility` and `Drained` types, the
+`libloading` dependency, and `PluginConfig::{library, listen}`. About 2 400 lines.
+
+**The removal was not a deletion, and the interesting part is what had to move.**
+Three things would have broken silently if the files had simply been dropped:
+
+* **The generation counter.** `Listeners::after_replace` derived the generation
+  from the facility. With the facility gone it would have notified
+  `Available { generation: 0 }` for ever and **never** `GenerationChanged` -- so
+  after a rebootstrap every peer would go on using handles naming a database that
+  no longer exists, which is the exact failure the two-frame notification was
+  written to prevent. `Channel` now keeps the `Host` and bumps it. The counter is
+  an `Arc<AtomicU64>` the sessions share, so a bump on the channel's copy is what
+  they read.
+* **The lease counter and the drain contract.** `Host::lease`, `LeaseGuard`,
+  `SnapshotHandle`, `LanesHandle` and `Host::leases` existed **only** to answer
+  "has the plugin let go", because an in-process lease pinned the directory lock
+  and no host-side call could take one back. A peer's snapshots belong to its
+  session, so closing the socket takes them back with no cooperation. All of it is
+  dead and removed, and the module headers that explained the drain now explain why
+  there is nothing to drain -- a rationale comment for a removed mechanism is worse
+  than none.
+* **`plugin::wire` stopped being `unsafe`.** It `dlopen`ed a library named in the
+  configuration and ran its initializers. Nothing here loads foreign code now, so
+  there is no trust assertion left for a caller to make. **That change of signature
+  is the clearest single statement of what the removal bought** -- the daemon's
+  startup no longer contains an `unsafe` block whose safety argument is "the
+  operator's configuration is trusted".
+
+**`abi.rs` survives, trimmed to `Status` and `Role`.** The channel puts a `Status`
+discriminant in `Frame::Fault`, so those values are still a wire contract. Their
+second opinion used to be a test that *parsed the C header*; the header is gone and
+the values did not stop being a contract when it went, so
+`the_status_and_role_codes_are_frozen` writes them down instead. The module keeps
+its name because `Status` is public and renaming it would charge consumers for
+tidiness.
+
+**An old configuration naming a library now fails to parse**, because
+`deny_unknown_fields` is on `PluginConfig`. That is wanted: silently ignoring
+`library` would start a daemon the operator believes is running their plugin and
+which is not.
+
+**What was actually lost.** A run could be lent zero-copy through the C table and
+cannot be over the wire. That is a real capability -- and as it turned out the
+table was lending the *stored* `( start, len_minus_1 )` pairs under a header
+promising `[ start, end ]`, a silent wrong answer fixed hours earlier the same day,
+so the zero-copy path was never correct in the form anyone used it. The measured
+cost of the channel against the table is in `plugin-shape-performance.md`: the copy
+is 1.5-2.1x and batching recovers most of the round trips.
+
+`hosted-plugin-abi-design.md` and `hosted-plugin-abi-assessment.md` are annotated
+SUPERSEDED at the top rather than deleted. They are the record of a design that was
+built, measured and retired, and much of their reasoning -- lease lifetimes,
+rebootstrap semantics, role changes -- is the reasoning the channel implements. An
+unannotated design document is a plan waiting for a session to execute it.
+
+## 2026-09-29 -- a security review, and the one claim in the cdylib removal that was wrong
+
+Codex reviewed the out-of-process channel, static only, and reported six findings.
+**All six verified against source; none is a false positive.** Two are things I had
+already recorded independently, one is an already-filed item seen from a better
+angle, and one is a correctness bug that contradicts something I wrote hours
+earlier.
+
+**Item 1 is the one that matters, and it makes a liar of the removal entry.**
+`Listeners::before_close` announced `Frame::Unavailable` and stopped. A peer's
+`Session` owns its snapshots; a `Snapshot` holds `Arc<DbInner>`, which holds the
+directory lock. So on a follower rebootstrap `close_for_rebuild` dropped the
+`Arc<Db>` and `open_if_needed` then failed `AlreadyOpen` **for as long as a peer
+chose to hold on**, surfacing seconds later as an error naming nothing.
+
+That is precisely the hazard the in-process drain contract existed for, and this
+morning's removal entry said the channel needed no such contract because "the host
+takes them back by closing, with no cooperation". **That is true at shutdown and
+false at rebootstrap** -- `lifecycle` closes the channel at teardown, and the
+follower path only notified. I generalized from the path I had been reading to the
+one I had not. The bug predates the removal; what the removal did was delete the
+mechanism that handled the analogous case and assert the remaining path was fine.
+
+`Channel::disconnect_peers` now shuts every peer socket, which ends each serving
+thread and drops its session, **keeping the listener up** so peers reconnect and
+learn the new generation from the greeting. `before_close` announces and then
+revokes: announcing first is a courtesy to a peer that is reading, revoking is the
+guarantee. `stop` was rewritten to call the same function, since stopping is
+disconnecting plus closing the listener.
+
+**Item 2 compounds it, and is worse than reported.** `notify` held the global
+`peers` mutex across a **blocking** `write_all` to every peer. A Unix socket write
+blocks once the receiver's buffer fills, so a peer that stops reading froze
+`notify` for ever -- and `stop` waits on that same mutex, so one uncooperative peer
+could stall not just a rebootstrap but the whole daemon's shutdown. Reported as a
+channel problem; it reaches the process. `notify` now snapshots the peer list,
+releases the lock, and writes with a 2-second timeout; a timeout **disconnects**
+rather than retries, because a half-written frame has already desynchronized a
+protocol with no resynchronisation point, and a peer that reconnects is told
+everything it needs in the greeting.
+
+**Items 3 and 4 partly corroborate what I had already written down**, which is
+worth noting because it is evidence about where independent review adds value and
+where it does not. I had recorded the missing peer cap and the missing socket mode
+in the operator plan a few hours earlier, from thinking about deployment. What I
+had **not** seen is the sharper consequence: each `db.snapshot()` claims a slot in
+the process-wide reader registry, `MAX_READERS` is 4096, and a peer looping
+`SnapshotOpen` exhausts it for **everything, including the server's own queries**.
+That converts "a wasteful peer" into "a peer that denies service to unrelated
+readers", and it is the reason those are filed as one item rather than as a
+tidiness note.
+
+**Item 5's remedy already exists one file away**, which is the useful finding.
+`Channel::start` unconditionally unlinks its configured path, live socket or not,
+so two instances on one path silently split peers across two databases. Meanwhile
+`control.rs`'s `bind_unix` refuses a non-socket path, probes with `connect`,
+refuses if something is **already accepting**, unlinks only on `ConnectionRefused`,
+and chmods after bind with a note about the umask window. The channel is not
+missing a design; it is missing a copy. Filed with the precedent named, because an
+entry that says "do what that function does" is worth more than one that restates
+the hazard.
+
+**Item 6 is already filed and the review changes its character.**
+`key-enumeration-materializes-so-paging-it-is-quadratic` treats the full
+materialization as a performance question bounded by a cooperative consumer's
+documented contract. As a resource question it is different: a peer asking for one
+key still costs a whole-shard scan, which is request amplification reachable by
+anyone the socket admits. Same fix, different trigger -- no longer "a consumer who
+pages a lot" but "a peer who asks small, repeatedly", which needs no volume.
+
+**What I take from the shape of these.** The two I found myself came from asking
+"how would an operator deploy this"; the four I missed came from asking "what can a
+peer do to me". Those are different questions and I had only been asking the first.
+The removal entry's overreach has the same root: I asked whether the mechanism I
+was deleting was needed on the path in front of me, not on every path that reaches
+it.
+
+`a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement` pins item 1 with a
+deliberately **silent** peer -- it opens a snapshot and never reads again, which is
+exactly the case an announcement cannot reach -- and asserts the listener stays up
+and a fresh peer can still connect. It reddens against the announce-only behaviour,
+verified by restoring it.

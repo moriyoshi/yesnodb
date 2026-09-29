@@ -220,49 +220,33 @@ pub fn start_with_events(
     cfg: &Config,
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
 ) -> Result<FollowerNode, ConfigError> {
-    start_with_plugin(cfg, event_sink, None)
+    start_with_channel(cfg, event_sink, None)
 }
 
-/// As [`start_with_events`], with a loaded plugin to notify.
 ///
-/// The facility is passed in rather than loaded here, deliberately: loading runs
-/// arbitrary code and is the caller's trust decision, so the `unsafe` belongs at
-/// the point that reads the operator's configuration rather than buried in a
-/// replication task.
-pub fn start_with_plugin(
-    cfg: &Config,
-    event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
-    facility: crate::plugin::SharedFacility,
-) -> Result<FollowerNode, ConfigError> {
-    start_with_channel(cfg, event_sink, facility, None)
-}
-
-/// As [`start_with_plugin`], also notifying out-of-process channel peers.
+/// As [`start`], also notifying out-of-process channel peers.
 ///
-/// A channel peer must learn about a rebootstrap for the same reason an in-process
-/// plugin must: every handle it holds names a database that is about to stop
-/// existing. It does **not** have to drain, because closing is not required -- the
+/// A channel peer must learn about a rebootstrap: every handle it holds names a
+/// database that is about to stop existing. It does **not** have to drain -- the
 /// session's snapshots are released by the host when it drops them, and the peer's
 /// next request answers `UNAVAILABLE`.
 pub fn start_with_channel(
     cfg: &Config,
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
-    facility: crate::plugin::SharedFacility,
     channel: Option<Arc<crate::plugin::Channel>>,
 ) -> Result<FollowerNode, ConfigError> {
-    start_with_wiring(cfg, event_sink, facility, channel, None)
+    start_with_wiring(cfg, event_sink, channel, None)
 }
 
 /// As [`start_with_channel`], reading through a slot the caller already built.
 ///
-/// A plugin's `Host` must read the **same** slot this node fills, so a caller that
-/// has wired plugins passes its slot here. Without that the plugins would hold an
-/// empty slot for ever and every read would answer `UNAVAILABLE`, which looks like a
-/// broken peer rather than a wiring mistake.
+/// The channel's `Host` must read the **same** slot this node fills, so a caller
+/// that has wired a channel passes its slot here. Without that the peers would hold
+/// an empty slot for ever and every read would answer `UNAVAILABLE`, which looks
+/// like a broken peer rather than a wiring mistake.
 pub fn start_with_wiring(
     cfg: &Config,
     event_sink: Option<Arc<dyn yesno_core::events::CoreEventSink>>,
-    facility: crate::plugin::SharedFacility,
     channel: Option<Arc<crate::plugin::Channel>>,
     slot_in: Option<DbSlot>,
 ) -> Result<FollowerNode, ConfigError> {
@@ -326,7 +310,6 @@ pub fn start_with_wiring(
                 db_slot.as_ref(),
                 event_sink.as_ref(),
                 crate::plugin::Listeners {
-                    facility: facility.as_ref(),
                     channel: chan.as_deref(),
                 },
             )
@@ -541,11 +524,13 @@ async fn one_pass(
 ///
 /// The comment below observes that an in-flight `do_get`'s `Snapshot` can keep the
 /// directory lock alive "by the length of one read" -- self-limiting, so the reopen
-/// succeeds on a later pass. A plugin's lease has no such bound: it lives as long
-/// as the plugin chooses, and nothing on this side can take it back. So the
-/// facility is told before the drop and then *asked whether it complied*; a
-/// non-zero count is logged against the library by name, because the alternative
-/// is an unattributable `AlreadyOpen` from `open_if_needed` seconds later.
+/// succeeds on a later pass. **A channel peer's snapshot has no such bound**: it
+/// lives as long as the peer chooses. So `before_close` does not merely announce
+/// the close, it **disconnects every peer**, which ends each serving thread and
+/// drops the snapshots it held. Announcing alone was the behaviour until a security
+/// review on 2026-09-29 pointed out that it leaves `open_if_needed` failing
+/// `AlreadyOpen` for as long as a peer holds on, as an unattributable error seconds
+/// later.
 fn close_for_rebuild(
     slot: Option<&DbSlot>,
     st: &Arc<FollowerStatus>,

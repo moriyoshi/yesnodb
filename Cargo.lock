@@ -7700,7 +7700,6 @@ name = "yesno-plugin"
 version = "0.1.0"
 dependencies = [
  "libc",
- "libloading",
  "memmap2",
  "yesno-core",
 ]

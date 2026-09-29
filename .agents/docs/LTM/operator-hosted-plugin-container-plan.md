@@ -27,14 +27,14 @@ And one thing the peer conspicuously does **not** need: access to the data
 directory. `yesnod` is the only process that opens the database; the peer's
 snapshots belong to `yesnod` and are keyed by connection. So the plugin container
 mounts the socket volume and nothing else, and that should be **enforced by the
-reconciler and asserted by a test**, not merely left out. It is the structural
-security difference between this and the in-process `library`, and an accidental
-`data` mount would quietly discard it.
+reconciler and asserted by a test**, not merely left out. An accidental `data`
+mount would quietly discard a property nothing else is defending.
 
 ## The in-process plugin is not part of this
 
-**Settled 2026-09-29: the `cdylib` path is out of the picture.** `spec.plugin`
-describes a container, and there is no CRD field for `PluginConfig::library`.
+**Settled 2026-09-29: the `cdylib` path is gone**, removed from the tree the same
+day. `spec.plugin` describes a container, and there is nothing else it could
+describe.
 
 The property that makes this the right and only extension point is worth stating
 positively rather than as a comparison: **a peer in its own process cannot corrupt
@@ -43,10 +43,11 @@ its socket closes, its snapshots are released, and the daemon carries on. That i
 not a mitigation of the in-process design's hazards, it is the absence of them,
 and it is why the operator has a plugin story at all.
 
-`PluginConfig::library` still exists in the daemon's configuration as this is
-written. Whether it is removed from the tree is a separate decision from this
-plan; nothing here depends on it either way, and nothing here should grow a field
-that reaches it.
+`PluginConfig::library` **was removed from the daemon's configuration on
+2026-09-29**, along with the ABI behind it -- see
+[the removal record](./removed-cdylib-plugin-abi.md). So there is no longer a
+field for a CRD to reach even if someone wanted one, and an old `yesnod.toml`
+naming a library fails to parse rather than being quietly ignored.
 
 ## Phase 0: the socket path must be settable outside the config file
 

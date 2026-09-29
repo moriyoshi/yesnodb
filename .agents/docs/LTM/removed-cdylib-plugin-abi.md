@@ -1,3 +1,66 @@
+# Removed: the in-process `cdylib` Plugin ABI
+
+**Removed from the tree on 2026-09-29**, by the maintainer's decision, after the
+out-of-process channel became the plugin story. This document preserves the part
+that was a **published contract** -- the C header -- because a consumer may hold a
+copy of it and because a header is the one artefact that cannot be reconstructed
+from behaviour.
+
+This follows the `yesno-core/src/stats.rs` precedent recorded in `AGENTS.md`: the
+finding outlives the instrument, and removal is recorded rather than merely done.
+
+## What was removed
+
+| path | lines | what it was |
+|---|---|---|
+| `yesno-plugin/include/yesno_plugin.h` | 287 | the C contract, reproduced below |
+| `yesno-plugin/src/table.rs` | 586 | the `extern "C"` host table over a live `Db` |
+| `yesno-plugin/src/loader.rs` | 222 | `dlopen`, `yesno_plugin_init`, version and table-size negotiation |
+| `yesno-plugin/src/abi.rs` | partial | `ChunkKind`, `AbiHeader`, `Chunk`, `ABI_V1`; `Status` and `Role` stayed, the channel uses them |
+| `yesno-plugin/build.rs` | 57 | compiled the C fixture so a test could `dlopen` it |
+| `yesno-plugin/tests/plugin.c` | 266 | the fixture, in C on purpose so it could not link `yesno-core` |
+| `yesno-plugin/tests/host_table.rs` | 615 | the table's tests |
+| `yesno-plugin/tests/load_c_plugin.rs` | 313 | the real `dlopen` round trip |
+| `yesno-server/src/plugin.rs` | partial | `Facility`, and the lifecycle callbacks that drove it |
+| `PluginConfig::library`, `PluginConfig::listen` | | the configuration that named a library |
+
+The Rust source is not reproduced here. It is recoverable in full with
+`git show <the removal commit>^:<path>`, and unlike the header it describes a
+mechanism this project has decided against rather than an interface anyone else
+implements.
+
+## Why it went
+
+The out-of-process channel does the same job without the three properties that
+made this one a permanent liability, and they are worth stating because they are
+the general argument against in-process extension, not a complaint about this
+implementation:
+
+* **It shared the address space.** A plugin could corrupt the heap. The
+  configuration field's own documentation said naming a library "is an operator
+  decision of the same weight as naming the data directory", which is an
+  admission that it was never a sandboxed extension point.
+* **A panic escaping a callback aborted the daemon.** Every table entry had to
+  catch its own unwinding, and the correctness of the whole surface rested on
+  nobody ever adding an entry that forgot.
+* **Its leases were invisible to the shutdown proof.** The drain contract existed
+  because a plugin holding a lease across a close had no other backstop; the
+  channel replaces that with socket closure, which needs no cooperation from the
+  peer and survives its `SIGKILL`.
+
+Against that, the channel costs a copy and some round trips -- measured, and
+recorded in `plugin-shape-performance.md`: the copy is 1.5-2.1x and batching
+blocks recovers most of the rest.
+
+One thing was genuinely lost. **A run could be lent zero-copy through the C table
+and cannot be over the wire** -- though as it turned out, the table was lending
+the *stored* `( start, len_minus_1 )` pairs under a header promising
+`[ start, end ]`, which was a silent wrong answer fixed hours before this removal.
+The zero-copy path for runs was therefore never correct in the form anyone used.
+
+## The header, as published
+
+```c
 /* SPDX-License-Identifier: MIT OR Apache-2.0
  *
  * The yesnod-hosted plugin ABI.
@@ -285,3 +348,4 @@ typedef yesno_status (*yesno_plugin_init_fn)(const yesno_host_api *host,
 #endif
 
 #endif /* YESNO_PLUGIN_H */
+```

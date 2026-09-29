@@ -313,35 +313,29 @@ impl ClientTls {
     }
 }
 
-/// A plugin yesnod loads into its own process.
+/// The out-of-process plugin channel.
 ///
-/// # This is as trusted as the server binary
+/// # A peer is not trusted with this process, and that is the design
 ///
-/// `dlopen` runs the library's initializers before returning, and once loaded it
-/// shares the address space: it can corrupt the heap, and if it lets a panic or an
-/// exception escape a callback the process aborts. Naming one here is an operator
-/// decision of the same weight as naming the data directory, not a sandboxed
-/// extension point.
+/// There used to be a `library` here, naming a `cdylib` the daemon `dlopen`ed.
+/// That shared the address space: it could corrupt the heap, and a panic escaping
+/// a callback aborted the process, so naming one was an operator decision of the
+/// same weight as naming the data directory rather than a sandboxed extension
+/// point. It was removed on 2026-09-29 --
+/// `.agents/docs/LTM/removed-cdylib-plugin-abi.md` preserves the C contract.
+///
+/// **An old configuration naming a library now fails to parse**, because
+/// `deny_unknown_fields` is on. That is the wanted behaviour: silently ignoring
+/// `library` would start a daemon that the operator believes is running their
+/// plugin and which is not.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
-    /// Absolute path to the shared library. Empty disables the facility.
-    pub library: String,
-    /// Address handed to the plugin's `serve_start`.
+    /// Unix socket path for the channel. Empty disables it.
     ///
-    /// The host does not bind this; the plugin owns its listener and the host owns
-    /// when it runs. Empty means the plugin is loaded and its callbacks are
-    /// delivered, but it is never asked to serve -- which is what a node that
-    /// should score without answering queries wants.
-    pub listen: String,
-
-    /// Unix socket path for the **out-of-process** channel. Empty disables it.
-    ///
-    /// Independent of `library`: a node may serve the channel without loading
-    /// anything in-process, which is the recommended shape. A peer connecting here
-    /// runs in its own process, so it cannot abort this one, needs no filesystem
-    /// access to the data directory, and its snapshots are released when its socket
-    /// closes.
+    /// A peer connecting here runs in its own process, so it cannot abort this one,
+    /// needs no filesystem access to the data directory, and its snapshots are
+    /// released when its socket closes.
     pub channel_socket: String,
 
     /// Lane handles one channel connection may hold at once.
@@ -378,8 +372,6 @@ pub struct PluginConfig {
 impl Default for PluginConfig {
     fn default() -> Self {
         PluginConfig {
-            library: String::new(),
-            listen: String::new(),
             channel_socket: String::new(),
             channel_max_handles: 4,
             channel_max_lanes: 1024,
@@ -390,11 +382,6 @@ impl Default for PluginConfig {
 }
 
 impl PluginConfig {
-    /// Whether an in-process library is configured.
-    pub fn enabled(&self) -> bool {
-        !self.library.trim().is_empty()
-    }
-
     /// Whether the out-of-process channel is configured.
     pub fn channel_enabled(&self) -> bool {
         !self.channel_socket.trim().is_empty()

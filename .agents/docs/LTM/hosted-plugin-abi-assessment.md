@@ -1,5 +1,16 @@
 # A yesnod-hosted Plugin ABI: What Exists, and the Primitives That Do Not
 
+> **SUPERSEDED 2026-09-29.** The in-process `cdylib` ABI this document designs was
+> **removed from the tree**; the out-of-process channel is the plugin story. Read
+> this as the record of a design that was built, measured against the alternative,
+> and then retired -- not as a plan. What survives of it is in
+> [the removal record](./removed-cdylib-plugin-abi.md), which preserves the
+> published C header, and the channel's own design is in `yesno-plugin/src/ipc.rs`
+> and [the operator plan](./operator-hosted-plugin-container-plan.md). The
+> reasoning below about lease lifetimes, rebootstrap semantics and role changes is
+> still the reasoning the **channel** implements, so it is worth reading for that;
+> the function table and the drain contract are gone.
+
 Assessment of the `haiiie` handoff of 2026-09-28 ( a versioned function-pointer
 table over the live `Db`, snapshot-safe multi-lane reads, follower rebootstrap and
 role lifecycle, service registration ) against the tree as of `cfd0e88`.

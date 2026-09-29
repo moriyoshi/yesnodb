@@ -264,8 +264,7 @@ async fn follow(
     // SAFETY: `plugin.library`, when set, is loaded and run. That is the operator's
     // configuration and this is the process that reads it, which is where the
     // assertion belongs rather than inside a library call.
-    let wiring = match unsafe { yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Follower) }
-    {
+    let wiring = match yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Follower) {
         Ok(w) => w,
         Err(error) => {
             publish_server(
@@ -279,30 +278,25 @@ async fn follow(
             return Outcome::Exit(std::process::ExitCode::FAILURE);
         }
     };
-    let (slot, facility, channel) = match wiring {
-        Some(w) => (Some(w.slot), w.facility, w.channel),
-        None => (None, None, None),
+    let (slot, channel) = match wiring {
+        Some(w) => (Some(w.slot), w.channel),
+        None => (None, None),
     };
-    let node = match yesno_server::follower::start_with_wiring(
-        cfg,
-        event_sink,
-        facility,
-        channel.clone(),
-        slot,
-    ) {
-        Ok(node) => node,
-        Err(error) => {
-            publish_server(
-                hub,
-                pb::server_lifecycle_event::Operation::Start,
-                pb::EventPhase::Failed,
-                false,
-                &error.to_string(),
-            );
-            eprintln!("yesnod: cannot start following: {error}");
-            return Outcome::Exit(std::process::ExitCode::FAILURE);
-        }
-    };
+    let node =
+        match yesno_server::follower::start_with_wiring(cfg, event_sink, channel.clone(), slot) {
+            Ok(node) => node,
+            Err(error) => {
+                publish_server(
+                    hub,
+                    pb::server_lifecycle_event::Operation::Start,
+                    pb::EventPhase::Failed,
+                    false,
+                    &error.to_string(),
+                );
+                eprintln!("yesnod: cannot start following: {error}");
+                return Outcome::Exit(std::process::ExitCode::FAILURE);
+            }
+        };
 
     let role_from = if transition.is_some() {
         pb::Role::Leader
@@ -489,7 +483,7 @@ async fn lead(
     let event_sink = hub.map(|hub| hub.core_sink());
     // SAFETY: as in `follow` -- the operator's configuration names the library, and
     // this is the process that reads it.
-    let wiring = match unsafe { yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Leader) } {
+    let wiring = match yesno_server::plugin::wire(cfg, yesno_plugin::abi::Role::Leader) {
         Ok(w) => w,
         Err(error) => {
             publish_server(
@@ -503,28 +497,27 @@ async fn lead(
             return Outcome::Exit(std::process::ExitCode::FAILURE);
         }
     };
-    let (slot, facility, channel) = match wiring {
-        Some(w) => (Some(w.slot), w.facility, w.channel),
-        None => (None, None, None),
+    let (slot, channel) = match wiring {
+        Some(w) => (Some(w.slot), w.channel),
+        None => (None, None),
     };
-    let running = match yesno_server::lifecycle::start_with_plugin(
-        cfg, event_sink, adopted, slot, facility, channel,
-    )
-    .await
-    {
-        Ok(running) => running,
-        Err(error) => {
-            publish_server(
-                hub,
-                pb::server_lifecycle_event::Operation::Start,
-                pb::EventPhase::Failed,
-                false,
-                &error.to_string(),
-            );
-            eprintln!("yesnod: cannot start: {error}");
-            return Outcome::Exit(std::process::ExitCode::FAILURE);
-        }
-    };
+    let running =
+        match yesno_server::lifecycle::start_with_plugin(cfg, event_sink, adopted, slot, channel)
+            .await
+        {
+            Ok(running) => running,
+            Err(error) => {
+                publish_server(
+                    hub,
+                    pb::server_lifecycle_event::Operation::Start,
+                    pb::EventPhase::Failed,
+                    false,
+                    &error.to_string(),
+                );
+                eprintln!("yesnod: cannot start: {error}");
+                return Outcome::Exit(std::process::ExitCode::FAILURE);
+            }
+        };
 
     let db = running.db();
     let term = db.term();

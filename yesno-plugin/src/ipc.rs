@@ -643,7 +643,7 @@ pub enum Frame {
         values: Vec<u64>,
         more: u8,
     },
-    /// A request failed. `status` matches the in-process ABI's codes.
+    /// A request failed. `status` is a [`crate::abi::Status`] discriminant.
     Fault {
         status: u32,
         message: String,

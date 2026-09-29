@@ -274,28 +274,18 @@ yesno/
                                 #   Bazel also emits its PIC static library for MySQL.
     include/yesno.h             #   ownership, threading, error-buffer, and seek contract
     tests/smoke.c               #   strict C11 ABI/runtime test against two durable databases
-  yesno-plugin/                 # Host side of the yesnod plugin ABI: a function table over a
-                                #   LIVE Db, for a plugin yesnod dlopens. Deliberately has no
-                                #   `open` -- the host owns the directory -- and no dlopen of
-                                #   its own, so the ABI is testable without a server while the
-                                #   loading and the role lifecycle stay in yesno-server.
-                                #   Counts the handles it mints, because Snapshot::clone
-                                #   refcounts one registry slot and Db::live_readers() therefore
-                                #   both over- and under-counts what a plugin holds.
-    include/yesno_plugin.h      #   the two tables, status codes, and the drain contract
-    src/abi.rs                  #   plain data: status codes, kinds, headers. A test parses the
-                                #     C header and asserts every discriminant agrees
-    src/table.rs                #   the extern "C" host table. Every entry catches its own
-                                #     panic; a caught panic in block_advance also POISONS the
-                                #     handle, since reporting and leaving it usable invites a
-                                #     retry over partly advanced streams
-    src/loader.rs               #   dlopen, yesno_plugin_init, version and table-size
-                                #     negotiation. The library is never unloaded: v1 has no hot
-                                #     unload, and dlclose while a plugin thread runs executes
-                                #     freed code
-    build.rs                    #   compiles tests/plugin.c into a .so so a test can dlopen it;
-                                #     a missing compiler is reported to the test, never skipped
-    tests/plugin.c              #   the fixture plugin, in C so it CANNOT link yesno-core
+  yesno-plugin/                 # Host side of the yesnod plugin channel: an out-of-process
+                                #   peer over a LIVE Db. Deliberately has no `open` -- the
+                                #   host owns the directory -- and no socket lifetime of its
+                                #   own, so the protocol is testable without a server while
+                                #   the listener and the role lifecycle stay in yesno-server.
+                                #   An in-process cdylib ABI ( a function table, a dlopen
+                                #   loader, a C header, a lease counter and a drain contract )
+                                #   was removed 2026-09-29; LTM/removed-cdylib-plugin-abi.md
+                                #   preserves the published header and the reasoning.
+    src/abi.rs                  #   the status and role codes a peer reads, all that survives
+                                #     of the C ABI's plain-data half. Values frozen: they
+                                #     travel in Frame::Fault now
     src/ipc.rs                  #   the out-of-process channel's wire format. Lived in
                                 #     yesno-wire for a day and moved here 2026-09-28: that
                                 #     crate exists to share ONE definition between two

@@ -1,244 +1,42 @@
-//! The plugin facility: when to load, and when to tell a plugin things.
+//! The plugin channel: a Unix socket yesnod serves out-of-process peers on.
 //!
-//! The ABI, the loader and the negotiation live in `yesno-plugin`, which has no
-//! server and is testable without one. What is here is only the part that needs a
-//! server: the slot, the role, the generation, and the ordering of the callbacks
-//! around a rebootstrap.
+//! The protocol and the session live in `yesno-plugin`, which has no server and
+//! is testable without one. What is here is only the part that needs a server:
+//! the slot, the role, the listener's lifetime, and the notifications a
+//! rebootstrap has to push.
 //!
-//! # The drain is the whole reason this type exists
+//! # There is no drain contract, and that is the point
 //!
-//! A plugin's lease is a `Snapshot`, and a `Snapshot` holds `Arc<DbInner>`, which
-//! holds the directory lock `File`. So a lease outstanding when the host wants to
-//! reopen makes `Db::open_replica` fail `AlreadyOpen` -- and there is **no
-//! host-side call that takes a lease back**. `Db::evict_oldest_reader` does not:
-//! its own doc says "Does not free the slot", so it releases the reclamation floor
-//! without releasing the lock, which is worse in both directions.
+//! This module used to open with one, because the in-process facility needed it:
+//! a plugin's lease was a `Snapshot`, a `Snapshot` holds `Arc<DbInner>` which
+//! holds the directory lock, and **no host-side call takes a lease back** --
+//! `Db::evict_oldest_reader` releases the reclamation floor without releasing the
+//! lock, which is worse in both directions. So a plugin caching handles between
+//! requests, the obvious optimization, would hold the lock indefinitely and
+//! surface as an unattributable `AlreadyOpen` seconds later. The facility had to
+//! ask the plugin to drain, then verify, then name it in the failure.
 //!
-//! The existing code already tolerates a narrow version of this. `close_for_rebuild`
-//! notes that an in-flight `do_get` holds a snapshot, "so the lock may outlive this
-//! by the length of one read" -- self-limiting, so a later pass succeeds. **A
-//! scoring lease has no such bound.** A plugin caching handles between requests,
-//! which is the obvious optimization, would hold the lock open indefinitely and
-//! surface as an unattributable `AlreadyOpen` seconds later in `open_if_needed`.
-//!
-//! So `before_close` drains and then *verifies*, and reports the plugin by name
-//! with a count when it does not. Verification uses the facility's own lease
-//! counter rather than `Db::live_readers()`, which cannot answer this in either
-//! direction: it over-counts, because any in-flight query holds a slot, and
-//! under-counts, because `Snapshot::clone` refcounts one slot so N handles read as
-//! one.
+//! A peer's snapshots belong to its **connection**. Closing the socket releases
+//! them -- peer exit, crash, container stop, `SIGKILL`, or this side dropping the
+//! listener -- so the host takes them back by closing, needs no cooperation, and
+//! has nothing to verify. The in-process facility was removed on 2026-09-29 and
+//! this paragraph is what replaced it.
 
 use std::sync::Arc;
 
-use yesno_plugin::abi::{Role, Status};
+use yesno_plugin::abi::Role;
 use yesno_plugin::channel::{Arena, Limits, Session};
 use yesno_plugin::ipc::Frame;
-use yesno_plugin::loader::{LoadError, LoadedPlugin};
 use yesno_plugin::Host;
 
 use crate::config::Config;
-use crate::guard::DbSlot;
 
-/// A loaded plugin and the host state it reads through.
-pub struct Facility {
-    plugin: LoadedPlugin,
-    host: Host,
-    /// Empty when the plugin should be loaded but never asked to serve.
-    listen: String,
-    library: String,
-}
-
-/// What a drain attempt observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Drained {
-    /// The plugin released everything. The host may reopen.
-    Clean,
-    /// Leases are still outstanding. Reopening will fail `AlreadyOpen`.
-    Outstanding(usize),
-    /// The plugin's callback answered a failure, and leases are as reported.
-    Refused(Status, usize),
-}
-
-impl Facility {
-    /// Load the configured plugin, if any, and announce the current state.
-    ///
-    /// `None` when no library is configured, which is the default.
-    ///
-    /// # Safety
-    ///
-    /// Loads and runs arbitrary code from `cfg.plugin.library`; see
-    /// `PluginConfig`. The caller is asserting the operator's configuration is
-    /// trusted.
-    pub unsafe fn load(
-        cfg: &Config,
-        slot: DbSlot,
-        role: Role,
-    ) -> Result<Option<Facility>, LoadError> {
-        if !cfg.plugin.enabled() {
-            return Ok(None);
-        }
-        let host = Host::new(slot, 1, role);
-        // SAFETY: The caller's assertion, restated above.
-        let plugin =
-            unsafe { LoadedPlugin::load(std::ffi::OsStr::new(&cfg.plugin.library), host.clone()) }?;
-        let f = Facility {
-            plugin,
-            host,
-            listen: cfg.plugin.listen.clone(),
-            library: cfg.plugin.library.clone(),
-        };
-        tracing::info!(
-            library = %f.library,
-            abi = f.plugin.header().version,
-            table_bytes = f.plugin.header().size,
-            "plugin loaded"
-        );
-        Ok(Some(f))
-    }
-
-    /// The library this facility loaded, for a message an operator can act on.
-    pub fn library(&self) -> &str {
-        &self.library
-    }
-
-    /// The ABI version the plugin declared.
-    pub fn header_version(&self) -> u32 {
-        self.plugin.header().version
-    }
-
-    /// The table size the plugin declared.
-    pub fn header_size(&self) -> u32 {
-        self.plugin.header().size
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.host.generation()
-    }
-
-    /// Leases the plugin holds right now.
-    pub fn leases(&self) -> usize {
-        self.host.leases()
-    }
-
-    /// A database is available at `generation`. Announce it, then start serving.
-    pub fn after_open(&self, generation: u64) {
-        let st = self.plugin.on_available(generation);
-        if st != Status::Ok {
-            tracing::warn!(
-                library = %self.library,
-                status = st.name(),
-                "the plugin refused on_available; it will not be asked to serve"
-            );
-            return;
-        }
-        self.start_serving();
-    }
-
-    /// Ask the plugin to serve, when an address is configured.
-    pub fn start_serving(&self) {
-        if self.listen.trim().is_empty() {
-            return;
-        }
-        match self.plugin.serve_start(&self.listen) {
-            Ok(Status::Ok) => {
-                tracing::info!(library = %self.library, addr = %self.listen, "plugin serving")
-            }
-            Ok(st) => tracing::warn!(
-                library = %self.library,
-                status = st.name(),
-                "the plugin refused to start serving"
-            ),
-            Err(e) => {
-                tracing::warn!(library = %self.library, error = %e, "cannot pass the listen address")
-            }
-        }
-    }
-
-    /// Stop serving. Best effort: a refusal is logged, not propagated.
-    pub fn stop_serving(&self) {
-        if self.listen.trim().is_empty() {
-            return;
-        }
-        let st = self.plugin.serve_stop();
-        if st != Status::Ok {
-            tracing::warn!(
-                library = %self.library,
-                status = st.name(),
-                "the plugin refused to stop serving; its threads may still be running"
-            );
-        }
-    }
-
-    /// Tell the plugin the database is going away, then check that it let go.
-    ///
-    /// Called **before** the last `Arc<Db>` is dropped, because the plugin's
-    /// handles hold `Arc<DbInner>` and the host's drop is not what releases them.
-    pub fn before_close(&self) -> Drained {
-        self.stop_serving();
-        let st = self.plugin.on_unavailable();
-        let left = self.host.leases();
-        if st != Status::Ok {
-            tracing::error!(
-                library = %self.library,
-                status = st.name(),
-                leases = left,
-                "the plugin refused the drain; reopening will fail while leases remain"
-            );
-            return Drained::Refused(st, left);
-        }
-        if left != 0 {
-            // Named, counted, and attributed. The alternative is this resurfacing
-            // as `AlreadyOpen` from a reopen several seconds later, with nothing
-            // connecting the two.
-            tracing::error!(
-                library = %self.library,
-                leases = left,
-                "the plugin returned from on_unavailable holding leases; the database \
-                 cannot be reopened until it releases them, and no host-side call can \
-                 take them back"
-            );
-            return Drained::Outstanding(left);
-        }
-        Drained::Clean
-    }
-
-    /// The database was replaced. Bump the generation and tell the plugin.
-    ///
-    /// Returns the new generation, which is what a plugin compares against.
-    pub fn after_replace(&self) -> u64 {
-        let old = self.host.generation();
-        let new = self.host.bump_generation();
-        let st = self.plugin.on_generation_change(old, new);
-        if st != Status::Ok {
-            tracing::warn!(
-                library = %self.library,
-                status = st.name(),
-                "the plugin refused on_generation_change; its handles are stale regardless"
-            );
-        }
-        new
-    }
-
-    /// This node's role changed.
-    pub fn set_role(&self, to: Role) {
-        let from = self.host.role();
-        if from == to {
-            return;
-        }
-        self.host.set_role(to);
-        let st = self.plugin.on_role_change(from, to);
-        if st != Status::Ok {
-            tracing::warn!(
-                library = %self.library,
-                status = st.name(),
-                "the plugin refused on_role_change"
-            );
-        }
-    }
-}
-
-/// Shared handle, so the follower task and the startup path see one facility.
-pub type SharedFacility = Option<Arc<Facility>>;
+/// How long a notification write may block before its peer is disconnected.
+///
+/// Short on purpose. A notification is tens of bytes, so a peer that cannot accept
+/// one inside this window is not merely busy -- it has stopped reading, and the
+/// frames behind it would queue without bound.
+const NOTIFY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The out-of-process channel: a Unix socket yesnod serves peers on.
 ///
@@ -274,6 +72,19 @@ pub struct Channel {
     /// stop at teardown -- so a `stop( self )` would have forced one of them to be
     /// different from the other for no reason but this field.
     listener: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The generation counter a peer reads in the greeting.
+    ///
+    /// **Held here because the in-process facility used to own it.** When a
+    /// rebootstrap replaced the database, the facility bumped the generation and
+    /// the channel reported whatever the facility returned -- so with the
+    /// facility gone the channel would have notified `Available { generation: 0 }`
+    /// for ever and never `GenerationChanged`, and every peer would have gone on
+    /// using handles that name a database that no longer exists. Deleting the
+    /// facility without moving this is the quiet half of that removal.
+    ///
+    /// Sessions hold clones of this `Host` and the counter is an `Arc<AtomicU64>`,
+    /// so a bump here is what they read.
+    host: Host,
 }
 
 impl Channel {
@@ -308,6 +119,9 @@ impl Channel {
         let inline = cfg.plugin.channel_inline;
         let accept_peers = peers.clone();
         let accept_stop = stop.clone();
+        // The accept loop takes the `Host`; the channel keeps a clone so it can
+        // bump the generation on a rebootstrap. Both share one `Arc<AtomicU64>`.
+        let kept = host.clone();
         let handle = std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 if accept_stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -338,7 +152,16 @@ impl Channel {
             peers,
             stop,
             listener: std::sync::Mutex::new(Some(handle)),
+            host: kept,
         }))
+    }
+
+    /// Record that the database was replaced, and return the new generation.
+    ///
+    /// The counter the peers' sessions read in their greeting; see the `host`
+    /// field for why it lives on the channel now.
+    pub fn bump_generation(&self) -> u64 {
+        self.host.bump_generation()
     }
 
     /// Connections currently served.
@@ -359,13 +182,104 @@ impl Channel {
                 return;
             }
         };
-        let Ok(mut peers) = self.peers.lock() else {
+        // **The global lock is released before any write.** It used to be held
+        // across `write_all` on every peer, and a Unix socket write blocks once the
+        // receiver's buffer fills -- so one peer that stopped reading blocked this
+        // call for ever, and `stop` blocked behind the same mutex. A single
+        // uncooperative peer could therefore stall a rebootstrap *and* the daemon's
+        // shutdown. Taking a snapshot of the list first means a slow peer delays
+        // only itself.
+        let Some(targets) = self.peer_snapshot() else {
             return;
         };
-        peers.retain(|p| match p.lock() {
-            Ok(mut s) => std::io::Write::write_all(&mut *s, &bytes).is_ok(),
-            Err(_) => false,
-        });
+        let mut dead = Vec::new();
+        for peer in targets {
+            if !Self::write_frame(&peer, &bytes) {
+                dead.push(peer);
+            }
+        }
+        self.drop_peers(&dead);
+    }
+
+    /// The live peers, cloned so writes happen with the lock released.
+    fn peer_snapshot(&self) -> Option<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>> {
+        self.peers.lock().ok().map(|p| p.clone())
+    }
+
+    /// Write one whole frame, or report the peer unusable.
+    ///
+    /// Bounded by a write timeout, because an unbounded write is what item 2 of the
+    /// 2026-09-29 security review was about. **A timeout disconnects the peer
+    /// rather than retrying**, and that is not harshness: `write_all` that stops
+    /// half way has already put part of a frame on the wire, and the protocol has
+    /// no resynchronisation point, so the connection is unusable whatever happens
+    /// next. Dropping it is the honest outcome, and a peer reconnects and is told
+    /// the current generation in its greeting.
+    fn write_frame(
+        peer: &Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
+        bytes: &[u8],
+    ) -> bool {
+        let Ok(mut stream) = peer.lock() else {
+            return false;
+        };
+        if stream
+            .set_write_timeout(Some(NOTIFY_WRITE_TIMEOUT))
+            .is_err()
+        {
+            return false;
+        }
+        std::io::Write::write_all(&mut *stream, bytes).is_ok()
+    }
+
+    /// Forget these peers and shut their sockets, which ends their serving threads.
+    fn drop_peers(&self, dead: &[Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>]) {
+        if dead.is_empty() {
+            return;
+        }
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.retain(|p| !dead.iter().any(|d| Arc::ptr_eq(d, p)));
+        }
+        for peer in dead {
+            if let Ok(s) = peer.lock() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Disconnect every peer, keeping the listener accepting.
+    ///
+    /// # This is what makes a rebootstrap able to finish
+    ///
+    /// A peer's `Session` owns the snapshots it opened, and a `Snapshot` holds
+    /// `Arc<DbInner>`, which holds the directory lock. Telling a peer the database
+    /// is going away does **not** take those back -- it is a courtesy, and a peer
+    /// that is slow, busy or uncooperative keeps the lock alive. The follower would
+    /// then drop its `Arc<Db>`, try to reopen, and fail `AlreadyOpen` for as long as
+    /// the peer felt like holding on, surfacing as an unattributable error seconds
+    /// later in `open_if_needed`.
+    ///
+    /// That is the same hazard the removed in-process facility had a drain contract
+    /// for, and the channel's advantage is that it needs no contract: shutting the
+    /// socket ends the serving thread, which drops the `Session`, which drops the
+    /// snapshots. **The host takes them back rather than asking.** The listener is
+    /// deliberately left up, so a peer reconnects on its own and is told the new
+    /// generation in its greeting.
+    ///
+    /// Found by a security review on 2026-09-29, which is also when the drain this
+    /// replaces was deleted; the journal entry for that removal claimed closing
+    /// already happened on every path, and it happened only at shutdown.
+    pub fn disconnect_peers(&self) -> usize {
+        let Ok(mut peers) = self.peers.lock() else {
+            return 0;
+        };
+        let taken: Vec<_> = peers.drain(..).collect();
+        drop(peers);
+        for peer in &taken {
+            if let Ok(s) = peer.lock() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        taken.len()
     }
 
     /// Stop accepting and close every connection.
@@ -376,14 +290,10 @@ impl Channel {
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         // Shutting each peer's socket unblocks its serving thread out of `read`,
-        // which is what a `stop` flag alone cannot do.
-        if let Ok(mut peers) = self.peers.lock() {
-            for p in peers.drain(..) {
-                if let Ok(s) = p.lock() {
-                    let _ = s.shutdown(std::net::Shutdown::Both);
-                }
-            }
-        }
+        // which is what a `stop` flag alone cannot do. Shared with
+        // [`Channel::disconnect_peers`], which does exactly this for a rebootstrap;
+        // the only difference is that this one also stops the listener.
+        self.disconnect_peers();
         // And connect to our own listener once, so its blocking `accept` returns and
         // the thread sees the flag.
         let _ = std::os::unix::net::UnixStream::connect(&self.path);
@@ -483,53 +393,54 @@ fn serve_one(
 /// had gone too far.
 #[derive(Clone, Copy, Default)]
 pub struct Listeners<'a> {
-    pub facility: Option<&'a Arc<Facility>>,
     pub channel: Option<&'a Channel>,
 }
 
 impl Listeners<'_> {
-    /// Tell everyone the database is going away, and report whether the in-process
-    /// plugin actually let go.
+    /// Tell peers the database is going away.
     ///
-    /// A channel peer is not asked to drain: closing its socket is what releases its
-    /// snapshots, and that happens whether it cooperates or not.
+    /// **Nothing is asked to drain, and nothing is verified.** A peer's snapshots
+    /// belong to its connection, so this side takes them back by closing the
+    /// socket whether the peer cooperates or not. The in-process facility needed
+    /// a drain-then-verify handshake here because a lease it held could keep the
+    /// directory lock and there was no host-side call to take one back; the
+    /// notification below is a courtesy so a peer can stop issuing requests it
+    /// knows will fail, not a precondition for anything.
     pub fn before_close(&self) {
-        if let Some(c) = self.channel {
-            c.notify(&Frame::Unavailable);
-        }
-        if let Some(f) = self.facility {
-            match f.before_close() {
-                Drained::Clean => {}
-                other => tracing::error!(
-                    library = f.library(),
-                    outcome = ?other,
-                    "the plugin did not drain; the reopen may fail until it releases"
-                ),
-            }
+        let Some(c) = self.channel else {
+            return;
+        };
+        // Announced first, so a peer that is reading learns why its connection is
+        // about to end rather than seeing a bare EOF.
+        c.notify(&Frame::Unavailable);
+        // **Then taken back.** The notification is a courtesy and cannot be relied
+        // on: a peer's snapshots hold the directory lock, and a peer under load or
+        // simply uninterested would keep the reopen failing `AlreadyOpen`
+        // indefinitely. Disconnecting ends each serving thread, which drops its
+        // session and with it every snapshot it held.
+        let dropped = c.disconnect_peers();
+        if dropped > 0 {
+            tracing::info!(
+                peers = dropped,
+                "disconnected channel peers so the database can be reopened"
+            );
         }
     }
 
-    /// Tell everyone a different database is in the slot now.
+    /// Tell peers a different database is in the slot now.
     pub fn after_replace(&self) {
-        let generation = self.facility.map(|f| {
-            let g = f.after_replace();
-            f.after_open(g);
-            g
+        let Some(c) = self.channel else {
+            return;
+        };
+        let generation = c.bump_generation();
+        // Two frames rather than one: a peer that only ever saw `Available` could
+        // not distinguish "back after a rebuild" from "back unchanged", and every
+        // handle it holds names the previous database.
+        c.notify(&Frame::GenerationChanged {
+            old: generation.saturating_sub(1),
+            new: generation,
         });
-        if let Some(c) = self.channel {
-            // Two frames rather than one: a peer that only ever saw `Available`
-            // could not distinguish "back after a rebuild" from "back unchanged",
-            // and every handle it holds names the previous database.
-            if let Some(g) = generation {
-                c.notify(&Frame::GenerationChanged {
-                    old: g.saturating_sub(1),
-                    new: g,
-                });
-            }
-            c.notify(&Frame::Available {
-                generation: generation.unwrap_or(0),
-            });
-        }
+        c.notify(&Frame::Available { generation });
     }
 }
 
@@ -546,19 +457,18 @@ impl Listeners<'_> {
 pub struct Wiring {
     /// The slot to hand the startup path, so it fills the one the plugins read.
     pub slot: crate::guard::DbSlot,
-    pub facility: SharedFacility,
     pub channel: Option<Arc<Channel>>,
 }
 
-/// Build the plugin wiring for `role`, or `None` when neither shape is configured.
+/// Build the plugin wiring for `role`, or `None` when no channel is configured.
 ///
-/// # Safety
-///
-/// Loads and runs arbitrary code when `plugin.library` is set; see `PluginConfig`.
-/// The caller is asserting the operator's configuration is trusted, which is why
-/// this is called from the daemon's startup rather than from a library function.
-pub unsafe fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
-    if !cfg.plugin.enabled() && !cfg.plugin.channel_enabled() {
+/// **This used to be `unsafe`**, because it `dlopen`ed a library named in the
+/// configuration and ran its initializers. It is safe now: a peer is a separate
+/// process, so nothing here loads or runs foreign code, and there is no trust
+/// assertion left for a caller to make. That change of signature is the clearest
+/// single statement of what removing the in-process facility bought.
+pub fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
+    if !cfg.plugin.channel_enabled() {
         return Ok(None);
     }
 
@@ -568,13 +478,11 @@ pub unsafe fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
     // peer rather than a misconfiguration. `follower.serve_reads` is what makes a
     // standby hold a database open at all.
     if role == Role::Follower && !cfg.follower.serve_reads {
-        return Err(
-            "plugin.library or plugin.channel_socket is set on a follower with \
+        return Err("plugin.channel_socket is set on a follower with \
              follower.serve_reads = false; a cold standby never opens a database, so \
              every plugin read would answer UNAVAILABLE. Enable follower.serve_reads \
              or remove the plugin configuration."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Empty: the startup path fills it with the database it opens, and the plugins
@@ -582,18 +490,9 @@ pub unsafe fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
     let slot: crate::guard::DbSlot = Arc::new(std::sync::RwLock::new(None));
     let host = Host::new(slot.clone(), 1, role);
 
-    // SAFETY: the caller's assertion, restated on this function.
-    let facility = unsafe { Facility::load(cfg, slot.clone(), role) }
-        .map_err(|e| format!("cannot load the plugin library: {e}"))?
-        .map(Arc::new);
-
     let channel = Channel::start(cfg, host)
         .map_err(|e| format!("cannot start the plugin channel: {e}"))?
         .map(Arc::new);
 
-    Ok(Some(Wiring {
-        slot,
-        facility,
-        channel,
-    }))
+    Ok(Some(Wiring { slot, channel }))
 }
