@@ -112,7 +112,7 @@ Alongside them, `tests/allocation.rs` asserts allocation budgets as *tests, not 
 - `.agents/docs/ARCHITECTURE.md`: module map, data model, invariants, and design policies.
 - `.agents/docs/QUALITY_GATE.md`: the checklist a change must pass, and the implementation conventions behind it.
 - `.agents/docs/TESTING.md`: the end-to-end harness in depth — the verb surface, the handle model, and what may not go in a scenario.
-- `docs/operations.md`: the operator guide, including backup, restore, promotion, measured RPO/RTO, and disaster recovery.
+- `docs/operations/`: the operator guide, split per task: `configuration.md`, `deployment.md`, `backup.md`, `snapshots.md`, `restore.md`, and `replication.md` ( promotion, measured RPO/RTO, and disaster recovery ), with `index.md` as the hub.
 - `.agents/docs/TODO.md`: active backlog extracted from journal and LTM maintenance.
 - `.agents/docs/JOURNAL.md`: append-only working log.
 - `.agents/docs/LTM/INDEX.md`: durable long-term memory index.

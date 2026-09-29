@@ -34,4 +34,4 @@ cleanup. Every external input is a declared Bazel runfile.
 The extension does not share PostgreSQL's WAL or commit clock. Its isolation,
 backup requirements, SQL examples, and current limitations are documented in
 the [integrations guide](../docs/integrations.md) and
-[operations guide](../docs/operations.md).
+[operations guide](../docs/operations/index.md).

@@ -1,7 +1,7 @@
 # Documents for both humans and coding agents
 
 * [README.md](./README.md) ... the human-facing description of the crate: what it is, how to run the server, and an honest list of what is not built. It owns that description — do not restate deployment guidance in `.agents/docs/` and let the two drift.
-* [docs/operations.md](./docs/operations.md) ... the operator guide: configuration, backup, restore, replication, promotion, measured RPO/RTO, and disaster recovery.
+* [docs/operations/](./docs/operations/index.md) ... the operator guide, one file per task: `index.md` ( operating envelope and the guide list ), `configuration.md`, `deployment.md` ( container image, Kubernetes, ECS ), `backup.md` ( base backups, archiving, retention ), `snapshots.md` ( snapshot providers ), `restore.md` ( archive restore and PITR ), and `replication.md` ( replication, measured RPO/RTO, promotion, disaster recovery ).
 
 # Documents for coding agents
 

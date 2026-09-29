@@ -27,5 +27,5 @@ cargo run -p yesno-server-utils --bin yesnoctl -- --help
 cargo run -p yesno-server-utils --bin yesno-archive -- --help
 ```
 
-The workspace [operations guide](../docs/operations.md) owns configuration,
+The workspace [operations guide](../docs/operations/index.md) owns configuration,
 backup, snapshot, and recovery procedures.

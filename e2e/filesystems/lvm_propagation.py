@@ -1,7 +1,7 @@
 # The documented container topology, expressed with mount namespaces.
 #
-# `operations.md` requires that the agent-created snapshot mount reach the
-# database through host-to-container propagation. A container is a mount
+# `docs/operations/snapshots.md` requires that the agent-created snapshot mount
+# reach the database through host-to-container propagation. A container is a mount
 # namespace, so this runs yesnod under `PrivateMounts=yes` — Docker's
 # `bind-propagation=rslave`, Kubernetes' `mountPropagation: HostToContainer` —
 # with the privileged agent in the host namespace, and requires the lease to

@@ -57,7 +57,7 @@ Durability is a system-wide ordering contract, not merely a WAL format. Per-shar
 - `yesno-server/` owns authentication, daemon lifecycle, checkpoint driving, metrics, and promotion.
 - `yesno-flight/` owns guarded query and write services plus snapshot tickets.
 - `yesno-pg/src/` owns PostgreSQL isolation mapping, pending overlays, transaction callbacks, and prepared-transaction integration.
-- `docs/operations.md` owns the operator-facing promotion, backup, restore, and recovery procedure.
+- `docs/operations/` owns the operator-facing procedures: `replication.md` for promotion and recovery, `backup.md` and `restore.md` for backup and restore.
 
 ## Tests
 

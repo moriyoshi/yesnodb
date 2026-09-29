@@ -49,7 +49,7 @@ Recovery is a chain of separately owned guarantees: the server grants a consiste
 - `yesno-server/src/replication/` owns WAL streaming and retention acknowledgement.
 - `yesno-operator/` owns claim discovery, rendered configuration, rollout identity, and status.
 - `e2e/scenarios/{basebackup,archive,pitr,pitr_retention}.py`, `e2e/filesystems/`, `e2e/operator/`, and `e2e/aws/` own progressively stronger operational evidence.
-- `docs/operations.md` owns the operator-facing recovery, promotion, and disaster-recovery procedure.
+- `docs/operations/` owns the operator-facing procedures: `backup.md`, `snapshots.md` and `restore.md` for backup, snapshot providers and recovery; `replication.md` for promotion and disaster recovery.
 
 ## Tests
 

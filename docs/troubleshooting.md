@@ -193,5 +193,5 @@ An mmap I/O failure on a network filesystem may terminate the process rather
 than return an ordinary database error. yesnodb requires a supported local
 filesystem; move the data to one before further testing.
 
-The [operations guide](operations.md) owns the complete backup, restore,
+The [operations guide](operations/index.md) owns the complete backup, restore,
 replication, and promotion procedures.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flag characters in `docs/*.md` that pdflatex cannot typeset.
+"""Flag characters in `docs/**/*.md` that pdflatex cannot typeset.
 
 The documents under `docs/` are Pandoc-flavoured Markdown that must convert to
 TeX. A bare Unicode symbol *outside* math mode is fatal there and invisible
@@ -26,7 +26,7 @@ What is allowed, and why the allowlist is small:
 Verbatim spans are **not** exempt. `\texttt{}` does not rescue an unmapped
 character, so a symbol inside backticks fails exactly like one in prose.
 
-Usage:  python3 scripts/check-tex-safe.py [files...]     (default: docs/*.md)
+Usage:  python3 scripts/check-tex-safe.py [files...]     (default: docs/**/*.md)
 Exit 1 on any finding.
 """
 
@@ -70,7 +70,7 @@ def check(path: str) -> list:
 
 
 def main() -> int:
-    files = sys.argv[1:] or sorted(glob.glob("docs/*.md"))
+    files = sys.argv[1:] or sorted(glob.glob("docs/**/*.md", recursive=True))
     if not files:
         print("check-tex-safe: no files to check", file=sys.stderr)
         return 0

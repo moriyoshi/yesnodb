@@ -165,4 +165,4 @@ replica promotion.
 
 For expression syntax, continue with the [query-language reference](query-language.md).
 For durability and backup considerations, continue with the
-[operations guide](operations.md).
+[operations guide](operations/index.md).

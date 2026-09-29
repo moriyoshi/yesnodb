@@ -29,6 +29,6 @@ cargo run -p yesno-server --bin yesno -- --help
 ```
 
 The root [getting-started guide](../docs/getting-started.md) owns setup and
-first-use instructions. Use the [operations guide](../docs/operations.md) for
+first-use instructions. Use the [operations guide](../docs/operations/index.md) for
 configuration, TLS, backup, replication, and recovery procedures. Current
 deployment limitations are listed in the [workspace README](../README.md).

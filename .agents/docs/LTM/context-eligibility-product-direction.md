@@ -53,7 +53,7 @@ The durable advantage is the trust protocol and ecosystem: publisher-controlled 
 - `yesno-wire/` - versioned request and expression encodings.
 - `yesno-core/src/db/` - commit versions, visibility waits, snapshots, and conditional-write boundary.
 - `yesno-tantivy/` and `yesno-search-java/` - examples of keeping ranking outside the eligibility engine.
-- `README.md` and `docs/operations.md` - human-facing product limits and deployment responsibilities.
+- `README.md` and `docs/operations/` - human-facing product limits and deployment responsibilities.
 
 ## Test Coverage
 

@@ -157,7 +157,7 @@ Force and verify a durable checkpoint with:
 ./target/release/yesnoctl checkpoint
 ```
 
-Use the [operations guide](operations.md) before binding a non-loopback address
+Use the [operations guide](operations/index.md) before binding a non-loopback address
 or keeping important data. It covers TLS, authentication, metrics, backup,
 replication, promotion, and restore. The [integrations guide](integrations.md)
 covers Arrow, Flight, DataFusion, and PostgreSQL.

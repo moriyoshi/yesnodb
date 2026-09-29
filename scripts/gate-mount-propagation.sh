@@ -3,11 +3,11 @@
 # Opt-in: does a real container runtime actually produce the mount propagation
 # the snapshot-agent deployment depends on?
 #
-# `operations.md` requires the agent's snapshot mount to reach the database
-# through host-to-container propagation. `e2e/filesystems/lvm_propagation.py`
-# covers the *receiving* half with systemd's `PrivateMounts=yes`, which is what
-# `bind-propagation=rslave` and `mountPropagation: HostToContainer` are supposed
-# to produce. It does not cover the *sending* half: nothing checked that
+# `docs/operations/snapshots.md` requires the agent's snapshot mount to reach
+# the database through host-to-container propagation.
+# `e2e/filesystems/lvm_propagation.py` covers the *receiving* half with
+# systemd's `PrivateMounts=yes`, which is what `bind-propagation=rslave` and
+# `mountPropagation: HostToContainer` are supposed to produce. It does not cover the *sending* half: nothing checked that
 # Docker's flags put the agent's mounts in the host's peer group at all.
 #
 # This does, with the runtime rather than with an equivalent:

@@ -105,7 +105,7 @@ The AWS arm also found a follower-bootstrap defect outside the operator itself. 
 - `scripts/gate-operator.sh` - Docker-only live gate selector.
 - `yesno-operator/e2e/` - pinned driver and workload image inputs.
 - `e2e/aws/operator.py` - real-EBS operator assertions on the Terraform-owned EKS cluster.
-- `docs/operations.md` - operator-facing deployment, promotion, fencing, and recovery guidance.
+- `docs/operations/deployment.md`, `docs/operations/replication.md` - operator-facing deployment, promotion, fencing, and recovery guidance.
 
 ## Test Coverage
 

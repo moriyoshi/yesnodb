@@ -21,14 +21,21 @@ the project README before it holds important data.
 
 ## Run and recover a service
 
-- [Operations](operations.md) covers configuration, TLS, authentication,
-  metrics, backup, restore, replication, and promotion.
+- [Operations](operations/index.md) states the operating envelope and leads to
+  one guide per task:
+  [configuration and service lifecycle](operations/configuration.md),
+  [container image and deployment](operations/deployment.md),
+  [backup and archiving](operations/backup.md),
+  [snapshot providers](operations/snapshots.md),
+  [restore](operations/restore.md), and
+  [replication and disaster recovery](operations/replication.md).
 - [Troubleshooting](troubleshooting.md) starts from visible symptoms such as a
   refused connection, stale ticket, growing disk use, or replication lag.
 - On Kubernetes, an operator manages leader and follower Deployments, retained
   storage, stable read-write and read-only endpoints, and fenced automatic
-  promotion. The operations guide's Kubernetes section says what it arranges;
-  its own guide is the `yesno-operator` README, linked from the project README.
+  promotion. The Kubernetes section of the
+  [deployment guide](operations/deployment.md) says what it arranges; its own
+  guide is the `yesno-operator` README, linked from the project README.
 
 ## Understand the design
 

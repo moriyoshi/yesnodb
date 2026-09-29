@@ -8596,3 +8596,34 @@ container, no socket volume, no channel environment.
 an LTM entry on KV attention set operations, its JSON companion, an INDEX row, and
 a `docs/operations/` directory splitting the operator guide. None of it is in this
 commit, which stages five paths explicitly rather than using `git add -A`.
+
+## 2026-09-30 -- the operator guide is a directory now
+
+`docs/operations.md` had reached 1 615 lines, and its `## Backup` section alone
+ran about 890 of them, about 565 of those being snapshot-provider setup (ZFS,
+Btrfs, LVM and the privileged agent, local and deferred EBS) with no heading
+between the base-backup intro and WAL archiving. It is now `docs/operations/`:
+`index.md` (caveat, operating envelope, guide list), `configuration.md`,
+`deployment.md`, `backup.md`, `snapshots.md`, `restore.md`, `replication.md`.
+The text was moved by line range, not rewritten; a line-multiset comparison
+against `HEAD:docs/operations.md` showed only the intended heading changes, one
+split line, and the new intros. New `##` headings were added only inside what
+used to be Backup. Old anchors did not matter: nothing in the tree linked to
+`operations.md#...`.
+
+**The TeX gate would have skipped the new directory.** `check-tex-safe.py`
+defaulted to `glob("docs/*.md")`, which does not recurse, so a subdirectory under
+`docs/` would have passed "docs/ converts to TeX" without being examined -- the
+same skip-without-signal failure as `gate-clippy-saw-two-crates`. It now globs
+`docs/**/*.md` recursively (15 files, previously 9).
+`check-docs-selfcontained.py` already used `rglob`.
+
+**One comment cites a statement the docs do not make.** `yesno-server/src/plugin.rs`
+says the real boundary for the plugin socket is a private parent directory
+"which the operations guide states". The guide says so only for the *control*
+socket, now in `operations/backup.md`, and the plugin-channel section of
+`operations/configuration.md` says nothing about the parent directory. The
+comment was retargeted to `backup.md`, where the statement actually is, and the
+gap was left open rather than filled in as part of a move.
+
+---

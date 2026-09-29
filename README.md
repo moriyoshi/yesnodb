@@ -21,7 +21,7 @@ CLI is `yesno`, and administrative backup and checkpoint operations are under
 Start with the [documentation index](docs/index.md) or the
 [getting-started guide](docs/getting-started.md). The documentation also includes
 guides to [data modeling](docs/data-modeling.md), the
-[query language](docs/query-language.md), [operations](docs/operations.md),
+[query language](docs/query-language.md), [operations](docs/operations/index.md),
 [troubleshooting](docs/troubleshooting.md), and
 [integrations](docs/integrations.md).
 
@@ -312,8 +312,8 @@ In CI this is continuous: `.github/workflows/release.yml` runs the full `ci.yml`
 first and publishes only if it passes, so a commit that fails clippy or the
 oracle suite ships nothing. A merge to `main` publishes `edge` and
 `sha-<commit>`; a `v1.2.3` tag publishes `1.2.3`, `1.2`, `1`, and `latest`.
-`latest` follows releases and never the tip of development. See
-[`docs/operations.md`](docs/operations.md) for which tag to pin.
+`latest` follows releases and never the tip of development. See the
+[deployment guide](docs/operations/deployment.md) for which tag to pin.
 
 The build is two stages — cross-compile per architecture, then assemble — so the
 architectures can be built concurrently, and neither stage ever emulates:
@@ -329,8 +329,8 @@ container alone.
 
 Deployment details for each target — the `Recreate` requirement, local-volume
 requirement, security context, and the probes that ECS and Kubernetes need
-because neither reads the image's healthcheck — are in
-[`docs/operations.md`](docs/operations.md).
+because neither reads the image's healthcheck — are in the
+[deployment guide](docs/operations/deployment.md).
 
 Kubernetes users can start with the [`yesno-operator`](yesno-operator/README.md),
 which manages leader/follower deployments, retained per-instance storage,
@@ -544,7 +544,7 @@ Important operational properties:
 - `yesnoctl restore` verifies an archived base and immutable WAL history, then
   reconstructs an exact committed logical version or the durable archive tip.
 
-The [operations guide](docs/operations.md) gives the backup, restore,
+The [operations guide](docs/operations/index.md) gives the backup, restore,
 promotion, fencing, and rejoin procedures. The two-node demonstration exercises
 bootstrap, a read-serving replica, role separation, and manual promotion:
 
@@ -643,7 +643,7 @@ so the cardinality of the complete ordinal universe remains representable.
 
 No. Replication can copy corruption or operator mistakes and is always
 potentially behind the leader. Use the backup and archive procedures in the
-[operations guide](docs/operations.md) for independently restorable copies.
+[operations guide](docs/operations/index.md) for independently restorable copies.
 
 ### Can yesnodb use NFS or another network filesystem?
 

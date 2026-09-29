@@ -1555,9 +1555,9 @@ async fn bind_unix(
     // There is a window between bind and chmod in which the socket carries
     // the umask-derived mode. The containing directory is the boundary that
     // closes it — an operator who narrows the socket must own the directory
-    // too, which `operations.md` says — and doing this before bind would mean
-    // mutating the process umask, which is global and would race every other
-    // file the daemon creates.
+    // too, which `docs/operations/backup.md` says — and doing this before bind
+    // would mean mutating the process umask, which is global and would race
+    // every other file the daemon creates.
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;

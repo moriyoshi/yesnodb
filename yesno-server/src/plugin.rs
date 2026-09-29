@@ -604,8 +604,8 @@ impl Channel {
         // Removed only while it is still a socket. That does not make the path
         // safe -- a replacement swapped in by anything that can write the parent
         // directory would also be a socket -- and the real boundary is a private
-        // parent, which `operations.md` states. It does stop the ordinary mistake
-        // of deleting a regular file somebody put there.
+        // parent, which `docs/operations/backup.md` states. It does stop the
+        // ordinary mistake of deleting a regular file somebody put there.
         if std::fs::symlink_metadata(&self.path)
             .map(|m| {
                 use std::os::unix::fs::FileTypeExt as _;

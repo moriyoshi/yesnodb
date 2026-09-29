@@ -51,7 +51,7 @@ Bootstrap writes each shard beside its final name, empties the shard log before 
 
 TLS supports bearer principals and mTLS identities. An empty principal configuration means open access, matching development behavior. Replication defaults are stricter than query defaults because a writable follower endpoint changes durable state.
 
-Packaging lives under `dist/`, while disaster recovery procedure and real RPO live in `docs/operations.md`. Replication is not a backup: it eagerly copies logical mistakes and depends on retained WAL or a new base image.
+Packaging lives under `dist/`, while disaster recovery procedure and real RPO live in `docs/operations/replication.md`. Replication is not a backup: it eagerly copies logical mistakes and depends on retained WAL or a new base image.
 
 ### Durable control and lifecycle state
 
@@ -80,7 +80,7 @@ Storage and Flight operations emit structural `tracing` spans without keys, ordi
 - `yesno-core/src/wal/` - global LSN framing, generation rollover and reclamation, and recovery suffix cuts.
 - `yesno-core/src/db/` - checkpoint policy, leadership term, and read-only follower mode.
 - `e2e/scenarios/{replication,replica_lag,server_lifecycle,server_auth,failover,live_replica}.py` - operational sequences.
-- `docs/operations.md` - promotion, backup, and recovery runbook.
+- `docs/operations/` - promotion and recovery runbook in `replication.md`; backup and restore in `backup.md` and `restore.md`.
 
 ## Test Coverage
 

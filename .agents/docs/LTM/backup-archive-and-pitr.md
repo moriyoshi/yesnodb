@@ -115,7 +115,7 @@ WAL floors are computed per `( term, shard )` only when every retained base of t
 - `yesno-core/src/wal/` - framed WAL history consumed by replication and recovery.
 - `e2e/scenarios/{basebackup,archive,pitr,pitr_retention}.py` - portable operational recovery sequences.
 - `e2e/filesystems/` - deployed native-snapshot and S3 recovery scenarios.
-- `docs/operations.md` - operator-facing backup, restore, archive, and disaster-recovery contract.
+- `docs/operations/backup.md`, `docs/operations/restore.md` - operator-facing backup, archive, and restore contract; `docs/operations/replication.md` for disaster recovery.
 
 ## Test Coverage
 
