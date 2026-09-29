@@ -259,6 +259,10 @@ handle a role transition live, and it should be documented rather than discovere
 
 ## Phase 3: resource accounting, which needs a measurement not an assertion
 
+**DONE 2026-09-30.** Both bullets are closed, one by measurement that reversed its
+own premise and one because the cap it asked for had already landed.
+
+
 Arena size is `maxHandles * maxBlocks * maxLanes * LANE_BYTES`. At the defaults
 that is `4 * 16 * 1024 * 8192` = **512 MiB per connection** of address space. It
 is a sparse `memfd`, so the reservation is address space and the cost is the
@@ -267,21 +271,26 @@ why the fixed-slot layout is affordable.
 
 Two things follow that the plan must not hand-wave:
 
-* **Which cgroup is charged for a touched arena page is an open question.** The
-  pages are shared `memfd` pages; the intuition is that first touch charges the
-  faulting process, which is `yesnod` writing lanes, so the arena counts against
-  the `yesnod` container's limit and not the plugin's. **That is an assumption,
-  and it should be measured before any memory limit is recommended** -- a probe
-  that reads `memory.current` for both containers' cgroups across a large scan
-  settles it in an afternoon, and getting it backwards means an OOMKill in the
-  container an operator did not size.
-* **There is no cap on concurrent connections.** `Channel::start` accepts in a
-  loop and spawns a thread per peer, and each `Session` builds **its own** arena,
-  so N peers cost N arenas and N threads with nothing bounding N. For an
-  operator-deployed sidecar the peer is trusted and this is tolerable, but it
-  should be stated in the CRD documentation, and a `channel_max_peers` is the
-  right follow-up -- it is a cap whose justification names a resource the channel
-  owns, so it belongs to the channel.
+* **Measured 2026-09-30, and the assumption was wrong.** This bullet used to say
+  the intuition was first-touch charging, so the arena would count against
+  `yesnod` and not the peer, and that it should be measured before any limit was
+  recommended. It was measured: **the same pages are charged in full to both
+  cgroups at once.** A peer that has only *read* a 128 MiB half reports 128 MiB of
+  `shmem` while the host's charge does not fall. So the guidance inverts -- size
+  the arena into **both** containers' limits -- and a deployment that gave the
+  peer a small limit on the old theory would OOMKill it on its first large scan,
+  which is the failure this bullet predicted arriving from the direction it did
+  not. Full construction, the numbers, and one anomaly left deliberately
+  unexplained are in [Who Pays for a Touched Arena Page](./arena-cgroup-charging.md).
+* **The connection cap exists now**, so this bullet is closed. It asked for a
+  `channel_max_peers` on the grounds that a cap justified by a resource belongs to
+  whoever owns that resource; the security review of 2026-09-29 arrived at the
+  same conclusion independently and it landed then, with a per-session snapshot
+  quota beside it. Both are on the CRD as `channel.maxPeers` and
+  `channel.maxSnapshots`. Note the sharper reason the review supplied: the
+  snapshot quota bounds a **shared** resource, since every snapshot claims one of
+  the database's 4096 reader slots and pins the reclamation floor, so an
+  unbounded peer denies service to readers that have nothing to do with it.
 
 ## Phase 4: tests, in the two layers that already exist
 

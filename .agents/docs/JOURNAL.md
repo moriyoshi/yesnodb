@@ -8677,3 +8677,74 @@ Promotion restarting the peer is documented on the CRD rather than in `docs/`,
 partly because that is where a user reads a field's contract and partly because
 another session is mid-way through splitting `docs/operations.md` into a
 directory; editing it now would collide with work in progress.
+
+## 2026-09-30 -- Phase 3: the arena is charged to both containers, not one
+
+Measured, and it **reversed the plan's own premise**. The plan said the intuition
+was first-touch charging -- `yesnod` writes the lanes, so the arena counts against
+`yesnod` and not the peer -- and said in as many words that this was an assumption
+to be measured before any memory limit was recommended. It was measured, and the
+opposite is true: **the same pages are charged in full to both cgroups at once.**
+
+```text
+  256 MiB memfd, 128 MiB per half
+  phase                    host shmem    peer shmem
+  A  host wrote 1st half      128.0M         0.0M
+  B  peer read 1st half       128.0M       128.0M
+  C  peer wrote 2nd half      128.0M       128.0M
+```
+
+At B the peer has written nothing and carries the full 128 MiB of the half it
+merely read, while the host's charge does not fall. So the guidance inverts: size
+the arena into **both** containers' limits. A deployment that gave the peer a small
+limit on the old theory would OOMKill it on its first large scan -- exactly the
+failure the plan predicted, arriving from the direction the plan did not.
+`LTM/arena-cgroup-charging.md` has the construction.
+
+**Phase C was the control and the reason A alone proves nothing.** `yesnod` both
+creates the `memfd` and writes it, so an experiment where only it writes cannot
+tell first-touch accounting from creator accounting -- both predict the same
+answer. Having the peer write a half the host never touched is what separates
+them, and it is the arm I would have skipped if the plan had not said the
+assumption was the thing at issue.
+
+**And phase C does not add up, which is recorded rather than explained.** The peer
+ends with 256 MiB of shared pages resident and 128.0 M of `shmem`. Three candidate
+mechanisms are listed in the finding and none is tested. What is written down
+instead is the one-arm experiment that separates them -- a peer that writes the
+second half and never reads the first -- because a number recorded without a
+derivation can only be re-measured, and a mechanism asserted without one is the
+overclaim this session has already had to retract three times.
+
+The actionable conclusion does not wait on it: both sides can each report the full
+touched size, which is what sizing must assume, and whether the total is
+double-counted or moved between them changes the explanation and not the limit.
+
+**Getting the measurement to run at all took three detours worth noting.**
+A delegated user session cannot move a process between cgroups -- that needs write
+access to the **common ancestor** of source and destination, and here that is
+root-owned -- so the first probe died on `EACCES` writing `cgroup.procs`.
+`systemd-run --user` would have placed them and there is no user D-Bus. Two
+containers sharing a host directory for the socket is what worked, and it is also
+the deployment shape, so the detour improved the measurement.
+
+**Twice I hid the output that would have explained a failure**, once redirecting
+`docker run` into `/dev/null` and once piping through `tail` so the real error
+scrolled off. Both times the symptom was "containers do not exist" with no reason.
+The same mistake cost me a 400-second timeout on a deadlock yesterday. And the
+first two runs reported the peer as `0B` and then `GONE` for later phases because
+it exited before the driver sampled -- a sample that cannot distinguish zero from
+absent is worse than none, so the driver now prints `GONE` rather than a number.
+
+**One false alarm, corrected.** I ran `docker ps -q --filter ancestor=... | xargs
+docker kill`, saw a container whose command did not look like mine, and reported
+that I had probably killed another session's work. The exit code settled it: 137
+from my own foreground test, and Docker's `Command` column was showing the image's
+entrypoint with my argument appended. The broad filter was still the wrong tool --
+it is the `pkill -f` mistake in another spelling, and that is now three times in
+two days.
+
+**Note on the shared checkout.** `.agents/docs/LTM/INDEX.md` now holds both my new
+row and another session's edit to the packed-lenses row, so it is left
+**uncommitted**: committing it would put their in-progress text under my message.
+Nothing gates on the index, and whoever commits it next carries both.
