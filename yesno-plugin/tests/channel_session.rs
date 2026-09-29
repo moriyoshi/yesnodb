@@ -26,6 +26,7 @@ fn limits() -> Limits {
         max_handles: 2,
         max_lanes: 4,
         max_blocks: 1,
+        max_snapshots: 64,
     }
 }
 
@@ -453,6 +454,7 @@ fn a_batched_scan_sees_exactly_what_the_unbatched_one_sees() {
         max_handles: 1,
         max_lanes: 4,
         max_blocks: 3,
+        max_snapshots: 64,
     };
     let (_c2, _h2, _s2) = setup("batch-unused");
     let (_c3, host, _drop) = setup("batch-many");
@@ -507,6 +509,7 @@ fn a_batch_is_capped_by_the_server_not_the_request() {
         max_handles: 1,
         max_lanes: 4,
         max_blocks: 2,
+        max_snapshots: 64,
     };
     let (_c, host, _drop) = setup("batch-cap");
     let arena = Arena::new(l.arena_bytes()).unwrap();
@@ -750,6 +753,7 @@ fn a_wide_query_splits_across_handles_without_splitting_the_snapshot() {
         max_handles: 3,
         max_lanes: 128,
         max_blocks: 1,
+        max_snapshots: 64,
     };
     let arena = Arena::new(l.arena_bytes()).unwrap();
     let mut s = Session::new(host, arena, l);
@@ -1104,6 +1108,7 @@ fn a_wide_block_of_dense_lanes_is_served_in_both_transports() {
         max_handles: 4,
         max_lanes: 1024,
         max_blocks: 16,
+        max_snapshots: 64,
     };
 
     // --- inline ---
@@ -1254,6 +1259,7 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
         max_handles: 1,
         max_lanes: 2,
         max_blocks: 1,
+        max_snapshots: 64,
     };
 
     /// Rebuild a lane's ordinals from `[ start, end ]` pairs, the way a peer must.
@@ -1377,4 +1383,54 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
     }
     assert_eq!(inline1, want1, "inline: key 1 must decode to its whole run");
     assert_eq!(inline2, want2, "inline: key 2 as well");
+}
+
+/// A session may not hold unbounded snapshots.
+///
+/// **Item 3 of the 2026-09-29 security review, and the half that reaches past the
+/// connection.** `snapshot_open` inserted into the session's map with no bound.
+/// Memory is the least of it: every snapshot claims a slot in the process-wide
+/// reader registry, which has 4096 for the whole database, and pins the
+/// reclamation floor. So a peer looping here exhausts a table the server's own
+/// queries draw from and stops space being returned while it holds on -- a peer
+/// denying service to readers that have nothing to do with it.
+///
+/// Refused rather than evicting the oldest, because the peer holds handles that
+/// name these: silently invalidating one would turn a quota into a wrong answer on
+/// a snapshot the peer still believes in.
+#[test]
+fn a_session_may_not_open_snapshots_without_bound() {
+    let (_c, host, _unused) = setup("quota");
+    let l = Limits {
+        max_handles: 2,
+        max_lanes: 4,
+        max_blocks: 1,
+        max_snapshots: 3,
+    };
+    let mut s = Session::new_inline(host, l);
+    greet(&mut s);
+
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        match s.handle(Frame::SnapshotOpen) {
+            Frame::SnapshotOpened { snapshot, .. } => open.push(snapshot),
+            other => panic!("within the quota: {other:?}"),
+        }
+    }
+    match s.handle(Frame::SnapshotOpen) {
+        Frame::Fault { message, .. } => assert!(
+            message.contains("too many open snapshots"),
+            "the refusal must say what to do about it: {message}"
+        ),
+        other => panic!("past the quota this must be refused, got {other:?}"),
+    }
+
+    // Closing one makes room: it is a concurrency limit, not a lifetime budget.
+    s.handle(Frame::SnapshotClose {
+        snapshot: open.pop().unwrap(),
+    });
+    assert!(
+        matches!(s.handle(Frame::SnapshotOpen), Frame::SnapshotOpened { .. }),
+        "a released snapshot must free its slot"
+    );
 }

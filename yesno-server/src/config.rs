@@ -367,6 +367,46 @@ pub struct PluginConfig {
     /// of the copy. Measurement supports `>= 4` and does not resolve a best value,
     /// so 16 is a default rather than an optimum.
     pub channel_max_blocks: usize,
+
+    /// Peers served at once. Further connections are refused, not queued.
+    ///
+    /// **Each peer costs a thread and its own arena**, whose reservation is
+    /// `max_handles * max_blocks * max_lanes * 8 KiB` of address space -- 512 MiB at
+    /// the defaults. Without a cap those multiply by however many times a peer
+    /// chooses to connect. A refused connection is closed at once, so the peer
+    /// learns immediately rather than hanging in a backlog.
+    pub channel_max_peers: usize,
+
+    /// Snapshots one connection may hold open at once.
+    ///
+    /// **The bound that matters most, and not for memory.** Every snapshot claims a
+    /// slot in the process-wide reader registry, which has 4096 for the whole
+    /// database -- so a peer opening them in a loop does not merely waste its own
+    /// resources, it exhausts a table the server's own queries need, and pins the
+    /// reclamation floor while it does. A peer needs a handful: one per query in
+    /// flight.
+    pub channel_max_snapshots: usize,
+
+    /// Permission bits for the channel socket, as a string such as `"0600"`.
+    ///
+    /// Empty leaves the umask-derived mode. There is a window between `bind` and
+    /// `chmod` in which the socket carries that mode; the containing directory is
+    /// the boundary that closes it, exactly as for the control socket, because
+    /// setting the umask instead would be process-global and would race every other
+    /// file the daemon creates.
+    pub channel_socket_mode: String,
+
+    /// Unix user ids allowed to connect, beyond the daemon's own and root.
+    ///
+    /// **Empty is not "anyone": it is "this uid, and root".** The socket carries no
+    /// authentication -- `ClientHello.name` is a label the peer chooses -- so
+    /// without this anyone the filesystem admits could enumerate and read the whole
+    /// database. The credentials come from `SO_PEERCRED`, which the kernel fills in
+    /// and a peer cannot forge.
+    ///
+    /// Root is always allowed: it can reach the data directory directly anyway, so
+    /// refusing it would buy nothing and would break an administrator's diagnostic.
+    pub channel_allow_uids: Vec<u32>,
 }
 
 impl Default for PluginConfig {
@@ -377,11 +417,24 @@ impl Default for PluginConfig {
             channel_max_lanes: 1024,
             channel_max_blocks: 16,
             channel_inline: false,
+            channel_max_peers: 8,
+            channel_max_snapshots: 64,
+            channel_socket_mode: String::new(),
+            channel_allow_uids: Vec::new(),
         }
     }
 }
 
 impl PluginConfig {
+    /// [`PluginConfig::channel_socket_mode`], parsed. `None` leaves the umask.
+    pub fn socket_mode(&self) -> Option<u32> {
+        let text = self.channel_socket_mode.trim();
+        if text.is_empty() {
+            return None;
+        }
+        parse_socket_mode(text).ok()
+    }
+
     /// Whether the out-of-process channel is configured.
     pub fn channel_enabled(&self) -> bool {
         !self.channel_socket.trim().is_empty()

@@ -296,3 +296,76 @@ fn a_refused_snapshot_releases_its_slot() {
     // prove if the count and the slots ever disagreed.
     assert!(db.snapshot().is_ok());
 }
+
+/// The bounded key enumeration agrees with truncating the unbounded one.
+///
+/// `key_range_limited` exists so a small page does not cost a whole-range scan of
+/// every shard -- a 2026-09-29 security review pointed out that the channel's
+/// paging truncated *after* enumerating, which lets a peer buy a full scan for the
+/// price of a one-key request. The bound only counts if the answer is unchanged,
+/// and the unbounded function is the oracle for that.
+///
+/// Swept over many shard counts, window positions and limits, with tombstones and
+/// a memtable that is deliberately **not** checkpointed, because the merge of an
+/// ascending index walk with ascending memtable keys is where an off-by-one hides:
+/// a key present in both must be emitted once, and a key only in the memtable must
+/// not be skipped when the index runs out first.
+#[test]
+fn a_limited_key_range_is_a_prefix_of_the_unlimited_one() {
+    for shards in [1usize, 2, 4] {
+        let dir = std::env::temp_dir().join(format!(
+            "yesno-keylimit-{shards}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open_with(
+            &dir,
+            DbOptions {
+                shards,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Persisted keys, then a checkpoint, so the index holds them.
+        let mut b = db.batch();
+        for k in (0..200u64).map(|i| i * 3) {
+            b.insert(k, k * 65536 + 1);
+        }
+        b.commit().unwrap();
+        db.checkpoint().unwrap();
+
+        // Then memtable-only keys interleaved with them, and some deletions, so
+        // the merge and the liveness filter both have work to do.
+        let mut b = db.batch();
+        for k in (0..200u64).map(|i| i * 3 + 1) {
+            b.insert(k, k * 65536 + 2);
+        }
+        for k in (0..40u64).map(|i| i * 15) {
+            b.delete_key(k);
+        }
+        b.commit().unwrap();
+
+        let snap = db.snapshot().unwrap();
+        for (lo, hi) in [(0u64, 600u64), (0, 50), (37, 400), (100, 101), (500, 600)] {
+            let full = snap.key_range(lo, hi).unwrap();
+            for limit in [1usize, 2, 3, 7, 16, 64, 1000] {
+                let got = snap.key_range_limited(lo, hi, limit).unwrap();
+                let want: Vec<u64> = full.iter().copied().take(limit).collect();
+                assert_eq!(
+                    got, want,
+                    "shards={shards} lo={lo} hi={hi} limit={limit}: the bounded walk \
+                     must return the same keys the unbounded one starts with"
+                );
+            }
+            assert!(
+                snap.key_range_limited(lo, hi, 0).unwrap().is_empty(),
+                "a zero limit asks for nothing"
+            );
+        }
+        drop(snap);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

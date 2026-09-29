@@ -579,3 +579,121 @@ fn a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement() {
     drop(peer);
     channel.stop();
 }
+
+/// A live socket is never clobbered, and a non-socket path is refused outright.
+///
+/// **Item 5 of the 2026-09-29 security review.** `start` unconditionally unlinked
+/// its configured path, justified by "the database lock already proves no other
+/// yesnod holds this directory" -- an argument that does not cover the case that
+/// matters: two instances with *different* data directories and the same socket
+/// path. Each holds its own lock, so neither is refused, and the second silently
+/// redirects new peers to a different database while the first's existing peers
+/// carry on. Nobody observes the split, because both sides look healthy.
+#[test]
+fn a_second_channel_refuses_to_take_over_a_live_socket() {
+    let (_c, cfg, host, sock) = setup("clobber");
+    let first = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+    assert!(sock.exists());
+
+    let e = match Channel::start(&cfg, host.clone()) {
+        Err(e) => e,
+        Ok(_) => panic!("binding over a live socket must be refused, not silently taken"),
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        format!("{e}").contains("already accepting"),
+        "the message must say why: {e}"
+    );
+
+    // The first channel is untouched and still serving.
+    let mut peer = Peer::connect(&sock);
+    assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
+    drop(peer);
+    first.stop();
+
+    // A leftover socket from a dead process is not a live one, and is reclaimed.
+    let stale = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+    stale.stop();
+
+    // A path that exists and is not a socket is refused rather than deleted.
+    std::fs::write(&sock, b"not a socket").unwrap();
+    let e = match Channel::start(&cfg, host) {
+        Err(e) => e,
+        Ok(_) => panic!("a regular file must not be unlinked"),
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        sock.exists(),
+        "and it must still be there: refusing means not deleting"
+    );
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// The socket takes the configured mode.
+///
+/// Item 4's filesystem half. Without it the socket lands at the umask, which on a
+/// group-writable mount admits more than the deployment intends -- and the socket
+/// carries no authentication of its own, so whoever the mode admits can read the
+/// whole database.
+#[test]
+fn the_channel_socket_takes_the_configured_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_c, mut cfg, host, sock) = setup("mode");
+    cfg.plugin.channel_socket_mode = "0600".into();
+    let channel = Channel::start(&cfg, host).unwrap().unwrap();
+    let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the socket must carry the configured mode");
+    channel.stop();
+}
+
+/// Connections past the cap are refused, and refusing one frees room for the next.
+///
+/// Item 3's admission half. Each peer costs a thread and its own arena, so an
+/// uncapped accept loop lets one peer multiply those by reconnecting.
+#[test]
+fn peers_past_the_configured_limit_are_refused() {
+    let (_c, mut cfg, host, sock) = setup("cap");
+    cfg.plugin.channel_max_peers = 2;
+    let channel = Channel::start(&cfg, host).unwrap().unwrap();
+
+    let mut admitted = Vec::new();
+    for _ in 0..2 {
+        let mut p = Peer::connect(&sock);
+        assert!(matches!(p.read_frame(), Frame::ServerHello { .. }));
+        admitted.push(p);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while channel.peers() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(channel.peers(), 2, "both peers are being served");
+
+    // The third connects -- the listener still accepts -- but is closed without a
+    // greeting, which is what a refusal looks like from the peer's side.
+    let mut refused = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    refused
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        std::io::Read::read(&mut refused, &mut byte).unwrap(),
+        0,
+        "a refused peer must see EOF at once, not a connection that never answers"
+    );
+    assert_eq!(channel.peers(), 2, "and it was never counted");
+
+    // Room reopens when one leaves.
+    admitted.pop();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while channel.peers() > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut p = Peer::connect(&sock);
+    assert!(
+        matches!(p.read_frame(), Frame::ServerHello { .. }),
+        "the cap is a limit on concurrency, not a permanent budget"
+    );
+    drop(p);
+    drop(admitted);
+    channel.stop();
+}

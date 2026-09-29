@@ -4587,6 +4587,156 @@ impl Snapshot {
         self.collect_keys(Some((lo, hi)))
     }
 
+    /// The first `limit` live keys in `[lo, hi)`, ascending.
+    ///
+    /// # Why this exists rather than `key_range( .. ).truncate( n )`
+    ///
+    /// Truncating afterwards is what the plugin channel used to do, and it made a
+    /// one-key request cost a **whole-range enumeration** of every shard plus the
+    /// allocation behind it. That is fine for a cooperative caller reading its own
+    /// database and is not fine for a surface an out-of-process peer can reach: a
+    /// peer asking repeatedly for a tiny page pays almost nothing and costs the
+    /// server a full scan each time. A 2026-09-29 security review named it as
+    /// request amplification, which is what moved it from a performance note to a
+    /// bound worth having.
+    ///
+    /// # Why taking `limit` from each shard is enough
+    ///
+    /// Keys are partitioned across shards -- by I7 every chunk of one key lives in
+    /// one shard -- and each shard's index is walked in ascending key order. The
+    /// globally smallest `limit` keys must therefore each be among their own
+    /// shard's smallest `limit`, so gathering that many per shard and merging
+    /// cannot miss one. Work becomes `O( shards * limit )` in the index rather than
+    /// `O( keys in range )`.
+    ///
+    /// The memtable is still scanned whole, because it has no seek and is bounded
+    /// by its own flush threshold rather than by the database. That is the part
+    /// this does not fix, and it is in memory.
+    ///
+    /// A dead key costs a liveness check without yielding a result, so a range
+    /// whose keys are all tombstoned still walks them. That is bounded by the
+    /// tombstones present rather than by the key space, and it is strictly better
+    /// than before.
+    pub fn key_range_limited(&self, lo: u64, hi: u64, limit: usize) -> Result<Vec<u64>> {
+        self.check_live()?;
+        if lo >= hi || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<u64> = Vec::new();
+        for shard_ix in 0..self.db.shards.len() {
+            self.shard_keys_limited(shard_ix, lo, hi, limit, &mut out)?;
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Append at most `limit` of one shard's live keys in `[lo, hi)`, ascending.
+    ///
+    /// # The store lock is never held across a liveness check
+    ///
+    /// `key_is_live` takes the same shard's store mutex, which is **not
+    /// reentrant**, so calling it inside the index walk self-deadlocks -- silently,
+    /// as a hang with no error. `shard_keys` avoids that by scoping the lock to
+    /// candidate collection and filtering afterwards, and this does the same in
+    /// rounds: gather a bounded batch of candidates under the lock, release it,
+    /// then test liveness. The rounds are what keep it bounded *and* correct, since
+    /// a batch whose keys are all tombstoned yields nothing and must be followed by
+    /// another rather than reported as the end of the range.
+    fn shard_keys_limited(
+        &self,
+        shard_ix: usize,
+        lo: u64,
+        hi: u64,
+        limit: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        let shard = &self.db.shards[shard_ix];
+
+        // The memtable half, ascending: `iter_at` yields in `ChunkKey` order, so
+        // filtering preserves it and equal keys are adjacent. Taken under its own
+        // lock and released before the store's, the discipline `merged_chunks`
+        // follows and for the same reason.
+        let mem_keys: Vec<u64> = {
+            let mem = shard.mem.read().unwrap();
+            let mut keys: Vec<u64> = mem
+                .iter_at(self.version)
+                .map(|(ck, _)| ck.key())
+                .filter(|k| *k >= lo && *k < hi)
+                .collect();
+            keys.dedup();
+            keys
+        };
+
+        let has_index = self.roots[shard_ix].is_some() && shard.store.is_some();
+        let mut index_done = !has_index;
+        let mut mem_at = 0usize;
+        let mut found = 0usize;
+        let mut at = ChunkKey::range_start(lo);
+        let end = ChunkKey::range_start(hi);
+
+        while found < limit {
+            // One bounded batch of index candidates, with the lock scoped to it.
+            let mut batch: Vec<u64> = Vec::new();
+            if !index_done {
+                if let (Some(tree), Some(store)) =
+                    (self.roots[shard_ix].as_ref(), shard.store.as_ref())
+                {
+                    let store = store.lock().unwrap();
+                    while batch.len() < limit {
+                        let mut cursor = tree.range(&*store, at, end);
+                        let Some(item) = cursor.next() else {
+                            index_done = true;
+                            break;
+                        };
+                        let (ck, _) = item?;
+                        let key = ck.key();
+                        batch.push(key);
+                        if key == u64::MAX {
+                            index_done = true;
+                            break;
+                        }
+                        // The seek-past step, as in `shard_keys`: walking chunk by
+                        // chunk returns the same answer at one descent per chunk.
+                        at = ChunkKey::range_end(key);
+                    }
+                }
+            }
+
+            // Memtable keys at or below this batch's last are ordered before the
+            // next batch, so they belong to this round; the rest wait. With the
+            // index finished there is no cutoff and the remainder all belong now.
+            let cutoff = batch.last().copied();
+            let mut round: Vec<u64> = Vec::new();
+            while mem_at < mem_keys.len() && cutoff.is_none_or(|c| mem_keys[mem_at] <= c) {
+                round.push(mem_keys[mem_at]);
+                mem_at += 1;
+            }
+            round.extend(batch);
+            if round.is_empty() {
+                break;
+            }
+            round.sort_unstable();
+            round.dedup();
+
+            // No lock held here, which is the whole point of the round.
+            for key in round {
+                if self.key_is_live(shard_ix, key) {
+                    out.push(key);
+                    found += 1;
+                    if found >= limit {
+                        return Ok(());
+                    }
+                }
+            }
+            if index_done && mem_at >= mem_keys.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Shared body of [`Snapshot::keys`] and [`Snapshot::key_range`].
     fn collect_keys(&self, bounds: Option<(u64, u64)>) -> Result<Vec<u64>> {
         let mut out: Vec<u64> = Vec::new();

@@ -8267,3 +8267,87 @@ deliberately **silent** peer -- it opens a snapshot and never reads again, which
 exactly the case an announcement cannot reach -- and asserts the listener stays up
 and a fresh peer can still connect. It reddens against the announce-only behaviour,
 verified by restoring it.
+
+## 2026-09-29 -- the rest of the security review, and a deadlock I wrote while fixing it
+
+Items 3 to 6 of the Codex review, closing
+`plugin-channel-admits-unbounded-peers-and-snapshots`,
+`plugin-channel-socket-has-no-access-policy-and-clobbers-its-path` and
+`key-enumeration-materializes-so-paging-it-is-quadratic`.
+
+**Admission ( item 3 ).** `channel_max_peers` ( default 8 ) refuses connections
+past the limit **before** allocating, because the arena and the thread are per
+connection and deciding later would mean paying for a peer in order to turn it
+away; a refused peer is closed at once so it sees a refusal rather than a
+connection that never answers. `channel_max_snapshots` ( default 64 ) bounds one
+session. The second is the one that reaches past the connection: every snapshot
+claims a slot in the process-wide reader registry, 4096 for the whole database,
+so a peer looping there exhausts a table the server's own queries draw from and
+pins the reclamation floor while it holds on. It **refuses** rather than evicting
+the oldest -- the peer holds handles naming those snapshots, and silently
+invalidating one turns a quota into a wrong answer on something the peer still
+believes in.
+
+**Access ( item 4 ).** Two gates, and the entry is explicit that they are not
+interchangeable. `channel_socket_mode` sets the file mode after bind, with the
+same umask-window caveat `control.rs` documents. `SO_PEERCRED` supplies the uid,
+which the kernel fills in and a peer cannot forge; the default is "this uid and
+root", `channel_allow_uids` widens it, and root is unconditional because it can
+read the data directory anyway. **A peer whose credentials cannot be read is
+refused**: the call fails only if the socket is not a connected Unix socket, so an
+error means the assumption behind the check is untrue, and "I cannot tell who you
+are" on an authentication gate reads as no.
+
+**Binding ( item 5 ).** `bind_guarded` copies `control.rs::bind_unix` almost
+exactly: refuse a non-socket path, probe with `connect`, refuse if something is
+already accepting, unlink only on `ConnectionRefused`. The old one-liner's
+justification -- "the database lock already proves no other yesnod holds this
+directory" -- was a true statement that **does not cover the case that matters**:
+two instances with different data directories and one socket path each hold their
+own lock, so neither is refused and the second silently redirects new peers to
+another database while the first's existing peers carry on. Both sides look
+healthy, which is why nobody would notice.
+
+**Enumeration ( item 6 ), and the reframing was right to raise it.**
+`Snapshot::key_range_limited` walks at most `limit` keys per shard and merges,
+which is sound because keys are partitioned by shard ( I7 ) and each shard's index
+is walked ascending, so the globally smallest `limit` are each among their own
+shard's smallest `limit`. The channel now asks for `want + 1` instead of
+enumerating the range and truncating. **This closes both readings of the item**:
+the amplification the review named, and the quadratic paging the original entry
+named, because N pages now cost O( N * shards * page ) rather than N full scans.
+What is not fixed is the memtable, which has no seek and is scanned whole -- in
+memory, and bounded by its own flush threshold rather than by the database.
+
+# The bug I wrote, which is the part worth keeping
+
+The first version of `shard_keys_limited` held the shard's store mutex across the
+index walk **and** called `key_is_live` inside it. That mutex is not reentrant and
+`key_is_live` takes it, so it self-deadlocked: no error, no panic, just a test that
+never returned. I spent the first minutes assuming an infinite loop in my own merge
+logic, and traced the merge by hand twice before checking what `key_is_live`
+actually touches -- which took one grep and settled it immediately.
+
+**The existing `shard_keys` had it right and I did not read why.** It collects
+candidates under the lock, releases, and filters afterwards; that scoping looks
+like ordinary tidiness and is load-bearing. The rewrite does the same in rounds,
+which is also what makes it correct rather than merely deadlock-free: a batch whose
+keys are all tombstoned yields nothing and must be followed by another batch, not
+reported as the end of the range.
+
+Two process notes. **A hang is a worse failure than a panic and I treated it as a
+slow test**, letting a 400-second timeout elapse twice before suspecting a
+deadlock; the tell was that the probe printed the line before the call and nothing
+after, which a pipe into `tail` had been hiding by buffering. And I ran
+`pkill -f snapshot_at`, which matched my own shell and killed it -- **the second
+time in this session**, after noting the first time that `pgrep -x` is the right
+tool. Writing that down once was evidently not enough.
+
+`a_limited_key_range_is_a_prefix_of_the_unlimited_one` is the oracle: the
+unbounded function is the reference, swept over shard counts, windows and limits
+with tombstones and an uncheckpointed memtable, because the merge of an ascending
+index walk with ascending memtable keys is exactly where an off-by-one hides.
+`the_peer_credential_is_read_from_the_socket` exists because no integration test
+can catch a wrong `SO_PEERCRED` number or `struct ucred` layout -- they all connect
+as the same user, so they pass whether the credential is read correctly or the
+check is broken in the permissive direction.

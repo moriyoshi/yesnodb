@@ -78,6 +78,15 @@ the peer beside the daemon:
 | `--plugin-channel-max-blocks` | `YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS` | blocks one response may carry |
 | `--plugin-channel-inline` | `YESNOD_PLUGIN_CHANNEL_INLINE` | serve payloads in the frames, not a shared region |
 
+These have no flags and are set in the configuration file:
+
+| key | default | meaning |
+|---|---|---|
+| `channel_max_peers` | 8 | connections served at once; further ones are refused, not queued |
+| `channel_max_snapshots` | 64 | snapshots one connection may hold open |
+| `channel_socket_mode` | umask | permission bits for the socket, such as `"0600"` |
+| `channel_allow_uids` | empty | extra user ids allowed to connect |
+
 Two things an operator should know before setting them.
 
 **The socket is bound before the database opens, so its existence is not
@@ -92,6 +101,25 @@ the product of the three is what bounds it, and raising all three at once raises
 it multiplicatively. Leave them alone unless a peer reports a limit it cannot work
 within. A failure to bind the socket is fatal and says so, rather than leaving the
 channel quietly absent.
+
+**The socket is an access boundary, and it has no password.** A peer names itself
+in its greeting, but that name is a label it chooses, not a credential -- so
+whoever can open the socket can read the whole database. Two gates control that,
+and they are not interchangeable. The file mode is the first: set
+`channel_socket_mode = "0600"` on any shared or group-writable mount, because the
+default is whatever the umask gives. The second is the user id, taken from the
+kernel rather than from anything the peer says: by default only the id the daemon
+runs as, and `root`, may connect, and `channel_allow_uids` widens that
+deliberately. A mode cannot express "this user and no other in the group", and a
+user check cannot stop someone who never gets as far as connecting, which is why
+both exist.
+
+**Two daemons must not share a socket path.** Binding refuses a path that is
+already accepting connections, and refuses one that exists and is not a socket,
+rather than replacing it. A socket left behind by a process that died is
+recognised and reclaimed. This matters because the data directory lock does not
+help here: two daemons with different data directories and one socket path would
+otherwise silently serve different databases to whoever connected when.
 
 ## Logging and tracing
 

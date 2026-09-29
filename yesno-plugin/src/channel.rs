@@ -51,6 +51,15 @@ pub struct Limits {
     /// per-block cost almost entirely in round trips rather than in the copy, so
     /// this is the factor that moves it. One is the unbatched behaviour.
     pub max_blocks: usize,
+    /// Snapshots one session may hold open at once.
+    ///
+    /// **Unlike the three above, this one does not bound the arena.** Every
+    /// snapshot claims a slot in the process-wide reader registry -- 4096 for the
+    /// whole database -- and pins the reclamation floor, so an unbounded session
+    /// does not merely cost itself: it exhausts a table the server's own queries
+    /// draw from and stops space being reclaimed while it holds on. A peer needs
+    /// one per query in flight.
+    pub max_snapshots: usize,
 }
 
 impl Default for Limits {
@@ -59,6 +68,7 @@ impl Default for Limits {
             max_handles: 4,
             max_lanes: MAX_LANES,
             max_blocks: 1,
+            max_snapshots: 64,
         }
     }
 }
@@ -398,7 +408,13 @@ impl Session {
                 self.with_snapshot(snapshot, |s| {
                     // One extra, so "is there another page" is answered by what the
                     // engine returned rather than by guessing from a full page.
-                    let mut keys = s.key_range(lo, hi)?;
+                    //
+                    // **Bounded in the engine, not here.** This used to call
+                    // `key_range` and truncate, so a one-key request cost a
+                    // whole-range enumeration of every shard -- a peer could buy a
+                    // full scan for the price of the smallest possible page, which a
+                    // 2026-09-29 security review named as request amplification.
+                    let mut keys = s.key_range_limited(lo, hi, want.saturating_add(1))?;
                     let more = keys.len() > want;
                     keys.truncate(want);
                     Ok(Frame::Keys {
@@ -436,6 +452,15 @@ impl Session {
     }
 
     fn snapshot_open(&mut self) -> Frame {
+        if self.snapshots.len() >= self.limits.max_snapshots {
+            // Refused rather than evicting an older one: the peer holds handles
+            // that name these, and silently invalidating one would turn a quota
+            // into a wrong answer on a snapshot the peer still believes in.
+            return Self::fault(
+                Status::InvalidArgument,
+                "too many open snapshots on this connection; close one first",
+            );
+        }
         let Some(db) = self.host.db() else {
             return Self::fault(Status::Unavailable, "no database is open");
         };

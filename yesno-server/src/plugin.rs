@@ -31,6 +31,167 @@ use yesno_plugin::Host;
 
 use crate::config::Config;
 
+/// Bind the channel socket, refusing to clobber anything live.
+///
+/// # Why the old one-liner was wrong
+///
+/// This used to be an unconditional `remove_file` before `bind`, justified by "the
+/// database lock already proves no other yesnod holds this directory". **That
+/// argument does not cover the case that matters**: two instances with *different*
+/// data directories and the same configured socket path. Each holds its own
+/// directory lock, so neither is refused, and the second silently unlinks the
+/// first's live socket and binds its own. New peers then reach a different
+/// database while the first instance's existing peers carry on against the old
+/// one -- a split nobody observes, because both sides look healthy.
+///
+/// `control.rs::bind_unix` already had this right, and this is the same sequence:
+/// refuse a path that exists and is not a socket, probe it, refuse outright if
+/// something is *already accepting*, and unlink only when the connection is
+/// refused, which is what a socket left by a dead process does.
+fn bind_guarded(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::FileTypeExt as _;
+        if !metadata.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "plugin channel socket path '{}' exists and is not a socket",
+                    path.display()
+                ),
+            ));
+        }
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "plugin channel socket '{}' is already accepting connections; \
+                         another yesnod is serving it",
+                        path.display()
+                    ),
+                ));
+            }
+            // Nothing is listening, so the file is a leftover from a dead process.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    std::os::unix::net::UnixListener::bind(path)
+}
+
+/// Who may connect to the channel.
+///
+/// # `ClientHello.name` is a label, not a credential
+///
+/// The peer chooses it. So without this, every process the socket's permissions
+/// admit could open a snapshot and read the whole database -- which on a shared or
+/// group-writable mount is a wider set than the deployment intends. `SO_PEERCRED`
+/// is the credential that a peer cannot choose: the kernel fills it in at connect
+/// time from the peer's real identity.
+///
+/// The filesystem mode is the first gate and this is the second. Neither replaces
+/// the other: a mode cannot express "this uid and no other in the group", and a
+/// credential check cannot stop a peer that never gets to connect.
+#[derive(Clone)]
+struct AccessPolicy {
+    /// The daemon's own uid, always allowed.
+    own: u32,
+    /// Extra uids from the configuration.
+    allowed: Vec<u32>,
+}
+
+impl AccessPolicy {
+    fn from_config(cfg: &Config) -> AccessPolicy {
+        AccessPolicy {
+            // SAFETY: `geteuid` reads process state and cannot fail.
+            own: unsafe { libc_geteuid() },
+            allowed: cfg.plugin.channel_allow_uids.clone(),
+        }
+    }
+
+    /// Whether this connection's peer may be served.
+    ///
+    /// A peer whose credentials cannot be read is **refused**: the call fails only
+    /// if the socket is not a connected Unix socket, so an error here means the
+    /// assumption behind the whole check is untrue, and the safe reading of "I
+    /// cannot tell who you are" on an authentication gate is no.
+    fn admits(&self, stream: &std::os::unix::net::UnixStream) -> bool {
+        let Some(uid) = peer_uid(stream) else {
+            tracing::warn!("refusing a plugin channel peer: cannot read its credentials");
+            return false;
+        };
+        if self.permits(uid) {
+            return true;
+        }
+        tracing::warn!(
+            peer_uid = uid,
+            "refusing a plugin channel peer: its uid is not permitted"
+        );
+        false
+    }
+
+    /// The decision alone, separated so it can be tested without a second user.
+    ///
+    /// Root is allowed unconditionally: it can read the data directory directly, so
+    /// refusing it protects nothing and breaks an administrator's diagnostic.
+    fn permits(&self, uid: u32) -> bool {
+        uid == self.own || uid == 0 || self.allowed.contains(&uid)
+    }
+}
+
+/// The connected peer's user id, from `SO_PEERCRED`.
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let mut cred = Ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut len = std::mem::size_of::<Ucred>() as u32;
+    // SAFETY: `cred` is a live `SO_PEERCRED` payload of exactly `len` bytes, and
+    // `stream` outlives the call. The kernel writes the struct and updates `len`.
+    let rc = unsafe {
+        libc_getsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_PEERCRED,
+            &mut cred as *mut Ucred as *mut std::ffi::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of::<Ucred>()).then_some(cred.uid)
+}
+
+/// `struct ucred`: three 32-bit fields, no padding, on every Linux ABI.
+#[repr(C)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+// Declared rather than taking `libc`, as `yesno-core` does for `kill` and
+// `fallocate`. `yesno-server` is not under the lean-core budget, but two
+// three-argument declarations beside the code that reads them are clearer than a
+// dependency added for them.
+const SOL_SOCKET: i32 = 1;
+const SO_PEERCRED: i32 = 17;
+
+extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+    #[link_name = "getsockopt"]
+    fn libc_getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        value: *mut std::ffi::c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
 /// How long a notification write may block before its peer is disconnected.
 ///
 /// Short on purpose. A notification is tens of bytes, so a peer that cannot accept
@@ -94,11 +255,13 @@ impl Channel {
             return Ok(None);
         }
         let path = std::path::PathBuf::from(cfg.plugin.channel_socket.trim());
-        // A stale socket from a previous run refuses `bind` with `EADDRINUSE`, which
-        // is indistinguishable from a live server. Removing it is safe because the
-        // database lock already proves no other yesnod holds this directory.
-        let _ = std::fs::remove_file(&path);
-        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        let listener = bind_guarded(&path)?;
+        if let Some(mode) = cfg.plugin.socket_mode() {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+        }
+        let policy = AccessPolicy::from_config(cfg);
+        let max_peers = cfg.plugin.channel_max_peers.max(1);
 
         let limits = Limits {
             max_handles: cfg.plugin.channel_max_handles.max(1),
@@ -110,6 +273,7 @@ impl Channel {
                 .plugin
                 .channel_max_blocks
                 .clamp(1, yesno_plugin::ipc::MAX_BATCH),
+            max_snapshots: cfg.plugin.channel_max_snapshots.max(1),
         };
         let peers: Arc<
             std::sync::Mutex<Vec<Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>>>,
@@ -134,6 +298,25 @@ impl Channel {
                         continue;
                     }
                 };
+                // **Refused rather than queued, and before anything is allocated.**
+                // The arena and the thread are per connection, so admission has to
+                // happen here; deciding later would mean paying for the peer in
+                // order to turn it away.
+                if !policy.admits(&stream) {
+                    continue;
+                }
+                let live = accept_peers.lock().map(|p| p.len()).unwrap_or(0);
+                if live >= max_peers {
+                    tracing::warn!(
+                        live,
+                        max_peers,
+                        "refusing a plugin channel peer: the connection limit is reached"
+                    );
+                    // Closed at once so the peer sees a refusal now, instead of a
+                    // connection that appears to succeed and never answers.
+                    drop(stream);
+                    continue;
+                }
                 let host = host.clone();
                 let peers = accept_peers.clone();
                 std::thread::spawn(move || serve_one(stream, host, limits, inline, peers));
@@ -495,4 +678,69 @@ pub fn wire(cfg: &Config, role: Role) -> Result<Option<Wiring>, String> {
         .map(Arc::new);
 
     Ok(Some(Wiring { slot, channel }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SO_PEERCRED` is read correctly, which nothing else can show.
+    ///
+    /// **The integration tests cannot prove this.** They connect as the same user
+    /// the daemon runs as, so they pass whether the credential is read properly or
+    /// the check is broken in the permissive direction -- and a wrong `SO_PEERCRED`
+    /// constant, or a `struct ucred` whose layout does not match the kernel's,
+    /// fails exactly that way: it returns something, and that something happens not
+    /// to be compared against anything in a same-uid test.
+    ///
+    /// A socket pair is a connected Unix socket like any other, so the kernel fills
+    /// the credentials in for it, and the answer has a known value to check against.
+    #[test]
+    fn the_peer_credential_is_read_from_the_socket() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: `geteuid` reads process state and cannot fail.
+        let me = unsafe { libc_geteuid() };
+        assert_eq!(
+            peer_uid(&a),
+            Some(me),
+            "the credential of a socket to ourselves is our own uid; a mismatch \
+             means the struct layout or the option number is wrong"
+        );
+    }
+
+    /// The policy admits its own uid and root, and refuses anything else.
+    ///
+    /// Asserted against the predicate rather than through a socket, because a test
+    /// cannot connect as another user without privileges it should not need. What
+    /// this covers is the decision; `the_peer_credential_is_read_from_the_socket`
+    /// covers the input it decides on.
+    #[test]
+    fn the_access_policy_refuses_a_uid_it_was_not_given() {
+        let policy = AccessPolicy {
+            own: 1000,
+            allowed: vec![1500],
+        };
+        assert!(policy.permits(1000), "its own uid");
+        assert!(
+            policy.permits(0),
+            "root, which can read the directory anyway"
+        );
+        assert!(policy.permits(1500), "an explicitly allowed uid");
+        assert!(!policy.permits(1001), "a neighbouring uid is not allowed");
+        assert!(
+            !policy.permits(u32::MAX),
+            "and neither is the value a failed credential read would leave behind"
+        );
+    }
+
+    /// An empty allow list is "this uid and root", not "anyone".
+    #[test]
+    fn an_empty_allow_list_is_not_permissive() {
+        let policy = AccessPolicy {
+            own: 1000,
+            allowed: Vec::new(),
+        };
+        assert!(policy.permits(1000));
+        assert!(!policy.permits(1234));
+    }
 }
