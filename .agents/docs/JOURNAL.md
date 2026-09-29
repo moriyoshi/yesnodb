@@ -7795,3 +7795,93 @@ assertion is on the **error kind, not on success**: under that much churn
 changed continuously, which is a true statement about a directory being rewritten
 in a tight loop. What must never happen is a read failing because a file it merely
 *listed* went away.
+
+## 2026-09-29 -- foreign-reader liveness now asks the kernel, not the PID namespace
+
+Closes `foreign-reader-liveness-is-unsound-across-pid-namespaces`, filed
+2026-09-28 while exploring the out-of-process plugin and removed from `TODO.md`
+with this entry.
+
+**The bug.** `db::readers` decided a foreign reader's liveness from
+`kill( pid, 0 )` plus the process start time in field 22 of `/proc/<pid>/stat`.
+**Both are relative to a PID namespace.** A reader in another container registers
+the pid it sees inside its own; the writer probes that number in *its* namespace
+and reaches an unrelated process or none; the recorded start time then positively
+disagrees, the identity check refutes, and the reader is **declared dead** -- its
+reclamation floor released and its extents reused underneath it, which this
+module's own header names as the unsafe direction. Sound until now only because
+every caller was in-process or a PostgreSQL backend forked on the same host.
+
+**The fix is a `flock` per slot**, in `READERS.locks/<slot>`, held for the
+registration's whole life. The kernel releases it when the holder dies
+**regardless of namespace**, because the lock belongs to the open file
+description rather than to a pid -- so it answers exactly where the pid cannot,
+and it has nothing to say about pid reuse because it never consults one. This is
+the fix the backlog item proposed; what follows is what building it actually
+decided.
+
+**Liveness is a disjunction, and that is the safety argument.** A slot is live if
+the lock is held **or** the pid says so. Strictly weaker than either half alone,
+so the predicate can only call *more* slots live than before, never fewer: the
+change cannot introduce a new direction in which a reader is reclaimed
+underneath. That is also why all twelve pre-existing tests passed untouched, and
+why keeping the pid half was not optional -- a reader from a build without lock
+files holds none, and the pid is the only thing that can see it. The lock is
+probed only after the pid half says "gone", so the extra `open` plus `flock`
+falls solely on slots that were about to be reclaimed.
+
+**`flock` over `fcntl` byte-range locking, for two reasons and the second decided
+it.** Ranges would have kept everything inside the one `READERS` file, which is
+tidier. But they need `struct flock`, whose layout is padded and platform-varying
+-- and I had just removed the `libc` dependency from the core that morning, so it
+would have been hand-declared. A wrong `struct` layout is silently wrong, where a
+wrong `fn` signature of two ints is not; `flock( int, int )` is the same shape as
+the `kill` already declared there. The deciding reason is semantic: **`flock`
+locks belong to the open file description, so two separate opens in one process
+conflict**, whereas classic `fcntl` locks are per-process and a writer probing its
+own reader's lock would find it free and declare itself dead. The convenient
+primitive was the data-losing one. The unit test exercises precisely that
+same-process case, which is the harder of the two.
+
+**Every uncertainty answers "held".** `slot_lock_is_held` returns `false` in
+exactly two situations -- the lock file does not exist, so no lock-taking build
+ever claimed the slot; or the lock was **acquired here**, which proves nobody had
+it. An open that fails for any other reason, and a failing `flock`, both answer
+`true`. That also means no `errno` is needed anywhere: contention and "locking is
+broken here" are indistinguishable and want the same verdict, so `EWOULDBLOCK` --
+11 on Linux, 35 on Darwin -- never has to be named. Hardcoding it was the
+alternative, and the existing `is_eperm` had already had to split on the accessor
+name for the same family of reasons.
+
+**The lock files are never unlinked, and that is correctness rather than
+laziness.** A holder's lock lives on the inode. Remove the file and the next
+prober creates a *fresh* one at that path, locks it, and concludes the slot is
+free while the real holder is still reading. `drop` releases and leaves the file;
+an unlocked file is exactly the "nobody holds it" answer.
+`a_lock_file_left_behind_by_a_dead_reader_pins_nothing` is what keeps the other
+half true -- if a leftover file pinned, every slot ever used would hold the floor
+down for the life of the directory.
+
+**What this costs, stated rather than hidden.** Advisory locks are reliable on a
+local filesystem and **not to be trusted over NFS**, so the data directory may not
+live there. And where locking is unavailable entirely, `claim` proceeds *without*
+a lock rather than refusing: such a reader is exactly as protected as it was
+before this change. Refusing would have been the purer position and would make a
+working deployment stop opening readers at all, which is a worse failure than the
+one being fixed. `claim` distinguishes that case from losing a race for the slot
+by re-testing liveness -- if the slot is live now, a concurrent claimant won it
+and the next slot is the answer.
+
+**Not tested, deliberately: that the kernel releases the lock when a process
+dies.** No code of mine runs on that path; it is a kernel guarantee, and a test
+for it would be testing the kernel. What is tested is the wiring -- that dropping
+a registration releases the lock and frees the slot, that a refuted pid does not
+reclaim under a held lock, that a leftover file pins nothing, and that a slot with
+no lock file still falls back to the pid. The refuted-pid test reddens with the
+lock half removed, verified by removing it.
+
+**A PID namespace cannot be entered from a unit test, and does not need to be.**
+What the writer *observes* in that scenario is a slot whose pid is positively
+refuted, and that is forgeable with the existing `forge` helper. The test asserts
+the forgery actually refutes before relying on it, so it cannot pass by failing to
+set up.

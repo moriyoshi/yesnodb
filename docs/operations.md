@@ -11,7 +11,12 @@ readiness claim.
 - Put the data directory on a local filesystem with coherent `pwrite` and
   `MAP_SHARED` behavior.
 - Do not use NFS or another network filesystem. An mmap I/O failure can become
-  `SIGBUS`, which a process cannot recover from as an ordinary error.
+  `SIGBUS`, which a process cannot recover from as an ordinary error. There is a
+  second, independent reason: a reader in another process is kept visible to the
+  writer's space reclamation by an advisory lock on a file in the data directory,
+  and advisory locking is not dependable over a network filesystem. If it
+  silently does nothing, the writer can conclude that a running reader has gone
+  and reuse the space it is still reading.
 - Run one process per data directory. The database takes an exclusive file
   lock, so overlapping restarts fail deliberately.
 - Replication is asynchronous. It is not a backup and never provides zero RPO.

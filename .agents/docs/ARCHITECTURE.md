@@ -136,7 +136,11 @@ yesno/
         readers.rs              # cross-process reader registry: a foreign reader's
                                 #   ( pid, version, ckpt_seq ), plus an appended identity
                                 #   region pairing each slot with the reader's process
-                                #   start time, so a recycled pid no longer pins the floor.
+                                #   start time, so a recycled pid no longer pins the floor,
+                                #   plus a READERS.locks/ file per slot flock'd by its
+                                #   holder. Liveness is the disjunction of the two: the
+                                #   lock is what survives a PID namespace, the pid is what
+                                #   sees a reader from a build with no lock files.
                                 #   Reclamation condition 1 is enforced from process-local
                                 #   memory, so a reader in another process is invisible
                                 #   without this file.

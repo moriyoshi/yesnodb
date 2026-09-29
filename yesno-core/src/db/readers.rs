@@ -33,13 +33,63 @@
 //! coordinate: a slot is claimed with a compare-and-swap on its pid word, and
 //! nothing ever resizes or compacts.
 //!
-//! **Staleness is resolved by pid liveness, not by a heartbeat.** A reader
-//! that crashes leaves its slot populated for ever otherwise, and a heartbeat
-//! would make correctness depend on a timer — a reader merely *slow* would be
-//! declared dead and have its extents reclaimed underneath it. `kill(pid, 0)`
-//! answers the first half of the question that matters.
+//! Beside it, a `READERS.locks/` directory with one file per claimed slot,
+//! `flock`ed by its holder for the registration's whole life.
+//!
+//! **Staleness is resolved by liveness, not by a heartbeat.** A reader that
+//! crashes leaves its slot populated for ever otherwise, and a heartbeat would
+//! make correctness depend on a timer — a reader merely *slow* would be declared
+//! dead and have its extents reclaimed underneath it.
+//!
+//! # Liveness is a disjunction: the lock, or the pid
+//!
+//! A slot is live if **either** its `flock` is held **or** its pid says so, and
+//! both must say gone before reclamation is permitted. Taking the two together is
+//! strictly weaker than either alone, so the predicate can only ever call more
+//! slots live, never fewer — it adds no direction in which a reader is reclaimed
+//! underneath.
+//!
+//! **The lock is the one that is true across a PID namespace.** `kill(pid, 0)`
+//! and `/proc/<pid>/stat` are both relative to the caller's namespace, so a
+//! reader in another container registers a pid the writer resolves to an
+//! unrelated process or to nothing: the identity check then *positively* refutes
+//! the slot and the reader is declared dead, its floor released and its extents
+//! reused while it is still mapping them. That is the failure this file names as
+//! unsafe, arriving by the one route the pid can never report. The kernel
+//! releases an `flock` when the holding process dies **regardless of namespace**,
+//! because the lock belongs to the open file description rather than to a pid —
+//! so the lock answers correctly where the pid cannot, and it says nothing about
+//! pid reuse because it never consults one.
+//!
+//! **The pid half is kept because of older builds.** A reader from a build
+//! without lock files takes none, and its lock file does not exist; dropping the
+//! pid half would declare every such reader dead the moment a newer writer looked
+//! at it. Keeping both is what makes the two safe against one directory.
+//!
+//! The lock is probed only when the pid half has already said "gone", which is
+//! pure cost control: a slot whose pid is live and unrefuted is known live, so
+//! the `open` plus `flock` would buy nothing. The added syscalls therefore fall
+//! only on slots that were about to be reclaimed.
+//!
+//! **This puts a requirement on the filesystem**, and it is the price. Advisory
+//! locks are reliable on a local filesystem and are **not to be trusted over
+//! NFS**, so the data directory may not live there. Where locking is unavailable
+//! entirely, `claim` proceeds without a lock rather than refusing to open: such a
+//! reader is exactly as protected as it was before lock files existed, which is a
+//! worse position than this change intends and a far better one than no reader at
+//! all.
+//!
+//! **The lock files are never unlinked.** A holder's lock lives on the inode, so
+//! removing the file would let the next prober create a *fresh* one at that path,
+//! lock it, and conclude the slot is free while the real holder is still reading.
+//! `drop` releases the lock and leaves the file; an unlocked file is precisely the
+//! "nobody holds it" answer, and it pins nothing.
 //!
 //! # Pid reuse, and why a pid alone is not an identity
+//!
+//! This section describes the **fallback** half of the predicate above. It is
+//! still load-bearing — it is what judges a reader that holds no lock — and it is
+//! no longer the only witness.
 //!
 //! A pid is recycled, so a slot left by a crashed reader can name a live
 //! process that never registered. That direction costs space rather than
@@ -139,6 +189,14 @@ const TOTAL_BYTES: usize = IDENT_ENTRIES_OFF + MAX_READERS * IDENT_ENTRY_BYTES;
 pub struct ReaderRegistration {
     map: memmap2::MmapMut,
     slot: usize,
+    /// This slot's `flock`, held for the registration's whole life. It is what a
+    /// writer in another PID namespace can see; the kernel releases it on process
+    /// death regardless of namespace.
+    ///
+    /// `None` when locking is unavailable on this filesystem, in which case the
+    /// registration falls back to being visible through its pid alone — exactly
+    /// the protection it had before lock files existed.
+    lock: Option<std::fs::File>,
 }
 
 impl ReaderRegistration {
@@ -195,17 +253,38 @@ impl ReaderRegistration {
         for slot in 0..MAX_READERS {
             let off = slot * SLOT_BYTES;
             // Free, or held by a process that is gone — including one whose pid
-            // has since been recycled by an unrelated process.
-            if slot_is_live(&map, slot) {
+            // has since been recycled by an unrelated process, and including one
+            // in another PID namespace, which only the lock can report.
+            if slot_is_live(dir, &map, slot) {
                 continue;
             }
+            // Taken **before** the pid is published, so no writer can ever see a
+            // claimed slot whose lock is not yet held. The reverse order would
+            // open a window in which a cross-namespace probe finds a dead-looking
+            // pid and no lock, which is the reclaim-underneath-a-live-reader case.
+            let lock = match hold_slot_lock(dir, slot) {
+                Some(lock) => Some(lock),
+                // The slot looked free a moment ago and the lock is not available.
+                // Two causes, and they want opposite responses, so distinguish them
+                // by looking again: if the slot is live now, a concurrent claimant
+                // won it and the next slot is the answer.
+                None if slot_is_live(dir, &map, slot) => continue,
+                // Otherwise locking itself is unavailable here — a filesystem
+                // without `flock`, or a directory that cannot be created. Claiming
+                // anyway is deliberate: it leaves this reader exactly as protected
+                // as it was before lock files existed, whereas refusing would make
+                // a working configuration stop opening readers at all. The cost is
+                // the namespace exposure this change exists to remove, so it is
+                // narrowed to the case where the alternative is no reader.
+                None => None,
+            };
             write_u64(&mut map, off + 8, version);
             write_u64(&mut map, off + 16, ckpt_seq);
             let ident = IDENT_ENTRIES_OFF + slot * IDENT_ENTRY_BYTES;
             write_u64(&mut map, ident, me);
             write_u64(&mut map, ident + 8, my_start);
             write_u64(&mut map, off, me);
-            return Ok(ReaderRegistration { map, slot });
+            return Ok(ReaderRegistration { map, slot, lock });
         }
         Err(CodecError::Invariant(
             "the reader registry is full; no slot is free",
@@ -222,6 +301,13 @@ impl Drop for ReaderRegistration {
         // after that would erase it. Zeroing the identity while the pid is
         // still set only degrades the slot to pid-only liveness, which is
         // conservative.
+        // Released before the pid is zeroed, which keeps the ordering claim in
+        // `slot_is_live` true: a nonzero pid always has its lock either held or
+        // belonging to a process that is still alive. In the window between the
+        // two a probe sees a live pid and answers "live", which is conservative.
+        // The file is left in place -- unlinking it would let a later prober
+        // create and lock a fresh inode while a real holder still had the old one.
+        drop(self.lock.take());
         let ident = IDENT_ENTRIES_OFF + self.slot * IDENT_ENTRY_BYTES;
         if ident + IDENT_ENTRY_BYTES <= self.map.len() {
             write_u64(&mut self.map, ident, 0);
@@ -260,7 +346,7 @@ pub fn floors(dir: &Path) -> Option<(u64, u64)> {
     let mut any = false;
     for slot in 0..MAX_READERS {
         let off = slot * SLOT_BYTES;
-        if !slot_is_live(&map, slot) {
+        if !slot_is_live(dir, &map, slot) {
             continue;
         }
         any = true;
@@ -272,16 +358,41 @@ pub fn floors(dir: &Path) -> Option<(u64, u64)> {
 
 /// Whether a slot names a reader that is still running.
 ///
-/// The conservative predicate. `false` — which permits reclamation — is
-/// returned only for a free slot, a pid that no longer exists, or a pid whose
-/// recorded and actual start times are both known, both nonzero, and different.
-/// Everything else is `true`.
-fn slot_is_live(map: &[u8], slot: usize) -> bool {
+/// The conservative predicate, and it is a **disjunction**: a slot is live if its
+/// lock is held *or* its pid says so. Both must say gone before reclamation is
+/// permitted, which makes this strictly weaker than the pid-only test it replaced
+/// — it can only ever call more slots live, never fewer, so it introduces no new
+/// direction in which a reader can be reclaimed underneath.
+///
+/// # Why the pid half is kept at all
+///
+/// A reader from a build that predates the lock files takes no lock, and its
+/// lock file does not exist, so the lock half answers "not held". Dropping the pid
+/// half would declare every such reader dead the moment a newer writer looked at
+/// it. Keeping both is what makes the two builds safe to run against one
+/// directory.
+///
+/// # Why the lock half comes second
+///
+/// Purely cost. The lock probe is an `open` plus an `flock`, and a slot whose pid
+/// is live and unrefuted is already known to be live, so the probe would buy
+/// nothing. Evaluating it only when the pid half says "gone" means the added
+/// syscalls fall exclusively on slots that were about to be reclaimed — rare, and
+/// precisely the population where being wrong costs data.
+fn slot_is_live(dir: &Path, map: &[u8], slot: usize) -> bool {
     let pid = read_u64(map, slot * SLOT_BYTES);
-    if pid == 0 || !pid_is_live(pid) {
+    if pid == 0 {
+        // Never claimed, or released. No lock can be outstanding: `drop` zeroes
+        // the pid *after* releasing, and `claim` takes the lock *before* writing
+        // one, so a zero pid means no holder in either direction.
         return false;
     }
-    !identity_refutes(recorded_start(map, slot, pid), proc_start_time(pid))
+    if pid_is_live(pid) && !identity_refutes(recorded_start(map, slot, pid), proc_start_time(pid)) {
+        return true;
+    }
+    // The pid says gone. On one host that is the truth; across a PID namespace it
+    // is an artefact of asking in the wrong namespace, and the lock is what knows.
+    slot_lock_is_held(dir, slot)
 }
 
 /// Whether the two start times **prove** the slot's reader is gone.
@@ -369,6 +480,121 @@ fn parse_start_time(stat: &str) -> Option<u64> {
 /// `kill(pid, 0)` rather than a `/proc` lookup: it is one syscall, it is
 /// portable across the platforms this crate supports, and `EPERM` — a process
 /// this user may not signal — correctly reads as *alive*.
+/// Directory holding one lock file per claimed slot, beside `READERS`.
+///
+/// A subdirectory rather than `READERS.<slot>.lock` beside the registry, so a
+/// data directory listing stays readable with a few thousand possible slots.
+const LOCKS_DIR: &str = "READERS.locks";
+
+fn slot_lock_path(dir: &Path, slot: usize) -> std::path::PathBuf {
+    dir.join(LOCKS_DIR).join(format!("{slot:04}"))
+}
+
+/// Take this process's lock on `slot`, to be held for the registration's life.
+///
+/// `None` means the lock could not be taken, and the caller must treat the slot
+/// as unavailable: either another process is holding it — which is precisely the
+/// case pid liveness cannot see — or the lock could not be created at all, and a
+/// claim that proceeded would be a reader nobody can prove is alive.
+///
+/// Creating the file is idempotent and it is **never removed**; see
+/// [`slot_lock_is_held`] for why unlinking would be unsafe.
+fn hold_slot_lock(dir: &Path, slot: usize) -> Option<std::fs::File> {
+    let path = slot_lock_path(dir, slot);
+    let _ = std::fs::create_dir_all(path.parent()?);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    flock_exclusive_nonblocking(&file).then_some(file)
+}
+
+/// Whether some live process holds `slot`'s lock.
+///
+/// # Why this is the liveness test worth having
+///
+/// The kernel releases an `flock` when the holding process dies, **whatever PID
+/// namespace it was in**, because the lock belongs to the open file description
+/// and not to a pid. So this answers the question `kill( pid, 0 )` only
+/// approximates, and it answers it correctly for a reader in a container, where
+/// the recorded pid names an unrelated process in the writer's namespace or none
+/// at all. It also has nothing to say about pid reuse, because it never consults
+/// a pid.
+///
+/// # Every uncertainty answers "held"
+///
+/// The unsafe direction is reporting a live reader as gone, so only two things
+/// yield `false`: the lock file does not exist, meaning no build that takes locks
+/// ever claimed this slot; or the lock was **acquired here**, which proves nobody
+/// held it. An open that fails for any other reason answers `true`, as does a
+/// failed `flock` — including a filesystem that does not implement locking, where
+/// answering `false` would silently reclaim under every foreign reader at once.
+///
+/// This deliberately needs no `errno`. `flock` failing is indistinguishable from
+/// contention here on purpose: both mean "cannot prove nobody holds it", which is
+/// the same verdict, so the `EWOULDBLOCK` value — 11 on Linux and 35 on Darwin —
+/// never has to be named.
+///
+/// # The lock files are never unlinked
+///
+/// Removing one would be a correctness bug, not tidiness. A holder's lock lives
+/// on the inode; unlink it and the next prober creates a *new* file at that path,
+/// locks it successfully, and concludes the slot is free while the old holder is
+/// still reading. So `drop` releases the lock and leaves the file, and an
+/// unlocked file is exactly the "nobody holds it" answer.
+fn slot_lock_is_held(dir: &Path, slot: usize) -> bool {
+    let file = match std::fs::File::open(slot_lock_path(dir, slot)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if !flock_exclusive_nonblocking(&file) {
+        return true;
+    }
+    // Acquired, so it was free. Dropping `file` releases it; unlocking first
+    // keeps that explicit rather than resting on the close.
+    // SAFETY: a live descriptor this function owns.
+    unsafe { libc_flock(std::os::fd::AsRawFd::as_raw_fd(&file), LOCK_UN) };
+    false
+}
+
+/// `flock( fd, LOCK_EX | LOCK_NB )`, as a bool: did we get it.
+fn flock_exclusive_nonblocking(file: &std::fs::File) -> bool {
+    // SAFETY: `flock` takes a borrowed descriptor and an integer and writes no
+    // memory. `file` outlives the call.
+    let rc = unsafe { libc_flock(std::os::fd::AsRawFd::as_raw_fd(file), LOCK_EX | LOCK_NB) };
+    rc == 0
+}
+
+// `flock` is declared here rather than through the `libc` crate, for the reason
+// the `kill` declaration below gives: `yesno-core` promises five direct
+// dependencies and `scripts/check-lean-core.sh` fails if it gains a sixth.
+//
+// **`flock` was chosen over `fcntl` byte-range locking partly for this.** Ranges
+// would have kept everything in the one `READERS` file, but they need
+// `struct flock`, whose layout is padded ( `l_type`, `l_whence`, a four-byte hole,
+// `l_start`, `l_len`, `l_pid` ) and differs across platforms — exactly the kind of
+// declaration that is silently wrong rather than loudly wrong. `flock` is two
+// integers, like `kill`. The other half of the reason is semantic and decided it
+// anyway: `flock` locks belong to the **open file description**, so two separate
+// opens in one process conflict, whereas classic `fcntl` locks are per-process and
+// a writer probing its own reader's lock would find it free and declare itself
+// dead. That is the data-losing direction, reached by using the more convenient
+// primitive.
+extern "C" {
+    #[link_name = "flock"]
+    fn libc_flock(fd: i32, operation: i32) -> i32;
+}
+
+// LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 -- the same values on Linux, Darwin
+// and the BSDs.
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+const LOCK_UN: i32 = 8;
+
 fn pid_is_live(pid: u64) -> bool {
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
@@ -773,5 +999,135 @@ mod tests {
         assert_eq!(parse_start_time(""), None);
         assert_eq!(parse_start_time("42 (cat) R 1 2"), None);
         assert_eq!(parse_start_time("no parens at all"), None);
+    }
+
+    /// The PID-namespace case, which is the whole reason the locks exist.
+    ///
+    /// A reader in a container registers the pid it sees in its **own**
+    /// namespace. The writer probes that number in *its* namespace and reaches an
+    /// unrelated process or none, so `kill( pid, 0 )` and the recorded start time
+    /// both say "gone" and the old predicate declared the reader dead -- releasing
+    /// its reclamation floor and reusing its extents underneath it, the one
+    /// direction `db::readers` names as unsafe.
+    ///
+    /// A test cannot enter a PID namespace, but it does not need to: what the
+    /// writer *observes* is a slot whose pid is positively refuted, and that is
+    /// forgeable. The lock is real, held by this process, and is the only thing
+    /// left that knows the reader is alive.
+    #[test]
+    fn a_slot_whose_pid_is_refuted_is_still_live_while_its_lock_is_held() {
+        let d = tmp("nslive");
+        let me = std::process::id() as u64;
+        let r = ReaderRegistration::claim(&d, 5, 3).unwrap();
+        assert!(
+            r.lock.is_some(),
+            "the fixture needs a filesystem that supports flock"
+        );
+        let Some(real) = proc_start_time(me) else {
+            return; // No `/proc`: nothing can be refuted, so nothing to assert.
+        };
+
+        // Exactly what a cross-namespace probe sees: the slot's pid names some
+        // other process, so the identity check refutes it.
+        let mut map = forge(&d);
+        write_u64(&mut map, IDENT_ENTRIES_OFF + 8, real.wrapping_add(1));
+        map.flush().unwrap();
+        drop(map);
+        assert!(
+            identity_refutes(Some(real.wrapping_add(1)), Some(real)),
+            "the forgery must actually refute, or this test proves nothing"
+        );
+
+        assert_eq!(
+            floors(&d),
+            Some((5, 3)),
+            "a refuted pid must not reclaim under a reader whose lock is held"
+        );
+
+        // And the slot is not claimable while that lock is outstanding.
+        let other = ReaderRegistration::claim(&d, 9, 9).unwrap();
+        assert_ne!(
+            other.slot, r.slot,
+            "a locked slot must not be handed to a second reader"
+        );
+    }
+
+    /// The complement: releasing must actually release, or the fix trades a
+    /// data-loss bug for a slot that can never be reused.
+    #[test]
+    fn dropping_a_registration_releases_its_lock_and_frees_the_slot() {
+        let d = tmp("nsfree");
+        let slot = {
+            let r = ReaderRegistration::claim(&d, 5, 3).unwrap();
+            assert!(slot_lock_is_held(&d, r.slot), "held while registered");
+            r.slot
+        };
+        assert!(
+            !slot_lock_is_held(&d, slot),
+            "the lock must be released when the registration drops"
+        );
+        // The file itself stays: unlinking it would let a later prober lock a
+        // fresh inode while a real holder still had the old one.
+        assert!(
+            slot_lock_path(&d, slot).exists(),
+            "the lock file is deliberately never removed"
+        );
+        assert_eq!(floors(&d), None, "and the slot imposes no floor");
+        assert_eq!(
+            ReaderRegistration::claim(&d, 7, 7).unwrap().slot,
+            slot,
+            "the released slot is the one reused"
+        );
+    }
+
+    /// An unlocked lock file must not pin anything.
+    ///
+    /// The file outlives its holder by design, so "the file exists" has to mean
+    /// nothing on its own. If it pinned, every slot ever used would hold the
+    /// reclamation floor down for the life of the directory.
+    #[test]
+    fn a_lock_file_left_behind_by_a_dead_reader_pins_nothing() {
+        let d = tmp("nsstale");
+        {
+            let _r = ReaderRegistration::claim(&d, 5, 3).unwrap();
+        }
+        // The slot's pid is zeroed by `drop`; forge a dead one back in, which is
+        // what a crashed reader leaves.
+        let mut map = forge(&d);
+        write_u64(&mut map, 0, 0xffff_fffe);
+        map.flush().unwrap();
+        drop(map);
+        assert!(slot_lock_path(&d, 0).exists(), "the file is still there");
+        assert!(!slot_lock_is_held(&d, 0), "but nobody holds it");
+        assert_eq!(
+            floors(&d),
+            None,
+            "a leftover lock file must not impose a floor"
+        );
+    }
+
+    /// A slot never claimed has no lock file, and that must read as "not held"
+    /// rather than as an error -- it is how a reader from a build without lock
+    /// files looks, and that reader must still be judged by its pid.
+    #[test]
+    fn a_slot_with_no_lock_file_falls_back_to_pid_liveness() {
+        let d = tmp("nslegacy");
+        // No registration, so no lock file anywhere.
+        std::fs::write(d.join("READERS"), vec![0u8; TOTAL_BYTES]).unwrap();
+        assert!(!slot_lock_is_held(&d, 0));
+
+        // A live pid with no lock file is still live: this is the old build's
+        // reader, and dropping the pid half would declare it dead.
+        let mut map = forge(&d);
+        write_u64(&mut map, 0, std::process::id() as u64);
+        write_u64(&mut map, 8, 11);
+        write_u64(&mut map, 16, 4);
+        map.flush().unwrap();
+        drop(map);
+        assert_eq!(
+            floors(&d),
+            Some((11, 4)),
+            "a lock-less reader must still be seen through its pid"
+        );
     }
 }
