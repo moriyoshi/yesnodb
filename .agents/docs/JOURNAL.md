@@ -7710,3 +7710,88 @@ being discovered at 8 direct dependencies with no way to tell which were intende
 
 **Still open**: `foreign-reader-liveness-is-unsound-across-pid-namespaces`, which
 is what I had actually sat down to fix.
+
+## 2026-09-29 -- a WAL rotation race, and why it is probably not the archive ENOENT it was found chasing
+
+**Second occurrence of the archive sidecar failure**, this time in `archive.py`
+rather than `pitr_retention.py`, and **with no second gate running beside it**:
+
+```text
+  RuntimeError: srv_archive_wait(): yesno returned an error:
+      No such file or directory ( os error 2 )
+```
+
+That weakens the contention explanation the filed item rests on. It passes 3/3 in
+isolation at ~38 s, so the trigger is still load -- but the gate's own 41-scenario
+run is enough, and the earlier entry's "two gates at once" framing made the bar
+look higher than it is. Not mine: it predates today's changes, first seen
+2026-09-28.
+
+**The filed item's ask was to capture which path is missing, and that is now
+done.** `std::io::Error` carries no path -- `File::open( p )` failing yields
+exactly "No such file or directory ( os error 2 )" -- and `ArchiveError` is
+`Box<dyn Error>`, so the `?` that boxes it is precisely where the only
+identifying information is lost. The sidecar is a **detached task** whose error
+surfaces through a metric wait seconds later in another process, so that string is
+the entire report. `archive::ctx` and `sidecar::ctx` now attach the path at every
+filesystem site in those two files.
+
+**The strongest suspect is the direct-path snapshot flow**, `sidecar.rs`: the
+server names a snapshot file on shared storage and the sidecar stats it, so a
+lease release or checkpoint cleanup landing between the two is exactly a bare
+`ENOENT` on a path the sidecar never chose. Not confirmed -- said as a suspect,
+which is what the next occurrence will settle now that the path is printed.
+
+# The bug this actually found, which is a different one
+
+Reading for the ENOENT's origin, I traced `log_bounds` -> `catalog` ->
+`discover_generations` in `wal/writer.rs` and found a real defect:
+
+```rust
+for entry in std::fs::read_dir( parent )? {
+    ...
+    len: entry.metadata().map_err( io_err )?.len(),   // ENOENT if recycled
+```
+
+**`catalog` is built to tolerate exactly this and its helper defeated it.** That
+function reads the sealed-generation list on both sides of opening the active
+file and retries up to eight times when the two disagree, precisely so rollover
+cannot be observed half-done; it even treats `NotFound` on the *active* file as
+length zero. But listing a directory and stat-ing each entry are two steps, and a
+generation recycled between them makes `DirEntry::metadata` return `ENOENT` --
+which went straight out through the retry loop that exists for this condition.
+
+`discover_generations` now returns `Option`, `None` meaning "the directory changed
+while being listed", and `catalog` retries. **Returning `None` rather than
+skipping the entry is load-bearing**: skipping yields a list with a hole, and the
+contiguity check would then reject it as `WAL generations are not contiguous` --
+converting a transient race into a different hard error that reads like
+corruption. Only `NotFound` is tolerated; a permission or I/O failure is not a
+race and retrying it eight times would only delay the report.
+`discover_generations_stable` is the retrying wrapper for the two callers not
+already inside `catalog`'s loop.
+
+**It is probably not the archive failure, and saying so is the point.** `io_err`
+maps `NotFound` to the string `write-ahead log not found`, while the observed
+message is the raw `No such file or directory ( os error 2 )` -- a bare
+`io::Error`, so it came from a `?` in the archive path, not from here. I had
+written most of a diagnosis claiming this *was* the cause before checking what
+`io_err` actually produces. **A mechanism that would explain the symptom is not
+evidence that it did**, which is a lesson this journal already records from
+another direction; the cheap discriminator was the error string, and it took one
+grep.
+
+So this lands as an independently real bug with its own test, and
+`the-archive-sidecar-fails-with-enoent-under-load` stays open with better
+instrumentation and one more data point.
+
+**The test is a stress test, deliberately.** There is no deterministic hook
+between the `read_dir` and the `metadata`, so
+`reading_wal_bounds_while_generations_rotate_never_reports_a_missing_file`
+churns a sealed generation while reading bounds 4000 times. It reddens on the
+unfixed code within a few hundred iterations, verified by restoring it. Its
+assertion is on the **error kind, not on success**: under that much churn
+`catalog` may legitimately exhaust its eight attempts and say the generations
+changed continuously, which is a true statement about a directory being rewritten
+in a tight loop. What must never happen is a read failing because a file it merely
+*listed* went away.

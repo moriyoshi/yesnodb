@@ -226,6 +226,17 @@ pub struct ArchiveOptions {
 ///
 /// A bare number is refused. "Retention 7" is seven of something, and every
 /// wrong guess about which deletes recoverable history.
+/// Attach the path to an `io::Error` before it is boxed into [`ArchiveError`].
+///
+/// The sidecar is a detached task: its error surfaces through a metric wait,
+/// seconds later and in another process, so the `Display` string is the whole
+/// report. `std::io::Error` carries no path and `ArchiveError` is a boxed
+/// `dyn Error`, so the `?` that boxes it is exactly where the only identifying
+/// information is lost. Mirrors `archive::ctx`.
+fn ctx(doing: &str, path: &std::path::Path, error: std::io::Error) -> ArchiveError {
+    format!("cannot {doing} '{}': {error}", path.display()).into()
+}
+
 pub(crate) fn parse_duration_micros(text: &str) -> Result<u64, ArchiveError> {
     let text = text.trim();
     let (digits, unit) = text.split_at(text.len().saturating_sub(1));
@@ -735,7 +746,14 @@ async fn materialize_snapshot(
                 {
                     return Err("direct snapshot path does not name the requested file".into());
                 }
-                let size = tokio::fs::metadata(&path).await?.len();
+                // Named by the server and stat-ed here, so the file can be
+                // released between the two. Without the path this is a bare
+                // "No such file or directory ( os error 2 )" from a detached
+                // task -- see `the-archive-sidecar-fails-with-enoent-under-load`.
+                let size = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|e| ctx("stat the direct snapshot file", &path, e))?
+                    .len();
                 if size != expected.size {
                     return Err(format!(
                         "direct snapshot file '{}' is {size} bytes, lease says {}",
@@ -755,9 +773,13 @@ async fn materialize_snapshot(
                     return Err("snapshot response mixed direct paths and streamed files".into());
                 }
                 streamed = true;
-                tokio::fs::create_dir_all(target).await?;
+                tokio::fs::create_dir_all(target)
+                    .await
+                    .map_err(|e| ctx("create the snapshot target directory", target, e))?;
                 let path = target.join(&expected.name);
-                let mut file = tokio::fs::File::create(&path).await?;
+                let mut file = tokio::fs::File::create(&path)
+                    .await
+                    .map_err(|e| ctx("create the snapshot file", &path, e))?;
                 let mut offset = 0u64;
                 let mut chunk = first;
                 let mut data = data;

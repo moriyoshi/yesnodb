@@ -740,6 +740,14 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
   **Why it is filed rather than dismissed.** The failing path is the archiver, which nothing in that session's changes touches, so contention is the likely explanation -- but "likely" is not the same as shown, and an `ENOENT` escaping a background task is a different kind of event from a slow one. If the archiver assumes a file it is about to read cannot have been rotated or removed underneath it, load only makes that visible rather than causing it. The next occurrence should capture which path was missing, which the current message does not say.
 
+  **Second occurrence 2026-09-29, in `archive.py`, with only one gate running.** Same verb, same `Ok( Err( error ) )` arm, same bare message. **That weakens the contention framing above**: the gate's own 41-scenario run is load enough, and "two gates at once" set the bar higher than the failure needs. Still passes 3/3 in isolation at ~38 s, so load remains the trigger rather than the cause.
+
+  **The "capture which path" ask is now done.** `std::io::Error` carries no path and `ArchiveError` is a boxed `dyn Error`, so the `?` that boxes it was where the only identifying information was lost -- and the sidecar is a detached task whose error surfaces through a metric wait in another process, so that string is the whole report. `archive::ctx` and `sidecar::ctx` attach the path at every filesystem site in those two files. **The next occurrence will name the file.**
+
+  **Strongest suspect, unconfirmed**: the direct-path snapshot flow in `sidecar.rs`, where the server names a snapshot file on shared storage and the sidecar stats it -- a lease release or checkpoint cleanup landing between the two is exactly a bare `ENOENT` on a path the sidecar never chose.
+
+  **Do not confuse this with the WAL rotation race fixed the same day** ( `discover_generations`, JOURNAL 2026-09-29 ). That one was found while reading for this one and is genuinely a bug, but `io_err` maps `NotFound` to `write-ahead log not found` while this failure reports the raw `No such file or directory ( os error 2 )`, so they are different sites. Fixing it did not close this.
+
   **Immediate operational note**, independent of the cause: **do not run the two gates concurrently.** The rule requiring both does not say "at once", and a timing-sensitive scenario failing for want of CPU costs a re-run and reads as a real failure.
 
 ### Storage

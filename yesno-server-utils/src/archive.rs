@@ -26,6 +26,23 @@ pub mod pb {
 /// One sidecar failure, safe to move across its asynchronous worker tasks.
 pub type ArchiveError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Attach the path to an `io::Error` before it is boxed into [`ArchiveError`].
+///
+/// **`std::io::Error` carries no path.** `File::open( p )` failing yields
+/// exactly "No such file or directory ( os error 2 )", and `ArchiveError` is a
+/// boxed `dyn Error`, so the `?` that boxes it is where the only identifying
+/// information is lost. The archiver runs as a detached task whose error
+/// surfaces through a metric wait many seconds later and in another process, so
+/// that string is the entire report.
+///
+/// This is not hypothetical. The sidecar died with a bare `os error 2` twice --
+/// `pitr_retention.py` on 2026-09-28 and `archive.py` on 2026-09-29 -- and
+/// neither occurrence could say **which** file was missing, so neither could be
+/// diagnosed. See `the-archive-sidecar-fails-with-enoent-under-load`.
+fn ctx(doing: &str, path: &std::path::Path, error: std::io::Error) -> ArchiveError {
+    format!("cannot {doing} '{}': {error}", path.display()).into()
+}
+
 /// Archive metadata schema emitted by this version of the sidecar.
 pub const SCHEMA_VERSION: u32 = 2;
 const MULTIPART_BYTES: usize = 8 * 1024 * 1024;
@@ -411,7 +428,10 @@ impl ArchiveStore {
     }
 
     async fn put_file(&self, source: &Path, key: &str) -> Result<UploadedFile, ArchiveError> {
-        let size = tokio::fs::metadata(source).await?.len();
+        let size = tokio::fs::metadata(source)
+            .await
+            .map_err(|e| ctx("stat the upload source", source, e))?
+            .len();
         if size == 0 {
             self.inner
                 .put(&self.path(key), PutPayload::from(Vec::<u8>::new()))
@@ -419,7 +439,9 @@ impl ArchiveStore {
             return Ok(UploadedFile { size, crc32c: 0 });
         }
 
-        let mut source_file = tokio::fs::File::open(source).await?;
+        let mut source_file = tokio::fs::File::open(source)
+            .await
+            .map_err(|e| ctx("open the upload source", source, e))?;
         let mut upload = self.inner.put_multipart(&self.path(key)).await?;
         let mut checksum = 0u32;
         let mut transferred = 0u64;
@@ -520,9 +542,11 @@ pub fn inspect_base(dir: &Path) -> Result<BaseInspection, ArchiveError> {
     let mut commit_clock = 0u64;
     let mut wal_cursors = Vec::with_capacity(shard_images.len());
     for (shard, image) in shard_images {
-        let mut file = std::fs::File::open(&image)?;
+        let mut file =
+            std::fs::File::open(&image).map_err(|e| ctx("open the shard image", &image, e))?;
         let mut head = vec![0u8; 2 * yesno_core::store::PAGE];
-        file.read_exact(&mut head)?;
+        file.read_exact(&mut head)
+            .map_err(|e| ctx("read the shard image superblock", &image, e))?;
         let page = yesno_core::store::PAGE;
         let superblock = yesno_core::store::superblock::pick(&head[..page], &head[page..])?
             .ok_or_else(|| format!("'{}' has no readable superblock", image.display()))?;
@@ -759,7 +783,7 @@ fn uuid_hex(uuid: &[u8]) -> Result<String, ArchiveError> {
 
 fn database_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, ArchiveError> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for entry in std::fs::read_dir(dir).map_err(|e| ctx("list the image directory", dir, e))? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -783,17 +807,24 @@ async fn write_local_state(path: &Path, bytes: Vec<u8>) -> Result<(), ArchiveErr
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ctx("create the state directory", parent, e))?;
         let name = path
             .file_name()
             .ok_or_else(|| format!("state path '{}' has no file name", path.display()))?;
         let temporary = parent.join(format!(".{}.partial", name.to_string_lossy()));
-        let mut file = std::fs::File::create(&temporary)?;
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|e| ctx("create the state temporary", &temporary, e))?;
         use std::io::Write as _;
         file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        file.sync_all()
+            .map_err(|e| ctx("sync the state temporary", &temporary, e))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|e| ctx("rename the state temporary", &temporary, e))?;
+        std::fs::File::open(parent)
+            .map_err(|e| ctx("open the state directory to sync it", parent, e))?
+            .sync_all()
+            .map_err(|e| ctx("sync the state directory", parent, e))?;
         Ok(())
     })
     .await??;
