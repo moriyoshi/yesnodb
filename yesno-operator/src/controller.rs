@@ -1854,6 +1854,9 @@ mod tests {
             resources: None,
             ports: Vec::new(),
             run_as_user: Some(2000),
+            readiness_probe: None,
+            liveness_probe: None,
+            startup_probe: None,
             channel: crate::api::PluginChannelSpec::default(),
         });
         assert!(

@@ -8627,3 +8627,53 @@ comment was retargeted to `backup.md`, where the statement actually is, and the
 gap was left open rather than filled in as part of a move.
 
 ---
+
+## 2026-09-30 -- Phase 2: the peer's readiness is not the daemon's
+
+`readinessProbe`, `livenessProbe` and `startupProbe` on `PluginSpec`, passed
+through verbatim, plus the readiness and shutdown semantics written into the
+CRD's own documentation.
+
+**The operator synthesises no probe, and that is the decision rather than an
+omission.** Two candidates exist and both are wrong. Probing the channel socket
+reports ready while nothing can be answered -- `yesnod` binds it *before* it
+opens the database, so a peer connects at once and is told `UNAVAILABLE` by every
+request until startup finishes and again through a rebootstrap. Probing `yesnod`
+makes the **whole Pod** unready for the duration of a rebuild, which is arguably
+right for a peer answering queries and plainly wrong for one that scores in the
+background. The operator cannot tell those two apart, so the choice belongs to
+whoever wrote the peer, and omitting a probe leaves Kubernetes' own default
+rather than a decision made here.
+
+`plugin_probes_are_passed_through_and_never_synthesised` asserts both halves --
+what the spec gives arrives unchanged, and what it omits stays omitted. The
+second half is the one that would rot: adding a "helpful" default later would
+look like an improvement and would silently couple every peer's readiness to the
+daemon's.
+
+**Two premises checked rather than trusted, which is becoming the routine.** The
+plan said the Pod's grace period should be at least `shutdownGraceSecs`; it
+already was, `+ 10`, from before Phase 1, and it is Pod-wide so the sidecar shares
+it. And the plan still described teardown as draining plugin leases -- **the drain
+went with the in-process facility on 2026-09-29**. Corrected in place with a note,
+because a design document that describes a mechanism which no longer exists is
+how a later session reimplements it.
+
+**`the_peer_is_a_plain_container_with_no_ordering`** records why there is no
+restartable `initContainer`. Those exist to start a dependency *before* the main
+container; the dependency runs the other way here -- the peer needs `yesnod`,
+`yesnod` needs nothing from the peer, and the peer must retry through
+`UNAVAILABLE` regardless. Ordering it first would make Pod startup wait on
+something that cannot yet succeed.
+
+**The CRD grew 533 -> 856 lines**, almost entirely three embedded `Probe` schemas.
+Worth paying rather than narrowing them to a subset the operator would then have
+to map into a real `Probe`: a peer's health check is the peer author's business,
+and a narrowed copy is a second definition to keep in step. The
+`checked_in_crd_matches_the_rust_api` test caught the regeneration twice in this
+phase, which is the second day it has earned its place.
+
+Promotion restarting the peer is documented on the CRD rather than in `docs/`,
+partly because that is where a user reads a field's contract and partly because
+another session is mid-way through splitting `docs/operations.md` into a
+directory; editing it now would collide with work in progress.

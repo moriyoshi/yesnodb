@@ -204,6 +204,18 @@ belt-and-braces rather than the mechanism.
 
 ## Phase 2: readiness, ordering, and the thing most likely to be got wrong
 
+**DONE 2026-09-30.** `readinessProbe`, `livenessProbe` and `startupProbe` on
+`PluginSpec`, passed through verbatim; the readiness and promotion semantics
+written into the CRD's own documentation, which is where a user reads them; two
+tests. The grace period already covered this -- it was `shutdownGraceSecs + 10`
+before Phase 1 and is Pod-wide, so the sidecar shares it.
+
+The CRD grew 533 -> 856 lines, almost all of it three embedded `Probe` schemas.
+That is the price of passing probes through instead of narrowing them to a
+subset the operator would then have to map, and it is worth paying: a peer's
+health check is the peer author's business.
+
+
 **Socket existence is not readiness.** `plugin::wire` binds the socket *before*
 the database opens, so a peer can connect immediately and get `UNAVAILABLE` from
 every request until `yesnod` finishes opening -- and again for the duration of a
@@ -224,8 +236,11 @@ it. So:
   operator-side wait should key on.
 
 **Shutdown needs no ordering, and this is a property of the design worth
-recording.** Teardown drains plugin leases and then stops the channel; closing a
-peer's socket is what releases its snapshots. So if the plugin container dies
+recording.** Teardown closes the channel, and closing a peer's socket is what
+releases its snapshots. ( This paragraph said "drains plugin leases and then
+stops the channel" until 2026-09-30; the drain belonged to the in-process
+facility and went with it on 2026-09-29. Nothing drains now -- the host takes the
+snapshots back by closing, which is the point. ) So if the plugin container dies
 first the drain is trivially satisfied, and if `yesnod` goes first the peer sees
 EOF. Either order is safe *because* liveness is socket closure. The Pod's
 `terminationGracePeriodSeconds` should still be at least

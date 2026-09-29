@@ -290,6 +290,13 @@ fn plugin_container(cluster: &YesnoCluster, plugin: &crate::api::PluginSpec) -> 
                 .collect()
         }),
         resources: plugin.resources.clone(),
+        // Passed through, never synthesised. A peer's readiness is not the
+        // daemon's, and the operator cannot tell a query-serving peer from a
+        // background scorer; see `PluginSpec::readiness_probe`. Omitted means no
+        // gate, which is Kubernetes' default rather than a decision made here.
+        readiness_probe: plugin.readiness_probe.clone(),
+        liveness_probe: plugin.liveness_probe.clone(),
+        startup_probe: plugin.startup_probe.clone(),
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
             capabilities: Some(Capabilities {
@@ -1429,6 +1436,9 @@ mod tests {
                 container_port: 8080,
             }],
             run_as_user: None,
+            readiness_probe: None,
+            liveness_probe: None,
+            startup_probe: None,
             channel: PluginChannelSpec {
                 max_lanes: Some(265),
                 max_peers: Some(2),
@@ -1516,6 +1526,91 @@ mod tests {
         );
         assert_eq!(plugin.args.as_deref(), Some(&["--serve".to_string()][..]));
         assert_eq!(plugin.ports.as_ref().unwrap()[0].container_port, 8080);
+    }
+
+    /// Probes reach the peer unchanged, and none is invented for it.
+    ///
+    /// **Readiness is the thing most likely to be got wrong here.** `yesnod` binds
+    /// the channel socket *before* it opens the database, so a peer can connect
+    /// immediately and be told `UNAVAILABLE` by every request until startup
+    /// finishes -- and again through a rebootstrap. Any probe the operator
+    /// synthesised would therefore either test the socket, which reports ready
+    /// while nothing can be answered, or test `yesnod`, which makes the whole Pod
+    /// unready during a rebuild. Neither is right for both a query-serving peer
+    /// and a background scorer, and the operator cannot tell them apart.
+    ///
+    /// So the assertion is in two halves: what the spec gives is passed through,
+    /// and what it omits stays omitted.
+    #[test]
+    fn plugin_probes_are_passed_through_and_never_synthesised() {
+        // Omitted stays omitted.
+        let c = with_plugin(peer());
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let plugin = pod.containers.iter().find(|c| c.name == "plugin").unwrap();
+        assert!(
+            plugin.readiness_probe.is_none()
+                && plugin.liveness_probe.is_none()
+                && plugin.startup_probe.is_none(),
+            "no probe may be invented for a peer whose readiness the operator \
+             cannot define"
+        );
+
+        // Given, passed through unchanged.
+        let mut p = peer();
+        p.readiness_probe = Some(Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some("/ready".into()),
+                port: IntOrString::Int(8080),
+                ..Default::default()
+            }),
+            period_seconds: Some(7),
+            ..Default::default()
+        });
+        let c = with_plugin(p);
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let plugin = pod.containers.iter().find(|c| c.name == "plugin").unwrap();
+        let probe = plugin.readiness_probe.as_ref().expect("the given probe");
+        assert_eq!(probe.period_seconds, Some(7));
+        assert_eq!(
+            probe.http_get.as_ref().unwrap().path.as_deref(),
+            Some("/ready"),
+            "the peer's own endpoint, not the daemon's"
+        );
+    }
+
+    /// The peer is an ordinary container, not a native sidecar.
+    ///
+    /// A restartable `initContainer` exists to start a dependency **before** the
+    /// main container. The dependency runs the other way here: the peer needs
+    /// `yesnod`, which needs nothing from the peer, and the peer has to retry
+    /// through `UNAVAILABLE` regardless. Ordering it first would buy nothing and
+    /// would make the Pod's startup wait on something that cannot yet succeed.
+    ///
+    /// Shutdown needs no ordering either, and that is a property of the channel
+    /// rather than of this Pod: a peer's snapshots are released when its socket
+    /// closes, so whichever container the kubelet stops first, the other sees the
+    /// consequence it needs.
+    #[test]
+    fn the_peer_is_a_plain_container_with_no_ordering() {
+        let c = with_plugin(peer());
+        let source = config_source(&c, 0, InstanceRole::Leader, None, None, None);
+        let d = deployment(&c, 0, InstanceRole::Leader, &source, 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert!(
+            pod.init_containers.is_none(),
+            "the peer depends on yesnod, not the reverse; nothing is ordered first"
+        );
+        // The grace period is Pod-wide and both containers share it, so it must
+        // still cover the daemon's drain and final checkpoint.
+        assert!(
+            pod.termination_grace_period_seconds.unwrap()
+                >= i64::try_from(c.spec.shutdown_grace_secs).unwrap(),
+            "the shared grace period must cover yesnod's own shutdown budget"
+        );
     }
 
     /// The peer cannot reach the database directory.

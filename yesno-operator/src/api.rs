@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::api::core::v1::{Probe, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -136,6 +136,27 @@ pub struct YesnoClusterSpec {
 /// so a field for it is a way to get it wrong with nothing to gain. The path is
 /// always `/run/yesno/plugin.sock` on an `emptyDir` shared by both containers --
 /// which is also what makes it writable despite `readOnlyRootFilesystem`.
+///
+/// # What the peer must tolerate
+///
+/// **The socket is bound before the database opens, so its existence is not
+/// readiness.** A peer can connect at once and be answered `UNAVAILABLE` by every
+/// request until startup finishes, and again for the whole of a rebootstrap. A
+/// peer that treats the first `UNAVAILABLE` as fatal crash-loops on every start;
+/// it is "not yet", and the correct response is to wait and ask again.
+///
+/// **A promotion restarts the peer.** Promotion rewrites the role label and the
+/// generated configuration, the config-identity annotation changes with it, and
+/// the Deployment strategy is `Recreate` -- so the Pod is replaced and the peer
+/// starts again against the new role. That is deliberate: it is simpler than
+/// asking every peer to handle a role transition in place, and a restart is a
+/// path every peer already has to work on.
+///
+/// **Shutdown needs no ordering.** A peer's snapshots are released when its socket
+/// closes, so whichever container the kubelet stops first, the other sees what it
+/// needs -- the peer an EOF, the daemon a reader that has gone. The Pod's
+/// termination grace period is shared and is sized from `shutdownGraceSecs`, which
+/// governs the daemon's own drain and final checkpoint.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSpec {
@@ -180,6 +201,39 @@ pub struct PluginSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<i64>", range(min = 1, max = 65535))]
     pub run_as_user: Option<u32>,
+
+    /// Readiness probe for the peer, passed through verbatim.
+    ///
+    /// # Why the operator does not synthesise one
+    ///
+    /// **A peer's readiness is not the daemon's.** Keying it on `yesnod` would
+    /// make the whole Pod unready for the duration of a rebootstrap -- which is
+    /// arguably right for a peer that answers queries and plainly wrong for one
+    /// that only scores in the background, and the operator cannot tell which it
+    /// has. So the choice belongs to whoever wrote the peer, and omitting this
+    /// leaves the container with no readiness gate, which is Kubernetes' own
+    /// default rather than a decision made here.
+    ///
+    /// **Do not probe the channel socket.** `yesnod` binds it *before* it opens
+    /// the database, so a peer can connect immediately and be told `UNAVAILABLE`
+    /// by every request until startup finishes, and again through a rebootstrap.
+    /// The socket existing means nothing; a probe that tests it reports ready
+    /// while no query can be answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<Probe>,
+
+    /// Liveness probe for the peer, passed through verbatim.
+    ///
+    /// Note what a peer must **not** treat as death: `UNAVAILABLE` is "not yet",
+    /// pushed while the database is closed or rebuilding. A peer that exits on the
+    /// first one crash-loops through every startup, and a liveness probe that
+    /// fails on it does the same thing more slowly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness_probe: Option<Probe>,
+
+    /// Startup probe for the peer, passed through verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_probe: Option<Probe>,
 
     /// Channel limits handed to `yesnod`.
     #[serde(default)]
