@@ -94,13 +94,25 @@ pub(super) fn apply_record(sh: &Shard, mem: &mut Memtable, rec: &Record) -> Resu
         RecType::ChunkImage => {
             // key, then the chunk's ordinals in full.
             //
-            // **This record unions. The live path that writes it replaces.**
-            // `Op::PutChunk` applies to the memtable through
-            // `Memtable::put_chunk`, which overwrites the chunk's MVCC value,
-            // and logs as this record, which replay applies with the
-            // per-ordinal `insert` below. The two agree only because the sole
-            // producer — `WriteBatch::store_set` — emits a `ChunkDelete` first,
-            // so both are unioning into an emptied key.
+            // **Nothing in this tree writes this record any more.** `Op::PutChunk`
+            // emitted it until 2026-09-30 and now emits a `ChunkPatch` carrying the
+            // container payload, because eight bytes per set bit expanded a
+            // 296 997 960-byte dense bundle into 9 506 355 680 WAL bytes. This arm
+            // stays because **a WAL written before that change must still replay**,
+            // and because a follower may still be shipped one from a sealed
+            // generation. Do not delete it on the grounds that it has no producer.
+            //
+            // It follows that no test exercises this path incidentally, so one
+            // exercises it deliberately: `an_old_chunk_image_record_still_replays`
+            // builds the record by hand. Without it this arm would rot silently and
+            // the first thing to notice would be a recovery.
+            //
+            // **This record unions. The live path that wrote it replaced.**
+            // `Memtable::put_chunk` overwrites the chunk's MVCC value while replay
+            // applies the per-ordinal `insert` below, and the two agreed only
+            // because the producer emitted a `ChunkDelete` first, so both unioned
+            // into an emptied key. That is still true of the `ChunkPatch` that
+            // replaced it, whose `clear` half is empty — see `db/mod.rs`.
             //
             // Do not add a `PutChunk` producer that omits that delete: it would
             // commit one state and replay another, and no test in the tree

@@ -9093,3 +9093,108 @@ behavioural: 55 plugin tests pass, including
 `a_batched_scan_sees_exactly_what_the_unbatched_one_sees` and
 `a_wide_block_of_dense_lanes_is_served_in_both_transports`, plus `gate.sh` and
 `gate-operator.sh`. A matched re-measurement on a quiet host is still owed.
+
+## 2026-09-30 -- compact WAL chunk images: the record type to do it with already existed
+
+`Op::PutChunk` logged **eight bytes per set bit**. A 296 997 960-byte half-dense
+prefill bundle therefore produced 9 506 355 680 WAL bytes, 32.01x expansion, and
+`8 * set_bits` accounted for all of it with nothing left over for framing -- a
+diagnosis that closes rather than merely fits. It now logs a container payload, and
+the expansion is **1.01x**.
+
+**The asked-for design was not needed.** The handoff proposed designing "a versioned
+compact chunk-image WAL representation and replay path". `RecType::ChunkPatch`
+already carried container payloads and already had a replay path, added for
+`merge_set`. A `ChunkPatch` whose `clear` half is **empty** replays as
+`( old \ {} ) union c`, which is *exactly* the union `ChunkImage` already replayed.
+So the change is one match arm and a size chooser, with no new record type, no format
+version, no new decoder and no new fuzz surface.
+
+**Every compatibility requirement falls out of that rather than being engineered.**
+A WAL written before today still replays, because the `ChunkImage` arm is untouched.
+A WAL written after it still reads on any binary that knows `ChunkPatch`, which is
+type 11 in the shipped format and already produced by `merge_set` -- so **no replica
+needs upgrading**, which a new `RecType = 12` would have required, since this tree
+treats an unknown record type as an error by design rather than skipping it.
+Delete-before-images is untouched and still load-bearing: `store_set` still emits the
+leading `DeleteKey`, and it is still the only thing reconciling replace-live with
+union-on-replay.
+
+**Why it had been rejected, and why every reason had expired.** The old comment on
+`Op::to_record` gave three: replay "has no container decoder wired to it"; a
+whole-image record "would be a second encoding path to keep in step with `codec`";
+and it "costs bytes on a rare operation". `ChunkPatch` wired a decoder into replay.
+`record::encode_chunk_patch` is not a second encoding path -- it **is** `codec`,
+whose decoder is already a fuzz target, and `encode_chunk_patch`'s own doc says so
+while citing this very rejection. And the operation is not rare: `store_set` emits
+one record per chunk, so a dense bulk load is nothing else. **Three premises, all
+false, in a comment that had outlived them.**
+
+**The patch is not smaller everywhere, so the encoding is chosen per chunk.** Two
+mask headers are a fixed 18 bytes above the key and prefix, so a chunk holding a
+handful of ordinals is cheaper written out. Measured before the chooser existed: a
+64-chunk key at four ordinals per chunk cost 5 728 bytes as patches against 5 120 as
+images. Choosing the smaller makes this a **strict** improvement at every density
+rather than a 63x win with a regression in the corner, and it keeps the `ChunkImage`
+arm reachable from a live producer instead of only from an old WAL.
+
+**Measurements.** Harness preserved at `.agents-workspace/tmp/wal-compact-measure`,
+a standalone crate with a path dependency. Each shape writes one `store_set` over 64
+chunks at the stated density, measures `Db::wal_bytes()` across the commit, reopens
+without a checkpoint to time pure WAL replay, and subtracts a measured 96-byte
+per-commit overhead so the comparison is between chunk records. The "before" column
+is computed -- the old encoding was exactly one framed `ChunkImage` per chunk of
+`HEADER + 8 + 8 * n` -- because that is not a quantity worth rebuilding a binary to
+observe. Its fidelity is checkable: at full size it predicts 9 505 508 768 against
+the 9 506 355 680 actually measured by the handoff, 0.009% apart.
+
+| shape        | bits      | chunk-record bytes | before        | change      |
+| ------------ | --------- | ------------------ | ------------- | ----------- |
+| dense        | 4 194 304 | 529 408            | 33 557 504    | 63.39x less |
+| half-dense   | 2 097 152 | 529 408            | 16 780 288    | 31.70x less |
+| quarter      | 1 048 576 | 529 408            | 8 391 680     | 15.85x less |
+| 1/64         | 65 536    | 136 192            | 527 360       | 3.87x less  |
+| 1/1024       | 4 096     | 13 312             | 35 840        | 2.69x less  |
+| 1/16384      | 256       | 5 120              | 5 120         | identical   |
+
+Full size, the handoff's own shape ( 36 254 chunks, half-dense, deferred checkpoint
+policy ): 1 187 971 072 set bits, **299 893 088** WAL bytes against 9 505 508 768,
+**31.70x less**, 0.25 bytes per set bit against 8.00, and WAL commit **239.9 ms**
+against the 10.71 s the handoff measured for the same stage. Replay of the whole
+bundle is 714.8 ms. **The handoff measured 32.01x expansion and this measures 31.70x
+reduction on the same shape** -- two numbers meeting from opposite directions, which
+is corroboration rather than coincidence.
+
+**Two harness defects, both mine, both worth recording because both produced
+confident wrong numbers.**
+
+* The first baseline modelled a whole set as **one** record, which understated the
+  old cost for any multi-chunk key and made the sparsest shape read as a 2.8x
+  regression when its chunk records are byte-identical. A baseline is a measurement
+  and needs checking like one.
+* **`Db::wal_bytes()` is not a write-volume meter.** At full size the default policy
+  auto-checkpoints inside `commit`, sealing and reclaiming generations, so the gauge
+  *falls* during the commit being measured and the subtraction underflowed -- the
+  first full-size run printed 18446744073709551136. The full-size figures use a
+  policy that never checkpoints on its own. Anything measuring bytes written must
+  either defer checkpointing or count appends, never sample a gauge that reclamation
+  moves downward.
+
+**A process failure, twice in one session.** `scripts/gate.sh` failed on a clippy
+lint in new test code on two separate occasions here, both because clippy was run
+before the last edit rather than after it. Each cost a full gate cycle. The lint gate
+is worthless run at any point other than last.
+
+Verified: `scripts/gate.sh` passes ( lib 991, `crash_matrix` 9, `durability` 62,
+`chunk_patch` 15 ), and `scripts/gate-pg.sh` passes, which CLAUDE.md requires for a
+`yesno-core` change because Bazel builds it too. `a_dense_store_set_does_not_log_one_ordinal_per_bit`
+pins the size property and fails at 2 097 440 bytes when the old encoder is restored;
+`an_old_chunk_image_record_still_replays` drives the now-secondary arm deliberately,
+through `apply_record`, because a hand-built committed record would need a
+`CommitIntent` and `ShardCommit` and would mostly test that scaffolding.
+
+**Not verified.** Crash recovery is covered only by the existing byte-exhaustive
+`crash_matrix`, which passes but was written against the old record; a torn
+`ChunkPatch` body is decoded by `decode_chunk_patch`, whose length checks predate
+this change and are exercised by `chunk_patch.rs`. No new torn-record case was added
+for the `PutChunk` producer specifically.

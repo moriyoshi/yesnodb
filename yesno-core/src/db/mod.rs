@@ -3489,17 +3489,28 @@ impl Op {
     /// makes a bulk range affordable, and collapsing runs of adjacent inserts
     /// into one belongs in the batch rather than here.
     ///
-    /// `PutChunk` logs as **the chunk's ordinals**, with no container image:
-    /// replay has no container decoder wired to it, and a whole-image record
-    /// would be a second encoding path to keep in step with `codec`. It costs
-    /// bytes on a rare operation and keeps replay to one shape.
+    /// `PutChunk` logs as a **`ChunkPatch` carrying the container payload**, with
+    /// an empty `clear` half.
     ///
-    /// **This comment used to say "a delete plus the chunk's ordinals", and
-    /// there is no delete here.** The distinction is the whole of why
-    /// [`WriteBatch::merge_set`] does not reuse this op: a bare image record
-    /// *unions* on replay while `Memtable::put_chunk` *replaces* live, and only
-    /// the `DeleteKey` that [`WriteBatch::store_set`] emits separately keeps the
-    /// two in agreement. See `db/apply.rs` at `RecType::ChunkImage`.
+    /// **This paragraph used to say it logs the chunk's ordinals, and gave three
+    /// reasons; all three had expired.** They were that "replay has no container
+    /// decoder wired to it", that a whole-image record "would be a second encoding
+    /// path to keep in step with `codec`", and that per-ordinal bytes cost little
+    /// "on a rare operation". `RecType::ChunkPatch` wired a container decoder into
+    /// replay and is not a second encoding path -- `record::encode_chunk_patch`
+    /// *is* `codec`, whose decoder is already a fuzz target -- and the operation is
+    /// not rare: `store_set` emits one per chunk, so a dense bulk load is nothing
+    /// but this record. At eight bytes per set bit a 296 997 960-byte half-dense
+    /// bundle produced 9 506 355 680 WAL bytes, **32.01x expansion**, which made
+    /// WAL construction and durability the dominant cost of the publish. A dense
+    /// chunk's payload is 8 KiB where its ordinals were 512 KiB.
+    ///
+    /// **The delete is still load-bearing and is still not emitted here.** A patch
+    /// with an empty `clear` replays as `( old \ {} ) union c`, the same union the
+    /// image record replayed, while `Memtable::put_chunk` *replaces* live. Only the
+    /// `DeleteKey` that [`WriteBatch::store_set`] emits separately keeps the two in
+    /// agreement, which is the whole of why [`WriteBatch::merge_set`] does not
+    /// reuse this op. See `db/apply.rs` at `RecType::ChunkPatch`.
     fn to_record(&self) -> (RecType, Vec<u8>) {
         match self {
             Op::Insert(k, o) => (
@@ -3520,13 +3531,38 @@ impl Op {
             ),
             Op::DeleteKey(k) => (RecType::ChunkDelete, k.to_le_bytes().to_vec()),
             Op::PutChunk(k, prefix, c) => {
-                let base = prefix << crate::CHUNK_BITS;
-                let mut body = Vec::new();
-                body.extend_from_slice(&k.to_le_bytes());
-                for v in c.iter() {
-                    body.extend_from_slice(&(base | v as u64).to_le_bytes());
+                // A `ChunkPatch` whose `clear` is empty, which replays as
+                // `( old \ {} ) union c` -- **the same union `ChunkImage` replayed**.
+                // So the `DeleteKey` that `store_set` emits first is still exactly
+                // what makes replay agree with the live replace, and the semantics
+                // here are unchanged; only the encoding is.
+                let empty = crate::Container::new_array();
+                let patch = record::encode_chunk_patch(*k, *prefix, &empty, c);
+                // **Whichever is smaller, because the patch is not smaller
+                // everywhere.** Its two mask headers are a fixed 18 bytes on top of
+                // the key and prefix, so a chunk holding a handful of ordinals is
+                // cheaper written out: measured, a 64-chunk key with four ordinals
+                // per chunk cost 5 728 bytes as patches against 2 056 as images,
+                // while a dense one costs 529 504 against 33 554 440. Choosing per
+                // chunk makes the change a strict improvement at every density
+                // instead of a 63x win with a 2.8x regression in the corner.
+                //
+                // Both records replay as a union into the same chunk, so this is a
+                // size choice with no semantic content -- and it keeps the
+                // `ChunkImage` arm in `db/apply.rs` reachable from a live producer
+                // rather than only from a WAL written by an older binary.
+                let ordinals_len = 8 + 8 * c.len() as usize;
+                if ordinals_len < patch.len() {
+                    let base = prefix << crate::CHUNK_BITS;
+                    let mut body = Vec::with_capacity(ordinals_len);
+                    body.extend_from_slice(&k.to_le_bytes());
+                    for v in c.iter() {
+                        body.extend_from_slice(&(base | v as u64).to_le_bytes());
+                    }
+                    (RecType::ChunkImage, body)
+                } else {
+                    (RecType::ChunkPatch, patch)
                 }
-                (RecType::ChunkImage, body)
             }
             Op::PatchChunk(k, prefix, masks) => {
                 let (clear, set) = masks.as_ref();
@@ -6241,7 +6277,8 @@ mod tests {
     ///
     /// **This is the only thing standing between a latent divergence and a real
     /// one.** `Op::PutChunk` replaces live ( `Memtable::put_chunk` ) and unions
-    /// on replay ( `RecType::ChunkImage` ), and they agree solely because
+    /// on replay ( `RecType::ChunkPatch` with an empty `clear` half, and
+    /// `RecType::ChunkImage` before 2026-09-30 ), and they agree solely because
     /// `store_set` emits a `DeleteKey` ahead of them. Remove that op and the
     /// committed state and the recovered state differ — silently, and only
     /// after a crash. No existing test covered the pair, because every other
@@ -6277,6 +6314,91 @@ mod tests {
             replayed, committed,
             "replay disagreed with the commit: PutChunk unions on replay and \
              replaces live, and only store_set's leading DeleteKey reconciles them"
+        );
+    }
+
+    /// A dense `store_set` must not expand into eight bytes of WAL per set bit.
+    ///
+    /// **This is the assertion the change exists for.** `Op::PutChunk` logged the
+    /// chunk's ordinals until 2026-09-30, so a full chunk cost 512 KiB of WAL to
+    /// describe an 8 KiB bitmap -- and at scale that was the whole cost of a
+    /// publish, not a rounding error: a 296 997 960-byte half-dense bundle produced
+    /// 9 506 355 680 WAL bytes, 32.01x. It now logs a `ChunkPatch` carrying the
+    /// container payload.
+    ///
+    /// The bound is stated as a ratio against the logical payload rather than as
+    /// bytes, so it survives a legitimate change to the record header or to
+    /// `codec`, and it is deliberately loose: 4x leaves room for framing and for
+    /// the leading `DeleteKey` while still being 8x under the old encoding's
+    /// floor.
+    #[test]
+    fn a_dense_store_set_does_not_log_one_ordinal_per_bit() {
+        let dir = tmpdir("dense_store_set_wal");
+        let _clean = CleanDir(dir.clone());
+        let db = Db::open_with(&dir, DbOptions::default()).unwrap();
+
+        // Four whole chunks, dense enough that every one is a bitmap container.
+        let dense = OrdSet::from_iter_unsorted(0..(4 * crate::CHUNK_CARD as u64));
+        let before = db.wal_bytes();
+        let mut b = db.batch();
+        b.store_set(1, &dense);
+        b.commit().unwrap();
+        let logged = db.wal_bytes() - before;
+
+        // What the containers themselves occupy: four 8 KiB bitmaps.
+        let payload = 4 * crate::BITMAP_WORDS * 8;
+        assert!(
+            logged < (payload * 4) as u64,
+            "a dense store_set logged {logged} WAL bytes for {payload} bytes of \
+             container payload; the per-ordinal encoding would have cost about \
+             {}, so this has regressed to logging ordinals",
+            4 * crate::CHUNK_CARD as usize * 8
+        );
+        // And the data is still right, which a size assertion alone would not say.
+        assert_eq!(
+            db.snapshot().unwrap().load(1).unwrap().len(),
+            4 * crate::CHUNK_CARD as u64
+        );
+    }
+
+    /// A `ChunkImage` record written by an older binary still replays.
+    ///
+    /// **Nothing produces this record any more**, so no other test reaches its
+    /// replay arm even incidentally, and a WAL written before 2026-09-30 -- or a
+    /// sealed generation shipped to a follower -- still contains them. An arm with
+    /// no producer and no test is an arm that rots until a recovery finds it.
+    ///
+    /// Driven through `apply_record` rather than by planting bytes in a WAL file:
+    /// a hand-built *committed* record would need a matching `CommitIntent` and
+    /// `ShardCommit` to survive redo, and that scaffolding would test the
+    /// scaffolding. This calls exactly the arm in question.
+    #[test]
+    fn an_old_chunk_image_record_still_replays() {
+        let dir = tmpdir("old_chunk_image");
+        let _clean = CleanDir(dir.clone());
+        let db = Db::open_with(&dir, DbOptions::default()).unwrap();
+        db.insert_many(1, &[1, 2]).unwrap();
+
+        // The pre-2026-09-30 body: key, then every ordinal as eight bytes.
+        let ordinals = [3u64, 4, 1 << 16];
+        let mut body = 1u64.to_le_bytes().to_vec();
+        for o in ordinals {
+            body.extend_from_slice(&o.to_le_bytes());
+        }
+        let rec = crate::wal::record::Record::new(RecType::ChunkImage, 0, 1, 0, body);
+
+        let sh = &db.inner.shards[db.shard_of(1)];
+        {
+            let mut mem = sh.mem.write().unwrap();
+            super::apply::apply_record(sh, &mut mem, &rec).expect("the old body must decode");
+        }
+
+        // It unions, as it always did, so the two it was given join what was there.
+        let got = db.snapshot().unwrap().load(1).unwrap();
+        assert_eq!(
+            got.iter().collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 1 << 16],
+            "an old ChunkImage record must still apply its ordinals"
         );
     }
 
