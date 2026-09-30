@@ -8748,3 +8748,173 @@ two days.
 row and another session's edit to the packed-lenses row, so it is left
 **uncommitted**: committing it would put their in-progress text under my message.
 Nothing gates on the index, and whoever commits it next carries both.
+
+## 2026-09-30 -- Phase 4: the example peer was a worked example of the mistake it warns about
+
+Phase 4 of `LTM/operator-hosted-plugin-container-plan.md`: the peer gets its own
+image, the kind arm grows a plugin scenario, and the example peer learned to do
+the one thing its own documentation demands.
+
+**The defect first, because it is the interesting part.** The CRD's
+`PluginSpec` documentation says, in as many words, that a peer must treat
+`UNAVAILABLE` as "not yet" and that one exiting on the first refusal will
+crash-loop through every startup. `yesno-channel-peer` -- shipped the previous day
+as "the artefact a consumer asks for" -- **exited on the first refusal**. It was a
+worked example of the mistake, written by the same session that wrote the warning,
+and nothing caught it because every test opened a database before the peer
+connected.
+
+`open_snapshot` now waits, and only on `UNAVAILABLE`: every other fault is a real
+answer -- a bad request, a snapshot too old, the wrong role -- and retrying those
+would turn a clear error into a hang.
+`a_peer_waits_for_a_database_that_is_not_open_yet` starts the server with an
+**empty slot**, which is exactly what a peer meets on a cold start, and fills it
+only after the peer has connected and been refused. It reddens against the old
+behaviour with an empty stdout, which is what a peer that has already exited
+leaves behind.
+
+**The peer image is its own, and deliberately not the product image.**
+`check-image-binaries.py` keeps the unified image's binary set equal to the set of
+binaries the product ships, with an empty exclusion list on purpose. An example
+and an e2e fixture is not a product binary, and putting it there would have been
+the first exception to a checker whose value is that it has none. So
+`yesno-plugin/dist/Dockerfile` builds it, and the harness builds and loads that
+third image **lazily, on request** -- a scenario that uses no plugin should not pay
+for a third Rust build.
+
+**Two harness checks caught design mistakes rather than typos.**
+`every_operator_output_is_declared_by_the_stack` refused
+`YESNO_OPERATOR_PLUGIN_IMAGE` because I had added it to the table mapping **EKS
+Terraform outputs** to config fields -- and the peer image is built locally, so
+that row claimed infrastructure that does not exist. The right answer was not a
+Terraform output but a guard: `op_enable_plugin` now refuses on the EKS backend,
+because its nodes have no registry to pull a locally built image from. The check
+turned a silently-wrong table into an explicit statement about which arm owns the
+scenario.
+
+And the opt-in had an ordering problem I only saw when looking for a flag to guard
+it with: `op_prepare` builds the images before a scenario can call anything, so an
+opt-in that had to precede image building would have had to precede
+`op_prepare` -- putting a build-order detail into every scenario's first line. The
+image is built in `create_database` instead, once, on demand.
+
+**What the scenario asserts is the whole path and nothing shorter.** A CRD field
+became a sidecar, which reached a Unix socket on a shared `emptyDir`, received the
+arena as a file descriptor, opened a snapshot, and counted a key written through
+Flight. The number comes from **the peer's own log**, not from the operator's view
+of the world, so a wrong lane decode or a wrong prefix is a wrong number rather
+than a passing test. The peer runs with `--hold` because a container that runs to
+completion is restarted: a peer that exits is a crash loop however right its
+answer was.
+
+Phase 4's third bullet needed no work. The e2e image's `CMD` already runs
+`e2e/operator/operator.py`, so a scenario added to that file is a scenario the
+gate runs. Worth noting its `--timeout 1200`: the plugin arm adds a third image
+build inside that budget.
+
+## 2026-09-30 -- the-operator-gate-was-red-for-a-week-and-nobody-ran-it
+
+`scripts/gate-operator.sh` failed on `e2e/operator/operator.py` line 68 with
+
+```
+yesno put returned "ingested 4 of 4 pairs at version 1", expected "ingested 4 of 4 pairs"
+```
+
+The failure has nothing to do with the plugin-container work the run was validating.
+`yesno put` prints `ingested R of N pairs` and appends ` at version V` when the server
+reports one ( `yesno-server/src/bin/yesno.rs:1293` ). That suffix arrived in `a74654e`
+on **2026-09-23**. The matcher in the harness asserts the whole line by string equality
+and dates from `85a41c2` on **2026-08-27**. So the operator gate could not have passed
+for anyone between those two dates, and the break surfaced only because this session
+ran it on 2026-09-30 -- seven days.
+
+**The finding is not the mismatch, it is the seven days.** A gate that is expensive to
+run is a gate that is rarely run, and a rarely run gate accumulates breaks that have
+nothing to do with whoever finally pays for the run. That is the same shape as
+`gate-clippy-saw-two-crates` ( 2026-09-06 ), where the tool and its written instructions
+drifted apart and the weaker one was the one anybody actually invoked. Here there is no
+second implementation -- there is a cost that discourages invocation at all.
+
+The cost is measurable and structural. `e2e/Dockerfile` copies the whole tree at
+`COPY --chown=yesno-builder:yesno-builder . /workspace` and *then* runs
+
+```
+RUN ./scripts/build-database-artifacts.sh postgresql
+RUN ./scripts/build-database-artifacts.sh mysql
+RUN ./scripts/build-database-artifacts.sh search
+```
+
+with no cache mount on any of the three, unlike the `build` stage above them which
+mounts both the cargo registry and `target/`. So editing one line of a Python scenario
+invalidates the copy and rebuilds Arrow C++, MySQL and the Gradle plugins from zero.
+This run spent roughly ten minutes there before reaching the scenario, and the fix for
+the scenario then bought a second full rebuild. Two candidate remedies, neither
+touching the from-source decision: mount Bazel's and Gradle's caches on those three
+steps, or copy only the artifact builds' inputs before them and `COPY . .` afterwards.
+
+**The fix to the matcher deliberately does not loosen it.** `strip_put_version` removes
+a trailing ` at version <digits>` and nothing else, so a wrong pair count still fails
+and so does any other trailing text; `only_a_well_formed_version_suffix_is_tolerated`
+pins that, and was checked against a loosened guard to confirm it fails. Tolerating the
+one field the scenario cannot predict is not the same as tolerating output drift, and
+the difference is worth the eleven lines.
+
+**Adjacent, answered while the build ran**: the official MySQL binary distribution
+cannot replace the from-source build. `yesno-mysql` is a storage-engine plugin and needs
+`sql/handler.h`, `sql/sql_class.h`, `sql/field.h` and friends; in `mysql-8.4.0.tar.gz`
+the only install rule in `sql/CMakeLists.txt` is `INSTALL_DEBUG_TARGET(mysqld ...)`,
+which installs no headers, and the `HEADERS` list in `include/CMakeLists.txt` offers
+exactly two plugin headers -- `mysql/client_plugin.h` and `mysql/plugin_auth_common.h`,
+both client-side. So for MySQL, building the server is a necessity. PostgreSQL is the
+opposite case and the distinction is worth keeping straight: it *does* install its
+server headers, so `yesno-pg` builds from source for ABI pinning, which is a choice.
+
+## 2026-09-30 -- a snapshot is a point in time, and a sidecar starts before the data
+
+Third defect from the Phase 4 operator gate, after the put-output drift and the
+invented Pod label. The scenario asserted that the peer sidecar reports cardinality
+3 for a key it had just written. The peer reported 0, and 0 was correct.
+
+`yesno-channel-peer` opened one snapshot at startup, scanned, printed
+`holding <n>` and blocked. A snapshot pins a version, and a sidecar is started by
+the same Pod template as `yesnod`, so it is running before anything is ingested.
+Its only scan therefore saw an empty database, for ever. No amount of waiting in
+the harness would have helped, and reordering the scenario could not help either:
+`op_enable_plugin` sets a flag consumed when the cluster manifest is built, so it
+has to precede cluster creation.
+
+**Why it survived review.** `holding 0` is also what an empty database returns, and
+what a broken lane decode would return, and what a wrong prefix would return. A
+single number that is the same for the correct-but-early answer and for three
+distinct failures carries no information about which one happened. I read that log
+line as a decode problem first and started looking at lane offsets.
+
+The fix is a `--watch` mode that re-opens a snapshot on an interval, releasing
+lanes before closing the snapshot because a snapshot refuses to close while a
+handle derived from it is live. It is deliberately **not** a change to `--hold`:
+`a_killed_peer_releases_its_snapshot` reads the first announcement and kills the
+process expecting a snapshot still open, and a mode that closed and reopened on a
+timer would leave a window in which that premise is false -- converting the one
+test that carries the entire liveness argument into a flaky one for a reason that
+has nothing to do with liveness. Two modes, one of which is never used by the
+scenario, is cheaper than one mode that makes a liveness proof probabilistic.
+
+**The finding worth keeping is about which layer catches what.** This is a property
+of a peer and a database -- re-open a snapshot, see later writes -- and it does not
+become a Kubernetes property by being deployed on Kubernetes. Proved at the layer
+that owns it, in `yesno-plugin/tests/peer_process.rs`, it costs 0.8 s and fails in
+0.55 s when the peer stops re-scanning. Discovered through `scripts/gate-operator.sh`
+it cost about forty minutes per attempt, three attempts, on a host at load 35. Four
+gate runs to find three defects, two of which had fast-layer homes.
+
+Two implementation notes that are easy to get backwards:
+
+* **The new test read stdout inline at first, and that was wrong.** `lines.next()`
+  blocks, so a peer that stopped announcing would hang the test rather than fail
+  it -- the exact failure the test exists to catch would have arrived as a hung
+  gate. It now reads on a thread and receives with a timeout.
+* **Both new tests were checked against a regressed implementation**, which is the
+  only way to know an assertion has teeth. Loosening `strip_put_version`'s digit
+  guard fails the put-output test on `at version v1`; making `--watch` stop
+  re-scanning fails the watch test with `Disconnected`. A test written after a fix
+  and never run against the bug is a test that has never been observed to fail.

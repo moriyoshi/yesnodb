@@ -178,3 +178,163 @@ fn a_killed_peer_releases_its_snapshot() {
          have released this -- which is the whole design"
     );
 }
+
+/// The peer waits through `UNAVAILABLE` instead of exiting.
+///
+/// **This is the behaviour the channel's own documentation demands of every peer
+/// and the example did not have.** `yesnod` binds the socket before it opens the
+/// database, so a peer started alongside it -- a sidecar, which is the whole
+/// point -- connects and is refused by every request until startup completes.
+/// Exiting on that is a crash loop with backoff, leaving the peer least likely to
+/// be running at the moment the database becomes usable.
+///
+/// The server here starts with an **empty slot**, which is exactly what `Host`
+/// reports while a database is closed or rebuilding, and fills it only after the
+/// peer has already connected and been refused at least once.
+#[test]
+fn a_peer_waits_for_a_database_that_is_not_open_yet() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-peerwait-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let clean = Clean(dir.clone());
+
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut b = db.batch();
+    for i in 0..3u64 {
+        b.insert(10, 7 + i);
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+    let db = Arc::new(db);
+
+    // Deliberately empty: every request will answer UNAVAILABLE until it is
+    // filled, which is what a peer meets on a cold start.
+    let slot: Arc<RwLock<Option<Arc<Db>>>> = Arc::new(RwLock::new(None));
+    let sock = dir.join("peer.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let host = Host::new(slot.clone(), 1, Role::Leader);
+    let limits = Limits {
+        max_handles: 2,
+        max_lanes: 2,
+        max_blocks: 4,
+        max_snapshots: 8,
+    };
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(stream) = incoming else { break };
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let Ok(arena) = Arena::new(limits.arena_bytes()) else {
+                    return;
+                };
+                if send_fd(&stream, arena.as_fd()).is_err() {
+                    return;
+                }
+                let mut session = Session::new(host, arena, limits);
+                let writer = std::sync::Mutex::new(stream.try_clone().unwrap());
+                let _ = serve_locked(&mut session, stream, &writer);
+            });
+        }
+    });
+
+    let child = std::process::Command::new(peer_binary())
+        .arg(&sock)
+        .arg("10")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the peer binary must run");
+
+    // Let it connect and be refused before the database appears. A peer that
+    // exits on the first refusal is already gone by now.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    *slot.write().unwrap() = Some(db);
+
+    let out = child.wait_with_output().expect("reap");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the peer must survive a cold start: {stdout}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "cardinality 3",
+        "and then read the database that arrived while it waited"
+    );
+    drop(clean);
+}
+
+/// A watching peer sees a write that landed after it started.
+///
+/// **The defect this pins cost a full Kubernetes gate run.** A snapshot is a point
+/// in time, so a peer that samples once at startup reports the database as it was
+/// before anything was ingested -- and a sidecar is started *with* its cluster, so
+/// that is always before. The operator fixture asserted a cardinality such a peer
+/// could never reach, and read as correct because zero is also what an empty
+/// database returns. Nothing about that needs Kubernetes to demonstrate.
+///
+/// It also proves the round closes what it opened: `max_snapshots` is 8 here, so a
+/// `Watch` that leaked a snapshot per round would start faulting within seconds.
+#[test]
+fn a_watching_peer_sees_a_write_that_came_after_it_started() {
+    let (_c, sock, db) = serve("watch", &[10]);
+    let mut child = std::process::Command::new(peer_binary())
+        .arg("--watch")
+        .arg(&sock)
+        .arg("10")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the peer binary must run");
+    // Read on a thread and receive with a timeout. Reading inline would block in
+    // `next()` forever once the peer stopped announcing, so the very failure this
+    // test exists to catch would arrive as a hung gate rather than as a red test.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let out = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    fn announced(rx: &std::sync::mpsc::Receiver<String>) -> String {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the peer must keep announcing")
+    }
+
+    // The first announcement predates the write. Asserting it exactly is what makes
+    // the second assertion mean something: if the peer already reported 14 here, the
+    // test would pass without ever re-opening anything.
+    let first = announced(&rx);
+    assert_eq!(
+        first, "holding 9",
+        "the nine ordinals `serve` wrote under key 10"
+    );
+
+    let mut b = db.batch();
+    for i in 1..=5u64 {
+        b.insert(10, 9 * 65536 + i);
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = first;
+    while std::time::Instant::now() < deadline && last != "holding 14" {
+        last = announced(&rx);
+    }
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+    assert_eq!(
+        last, "holding 14",
+        "a watching peer must re-open a snapshot and see the later write"
+    );
+}

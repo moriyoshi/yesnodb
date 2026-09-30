@@ -294,6 +294,38 @@ Two things follow that the plan must not hand-wave:
 
 ## Phase 4: tests, in the two layers that already exist
 
+**DONE 2026-09-30.** Both layers landed. Running the gate cost four attempts and
+turned up three defects, none of which the code review that preceded it had found.
+
+* **The gate was already red, for a week.** `yesno put` gained an ` at version V`
+  suffix on 2026-09-23 and the harness asserted the whole line by equality with a
+  matcher from 2026-08-27, so no operator-gate run could have passed in between.
+  Whoever runs an expensive gate first pays for everyone who did not.
+* **A selector on a label nothing sets.** `plugin_report` matched Pods on
+  `yesnodb.io/cluster`, where the ten other selectors in the same file use
+  `app.kubernetes.io/instance`. An invented label matches nothing, and nothing is
+  indistinguishable from "no leader yet" -- which is why it read as correct. Its
+  `items[0]` jsonpath also made kubectl fail before the empty-result check could
+  report anything, so the diagnosis arrived as a template dump.
+* **A snapshot is a point in time, and the sidecar starts with its cluster.** The
+  peer opened one snapshot at startup and held it, so its only scan predated every
+  write the scenario made and `holding 0` was the right answer to the wrong
+  question -- indistinguishable from an empty database. Fixed with a `--watch` mode
+  that re-opens on an interval, deliberately **separate** from `--hold`: the kill
+  test reads the first announcement and kills the process expecting a snapshot
+  still open, and a timer that closed and reopened would make that premise
+  intermittently false.
+
+**The carry-away is where the third defect was catchable.** It needed no cluster.
+`a_watching_peer_sees_a_write_that_came_after_it_started` in
+`yesno-plugin/tests/peer_process.rs` asserts the count before the write and after
+it, runs in under a second, and fails in half a second when the peer stops
+re-scanning. A property that holds between a peer and a database does not become a
+Kubernetes property by being deployed on Kubernetes, and proving it at the layer
+that owns it is three orders of magnitude cheaper. The e2e scenario is still worth
+having -- it is the only thing that proves a CRD field becomes a sidecar that
+reaches a socket -- but it should not be where a protocol property is discovered.
+
 * **`resources.rs` unit tests**, which is where the existing Pod assertions live
   ( they already assert mount counts and args ): the sidecar appears only when
   `spec.plugin` is set; it mounts the socket volume and **not** `data`; the

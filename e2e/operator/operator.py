@@ -4,6 +4,12 @@
 
 assert op_prepare("kind") is True
 
+# A plugin peer, in its own container beside yesnod. Opted into before op_create
+# because the peer is part of the generated manifest rather than a patch; the
+# image is built and loaded when the cluster is created, so this costs nothing
+# for the scenarios that do not use it.
+op_enable_plugin()
+
 # An absent security choice is invalid and must not create storage or a
 # workload. The scenario owns the assertions; the host only reports observed
 # Kubernetes state.
@@ -63,6 +69,22 @@ assert op_put([42, 42, 42, 7], [1, 5, 9, 5]) == 4
 assert op_count(42) == 3
 assert op_count(7) == 1
 assert op_checkpoint() > 0
+
+# The whole path, end to end: a CRD field became a sidecar, which reached a Unix
+# socket on a shared volume, received the arena as a file descriptor, opened a
+# snapshot and read a key this scenario wrote through Flight. Nothing below the
+# operator is mocked, and no part of it is asserted from the operator's own view
+# of the world -- the number comes from the peer.
+# Waits for the peer's next round, because its snapshot is its own point in time
+# and the write above landed after the sidecar started. On timeout the verb returns
+# what it last saw, so a wrong number shows up here rather than as a timeout.
+report = op_plugin_report(3)
+assert "plugin" in report["containers"], report
+assert "yesnod" in report["containers"], report
+# Key 42 holds three ordinals, written above and checkpointed. The peer counts
+# what it finds in the arena, so a wrong lane decode or a wrong prefix shows up
+# here as a wrong number rather than as a passing test.
+assert report["cardinality"] == 3, report
 
 # Replication is asynchronous. Establish the failover scenario's safety
 # precondition explicitly instead of assuming the checkpoint made the follower

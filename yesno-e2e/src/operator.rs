@@ -99,6 +99,7 @@ pub const OPERATOR_ENV: &[(&str, &str)] = &[
 pub const ENV_OPERATOR_KUBECONFIG: &str = "YESNO_OPERATOR_KUBECONFIG";
 pub const ENV_OPERATOR_IMAGE: &str = "YESNO_OPERATOR_IMAGE";
 pub const ENV_OPERATOR_SERVER_IMAGE: &str = "YESNO_OPERATOR_SERVER_IMAGE";
+pub const ENV_OPERATOR_PLUGIN_IMAGE: &str = "YESNO_OPERATOR_PLUGIN_IMAGE";
 pub const ENV_OPERATOR_NAMESPACE: &str = "YESNO_OPERATOR_NAMESPACE";
 pub const ENV_OPERATOR_STORAGE_CLASS: &str = "YESNO_OPERATOR_STORAGE_CLASS";
 pub const ENV_OPERATOR_ACCOUNT: &str = "YESNO_OPERATOR_SERVICE_ACCOUNT";
@@ -134,6 +135,8 @@ pub const OWNS: &[&str] = &[
     "op_create",
     "op_status",
     "op_enable_ebs_snapshots",
+    "op_enable_plugin",
+    "op_plugin_report",
     "op_snapshot_status",
     "op_put",
     "op_count",
@@ -346,6 +349,45 @@ impl World {
                     ("retention", MontyObject::String(status.retention)),
                     ("storage_class", MontyObject::String(status.storage_class)),
                     ("volume_mode", MontyObject::String(status.volume_mode)),
+                ]))
+            }
+            "op_enable_plugin" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                self.operator
+                    .harness_mut(verb)?
+                    .enable_plugin()
+                    .map_err(|error| operator_err(verb, error))?;
+                Ok(MontyObject::None)
+            }
+            "op_plugin_report" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let expected = a.u64(0)?;
+                let report = self
+                    .operator
+                    .harness_mut(verb)?
+                    .plugin_report(expected)
+                    .map_err(|error| operator_err(verb, error))?;
+                Ok(dict(vec![
+                    (
+                        "containers",
+                        MontyObject::List(
+                            report
+                                .containers
+                                .iter()
+                                .map(|c| MontyObject::String(c.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "cardinality",
+                        match report.cardinality {
+                            Some(n) => MontyObject::Int(n),
+                            None => MontyObject::None,
+                        },
+                    ),
+                    ("waited", MontyObject::Bool(report.waited)),
                 ]))
             }
             "op_enable_ebs_snapshots" => {
@@ -583,6 +625,30 @@ struct Config {
     storage_class: String,
     /// The EBS snapshot backend, present only when the cluster can support it.
     snapshot: Option<SnapshotInputs>,
+    /// Image for the example channel peer.
+    ///
+    /// Its own image rather than the product one: the peer is a worked example
+    /// and a fixture, and `scripts/check-image-binaries.py` keeps the product
+    /// image's binary set equal to what the product ships.
+    plugin_image: String,
+    /// Whether the generated cluster carries a `spec.plugin`.
+    ///
+    /// Off unless a scenario asks, so every existing assertion about the Pod --
+    /// container counts, mounts, volumes -- keeps describing the cluster it was
+    /// written for.
+    plugin: bool,
+}
+
+/// What the peer sidecar reported, and what ran beside it.
+struct PluginReport {
+    /// Container names in the leader Pod, so a scenario can assert the sidecar is
+    /// there rather than inferring it from a log that might be missing.
+    containers: Vec<String>,
+    /// The cardinality the peer printed, or `None` if it has not scanned yet.
+    cardinality: Option<i64>,
+    /// Whether the peer had to wait for the database, which is the normal case on
+    /// a cold start and is worth seeing rather than hiding.
+    waited: bool,
 }
 
 /// What a generated `spec.snapshot` needs that the harness cannot invent.
@@ -635,6 +701,14 @@ impl Config {
             kubeconfig: PathBuf::from(take(ENV_OPERATOR_KUBECONFIG)),
             operator_image: take(ENV_OPERATOR_IMAGE),
             server_image: take(ENV_OPERATOR_SERVER_IMAGE),
+            // Not a stack output: the peer image is built locally and loaded
+            // into the cluster, so there is no Terraform value to read. The EKS
+            // arm has no registry to push it to, which is why the plugin
+            // scenario is the kind arm's -- `enable_plugin` on EKS would name an
+            // image the nodes cannot pull.
+            plugin_image: env::var(ENV_OPERATOR_PLUGIN_IMAGE)
+                .unwrap_or_else(|_| "yesno-channel-peer:eks".to_string()),
+            plugin: false,
             namespace: take(ENV_OPERATOR_NAMESPACE),
             storage_class: take(ENV_OPERATOR_STORAGE_CLASS),
             snapshot: Some(SnapshotInputs {
@@ -674,6 +748,8 @@ impl Config {
             kubeconfig: work.join("kubeconfig"),
             operator_image: format!("yesno-operator:{cluster_name}"),
             server_image: format!("yesnod:{cluster_name}"),
+            plugin_image: format!("yesno-channel-peer:{cluster_name}"),
+            plugin: false,
             node_image: env::var("YESNO_E2E_KIND_NODE_IMAGE")
                 .unwrap_or_else(|_| PINNED_NODE_IMAGE.to_owned()),
             driver_container: env::var("YESNO_E2E_DRIVER_CONTAINER").ok(),
@@ -713,6 +789,7 @@ struct Harness {
     cluster_created: bool,
     driver_connected: bool,
     images_built: bool,
+    plugin_image_ready: bool,
     cleaned: bool,
 }
 
@@ -723,6 +800,7 @@ impl Harness {
             cluster_created: false,
             driver_connected: false,
             images_built: false,
+            plugin_image_ready: false,
             cleaned: false,
         }
     }
@@ -792,7 +870,37 @@ impl Harness {
             .arg(self.config.workspace.join("yesno-operator/dist/Dockerfile"))
             .args(["--tag", &self.config.operator_image])
             .arg(&self.config.workspace);
-        checked_status(&mut operator, "build operator image")
+        checked_status(&mut operator, "build operator image")?;
+
+        Ok(())
+    }
+
+    /// Build the peer image and put it in the cluster, once, on demand.
+    ///
+    /// Separate from `build_images` because the opt-in arrives after that has
+    /// run. Idempotent: a scenario that creates twice does not rebuild.
+    fn ensure_plugin_image(&mut self) -> Result<()> {
+        if !self.config.plugin || self.plugin_image_ready {
+            return Ok(());
+        }
+        let mut peer = Command::new("docker");
+        peer.current_dir(&self.config.workspace)
+            .env("DOCKER_BUILDKIT", "1")
+            .args(["build", "--file"])
+            .arg(self.config.workspace.join("yesno-plugin/dist/Dockerfile"))
+            .args(["--tag", &self.config.plugin_image])
+            .arg(&self.config.workspace);
+        checked_status(&mut peer, "build channel peer image")?;
+
+        if self.config.backend == Backend::Kind {
+            let mut load = self.kind();
+            load.args(["load", "docker-image"])
+                .arg(&self.config.plugin_image)
+                .args(["--name", &self.config.cluster_name]);
+            checked_status(&mut load, "load the channel peer image into kind")?;
+        }
+        self.plugin_image_ready = true;
+        Ok(())
     }
 
     fn create_cluster(&mut self) -> Result<()> {
@@ -834,8 +942,8 @@ impl Harness {
         let mut load = self.kind();
         load.args(["load", "docker-image"])
             .arg(&self.config.operator_image)
-            .arg(&self.config.server_image)
-            .args(["--name", &self.config.cluster_name]);
+            .arg(&self.config.server_image);
+        load.args(["--name", &self.config.cluster_name]);
         checked_status(&mut load, "load images into kind")
     }
 
@@ -983,7 +1091,10 @@ impl Harness {
         )
     }
 
-    fn create_database(&self) -> Result<()> {
+    fn create_database(&mut self) -> Result<()> {
+        // Before the manifest, because the manifest names the image and the
+        // kubelet will pull-fail on one the cluster does not have.
+        self.ensure_plugin_image()?;
         let manifest = self.config.work.join("cluster.yaml");
         fs::write(&manifest, cluster_manifest(&self.config))
             .map_err(|error| format!("cannot write {}: {error}", manifest.display()))?;
@@ -1091,7 +1202,11 @@ impl Harness {
         let output =
             self.exec_yesno_with_input(["put", "-"], &input, "ingest through the managed Pod")?;
         let expected = format!("ingested {} of {} pairs", keys.len(), keys.len());
-        assert_output("yesno put", &output, &expected)?;
+        // `yesno put` appends ` at version V` whenever the server reports one, which
+        // it has done since 2026-09-23. The scenario fixes the pair counts but not the
+        // version, so a well-formed suffix is removed before the exact match rather
+        // than written into it. Matching the whole line held this gate red for a week.
+        assert_output("yesno put", strip_put_version(output.trim()), &expected)?;
         Ok(keys.len() as u64)
     }
 
@@ -1166,6 +1281,128 @@ impl Harness {
     /// guess. A controller that invented a volume id from a `hostPath` volume,
     /// or that took the whole reconcile down when it could not read a
     /// PersistentVolume, fails here.
+    /// Have the next `op_create` include a `spec.plugin`.
+    ///
+    /// Opt-in rather than always on. Every existing assertion about the Pod --
+    /// container counts, mounts, volumes -- was written for a cluster without a
+    /// peer, and a third image is a third Rust build that a scenario which does
+    /// not use one should not pay for.
+    ///
+    /// The image is built and loaded lazily by `create`, not here, because
+    /// `op_prepare` has already built the other two by the time a scenario can
+    /// call this -- requiring the opt-in to come *before* `op_prepare` would put
+    /// a build-order detail into every scenario's first line.
+    fn enable_plugin(&mut self) -> Result<()> {
+        if self.config.backend != Backend::Kind {
+            return Err(
+                "op_enable_plugin is the kind arm's: the peer image is built \
+                        locally and loaded into the cluster, and EKS nodes have no \
+                        registry to pull it from"
+                    .to_string(),
+            );
+        }
+        self.config.plugin = true;
+        Ok(())
+    }
+
+    /// What the peer sidecar reported, read from its container log.
+    ///
+    /// The peer prints `holding <cardinality>` once it has scanned and is keeping
+    /// its snapshot open. Its log is the channel through which the scenario learns
+    /// the answer, because the peer serves no endpoint -- deliberately, since the
+    /// thing under test is the socket and the arena, not an HTTP surface.
+    ///
+    /// Reads the **leader's** Pod. A follower runs its own peer against its own
+    /// replica, and asserting on whichever Pod came back first would be a test
+    /// that passes for the wrong reason on a cluster where replication lagged.
+    fn plugin_report(&self, expected: u64) -> Result<PluginReport> {
+        // The peer re-scans on its own clock, so the answer for a write this
+        // scenario has just made appears on its *next* round, not immediately.
+        // Waiting for it is the same shape as `wait_count`; returning the last
+        // report on timeout rather than an error is what makes the scenario's
+        // assertion print the number actually seen.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let report = self.plugin_report_once()?;
+            if report.cardinality == Some(expected as i64) || Instant::now() >= deadline {
+                return Ok(report);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn plugin_report_once(&self) -> Result<PluginReport> {
+        // `app.kubernetes.io/instance` is the label the operator stamps on every Pod
+        // it owns, as the ten other selectors in this file already use. This one read
+        // `yesnodb.io/cluster`, a label nothing has ever set, and a selector on a
+        // label that does not exist matches nothing -- indistinguishable from a
+        // cluster with no leader yet, which is why it survived review.
+        let selector = format!("app.kubernetes.io/instance={CLUSTER},yesnodb.io/role=leader");
+        // `items[*]` rather than `items[0]`: with no match the latter makes kubectl's
+        // jsonpath engine fail with an index-out-of-bounds template error, so the
+        // check below never runs and the reason stays buried in an internal message.
+        let pod = self.kubectl_output(
+            [
+                "get",
+                "pods",
+                "--namespace",
+                &self.config.namespace,
+                "--selector",
+                &selector,
+                "--output",
+                "jsonpath={.items[*].metadata.name}",
+            ],
+            "find the leader pod",
+        )?;
+        let pod = pod
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if pod.is_empty() {
+            return Err(format!(
+                "no Pod matched {selector:?} to read a plugin log from"
+            ));
+        }
+
+        let containers = self.kubectl_output(
+            [
+                "get",
+                "pod",
+                &pod,
+                "--namespace",
+                &self.config.namespace,
+                "--output",
+                "jsonpath={.spec.containers[*].name}",
+            ],
+            "list the leader pod's containers",
+        )?;
+        let log = self.kubectl_output(
+            [
+                "logs",
+                &pod,
+                "--namespace",
+                &self.config.namespace,
+                "--container",
+                "plugin",
+            ],
+            "read the plugin container log",
+        )?;
+        // `holding <n>` is printed once the peer has scanned and is keeping the
+        // snapshot open. Anything else -- an empty log, a wait message, an error
+        // -- leaves `cardinality` absent rather than guessing a number.
+        let cardinality = log
+            .lines()
+            .filter_map(|l| l.strip_prefix("holding "))
+            .next_back()
+            .and_then(|n| n.trim().parse::<i64>().ok());
+        Ok(PluginReport {
+            containers: containers.split_whitespace().map(str::to_string).collect(),
+            cardinality,
+            waited: log.contains("database unavailable, waiting"),
+        })
+    }
+
     fn enable_ebs_snapshots(&self) -> Result<SnapshotBackendStatus> {
         let patch = "{\"spec\":{\"snapshot\":{\"backend\":\"ebs\",\"ebs\":\
                      {\"region\":\"ap-northeast-1\",\"filesystem\":\"ext4\"}}}}";
@@ -2046,6 +2283,22 @@ fn parse_u64(label: &str, value: &str) -> Result<u64> {
         .map_err(|error| format!("{label} returned {value:?}, expected a whole number: {error}"))
 }
 
+/// Remove a trailing ` at version <digits>` from a `yesno put` line.
+///
+/// Only a well-formed suffix is removed. Any other trailing text still reaches the
+/// exact match and still fails there, so this tolerates the one field the scenario
+/// cannot predict without tolerating output drift in general.
+fn strip_put_version(line: &str) -> &str {
+    match line.rsplit_once(" at version ") {
+        Some((head, version))
+            if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => line,
+    }
+}
+
 fn assert_output(label: &str, actual: &str, expected: &str) -> Result<()> {
     if actual.trim() == expected {
         Ok(())
@@ -2183,6 +2436,30 @@ fn cluster_manifest(config: &Config) -> String {
         claim_size(config),
         config.storage_class,
     );
+    if config.plugin {
+        // `--watch`, not `--hold`. A container that runs to completion is restarted
+        // by the kubelet, so a peer that exits is a crash loop however correct its
+        // answer was -- but merely staying alive is not enough either. A snapshot is
+        // a point in time and this sidecar starts with its cluster, so its first
+        // scan necessarily predates everything the scenario ingests: `--hold` reports
+        // the empty database for ever. `--watch` re-opens on an interval, which is
+        // also what a long-lived scoring plugin does.
+        //
+        // No probe is set: the operator synthesises none, and this peer serves no
+        // endpoint to probe. Its answer is read from its log.
+        manifest.push_str(&format!(
+            "\x20 plugin:\n\
+             \x20   image: {}\n\
+             \x20   imagePullPolicy: {}\n\
+             \x20   args: [\"--watch\", \"/run/yesno/plugin.sock\", \"42\"]\n\
+             \x20   channel:\n\
+             \x20     maxLanes: 8\n\
+             \x20     maxPeers: 2\n\
+             \x20     socketMode: \"0600\"\n",
+            config.plugin_image,
+            image_pull_policy(config),
+        ));
+    }
     if let Some(snapshot) = &config.snapshot {
         // `filesystem: ext4` matches what the EBS CSI driver formats a gp3
         // volume with by default. It is stated rather than defaulted because
@@ -2304,6 +2581,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_well_formed_version_suffix_is_tolerated() {
+        let expected = "ingested 4 of 4 pairs";
+        // The drift that closed this gate on 2026-09-23.
+        assert_eq!(
+            strip_put_version("ingested 4 of 4 pairs at version 1"),
+            expected
+        );
+        assert_eq!(strip_put_version(expected), expected);
+        // A wrong count still fails, which is the assertion's whole point.
+        assert!(assert_output(
+            "put",
+            strip_put_version("ingested 3 of 4 pairs at version 1"),
+            expected
+        )
+        .is_err());
+        // Anything that is not a version suffix is left in place and still fails.
+        for drifted in [
+            "ingested 4 of 4 pairs at version",
+            "ingested 4 of 4 pairs at version v1",
+            "ingested 4 of 4 pairs at version 1 and rolled back",
+            "ingested 4 of 4 pairs, truncated",
+        ] {
+            assert!(
+                assert_output("put", strip_put_version(drifted), expected).is_err(),
+                "{drifted:?} must not pass as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn operator_image_replacement_is_exact() {
         let source = "before\n          image: yesno-operator:local\nafter\n";
         let rendered = render_operator_manifest(source, "yesno-operator:test").unwrap();
@@ -2323,6 +2630,8 @@ mod tests {
             kubeconfig: PathBuf::from("/kube/config"),
             operator_image: "registry/yesno:operator".into(),
             server_image: "yesnod:test".into(),
+            plugin_image: "yesno-channel-peer:test".into(),
+            plugin: false,
             node_image: String::new(),
             driver_container: None,
             keep_cluster: false,
