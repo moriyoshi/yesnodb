@@ -38,42 +38,72 @@ the question got it wrong by citing `CHUNK_CARD` as an objection.
   resulting 8 KiB bitmap being L1-resident" -- constrains **container width**, which
   does not change. A span is a grouping of 8 KiB containers, not a wider container.
 
-## Why the index needs no change, which is the cheap part
+## Why the index needs no change, and a correction to this plan's first version
 
 `ChunkRef` is a packed `u64` whose `[ 0:40 )` field is **`cell`: a byte offset in the
-shard address space**, not an extent identifier. A span member therefore addresses its
-payload with `cell = span_base + i * 8192` and nothing new is needed. The 8 bytes per
-chunk stay 8 bytes per chunk.
+shard address space**, not an extent identifier. A member of a contiguous region
+therefore addresses its payload arithmetically and the 8 bytes per chunk stay 8 bytes.
 
-`[ 59:60 ) enc`, documented "0 = raw Roaring; MUST be 0 in v1", is the spare bit that
-marks a member whose integrity comes from a span header rather than from a trailer.
-`[ 60:64 )` remains reserved.
+**The first version of this plan then proposed marking members with the `[ 59:60 ) enc`
+bit, and that was wrong on two counts.** `ChunkRef::validate` *refuses* `enc = 1` on a
+non-inline reference with `UnsupportedEncoding`, so setting it would make every reader
+reject the file rather than understand it; and the bit's documented meaning is "an
+alternative array encoding", so using it for this would overload a field that already
+means something else. The reserved bits `[ 60:64 )` are likewise refused when non-zero,
+deliberately -- "a reader that ignores them cannot tell a future format from a valid
+file".
 
-## Proposed layout
+**The mechanism that already exists is the slab class.** `slab_of( cell )` resolves an
+address to a slab by arithmetic, a slab records its `class: u8`, and `PACKED_CLASS = 0`
+is the precedent: a reader learns "this is a packed page, its integrity comes from a
+page header rather than a trailer" from the **class**, never from a bit in the
+reference. Slab classes are persisted -- `store::slabmeta` landed 2026-09-13, and
+`Allocator::restore` falls back to `Opaque` only when its decode fails -- so a new
+class survives reopen.
 
-A **dense span** is a header followed by `N * 8192` contiguous bitmap payloads, with
-the header carrying magic, version, `N`, the key, the base prefix and a CRC -- the
-same arrangement packed pages already use, at a larger size. Members' `ChunkRef`s point
-at their payload bytes with `enc = 1`.
+So: **no `ChunkRef` change, no bit overloading, and no file a current reader must
+refuse.**
 
-**Admission is a rule, not a default.** Only full bitmap payloads, only consecutive
-prefixes of one key, only at checkpoint, and only above a minimum count worth the
-coupling. Modelled on `PACK_MAX`, and for the same reason: a layout that pays off for
-one shape must not be imposed on the others.
+## Proposed layout, corrected: a size class rather than a span type
+
+The blocker is visible in one line of the ladder. `CLASS_SIZES[ 10 ] = 8256`, annotated
+"exact for 8192", because a slot must hold the payload *plus its 8-byte trailer* rounded
+to a multiple of 64. **That 64 bytes of slack per chunk is what breaks adjacency**, and
+nothing else does.
+
+A new class whose slot is **exactly 8192 with no trailer**, admitting only full bitmap
+payloads and taking its integrity from the slab header as `PACKED_CLASS` does, makes
+consecutive slots adjacent by construction -- `slot_offset` arithmetic then *is* the
+contiguity. With `SLAB_BODY = SLAB_SIZE - SLAB_META = 2 097 152 - 8 192`, a slab holds
+**255 such slots**: one contiguous 2 MiB bitvector covering 16 711 680 ordinals.
+
+**And 2 MiB is enough, which is the reframing that makes this small.** Zero-copy does
+not require the whole set to be one buffer; it requires **each Arrow batch** to be one
+contiguous slice, because Arrow's constraint is one contiguous values buffer per column
+per *batch*. A 2 MiB slab yields a 16 711 680-row boolean batch, which is an ordinary
+batch size. So cross-slab contiguity is unnecessary and no allocator change beyond the
+new class is needed -- the existing policy already claims "a contiguous run of slabs"
+per checkpoint and bump-allocates within it, so a bulk-loaded key's chunks already land
+in one file window.
 
 ## The three costs, and the second is the design work
 
-1. **Reclamation granularity.** A span frees as a unit, so one live chunk pins the
-   whole region. This is a fourth coupling beside the three existing conditions and
-   has to be stated in `ARCHITECTURE.md` next to them.
+1. **Reclamation granularity, bounded to a slab.** A slab of this class frees as the
+   allocator already frees slabs, so this is not a new mechanism -- but a live chunk
+   keeps its 2 MiB slab alive, which is a coupling to state in `ARCHITECTURE.md` beside
+   the three existing conditions. Smaller than the first version of this plan feared,
+   because the unit is a slab rather than a whole key's region.
 2. **Degradation under partial update.** I2 makes a published extent immutable, so
-   updating one chunk of a span means rewriting the span or spilling that chunk to a
-   standalone extent. **Contiguity becomes a property that must be maintained and
-   compacted, not one the store has.** A write-once read-many cache fits; a
-   scattered-update set does not, and must degrade gracefully rather than thrash.
-3. **Torn-write blast radius.** One CRC over a span rather than per chunk. Packed
-   pages already accepted that trade at 4 KiB; this takes it to megabytes, so the
-   crash matrix needs a span case rather than inheriting the per-chunk one.
+   rewriting one chunk spills it to a fresh slot and punches a hole in the run.
+   **Contiguity becomes a property that must be maintained and compacted, not one the
+   store has** -- and the compactor already exists for exactly this, since
+   `alloc.rs` calls compaction "a *locality* mechanism, not merely space reclamation"
+   and relocates in `ChunkKey` order. So the lending path must handle a run broken into
+   several, and fall back to gathering for the fragments.
+3. **Torn-write blast radius.** Integrity for 255 chunks from a slab header rather
+   than 255 trailers. Packed pages already accepted that trade at 4 KiB; this takes it
+   to 2 MiB, so `crash_matrix` needs a case of its own rather than inheriting the
+   per-chunk one.
 
 ## Phases
 
