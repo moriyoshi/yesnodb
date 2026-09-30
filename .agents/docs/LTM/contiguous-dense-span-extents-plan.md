@@ -154,6 +154,44 @@ says which key owns which cell; the `crc32c` half is not, and recomputing it fro
 payload would be circular. The region is 8 192 bytes, exactly two OS pages, so A/B'ing
 it is natural and is what the superblock already does.
 
+## Two placements for the trailer, and which one to do first
+
+Raised by the maintainer: the eventual shape is a combination of **A** trailers in the
+slab's own metadata with contiguous payloads in that slab, and **B** trailers out of
+place entirely with payload-only slabs. They are not alternatives so much as two points
+on one axis, and the axis is **where contiguity stops**.
+
+`SLAB_META` sits *before* the body -- a slot is at
+`slab_id * SLAB_SIZE + SLAB_META + slot * class_size` -- so trailers placed in it do not
+interrupt the body, but the region itself still separates one body from the next.
+
+| | max contiguous run | slabs self-describing | metadata writes |
+| --- | --- | --- | --- |
+| **A** trailers in `SLAB_META` | 2 088 960 B = **255 payloads, 1.99 MiB** | yes | rides the occupancy write already made |
+| **B** payload-only slabs | `k * 2 MiB`; 64 slabs is **128 MiB, 16 384 payloads** | **no** | a side slab per run |
+
+**A is the cheap nine-tenths and should come first.** It delivers the whole goal --
+adjacency, hence a region Arrow can reference without a gather -- because **2 MiB is
+already 16 777 216 boolean rows**, an ordinary batch. Arrow's constraint is one
+contiguous values buffer **per batch**, not per result, so B's larger regions buy fewer
+and bigger batches rather than the capability itself. That is a throughput question and
+needs a measurement before it is worth the cost below.
+
+**B's cost is that a payload-only slab is not self-describing, and this tree has already
+been bitten by exactly that.** `slabmeta` exists because a reopened shard "could not tell
+which slots in an existing slab were live -- or even what size class the slab held", and
+the consequence was that "the first allocation after a reopen claimed slab 0 and wrote
+over the extents already in it". B reintroduces that shape for payload slabs: their class
+and occupancy live somewhere else. It is recoverable -- `fsck`'s rebuild re-derives
+occupancy from the index, which is the real source of truth -- but the side slab becomes a
+structure whose loss costs many slabs' worth of interpretation, and it wants A/B'ing at
+minimum.
+
+So: **A now, B behind a measurement**, and the admission rule that chooses between them
+per run is the decision the maintainer deferred. What that measurement has to answer is
+narrow -- whether one 128 MiB batch beats 64 of 2 MiB for a consumer -- and it can be
+answered with a throwaway writer before any of this is committed to.
+
 ## What the alignment measurement actually said, after three attempts at it
 
 **Conclusion: payload misalignment costs nothing measurable on this kernel, and the
