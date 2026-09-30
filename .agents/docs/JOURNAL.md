@@ -8982,3 +8982,43 @@ still in the image: `gate-pg.sh` passes ( reporting 1250 action cache hits ),
 price; a rebuild after an unrelated source edit is what will show the saving, and
 the number belongs here once it exists rather than now. Host load was 40-52
 throughout from an unrelated session, so any timing taken here is soft.
+
+## 2026-09-30 -- the e2e image cache, measured: 1753 s of artifact builds became 526 s
+
+The entry above landed the disk cache and said the saving was unmeasured because both
+runs to that point were cold. A rebuild has now produced one. The comparison is
+like-for-like: every run below rebuilt after a source edit inside the cargo
+workspace, which is what invalidates the single `COPY` layer, and the figures are the
+three `scripts/build-database-artifacts.sh` steps taken from Docker's own per-step
+progress timestamps.
+
+| step        | before ( run 4 ) | before ( driftfix ) | after | change |
+| ----------- | ---------------- | ------------------- | ----- | ------ |
+| postgresql  | 522 s            | 447 s               | 372 s | -29%   |
+| mysql       | 932 s            | 939 s               | 41 s  | -96%   |
+| search      | 298 s            | 338 s               | 114 s | -62%   |
+| **total**   | **1752.6 s**     | **1724.1 s**        | **526.4 s** | **-70%** |
+
+Two independent before-runs agreeing within 2% is what makes this a measurement
+rather than an anecdote; the whole operator gate came in at 966 s against a prior
+artifact phase alone of 1753 s. Bazel reported **530 and 43 disk cache hits** plus
+1111 action cache hits, so the mechanism is confirmed to be the cache and not
+incidental host variation. Load average was 35 for the after-run and 35-52 for the
+before-runs, which if anything understates the gain.
+
+**The MySQL step is where nearly all of it is**, 932 s to 41 s, because that step
+compiles Arrow C++ and MySQL from source and those are exactly the actions a
+content-addressed cache can return whole.
+
+**PostgreSQL only fell 29%, and that is the interesting number.** A disk cache hit
+still *materializes* the output into the output base, so a step dominated by copying
+large artifacts rather than by compiling them cannot approach the MySQL ratio. The
+step also runs two `bazel build` invocations, for pg17 and pg18. Do not expect a
+cache to flatten a step whose cost is I/O; the remaining 372 s is mostly not
+compilation, and shaving it would need a different mechanism than this one.
+
+**What this does not fix.** The layer is still invalidated by any source edit, so
+these 526 s are paid for a doc-only change to a scenario as surely as for a change to
+`yesno-core`. Reordering the copy would skip the steps outright, and the reason it
+was not done is in the entry above: silent staleness, with `yesno-e2e/BUILD.bazel`
+showing the Bazel-relevant set is wider than it looks.
