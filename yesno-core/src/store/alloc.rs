@@ -44,17 +44,79 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::extent::{class_size, is_packed_class, CLASS_SIZES, PACKED_CLASS};
+use super::extent::{class_size, is_packed_class, CLASS_SIZES, EXT_TRAILER_BYTES, PACKED_CLASS};
 use crate::error::{CodecError, Result};
 use crate::store::{SLAB_BODY, SLAB_META, SLAB_SIZE};
 
 /// Objects a slab of `class` holds.
+///
+/// **Each slot costs its size plus eight bytes of trailer**, because the trailers live in
+/// a table at the tail of the slab body rather than inside the slots. That is what makes
+/// consecutive payloads contiguous: a slot is exactly the payload, so slot `k` ends where
+/// slot `k + 1` begins. For the bitmap class it means 254 slots of 8192 where an inline
+/// trailer allowed 253 of 8256 -- more payloads in the slab, and adjacent.
 #[inline]
 pub fn slab_capacity(class: u8) -> u32 {
-    match class_size(class) {
-        Some(sz) if sz > 0 => (SLAB_BODY / sz as u64) as u32,
-        _ => 0,
+    let Some(sz) = class_size(class).filter(|s| *s > 0) else {
+        return 0;
+    };
+    if is_packed_class(class) {
+        // A packed page has no per-payload trailer at all; its header's CRC covers the
+        // body, so nothing is reserved for a table.
+        return (SLAB_BODY / sz as u64) as u32;
     }
+    // **At the tail of the body, and the metadata region was tried first and does not
+    // work.** The bitmap class needs only 255 * 8 = 2040 trailer bytes and `SLAB_META` has
+    // 8128 free, which would have left the body holding a whole 255 payloads. But
+    // `slabmeta` writes that region as one block at the end of a checkpoint, so it
+    // overwrites anything placed there earlier -- observed as
+    // `MisPointedExtent { .. found: 0 }` on the first reopen. Using it would mean folding
+    // the table into `slabmeta`'s own encode, and with it that block's CRC and A/B
+    // handling, which is a larger change than the 6 160 bytes per slab it saves.
+    //
+    // So each slot costs its size plus its trailer. For the bitmap class that is 254 slots
+    // of 8192 where an inline trailer allowed 253 of 8256: one more payload per slab, and
+    // adjacent, at the cost of 0.29% of the body against the old layout's 0.009%.
+    (SLAB_BODY / (sz as u64 + EXT_TRAILER_BYTES as u64)) as u32
+}
+
+/// Byte offset of slot `slot`'s **trailer**, in the table at the tail of the slab body.
+///
+/// The table begins where the payload region ends -- `capacity * class_size` past the
+/// body's start -- so the payload region is uninterrupted and the trailers are addressed
+/// by slot index. Eight-byte entries at a multiple of 64 from the body start, so each is
+/// naturally aligned.
+#[inline]
+pub fn trailer_offset(slab_id: u32, class: u8, slot: u32) -> u64 {
+    let cap = slab_capacity(class);
+    let size = class_size(class).unwrap_or(0) as u64;
+    slab_id as u64 * SLAB_SIZE
+        + SLAB_META
+        + cap as u64 * size
+        + slot as u64 * EXT_TRAILER_BYTES as u64
+}
+
+/// Which slot of its slab a cell is, for a standalone class.
+///
+/// `None` when the cell is not slot-aligned for that class, which is the same refusal
+/// [`Allocator::owning_class`] makes and for the same reason: a mis-pointed reference
+/// must not be resolved to a plausible slot.
+#[inline]
+pub fn slot_of_cell(cell: u64, class: u8) -> Option<u32> {
+    let size = class_size(class)? as u64;
+    if size == 0 {
+        return None;
+    }
+    let body = slab_of(cell) as u64 * SLAB_SIZE + SLAB_META;
+    if cell < body {
+        return None;
+    }
+    let off = cell - body;
+    if !off.is_multiple_of(size) {
+        return None;
+    }
+    let slot = (off / size) as u32;
+    (slot < slab_capacity(class)).then_some(slot)
 }
 
 /// Byte offset of a slot within the shard address space.
@@ -1337,66 +1399,89 @@ mod tests {
         assert_eq!(a.owning_class(taken), Some(new));
     }
 
-    /// A large page's base and size resolve from the slab, not from a modulus.
+    /// Consecutive bitmap slots are **adjacent and OS-page aligned**, and the trailer
+    /// table does not overlap them.
     ///
-    /// **This is the arithmetic that would misread silently.** `read_container_for`
-    /// computed a packed page's base as `cell - ( cell % store::PAGE )`, which is right
-    /// only while every packed page is 4 KiB *and* that size divides `SLAB_META`. A
-    /// 65 600-byte page satisfies neither, so the modulus would name an address inside
-    /// the previous page and the header parse would read payload bytes as a header --
-    /// a wrong answer, not an error, which is why this is asserted rather than assumed.
+    /// This is the property the whole dense-span effort exists for. A slot used to be
+    /// `round_up_64( payload + 8 )` = 8256 for an 8192-byte bitmap, so consecutive
+    /// payloads sat 64 bytes apart and each spanned three OS pages instead of two --
+    /// measured as 0 of 63 adjacent pairs on a real 64-chunk key. With the trailer in a
+    /// table at the tail of the slab body the slot is exactly the payload.
     ///
-    /// There is no producer of large pages until Phase 2, so nothing exercises this
-    /// incidentally. Deliberate coverage now, for the reason `RecType::ChunkImage`'s
-    /// replay arm needed its own test the day it lost its producer.
+    /// Asserting the **stride** is what makes this about contiguity rather than about
+    /// capacity, and asserting the table's position is what stops a future capacity
+    /// change from quietly letting the last slots write over their own trailers.
     #[test]
-    fn a_large_packed_page_resolves_its_own_base_and_size() {
-        let mut a = Allocator::new();
-        let page = class_size(crate::store::extent::PACKED_LARGE_CLASS).unwrap() as u64;
+    fn bitmap_slots_are_adjacent_and_their_trailers_are_out_of_the_way() {
+        let class = widest_standalone_class();
+        let size = class_size(class).unwrap() as u64;
+        assert_eq!(
+            size,
+            crate::BITMAP_BYTES as u64,
+            "the top standalone slot must be exactly a bitmap payload"
+        );
 
-        // Two pages, so the second one's base is not the slab body's start and a
-        // modulus against the page size cannot land on it by coincidence.
-        let first = a.alloc(crate::store::extent::PACKED_LARGE_CLASS).unwrap();
-        let second = a.alloc(crate::store::extent::PACKED_LARGE_CLASS).unwrap();
-        assert_eq!(second - first, page, "consecutive pages must be adjacent");
+        let cap = slab_capacity(class);
+        assert!(cap > 1, "a slab must hold several bitmaps");
 
-        for base in [first, second] {
-            // Every offset inside the page must resolve to the same base: its start, a
-            // payload just past the header, and its last byte.
-            for probe in [
-                base,
-                base + crate::store::packed::HEADER as u64,
-                base + page - 1,
-            ] {
-                assert_eq!(
-                    a.packed_page(probe),
-                    Some((base, page as usize)),
-                    "cell {probe} did not resolve to page {base}"
-                );
-            }
+        // Adjacent: slot k ends where slot k+1 begins.
+        for slot in 0..cap.min(8) {
+            let a = slot_offset(0, class, slot);
+            let b = slot_offset(0, class, slot + 1);
+            assert_eq!(b - a, size, "slot {slot} is not adjacent to the next");
+            assert!(
+                a.is_multiple_of(4096),
+                "slot {slot} at {a} is not OS-page aligned"
+            );
         }
 
-        // The modulus the old code used disagrees, which is what makes this test about
-        // the fix rather than about arithmetic in general.
-        let inside = second + crate::store::packed::HEADER as u64;
-        assert_ne!(
-            inside - (inside % page),
-            second,
-            "if a modulus happened to work here the test would prove nothing"
-        );
-
-        // And a standalone cell is not a packed page, so the two paths stay disjoint.
-        let plain = a.alloc(widest_standalone_class()).unwrap();
-        assert_eq!(a.packed_page(plain), None);
-        assert!(a.owning_class(plain).is_some());
+        // **The table must not overlap the payload region**, and it may sit on either side
+        // of it: in the metadata region for a wide class, where it costs the body nothing,
+        // or at the body's tail for a narrow one whose table is too big for that region.
+        // Asserting non-overlap rather than "after the last slot" is the difference -- an
+        // earlier version of this assertion said the latter and failed the moment the
+        // table moved in front.
+        let body = SLAB_META;
+        let first_slot = slot_offset(0, class, 0);
+        let last_end = slot_offset(0, class, cap - 1) + size;
+        let table = trailer_offset(0, class, 0);
+        let table_end = trailer_offset(0, class, cap - 1) + EXT_TRAILER_BYTES as u64;
         assert!(
-            a.owning_class(first).is_none(),
-            "a packed cell must not report a standalone class, or its caller reads a \
-             trailer out of payload bytes"
+            table_end <= first_slot || table >= last_end,
+            "the trailer table {table}..{table_end} overlaps the payloads \
+             {first_slot}..{last_end}"
         );
+        assert!(
+            table_end <= SLAB_SIZE && last_end <= SLAB_SIZE,
+            "the slab must contain both its payloads and its trailers"
+        );
+        // The table is at the tail, so the payload region stops short of the body's end by
+        // exactly the table's size -- which is the cost of getting adjacency.
+        assert_eq!(
+            table,
+            slot_offset(0, class, cap),
+            "the table follows the last slot"
+        );
+        let _ = body;
+
+        // Every slot resolves back to its own index, which is what the trailer lookup on
+        // the read path depends on.
+        for slot in [0, 1, cap / 2, cap - 1] {
+            assert_eq!(
+                slot_of_cell(slot_offset(0, class, slot), class),
+                Some(slot),
+                "slot {slot} did not resolve back to itself"
+            );
+        }
+        // A cell inside a slot is not a slot, so a mis-pointed reference is refused
+        // rather than resolved to a plausible neighbour.
+        assert_eq!(slot_of_cell(slot_offset(0, class, 1) + 8, class), None);
+        // And one past the end is not a slot either, which is what keeps a reference
+        // from addressing a trailer as though it were a payload.
+        assert_eq!(slot_of_cell(slot_offset(0, class, cap), class), None);
     }
 
-    /// The widest class a payload can actually be allocated into.
+    /// The widest class a payload can actually be allocated into.    /// The widest class a payload can actually be allocated into.
     ///
     /// **Not `CLASS_SIZES.len() - 1`.** Three tests took the last entry as "the widest
     /// class", which was the same thing while every packed class sat at index 0. It is
@@ -1442,14 +1527,25 @@ mod tests {
         // The bitmap class is exact-fit, so its capacity is what divides cleanly.
         let bitmap_class = class_for(crate::BITMAP_BYTES).unwrap();
         let cap = slab_capacity(bitmap_class);
-        assert_eq!(cap, (SLAB_BODY / 8256) as u32);
+        // Each slot costs its payload **plus its trailer**, which now lives in a table at
+        // the tail of the body rather than inside the slot. The capacity is therefore what
+        // `payload + 8` divides into the body -- 254, one *more* than the 253 an inline
+        // trailer allowed, because the slot no longer rounds up to 8256.
+        let per_slot = crate::BITMAP_BYTES as u64 + EXT_TRAILER_BYTES as u64;
+        assert_eq!(cap, (SLAB_BODY / per_slot) as u32);
         assert!(cap > 250, "expected 250+ bitmaps per slab, got {cap}");
 
-        // Waste per slab must stay negligible.
-        let waste = SLAB_BODY - cap as u64 * 8256;
+        // Waste per slab must stay small. **The bound was 0.1% and is now 0.5%, and that
+        // is a deliberate, recorded trade rather than a bound relaxed to pass.** With the
+        // trailer inline, 253 slots of 8256 tiled the body to within 192 bytes, 0.009%.
+        // With it in a table at the tail, 254 slots of 8192 plus 2032 bytes of table leave
+        // 6160, 0.29% -- because 255 payloads would fill the body exactly and leave the
+        // table nowhere to go. What is bought is that consecutive payloads are adjacent and
+        // OS-page aligned, which is the whole point; the reasoning is in JOURNAL 2026-09-30.
+        let waste = SLAB_BODY - cap as u64 * per_slot;
         assert!(
-            (waste as f64) / (SLAB_SIZE as f64) < 0.001,
-            "slab waste {waste} exceeds 0.1%"
+            (waste as f64) / (SLAB_SIZE as f64) < 0.005,
+            "slab waste {waste} exceeds 0.5%"
         );
     }
 

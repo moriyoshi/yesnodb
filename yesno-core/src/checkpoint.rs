@@ -316,21 +316,26 @@ pub fn run(
                 let cell = sink.allocator().alloc(class)?;
                 sink.write_extent(cell, &payload)?;
                 // The trailer is what makes a mis-pointed `ChunkRef` detectable.
-                // Its eight bytes are already reserved by the ladder — every
-                // slot is `round_up_64(payload + 8)` — and were simply never
-                // written, so the detection the design describes did not exist.
                 //
-                // It sits at a fixed distance from the slot *end*, so it can be
-                // found without knowing the payload length.
-                let slot = crate::store::extent::class_size(class)
-                    .ok_or(crate::CodecError::Invariant("unknown size class"))?
-                    as u64;
+                // **It lives in a table at the tail of the slab body, not inside the
+                // slot.** It used to sit at a fixed distance from the slot *end*, which
+                // meant every slot had to be `round_up_64( payload + 8 )` -- and that
+                // slack is the whole reason consecutive dense payloads could not be
+                // adjacent. A slot is now exactly the payload, and the trailer is
+                // addressed by slot index instead of by distance from the payload.
+                let slot = crate::store::alloc::slot_of_cell(cell, class).ok_or(
+                    crate::CodecError::Invariant("extent cell is not slot-aligned"),
+                )?;
                 let trailer = crate::store::extent::ExtTrailer {
                     ckey_tag: crate::store::extent::ckey_tag(d.key),
                     crc32c: crate::store::checksum::crc32c(&payload),
                 };
                 sink.write_extent(
-                    cell + slot - crate::store::extent::EXT_TRAILER_BYTES as u64,
+                    crate::store::alloc::trailer_offset(
+                        crate::store::alloc::slab_of(cell),
+                        class,
+                        slot,
+                    ),
                     &trailer.to_le_bytes(),
                 )?;
                 ChunkRef::extent(cell, c.kind(), c.len())?

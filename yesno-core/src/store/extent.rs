@@ -421,36 +421,23 @@ pub const PACK_MAX: usize = 2028;
 /// 2112 not 2048 ) so that a power-of-two payload plus its 8-byte trailer still
 /// fits exactly. Without the shift a 2048-byte payload would round to 3072 and
 /// waste 33%.
-/// Class of a **large** packed page, for a run of consecutive chunks of one key.
-///
-/// The reason it exists: a standalone extent carries its 8-byte trailer *after* its
-/// payload, and the ladder is sized so "payload plus trailer" fits, so
-/// `CLASS_SIZES[ 10 ]` is 8256 for an 8192-byte bitmap. **That 64 bytes of slack per
-/// chunk is the only reason consecutive dense payloads are not adjacent**, measured as
-/// 0 of 63 adjacent pairs on a 64-chunk key. A packed page has no per-payload trailer,
-/// so payloads inside one are contiguous -- which is what makes a region lendable to
-/// Arrow without a gather.
-///
-/// Packed rather than a new mechanism because [`PACKED_CLASS`] already does all of
-/// this at 4 KiB: `PackedPageBuilder::new` takes the page size as a parameter, payloads
-/// are appended in ascending `ChunkKey` order, and the header's CRC covers the body.
-/// Only the size and the checkpointer's admission rule differ.
-pub const PACKED_LARGE_CLASS: u8 = 11;
-
 /// Is `class` a packed page rather than a slot for one payload?
 ///
-/// Both packed classes sit **outside** the ascending size ladder and are never chosen
-/// by [`class_for`]: a packed page is selected by the checkpointer's admission rule, by
-/// payload size and locality, not by looking up a size class. Written as a predicate
-/// rather than tested against `PACKED_CLASS` at each site, because there are now two
-/// and a site that checks only the first silently treats a large page as a standalone
-/// extent -- which would read its first eight bytes as a trailer.
+/// A packed class sits **outside** the ascending size ladder and is never chosen by
+/// [`class_for`]: a packed page is selected by the checkpointer's admission rule, by
+/// payload size, not by looking up a size class.
+///
+/// A predicate rather than `== PACKED_CLASS` at each site. A second packed class existed
+/// briefly -- `PACKED_LARGE_CLASS`, for adjacency -- and five sites that spelled this as
+/// a position rather than a property were each silently wrong for it. Out-of-line
+/// trailers made that class unnecessary, but the shape of the mistake is worth not
+/// re-enabling.
 #[inline]
 pub const fn is_packed_class(class: u8) -> bool {
-    class == PACKED_CLASS || class == PACKED_LARGE_CLASS
+    class == PACKED_CLASS
 }
 
-pub const CLASS_SIZES: [u32; 12] = [
+pub const CLASS_SIZES: [u32; 11] = [
     4096, // 0  PACKED
     576,  // 1  payload <=  568
     704,  // 2           <=  696
@@ -461,32 +448,22 @@ pub const CLASS_SIZES: [u32; 12] = [
     3136, // 7           <= 3128
     4160, // 8           <= 4152   exact for 4096
     6208, // 9           <= 6200
-    8256, // 10          <= 8248   exact for 8192
-    // 11  PACKED_LARGE. Outside the ladder's ordering, like class 0.
-    //
-    // **Sized so a whole number of bitmaps fits, not to a round power of two.** Eight
-    // payloads plus the 40-byte page header is 65 576, rounded to 65 600 for the
-    // ladder's 64-byte rule. A flat 65 536 was tried first and holds only **seven**:
-    // `capacity` is `page_size - HEADER`, so the header comes out of the payload space
-    // and eight bitmaps overrun it by 40 bytes. The ladder already reasons this way --
-    // 2112 is annotated "exact for 2048" for the same reason.
-    //
-    // Deliberately much smaller than a slab. The page's CRC is verified as a unit, so
-    // reading *one* chunk re-checksums the whole page, and `read_container_for` already
-    // records that this amplification is unmeasured even at 4 KiB. For a run read whole
-    // -- the shape this exists for -- one 64 KiB checksum is no more work than eight
-    // 8 KiB ones, so the cost falls only on point reads into a packed run. It also sets
-    // `MAX_VERIFIED_SPAN`, which bounds a backward scan on every write, so growing this
-    // is a write-path cost as well. Raising it to a slab body would give 254 bitmaps in
-    // one 2 MiB region; that is a one-line change once Phase 2's writer can measure
-    // both costs.
-    65600,
+    // 10. **Exactly a bitmap payload.** It was 8256 -- `round_up_64( 8192 + 8 )` -- while
+    // every slot carried its own 8-byte trailer, and that 64 bytes of slack was the sole
+    // reason consecutive dense payloads could not be adjacent: `8256 % 4096 == 64` also
+    // put each one across three OS pages instead of two. The trailer now lives in a table
+    // at the tail of the slab body, so the slot is the payload and consecutive slots are
+    // contiguous.
+    8192,
 ];
 
 /// Smallest class whose slot holds `payload_len` plus a trailer, or `None` if
 /// the payload exceeds the largest class.
 pub fn class_for(payload_len: usize) -> Option<u8> {
-    let need = payload_len + EXT_TRAILER_BYTES;
+    // The payload alone. A slot used to have to hold `payload + EXT_TRAILER_BYTES`, which
+    // is what pushed an 8192-byte bitmap into an 8256-byte slot; the trailer is now in a
+    // table at the tail of the slab body and the slot holds only the payload.
+    let need = payload_len;
     CLASS_SIZES
         .iter()
         .enumerate()
@@ -560,7 +537,8 @@ pub fn validate_ladder(sizes: &[u32]) -> Result<()> {
     // storable in a slot of its own, and a packed page being bigger than any of them
     // would satisfy a `last()` check for the wrong reason.
     let top = standalone.last().copied().unwrap_or(0) as usize;
-    if top < crate::BITMAP_BYTES + EXT_TRAILER_BYTES {
+    // The payload alone, for the reason `class_for` computes `need` without a trailer.
+    if top < crate::BITMAP_BYTES {
         return Err(CodecError::Invariant(
             "top standalone class cannot hold a bitmap payload",
         ));
@@ -835,7 +813,13 @@ mod tests {
     #[test]
     fn top_class_is_exact_fit_for_a_bitmap_and_a_full_array() {
         let bitmap_class = class_for(crate::BITMAP_BYTES).unwrap();
-        assert_eq!(class_size(bitmap_class).unwrap(), 8256);
+        // **Exactly** the payload now, not `round_up_64( payload + 8 )`. The trailer is
+        // in a table at the tail of the slab body, and that is what makes consecutive
+        // bitmap payloads adjacent instead of 64 bytes apart.
+        assert_eq!(
+            class_size(bitmap_class).unwrap(),
+            crate::BITMAP_BYTES as u32
+        );
 
         // A 4096-element array has the same 8192-byte payload, so it lands in the
         // same class: array->bitmap promotion is a same-class rewrite with no
@@ -847,12 +831,24 @@ mod tests {
     #[test]
     fn class_selection_is_tight() {
         assert_eq!(class_size(class_for(1).unwrap()).unwrap(), 576);
-        assert_eq!(class_size(class_for(568).unwrap()).unwrap(), 576);
-        assert_eq!(class_size(class_for(569).unwrap()).unwrap(), 704);
-        // Power-of-two payloads stay exact-fit thanks to the +64 shift.
+        // **The boundaries moved by eight bytes and got tighter, which is the point.** A
+        // slot no longer has to hold the trailer, so a class of size S admits a payload of
+        // S rather than S - 8: 576 used to stop at 568.
+        assert_eq!(class_size(class_for(576).unwrap()).unwrap(), 576);
+        assert_eq!(class_size(class_for(577).unwrap()).unwrap(), 704);
+        // Power-of-two payloads still land in the class sized for them.
         assert_eq!(class_size(class_for(2048).unwrap()).unwrap(), 2112);
         assert_eq!(class_size(class_for(4096).unwrap()).unwrap(), 4160);
-        assert_eq!(class_for(8249), None, "beyond the top class");
+        // The top class is exactly a bitmap, so one more byte has nowhere to go.
+        assert_eq!(
+            class_size(class_for(crate::BITMAP_BYTES).unwrap()).unwrap(),
+            crate::BITMAP_BYTES as u32
+        );
+        assert_eq!(
+            class_for(crate::BITMAP_BYTES + 1),
+            None,
+            "beyond the top class"
+        );
     }
 
     #[test]

@@ -1,6 +1,29 @@
 # Contiguous dense span extents
 
-**Status: planned 2026-09-30.** Product-level requirement: a consumer storing a huge
+**Status: DONE 2026-09-30 for the dense case.** `CLASS_SIZES[ 10 ]` is 8192 and the extent
+trailer lives in a table at the tail of the slab body, so consecutive bitmap payloads are
+adjacent and OS-page aligned. The adjacency harness flipped from **0 of 63** adjacent pairs
+to **63 of 63**. 254 slots per slab where an inline trailer allowed 253.
+
+**Both deferred decisions turned out to be moot, which is the main thing to carry away.**
+The phases below call for a `DbOptions` switch and a minimum-run-length admission rule;
+neither exists, because **placement A needs no admission rule**. Every standalone bitmap
+gets a slot its own size, and consecutive ones land adjacent because a checkpoint
+bump-allocates within a contiguous slab run -- the locality policy `alloc.rs` already had.
+A threshold and a mode flag were artifacts of the packed-page design, not of the goal.
+`PACKED_LARGE_CLASS` is deleted and `MAX_VERIFIED_SPAN` is back to 8192.
+
+**What remains open is only B**, and only as a throughput question: A gives contiguous
+regions of 2 080 768 bytes, which is 16 646 144 boolean rows per Arrow batch, so the
+capability is delivered. B would make batches fewer and larger, and deciding it needs one
+measurement -- whether one 128 MiB batch beats sixty-four of 2 MiB for a consumer. Its cost
+is unchanged and is recorded below: a payload-only slab is not self-describing, which is
+the hazard `slabmeta` exists to prevent.
+
+Read the phases below as the record of how this was argued, not as a description of the
+code. Phase 1's large packed page is gone; Phases 2 to 4 as written no longer apply.
+
+**Original status: planned 2026-09-30.** Product-level requirement: a consumer storing a huge
 dense set ( a KV cache ) cannot receive it without a gather, which makes zero-copy
 transmission impossible and the product materially less attractive for that shape.
 

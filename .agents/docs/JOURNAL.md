@@ -9381,3 +9381,73 @@ modulus disagrees** with the correct base -- so it cannot pass vacuously. That m
 was right only while every packed page was 4 KiB *and* that size divided `SLAB_META`;
 65 600 satisfies neither, and the failure would have been a header parsed out of payload
 bytes, which is a wrong answer rather than an error.
+
+## 2026-09-30 -- dense contiguity, landed: the fix was a smaller slot, not a bigger page
+
+`CLASS_SIZES[ 10 ]` is 8192 instead of 8256 and the 8-byte extent trailer moved to a
+table at the tail of the slab body, addressed by slot index. **The adjacency harness
+flipped from 0 of 63 adjacent pairs to 63 of 63**, and that harness was written before
+any of this work, so it cannot have been shaped to agree.
+
+The whole cause was one rounding rule. A slot was `round_up_64( payload + 8 )`, so an
+8192-byte bitmap took 8256 bytes and consecutive dense payloads sat 64 bytes apart --
+and `8256 % 4096 == 64` also put each one across three OS pages instead of two. With the
+trailer out of the slot, the slot *is* the payload.
+
+**It gains rather than costs, in the dimension that matters**: 254 slots per slab where an
+inline trailer allowed 253. More payloads, adjacent, page-aligned.
+
+**Both deferred decisions evaporated.** The plan called for a `DbOptions` switch and a
+minimum-run-length admission rule, and the maintainer deferred the first and chose "full
+page" for the second. Neither exists, because **A needs no admission rule at all**: every
+standalone bitmap simply gets a slot its own size, and consecutive ones land adjacent
+because a checkpoint bump-allocates within a contiguous slab run -- which `alloc.rs`
+already documented as its locality policy. A threshold and a mode flag were artifacts of
+the packed-page design, not of the goal.
+
+`PACKED_LARGE_CLASS` is deleted, and with it `MAX_VERIFIED_SPAN` goes 65 600 back to 8192.
+**The round trip is the lesson and it is recorded in that constant's comment**: the wide
+version widened a scan that runs on every write in the shard, eightfold, to buy an
+adjacency that a *narrower* slot delivers for nothing.
+
+**The metadata region was tried first and does not work.** For the bitmap class the table
+is 2 040 bytes and `SLAB_META` has 8 128 free, which would have left the body holding a
+whole 255 payloads with no waste at all. But `slabmeta` writes that region as **one block**
+at the end of a checkpoint, so it overwrote trailers placed there earlier -- observed as
+`MisPointedExtent { .. trailer_off: 2097664, found: 0 }` on the first reopen, where the
+offset is slab 1's metadata region. Using it means folding the table into `slabmeta`'s own
+encode and inheriting that block's CRC and A/B handling, which is a larger change than the
+6 160 bytes per slab it saves. Recorded in `slab_capacity` where the decision lives.
+
+**A test bound was raised, and this is the explicit record CLAUDE.md asks for.** Slab waste
+goes from 192 bytes ( 0.009% ) to 6 160 ( 0.29% ), because 255 payloads tile the body
+exactly and would leave the table nowhere to go, so capacity is `body / ( payload + 8 )`.
+The assertion moved from 0.1% to 0.5% with the arithmetic written into it. **The bound was
+not wrong and is not being weakened to pass**: it described the old layout's waste, and the
+new layout buys adjacency with a different, still small, one. The tighter bound is
+recoverable through the `slabmeta` integration above, and that is the reason to do it.
+
+**Eleven tests encoded the old layout, in three shapes**, and the shapes are the reusable
+part:
+
+* **Trailer position**, six sites: fsck's shared fixture, its corruption test, a
+  `db::store` fixture and the assertion checking the error's `trailer_off`, and
+  `durability`'s `find_standalone_bitmap`. That last one is the interesting one -- it
+  confirmed a candidate payload by scanning **512 bytes past it** for the CRC, with a
+  comment saying the gap was "searched rather than assumed, which keeps this helper correct
+  across a ladder change". The search was the assumption: the trailer is now up to two
+  megabytes away, so it found nothing and reported "the fixture or the framing moved". It
+  computes the address from the public helpers now.
+* **Ladder arithmetic**, three sites: capacity, class-selection boundaries ( which got
+  *tighter* by eight bytes, since a class of size S now admits a payload of S rather than
+  S - 8 ), and the top class's exactness.
+* **Write ordering**, one site: `a_bitmap_is_never_packed` asserted on
+  `writes.values().next()`, meaning the lowest address written. The trailer used to follow
+  the payload and now precedes it in some layouts, so "the first write" stopped being the
+  payload. An assertion that depends on address order is one a layout change can invert.
+
+And one of mine: the new `bitmap_slots_are_adjacent_and_their_trailers_are_out_of_the_way`
+first asserted the table begins *after* the last slot, which failed the moment the table
+moved in front of the body during the `SLAB_META` attempt. **The invariant is non-overlap**,
+and stating it as a position rather than as a relation is the same class of mistake as the
+four "packed is class 0" index assumptions from Phase 1.

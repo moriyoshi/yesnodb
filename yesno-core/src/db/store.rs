@@ -458,9 +458,17 @@ impl ShardStore {
                 crate::store::packed::PackedHeader::verify(&bytes).map(|_| ())
             })?;
         } else if let Some(class) = self.alloc.owning_class(cell) {
-            let slot = crate::store::extent::class_size(class)
-                .ok_or(CodecError::Invariant("unknown size class"))? as u64;
-            let off = cell + slot - crate::store::extent::EXT_TRAILER_BYTES as u64;
+            // The trailer is in the table at the tail of the slab body, addressed by slot
+            // index. It used to sit at a fixed distance from the slot's *end*, which is
+            // what forced every slot to be wider than its payload and kept consecutive
+            // dense payloads from being adjacent.
+            let slot = crate::store::alloc::slot_of_cell(cell, class)
+                .ok_or(CodecError::Invariant("extent cell is not slot-aligned"))?;
+            let off = crate::store::alloc::trailer_offset(
+                crate::store::alloc::slab_of(cell),
+                class,
+                slot,
+            );
             let raw = self
                 .seg
                 .read_at(off, crate::store::extent::EXT_TRAILER_BYTES)?;
@@ -973,9 +981,7 @@ mod tests {
     /// that invents its own layout would pass while the real one was broken.
     #[test]
     fn an_extent_belonging_to_another_key_is_refused_with_evidence() {
-        use crate::store::extent::{
-            ckey_tag, class_for, class_size, ExtTrailer, EXT_TRAILER_BYTES,
-        };
+        use crate::store::extent::{ckey_tag, class_for, ExtTrailer};
 
         let p = tmp("mispointed-extent");
         let _c = Cleanup(p.clone());
@@ -999,17 +1005,16 @@ mod tests {
         let class = class_for(payload.len()).unwrap();
         let cell = s.alloc.alloc(class).unwrap();
         crate::checkpoint::ExtentWriter::write_extent(&mut s, cell, &payload).unwrap();
-        let slot = class_size(class).unwrap() as u64;
+        // In the table at the tail of the slab body, by slot index.
+        let idx = crate::store::alloc::slot_of_cell(cell, class).unwrap();
+        let trailer_at =
+            crate::store::alloc::trailer_offset(crate::store::alloc::slab_of(cell), class, idx);
         let trailer = ExtTrailer {
             ckey_tag: ckey_tag(owner),
             crc32c: crate::store::checksum::crc32c(&payload),
         };
-        crate::checkpoint::ExtentWriter::write_extent(
-            &mut s,
-            cell + slot - EXT_TRAILER_BYTES as u64,
-            &trailer.to_le_bytes(),
-        )
-        .unwrap();
+        crate::checkpoint::ExtentWriter::write_extent(&mut s, trailer_at, &trailer.to_le_bytes())
+            .unwrap();
 
         let cref = ChunkRef::extent(cell, c.kind(), c.len()).unwrap();
 
@@ -1029,7 +1034,9 @@ mod tests {
                 assert_eq!(key, other.0);
                 assert_eq!(c2, cell);
                 assert_eq!(cl, class);
-                assert_eq!(trailer_off, cell + slot - EXT_TRAILER_BYTES as u64);
+                // The error must name the address it actually read, which is the table
+                // entry rather than a distance from the slot's end.
+                assert_eq!(trailer_off, trailer_at);
                 assert_eq!(found, ckey_tag(owner));
                 assert_eq!(expected, ckey_tag(other));
             }

@@ -3465,15 +3465,23 @@ fn find_standalone_bitmap(file: &[u8]) -> Option<(usize, usize)> {
         // Confirm against the stored trailer checksum, so this still fails
         // loudly rather than silently if the framing ever moves.
         //
-        // The 8-byte trailer is ( ckey_tag, crc32c ) and it sits at the end
-        // of the **slot**, not adjacent to the payload — the slot is the
-        // payload rounded up to a size class, so the gap is class-dependent
-        // ( 60 bytes past the payload for this 8 KiB bitmap today ). The gap is
-        // therefore searched rather than assumed, which keeps this helper
-        // correct across a ladder change instead of pinning today's classes.
+        // **The trailer's address is computed, not searched.** This used to scan the 512
+        // bytes past the payload, on the reasoning that the trailer sat at the end of the
+        // slot and the gap was class-dependent -- which was correct while a slot was the
+        // payload rounded up to a class. It no longer is: the trailer lives in a table at
+        // the tail of the slab body, up to two megabytes away, so a bounded search finds
+        // nothing and the helper reported "the fixture or the framing moved". The public
+        // helpers give the exact entry, which survives a ladder change better than either
+        // a fixed gap or a wider window.
         let want = crc32c_append(0, &file[at..at + PAYLOAD]);
-        for gap in 0..=512usize {
-            let crc_at = at + PAYLOAD + gap;
+        let class = yesno_core::store::extent::class_for(PAYLOAD)?;
+        if let Some(slot) = yesno_core::store::alloc::slot_of_cell(at as u64, class) {
+            let crc_at = yesno_core::store::alloc::trailer_offset(
+                yesno_core::store::alloc::slab_of(at as u64),
+                class,
+                slot,
+            ) as usize
+                + 4;
             if crc_at + 4 <= file.len()
                 && u32::from_le_bytes(file[crc_at..crc_at + 4].try_into().unwrap()) == want
             {

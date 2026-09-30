@@ -315,10 +315,12 @@ impl VerifiedCache {
 /// one.** Widening the largest page widens this scan for every write, and a region
 /// *larger* than this is not cached at all ( see the length test in `verify_once` ),
 /// so an oversized page would re-checksum on every read rather than once. It was 8256
-/// — the top standalone slot — until `PACKED_LARGE_CLASS` arrived at 65 600 bytes on
-/// 2026-09-30, and that eightfold widening is the reason that class is 64 KiB rather
-/// than the 2 MiB a slab body would allow.
-const MAX_VERIFIED_SPAN: u64 = 65600;
+/// while every slot carried its own trailer, went to 65 600 for a large packed page on
+/// 2026-09-30, and came back to 8192 the same day once out-of-line trailers made that
+/// class unnecessary. **The round trip is the lesson**: the wide version widened a scan
+/// that runs on every write in the shard, eightfold, to buy an adjacency that a *narrower*
+/// slot delivers for nothing.
+const MAX_VERIFIED_SPAN: u64 = 8192;
 
 // Against the **maximum** of the ladder, not its last entry. The assertion here read
 // `CLASS_SIZES[ len - 1 ]`, which was the same thing only while every class ascended;

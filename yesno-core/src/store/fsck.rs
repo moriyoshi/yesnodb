@@ -277,15 +277,16 @@ impl Rebuilt {
 
         for site in &self.extents {
             let key = site.key;
-            let Some(slot) = class_size(site.class) else {
+            // Kept for its message, not for a value: `slot_of_cell` below also refuses an
+            // unknown class, but "unknown size class" says more than "not slot-aligned".
+            if class_size(site.class).is_none() {
                 out.push(format!(
                     "{key:?}: extent at {} has unknown size class {}",
                     site.cell, site.class
                 ));
                 continue;
-            };
-            // The trailer sits at a fixed distance from the slot *end*, which is
-            // what makes it findable without the payload length. The payload
+            }
+            // The payload
             // itself is exactly `payload_len` bytes at the cell: the bytes
             // between are never written, so widening the extent to the whole
             // slot would checksum uninitialised space.
@@ -299,7 +300,21 @@ impl Rebuilt {
                     continue;
                 }
             };
-            let tail = site.cell + slot as u64 - EXT_TRAILER_BYTES as u64;
+            // In the table at the tail of the slab body, by slot index -- not at a
+            // fixed distance from the slot's end, which is what a slot wider than its
+            // payload allowed and what kept dense payloads from being adjacent.
+            let Some(idx) = crate::store::alloc::slot_of_cell(site.cell, site.class) else {
+                out.push(format!(
+                    "{key:?}: extent at {} is not slot-aligned for class {}",
+                    site.cell, site.class
+                ));
+                continue;
+            };
+            let tail = crate::store::alloc::trailer_offset(
+                crate::store::alloc::slab_of(site.cell),
+                site.class,
+                idx,
+            );
             let raw = match read(tail, EXT_TRAILER_BYTES) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1151,14 +1166,15 @@ mod tests {
             let class = class_for(payload.len()).unwrap();
             let cell = alloc.alloc(class).unwrap();
             let key = ChunkKey::new(1, i);
-            let slot = class_size(class).unwrap() as u64;
+            // The trailer lives in the table at the tail of the slab body, by slot index.
+            let idx = crate::store::alloc::slot_of_cell(cell, class).unwrap();
             let trailer = ExtTrailer {
                 ckey_tag: ckey_tag(key),
                 crc32c: crc32c(&payload),
             };
             writes.push((cell, payload));
             writes.push((
-                cell + slot - EXT_TRAILER_BYTES as u64,
+                crate::store::alloc::trailer_offset(crate::store::alloc::slab_of(cell), class, idx),
                 trailer.to_le_bytes().to_vec(),
             ));
             entries.push((
@@ -1351,8 +1367,15 @@ mod tests {
     fn a_corrupt_extent_trailer_checksum_is_caught() {
         let mut f = checksum_fixture();
         let (cell, class) = f.extent;
-        let slot = class_size(class).unwrap() as u64;
-        f.image.flip(cell + slot - 4);
+        // The CRC32C is the trailer's second word, so it is four bytes into the entry --
+        // and the entry is in the table at the tail of the slab body, not at a fixed
+        // distance from the slot's end.
+        let at = crate::store::alloc::trailer_offset(
+            crate::store::alloc::slab_of(cell),
+            class,
+            crate::store::alloc::slot_of_cell(cell, class).unwrap(),
+        );
+        f.image.flip(at + 4);
         let (_, sums) = f.scan();
         assert_eq!(sums.len(), 1, "{sums:?}");
         assert!(sums[0].contains("fails its stored checksum"), "{}", sums[0]);
@@ -1413,10 +1436,13 @@ mod tests {
         let (tree, nodes) = build_tree(&mut alloc, &entries);
 
         let mut image = Image::covering(&alloc);
-        let slot = class_size(class).unwrap() as u64;
         image.put(cell, &payload);
         image.put(
-            cell + slot - EXT_TRAILER_BYTES as u64,
+            crate::store::alloc::trailer_offset(
+                crate::store::alloc::slab_of(cell),
+                class,
+                crate::store::alloc::slot_of_cell(cell, class).unwrap(),
+            ),
             &ExtTrailer {
                 ckey_tag: ckey_tag(key),
                 crc32c: crc32c(&payload),
