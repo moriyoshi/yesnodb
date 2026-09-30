@@ -220,13 +220,16 @@ fn schema_for(t: &Ticket) -> SchemaRef {
         match t.wire {
             SetWire::Containers => return yesno_arrow::containers_schema(),
             // **One schema for the whole stream, carrying the origin of the whole
-            // bitvector.** `mask_chunk_schema` puts the base ordinal in schema
+            // bitvector.** `bitvector_schema` puts the base ordinal in schema
             // metadata, and a Flight stream is stamped with exactly one schema, so a
             // per-chunk base could not be expressed here. It does not need to be:
             // the stream is dense and ordered, so row `n` across it is ordinal
             // `base + n` and batch boundaries carry no meaning.
             SetWire::Bitvector => {
-                return yesno_arrow::mask_chunk_schema(yesno_core::chunk_base(t.prefix_lo))
+                return yesno_arrow::bitvector_schema(
+                    yesno_core::chunk_base(t.prefix_lo),
+                    yesno_core::CHUNK_CARD,
+                )
             }
             SetWire::Ordinals => {}
         }
@@ -410,16 +413,36 @@ const BATCH_ROWS: usize = 8192;
 
 /// The widest prefix window a materialized bitvector may span.
 ///
-/// A bitvector costs one bit per ordinal *position*, so its size is a function of
-/// the window and not of the cardinality -- 8 KiB per chunk whether the chunk holds
-/// one ordinal or 65 535. At this cap a stream is 128 MiB of bits covering 2^30
-/// ordinal positions, which is a large answer and a finite one; the `2^48` chunks a
-/// default whole-key ticket names would be two pebibytes.
+/// A bitvector costs a fixed amount per ordinal *position*, so its size is a function of
+/// the window and not of the cardinality -- 8 KiB of payload per chunk whether the chunk
+/// holds one ordinal or 65 535. At this cap that is 128 MiB of payload covering `2^30`
+/// positions: a large answer and a finite one, where the `2^48` chunks a default whole-key
+/// ticket names would be two pebibytes.
+///
+/// **On the wire it is about twice the payload, measured 2026-10-01.** arrow-rs writes an
+/// all-valid validity buffer for a boolean column even when the field is declared
+/// non-nullable -- 65 536 rows produce a 16 712-byte stream for 8 192 bytes of payload,
+/// ratio 2.04, identical whether the field is nullable or not. So this cap admits roughly
+/// 256 MiB of stream, and the representation's honest advantage over an ordinal is **32x**
+/// rather than the 64x the payload alone suggests. The cap was chosen against the payload
+/// figure; it is not halved, because what it exists to refuse is an unbounded *window*
+/// rather than a large answer.
 ///
 /// So this is a **refusal**, not a truncation: answering a narrower window than was
 /// asked for would be a silently wrong answer, and the caller cannot tell a clipped
 /// bitvector from a sparse one.
 const BITVECTOR_MAX_CHUNKS: u64 = 16_384;
+
+/// Chunks per batch on the bitvector arm.
+///
+/// 64 chunks is 512 KiB of bits, chosen inside a **measured plateau** rather than at a
+/// guessed optimum. Serializing 128 MiB through the IPC stream writer at varying batch
+/// sizes ( 2026-10-01 ): 8 KiB batches run at 22-24 GiB/s, 64 KiB at 76-79, 2 MiB at
+/// 60-103, 16 MiB at 50-70, and a single 128 MiB batch collapses to **1.9 GiB/s**. So
+/// anything from 64 KiB to 2 MiB is indistinguishable within run-to-run variance, one chunk
+/// per batch is three times worse, and a very large batch is catastrophic -- the writer
+/// stages each batch through a copy, which is cheap only while it fits cache.
+const BITVECTOR_CHUNKS_PER_BATCH: usize = 64;
 
 /// Containers per batch on the dense arm.
 ///
@@ -1368,15 +1391,78 @@ impl FlightService for YesnoFlightService {
                         ))));
                         return;
                     }
-                    let schema =
-                        yesno_arrow::mask_chunk_schema(yesno_core::chunk_base(t.prefix_lo));
+                    let schema = yesno_arrow::bitvector_schema(
+                        yesno_core::chunk_base(t.prefix_lo),
+                        yesno_core::CHUNK_CARD,
+                    );
+                    // **The borrowed path first.** A window whose chunks are contiguous on
+                    // disk is lent as one buffer, so the batch is built without copying a
+                    // byte of payload -- measured 9x on that step. Anything the store will
+                    // not vouch for ( a gap, a memtable override, a non-bitmap chunk ) comes
+                    // back `None` and falls through to the staging walk below, which is
+                    // correct for every window.
+                    let mut lent = t.prefix_lo;
+                    while lent < t.prefix_hi {
+                        let end = (lent + BITVECTOR_CHUNKS_PER_BATCH as u64).min(t.prefix_hi);
+                        let Some(buf) =
+                            yesno_core::unstable_arrow::dense_span(&snap, t.key, lent, end)
+                        else {
+                            break;
+                        };
+                        let n = (end - lent) as usize;
+                        let offsets: Vec<i32> = (0..=n)
+                            .map(|i| (i * yesno_core::BITMAP_BYTES) as i32)
+                            .collect();
+                        let values = arrow_array::BinaryArray::new(
+                            yesno_arrow::arrow_buffer::OffsetBuffer::new(
+                                yesno_arrow::arrow_buffer::ScalarBuffer::from(offsets),
+                            ),
+                            buf,
+                            None,
+                        );
+                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)])
+                            .expect("one binary column of the declared type");
+                        if tx.blocking_send(Ok(rb)).is_err() {
+                            tracing::debug!(lent, "Flight bitvector receiver closed early");
+                            return;
+                        }
+                        lent = end;
+                    }
+                    if lent >= t.prefix_hi {
+                        tracing::info!(
+                            chunks = t.prefix_hi - t.prefix_lo,
+                            "Flight read lent a bitvector without copying"
+                        );
+                        return;
+                    }
+
                     let set = std::sync::Arc::new(set);
                     // `dense` takes an **inclusive** upper bound where the ticket's
-                    // window is half-open, hence the `- 1`; `span > 0` above is what
-                    // makes that subtraction safe.
-                    let masks =
-                        yesno_arrow::MaskStream::dense(set.stream(), t.prefix_lo, t.prefix_hi - 1);
+                    // window is half-open, hence the `- 1`. Resumed from where the borrow
+                    // stopped: restarting at `prefix_lo` would resend the chunks already
+                    // lent, and a consumer counts values from the stream's start.
+                    let masks = yesno_arrow::MaskStream::dense(set.stream(), lent, t.prefix_hi - 1);
                     let mut emitted = 0u64;
+                    let mut staged: Vec<u8> = Vec::new();
+                    let mut offsets: Vec<i32> = vec![0];
+                    let flush = |staged: &mut Vec<u8>, offsets: &mut Vec<i32>| -> bool {
+                        if offsets.len() == 1 {
+                            return true;
+                        }
+                        let values = arrow_array::BinaryArray::new(
+                            yesno_arrow::arrow_buffer::OffsetBuffer::new(
+                                yesno_arrow::arrow_buffer::ScalarBuffer::from(std::mem::replace(
+                                    offsets,
+                                    vec![0],
+                                )),
+                            ),
+                            std::mem::take(staged).into(),
+                            None,
+                        );
+                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)])
+                            .expect("one binary column of the declared type");
+                        tx.blocking_send(Ok(rb)).is_ok()
+                    };
                     for m in masks {
                         let m = match m {
                             Ok(m) => m,
@@ -1385,13 +1471,25 @@ impl FlightService for YesnoFlightService {
                                 return;
                             }
                         };
-                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(m.to_array())])
-                            .expect("one boolean column of the declared type");
-                        if tx.blocking_send(Ok(rb)).is_err() {
+                        // The mask's own bytes, bit-packed little-endian in ordinal order --
+                        // the layout a bitmap container already holds, which is why this
+                        // needs no conversion here and no decoder at the far end.
+                        let bytes = m.mask.values();
+                        debug_assert_eq!(bytes.len(), yesno_core::BITMAP_BYTES);
+                        staged.extend_from_slice(bytes);
+                        offsets.push(staged.len() as i32);
+                        emitted += 1;
+                        // `offsets` holds one more entry than there are values.
+                        if offsets.len() > BITVECTOR_CHUNKS_PER_BATCH
+                            && !flush(&mut staged, &mut offsets)
+                        {
                             tracing::debug!(emitted, "Flight bitvector receiver closed early");
                             return;
                         }
-                        emitted += 1;
+                    }
+                    if !flush(&mut staged, &mut offsets) {
+                        tracing::debug!(emitted, "Flight bitvector receiver closed early");
+                        return;
                     }
                     tracing::info!(chunks = emitted, "Flight read produced a bitvector");
                     return;

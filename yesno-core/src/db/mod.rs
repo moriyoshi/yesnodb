@@ -4937,6 +4937,105 @@ impl Snapshot {
     /// *produces* an error here, and swallowing it converted "silently correct"
     /// into "silently empty" -- strictly worse than not checking at all. A check
     /// whose error has nowhere to go is not a check.
+    /// One `Buffer` over `[ lo, hi )`'s payloads, when they are contiguous on disk.
+    ///
+    /// # What this is for
+    ///
+    /// A consumer that wants a dense set as Arrow needs **one contiguous values buffer**,
+    /// and assembling one by copying each chunk is the dominant cost of serving it --
+    /// measured at 57.7 GiB/s gathered against 529 GiB/s when the buffer is borrowed, a 9x
+    /// difference on the batch-building step alone. Since 2026-09-30 a standalone bitmap's
+    /// slot is exactly its payload, so consecutive chunks written in one checkpoint *are*
+    /// adjacent, and the gather is avoidable rather than structural.
+    ///
+    /// # Why it refuses so readily
+    ///
+    /// `None` is the safe answer and every doubt takes it, because the caller has a correct
+    /// slower path and lending the wrong bytes is a wrong answer. It refuses when the
+    /// memtable has **any** opinion in the window ( including a tombstone ), when a prefix
+    /// is missing, when any chunk is not a store-backed bitmap, and when the cells are not
+    /// adjacent at `BITMAP_BYTES`. A window with a gap can never qualify: the stride is what
+    /// makes bit `j` of value `i` addressable, so a hole would silently shift every later
+    /// bit.
+    ///
+    /// Each chunk is still read through `read_container_for`, so its trailer is verified
+    /// before any of its bytes are lent. Skipping that to save the reads would hand out
+    /// unverified payloads, which is the one thing the trailer exists to prevent.
+    ///
+    /// # What the caller inherits
+    ///
+    /// The returned `Buffer` pins the extents it covers for as long as it lives -- the third
+    /// reclamation condition, "no live Arrow `Buffer` points into it". `Buffer` is
+    /// `'static`, so an in-process consumer can hold a slab alive indefinitely; over a wire
+    /// the batch is written and dropped, which bounds it.
+    pub(crate) fn dense_span_buffer(
+        &self,
+        key: u64,
+        lo: Prefix48,
+        hi: Prefix48,
+    ) -> Option<arrow_buffer::Buffer> {
+        let want = hi.checked_sub(lo)?;
+        if want == 0 {
+            return None;
+        }
+        let shard = self.shard_for(key);
+
+        // The memtable first, and any opinion at all disqualifies the window. A finer rule
+        // would ask whether each override happens to equal what is on disk, which is both
+        // more work than the copy it saves and a chance to be wrong about staleness.
+        {
+            let mem = shard.mem.read().unwrap();
+            if mem
+                .key_chunks(key, self.version)
+                .any(|(p, _)| p >= lo && p < hi)
+            {
+                return None;
+            }
+        }
+
+        let tree = self.roots[self.shard_index(key)]?;
+        let store = shard.store.as_ref()?.lock().unwrap();
+
+        let mut first_cell = None;
+        let mut expect_prefix = lo;
+        let scan = tree.range(&*store, ChunkKey::new(key, lo), ChunkKey::new(key, hi));
+        for item in scan {
+            let (ck, cref) = item.ok()?;
+            // Strictly consecutive: the walk is ordered, so a prefix that is not the one
+            // expected means a hole, and a hole has no stride.
+            if ck.prefix() != expect_prefix {
+                return None;
+            }
+            if cref.kind() != crate::ContainerKind::Bitmap {
+                return None;
+            }
+            let cell = cref.cell()?;
+            match first_cell {
+                None => first_cell = Some(cell),
+                Some(base) => {
+                    let offset = (expect_prefix - lo) * crate::BITMAP_BYTES as u64;
+                    if cell != base + offset {
+                        return None;
+                    }
+                }
+            }
+            // Verified before anything is lent, and the container is dropped immediately --
+            // it is read for its trailer check, not for its payload.
+            match store.read_container_for(ck, cref) {
+                Ok(Some(c)) if c.kind() == crate::ContainerKind::Bitmap => {}
+                _ => return None,
+            }
+            expect_prefix += 1;
+        }
+        if expect_prefix != hi {
+            return None;
+        }
+
+        let base = first_cell?;
+        let len = want as usize * crate::BITMAP_BYTES;
+        store.segment().buffer_at(base, len).ok()
+    }
+
     fn merged_chunks(&self, key: u64) -> Result<Vec<(Prefix48, Container)>> {
         let shard = self.shard_for(key);
 

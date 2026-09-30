@@ -29,6 +29,16 @@ bazel_flags=()
 if [[ -n "${YESNO_BAZEL_DISK_CACHE:-}" ]]; then
     bazel_flags+=("--disk_cache=${YESNO_BAZEL_DISK_CACHE}")
 fi
+# The **repository** cache is a separate thing from the disk cache, and omitting it cost a
+# gate run on 2026-10-01: the disk cache holds action outputs, while an external repository's
+# download lives in the output base, which an image rebuild discards. So every rebuild
+# re-fetched the pinned MySQL tarball from `cdn.mysql.com`, and one fetch failed --
+# `Error downloading ... mysql-8.4.0.tar.gz`, with the URL reachable a minute later. Keyed by
+# sha256, which is exactly what a pinned download wants, so this makes a rebuild independent
+# of upstream availability rather than merely faster.
+if [[ -n "${YESNO_BAZEL_REPO_CACHE:-}" ]]; then
+    bazel_flags+=("--repository_cache=${YESNO_BAZEL_REPO_CACHE}")
+fi
 
 build_postgresql() {
     bazel build "${bazel_flags[@]}" \

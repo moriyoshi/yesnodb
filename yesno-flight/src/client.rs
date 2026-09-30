@@ -434,8 +434,10 @@ where
     /// Fetch a planned set query as a **wholly materialized bitvector** over
     /// `prefix_lo..prefix_hi`, one bit per ordinal position.
     ///
-    /// The stream carries a single boolean column, bit-packed, with the window's base
-    /// ordinal in the schema metadata. Chunks the set does not touch arrive as
+    /// The stream carries a single `Binary` column, one value per chunk of bit-packed
+    /// little-endian bits, with the window's base ordinal and the bits each value advances
+    /// in the schema metadata. A value is indexed directly -- nothing of Roaring is needed
+    /// to read it. Chunks the set does not touch arrive as
     /// all-zero rather than being skipped, so row `n` across the whole stream is
     /// ordinal `( prefix_lo << 16 ) + n` and batch boundaries mean nothing. That is
     /// the easiest thing to consume of the three representations: an Arrow selection

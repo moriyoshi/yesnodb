@@ -463,29 +463,138 @@ async fn a_materialized_bitvector_agrees_with_ordinals_and_refuses_an_unbounded_
         stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))),
     );
 
+    // **Decoded as a consumer with no Roaring would**: each value is bit-packed
+    // little-endian bits in ordinal order, so bit `j` of value `i` is ordinal
+    // `base + i * bits_per_value + j`. Both figures come from the schema metadata rather
+    // than being assumed, which is what makes the stream self-describing.
+    // Taken from the first batch, because a Flight stream's schema is not known until its
+    // first message has arrived -- `FlightRecordBatchStream::schema()` is `None` before
+    // then, which the first version of this test assumed otherwise.
+    let mut base = u64::MAX;
+    let mut per_value = 0u64;
     let mut from_bits: BTreeSet<u64> = BTreeSet::new();
-    let mut rows = 0u64;
+    let mut values = 0u64;
+    while let Some(b) = decoded.next().await {
+        let b = b.unwrap();
+        if per_value == 0 {
+            let meta = b.schema().field(0).metadata().clone();
+            base = meta
+                .get(yesno_arrow::schema::META_BASE_ORDINAL)
+                .expect("the base ordinal rides in the field metadata")
+                .parse()
+                .unwrap();
+            per_value = meta
+                .get(yesno_arrow::META_BITS_PER_VALUE)
+                .expect("the bits each value advances ride there too")
+                .parse()
+                .unwrap();
+            assert_eq!(base, 0, "this window starts at prefix 0");
+            assert_eq!(per_value, 65_536);
+        }
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        for i in 0..col.len() {
+            let bytes = col.value(i);
+            assert_eq!(
+                bytes.len() as u64,
+                per_value / 8,
+                "every value must be a whole chunk of bits, including the empty ones"
+            );
+            let origin = base + values * per_value;
+            for (byte, &v) in bytes.iter().enumerate() {
+                for bit in 0..8u32 {
+                    if v & (1 << bit) != 0 {
+                        from_bits.insert(origin + byte as u64 * 8 + bit as u64);
+                    }
+                }
+            }
+            values += 1;
+        }
+    }
+    assert_eq!(
+        values * per_value,
+        4 * 65_536,
+        "a bitvector must carry a bit for every position in its window, gaps included"
+    );
+    // Batched rather than one value per batch, which is what the measured plateau asks for.
+    assert!(values > 1, "the fixture must span several chunks");
+    assert_eq!(
+        from_bits, want,
+        "the bitvector decoded to a different set than the ordinals did"
+    );
+}
+
+/// A fully dense window goes down the **borrowed** path and still agrees with ordinals.
+///
+/// The test above deliberately has gaps, so it exercises the staging walk. This one has
+/// none, so `dense_span` vouches for every batch and the server builds them over lent
+/// buffers instead of copying -- a different code path, with its own offset arithmetic, and
+/// therefore its own chance to be wrong. That `dense_span` lends rather than copies is
+/// asserted in `yesno-core`'s `tests/dense_span.rs` by address; what this asserts is that
+/// the bytes it hands to Arrow describe the same set the ordinal path does.
+#[tokio::test]
+async fn a_borrowed_bitvector_agrees_with_ordinals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+
+    // Four chunks, every one dense enough to be a bitmap and none empty.
+    let want: BTreeSet<u64> = (0..4 * 65_536u64).filter(|o| o % 2 == 0).collect();
+    db.insert_many(7, &want.iter().copied().collect::<Vec<_>>())
+        .unwrap();
+    db.checkpoint().unwrap();
+
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = client_for(url).await;
+    let d = FlightDescriptor::new_cmd(7u64.to_le_bytes().to_vec());
+    let info = client.get_flight_info(d).await.unwrap().into_inner();
+    let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.clone();
+
+    let mut t = Ticket::decode(&raw)
+        .unwrap()
+        .with_wire(yesno_flight::SetWire::Bitvector);
+    t.prefix_lo = 0;
+    t.prefix_hi = 4;
+    let stream = client
+        .do_get(arrow_flight::Ticket::new(t.encode()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut decoded = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))),
+    );
+
+    let mut got: BTreeSet<u64> = BTreeSet::new();
+    let mut values = 0u64;
     while let Some(b) = decoded.next().await {
         let b = b.unwrap();
         let col = b
             .column(0)
             .as_any()
-            .downcast_ref::<arrow_array::BooleanArray>()
+            .downcast_ref::<arrow_array::BinaryArray>()
             .unwrap();
         for i in 0..col.len() {
-            if col.value(i) {
-                from_bits.insert(rows + i as u64);
+            let bytes = col.value(i);
+            assert_eq!(bytes.len(), 8192, "each value is one chunk of bits");
+            let origin = values * 65_536;
+            for (byte, &v) in bytes.iter().enumerate() {
+                for bit in 0..8u32 {
+                    if v & (1 << bit) != 0 {
+                        got.insert(origin + byte as u64 * 8 + bit as u64);
+                    }
+                }
             }
+            values += 1;
         }
-        rows += col.len() as u64;
     }
     assert_eq!(
-        rows,
-        4 * 65_536,
-        "a bitvector must carry a bit for every position in its window, gaps included"
+        values, 4,
+        "every chunk in the window must arrive exactly once"
     );
     assert_eq!(
-        from_bits, want,
-        "the bitvector decoded to a different set than the ordinals did"
+        got, want,
+        "the borrowed bitvector decoded to a different set than the ordinals did"
     );
 }

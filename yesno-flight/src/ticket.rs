@@ -54,7 +54,14 @@ pub enum SetWire {
     /// client that cannot read them.
     Containers,
     /// A **wholly materialized bitvector** over the ticket's prefix window:
-    /// `mask_chunk_schema`, one bit per ordinal position, gaps included.
+    /// `bitvector_schema`, one bit per ordinal position, gaps included.
+    ///
+    /// Carried as `Binary` -- one value per chunk -- rather than as a boolean column. A
+    /// boolean column's validity bitmap is one bit per **row**, and a row there is an
+    /// ordinal, so arrow-rs doubled the wire: 65 536 rows serialized to 16 712 bytes for
+    /// 8 192 bytes of payload, and identically whether the field was declared nullable or
+    /// not ( measured 2026-10-01 ). With a chunk per value, validity costs one bit per
+    /// 65 536 positions and the wire is the payload again.
     ///
     /// The simplest thing a consumer can receive -- a boolean column usable as an
     /// Arrow selection mask with no roaring decoder, no chunk reassembly and no

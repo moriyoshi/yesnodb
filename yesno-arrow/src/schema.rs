@@ -66,16 +66,37 @@ pub fn big_schema() -> SchemaRef {
     ]))
 }
 
-/// `{ matched: Boolean }` — a selection mask over one chunk.
+/// Bits per value in a [`bitvector_schema`] stream, as its metadata reports it.
+pub const META_BITS_PER_VALUE: &str = "yesno.bits_per_value";
+
+/// `{ bits: Binary }` — a materialized bitvector, one chunk of bits per value.
 ///
-/// `base_ordinal` rides in the field metadata so a consumer can align the mask
-/// against its own row numbering without a side channel.
-pub fn mask_chunk_schema(base_ordinal: u64) -> SchemaRef {
+/// # Why `Binary` and not `Boolean`
+///
+/// A boolean column carries a validity bitmap with **one bit per row**, and a row here is
+/// an *ordinal* — so arrow-rs doubles the wire: 65 536 rows serialize to 16 712 bytes for
+/// 8 192 bytes of payload, ratio 2.04, and identically whether the field is declared
+/// nullable or not ( measured 2026-10-01 ). Carrying the same bits as one `Binary` value
+/// per chunk makes a row a *chunk*, so validity costs one bit per 65 536 positions instead
+/// of one per position, and the wire is the payload again.
+///
+/// It stays decoder-free, which is the whole point of the representation: a value is
+/// bit-packed little-endian bits in ordinal order, so a consumer indexes it directly and
+/// needs nothing of Roaring. And because a value is the container's bytes verbatim, a
+/// batch's values buffer can be a **borrowed** slice of the store where consecutive chunks
+/// are adjacent, rather than a gathered copy.
+///
+/// `base_ordinal` is the first position of the *stream*, and `bits_per_value` says how far
+/// each value advances, so value `i` covers
+/// `base_ordinal + i * bits_per_value` onwards. Gaps are materialized as all-zero values,
+/// which is what keeps that arithmetic true.
+pub fn bitvector_schema(base_ordinal: u64, bits_per_value: u32) -> SchemaRef {
     let mut md = HashMap::new();
     md.insert(META_BASE_ORDINAL.to_string(), base_ordinal.to_string());
+    md.insert(META_BITS_PER_VALUE.to_string(), bits_per_value.to_string());
     Arc::new(Schema::new(vec![Field::new(
-        "matched",
-        DataType::Boolean,
+        "bits",
+        DataType::Binary,
         false,
     )
     .with_metadata(md)]))
@@ -114,7 +135,7 @@ mod tests {
         for s in [
             ordinals_schema(),
             pairs_schema(),
-            mask_chunk_schema(0),
+            bitvector_schema(0, 65_536),
             containers_schema(),
         ] {
             for f in s.fields() {
@@ -124,10 +145,22 @@ mod tests {
     }
 
     #[test]
-    fn mask_schema_carries_its_base_ordinal() {
-        let s = mask_chunk_schema(65_536);
+    fn a_bitvector_schema_carries_its_origin_and_stride() {
+        // Both figures, because a consumer needs them together: the base says where the
+        // stream starts and the stride says how far each value advances, and bit `j` of
+        // value `i` is `base + i * stride + j`. This replaced
+        // `mask_schema_carries_its_base_ordinal`, which covered the Boolean mask schema
+        // deleted on 2026-10-01 -- a boolean column's validity bitmap is one bit per *row*,
+        // and a row there was an ordinal, so it doubled the wire.
+        let s = bitvector_schema(65_536, 65_536);
         let md = s.field(0).metadata();
         assert_eq!(md.get(META_BASE_ORDINAL).map(String::as_str), Some("65536"));
+        assert_eq!(
+            md.get(META_BITS_PER_VALUE).map(String::as_str),
+            Some("65536")
+        );
+        assert_eq!(s.field(0).name(), "bits");
+        assert_eq!(s.field(0).data_type(), &DataType::Binary);
     }
 
     #[test]

@@ -9451,3 +9451,71 @@ first asserted the table begins *after* the last slot, which failed the moment t
 moved in front of the body during the `SLAB_META` attempt. **The invariant is non-overlap**,
 and stating it as a position rather than as a relation is the same class of mistake as the
 four "packed is class 0" index assumptions from Phase 1.
+
+## 2026-10-01 -- the bitvector wire: Binary not Boolean, and lent not gathered
+
+Two corrections from the maintainer, both of which improved the representation shipped on
+2026-09-30, plus the measurement that closed placement B.
+
+**B is closed: do not do it.** It would have made Arrow batches larger by dedicating whole
+slabs to payloads, and larger is worse. Serializing 128 MiB through the IPC stream writer at
+varying batch sizes: 8 KiB batches 22-24 GiB/s, 64 KiB 76-79, 2 MiB 60-103, 16 MiB 50-70,
+and a **single 128 MiB batch 1.9 GiB/s**. 64 KiB to 2 MiB is a plateau within run-to-run
+variance; above it degrades and one huge batch is 30-50x off. B's direction is wrong, and
+the cost it would have carried -- payload-only slabs are not self-describing, the hazard
+`slabmeta` exists to prevent -- buys nothing. Harness at
+`.agents-workspace/tmp/batchsize`.
+
+**The first version of that harness measured cache residency, not batch size.** It built one
+batch per arm and wrote it repeatedly, so small-batch arms stayed entirely in cache while the
+128 MiB arm streamed cold memory, and it reported a 44x spread. Every arm now traverses the
+same 128 MiB once, as zero-copy slices of one buffer. The ranking survived; the magnitude
+did not.
+
+**`Binary`, not `BooleanArray`, and the reason is where the validity bitmap lives.** A boolean
+column carries one validity bit per **row**, and a row there is an *ordinal*, so arrow-rs
+doubled the wire: 65 536 rows serialize to 16 712 bytes for 8 192 bytes of payload, ratio
+**2.04**, identically whether the field is declared nullable or not. Carried as one `Binary`
+value per chunk a row is a *chunk*, so validity costs one bit per 65 536 positions: ratio
+**1.06**, and better still with batching. I had begun writing the 2x into the docs as a
+property of the representation; it is a property of the *carrier*, and the maintainer's
+correction was to change the carrier.
+
+`mask_chunk_schema` was deleted with it -- nothing produced a Boolean mask stream any more.
+`MaskChunk::to_array` stays: it is the **in-process** filter path, which is what `masks.rs`
+exists for, and a filter kernel wants rows to be ordinals. The division is now clean --
+`Binary` where bytes cross a wire, `BooleanArray` where they do not.
+
+**Then lent rather than gathered, which is worth 9x on the step it removes.** Building a
+batch by copying each chunk into a fresh values buffer measures 57.7 GiB/s; handing Arrow a
+buffer it already has measures **529 GiB/s**. That gap is the gather, and it exists only
+because a batch needs one contiguous values buffer -- which, since the slot change made
+consecutive payloads adjacent, the store can now provide directly.
+`unstable_arrow::dense_span` returns one `Buffer` over `[ lo, hi )` through the store's
+existing `buffer_at`, whose `ExtentGuard` already carries the lifetime that reclamation
+condition 3 depends on. **No `unsafe` was needed**, and the alternative -- `from_custom_allocation`
+over adjacent chunk pointers in `yesno-flight` -- would have needed a SAFETY invariant, a
+journal note and a property test to buy the same thing the safe accessor already offers.
+
+**It refuses on any doubt, and the refusals are the tested part.** A memtable opinion
+anywhere in the window, a missing prefix, a non-bitmap chunk, or non-adjacent cells all give
+`None` and the caller gathers instead. The memtable rule is deliberately coarse -- *any*
+opinion disqualifies -- because asking whether each override happens to equal the disk copy
+is more work than the copy it saves and a fresh chance to be wrong about staleness. Trailers
+are still verified per chunk before any byte is lent; skipping that to save the reads would
+hand out unverified payloads, which is the one thing the trailer exists to prevent.
+
+**Borrowed and copied buffers hold identical bytes, so only an address can tell them apart.**
+`a_contiguous_window_is_lent_and_not_copied` asserts the span begins where the container's
+own `bitmap_words` does, and was checked against a gathering implementation, which fails it.
+The three refusals each also assert the *positive* case still works, so a refusal is about
+the hazard rather than about the key. And `a_borrowed_bitvector_agrees_with_ordinals` covers
+the Flight path with no gaps, because the bitvector test written yesterday has deliberate
+gaps and therefore exercised only the fallback -- a test can pass for a year without touching
+the path it appears to cover.
+
+**What is still not done.** The staging fallback copies, and always will for gaps, mixed
+kinds and memtable-resident chunks; that is the correct behaviour rather than a gap. And the
+wire still carries the bytes once through TLS, which no arrangement here avoids -- the
+vectored-I/O question is a separate prototype ( pane `%735`, gated on an strace of whether
+h2 and tokio-rustls emit `writev` at all ).

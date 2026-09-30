@@ -33,6 +33,35 @@ use crate::CHUNK_CARD;
 /// Re-exported so downstream crates provably link the same `arrow-buffer`.
 pub use arrow_buffer;
 
+/// One `Buffer` over a contiguous run of a key's bitmap payloads, or `None`.
+///
+/// **The whole-span counterpart to [`bitmap_mask`].** That one lends a single chunk; this
+/// lends `[ lo, hi )` at once, which is what an Arrow consumer actually needs -- a
+/// `BinaryArray` or a mask over many chunks takes **one** contiguous values buffer, so a
+/// per-chunk lend still leaves the caller gathering. Measured on the batch-building step:
+/// 57.7 GiB/s gathered against 529 GiB/s borrowed, a 9x difference.
+///
+/// Possible at all only since the extent trailer moved out of the slot ( 2026-09-30 ): a
+/// standalone bitmap's slot is now exactly its payload, so chunks written in one checkpoint
+/// are adjacent rather than 64 bytes apart.
+///
+/// **It refuses readily and `None` is not an error.** The memtable holding any opinion in
+/// the window, a missing prefix, a chunk that is not a store-backed bitmap, or cells that
+/// are not adjacent all yield `None`, and the caller is expected to have a gathering path.
+/// Every chunk's trailer is verified before its bytes are lent.
+///
+/// The returned buffer pins the extents it covers while it lives, which is the third
+/// reclamation condition; `Buffer` is `'static`, so an in-process holder can pin a slab
+/// indefinitely.
+pub fn dense_span(
+    snap: &crate::Snapshot,
+    key: u64,
+    lo: crate::Prefix48,
+    hi: crate::Prefix48,
+) -> Option<Buffer> {
+    snap.dense_span_buffer(key, lo, hi)
+}
+
 /// The container's bits as an Arrow mask, if it is a bitmap.
 ///
 /// `None` for array and run containers, which have no bit image to lend; use

@@ -284,10 +284,14 @@ USER yesno-builder
 # part of the image, so both are prunable with `docker builder prune` if they
 # outgrow their worth -- a Bazel disk cache has no garbage collector.
 RUN --mount=type=cache,target=/var/cache/yesno-bazel-disk,uid=10001,gid=10001,sharing=locked \
+    --mount=type=cache,target=/var/cache/yesno-bazel-repo,uid=10001,gid=10001,sharing=locked \
     YESNO_BAZEL_DISK_CACHE=/var/cache/yesno-bazel-disk \
+    YESNO_BAZEL_REPO_CACHE=/var/cache/yesno-bazel-repo \
     ./scripts/build-database-artifacts.sh postgresql
 RUN --mount=type=cache,target=/var/cache/yesno-bazel-disk,uid=10001,gid=10001,sharing=locked \
+    --mount=type=cache,target=/var/cache/yesno-bazel-repo,uid=10001,gid=10001,sharing=locked \
     YESNO_BAZEL_DISK_CACHE=/var/cache/yesno-bazel-disk \
+    YESNO_BAZEL_REPO_CACHE=/var/cache/yesno-bazel-repo \
     ./scripts/build-database-artifacts.sh mysql
 # The search step is cargo and Gradle rather than Bazel, and it recompiles the
 # whole workspace because this stage shares no `target/` with the release-binary

@@ -32,7 +32,9 @@ pub mod schema;
 pub use batch::{BatchPolicy, OrdinalBatchReader};
 pub use containers::{read_containers, ContainerBatchBuilder};
 pub use masks::{MaskChunk, MaskStream};
-pub use schema::{containers_schema, mask_chunk_schema, ordinals_schema, pairs_schema};
+pub use schema::{
+    bitvector_schema, containers_schema, ordinals_schema, pairs_schema, META_BITS_PER_VALUE,
+};
 
 /// Re-exported so downstreams provably link the same Arrow.
 pub use arrow_array;
