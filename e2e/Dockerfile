@@ -244,9 +244,60 @@ ENV DOCKER_HOST=unix:///var/run/docker.sock
 WORKDIR /workspace
 USER yesno-builder
 
-RUN ./scripts/build-database-artifacts.sh postgresql
-RUN ./scripts/build-database-artifacts.sh mysql
-RUN ./scripts/build-database-artifacts.sh search
+# A Bazel **disk cache**, and deliberately not the output base.
+#
+# The output base holds the artifacts every later gate consumes, reached through
+# the `.agents-workspace/tmp/bazel-*` convenience symlinks this repository
+# configures, and `scripts/build-database-artifacts.sh` copies nothing out of it.
+# So caching *it* would put those artifacts outside the image and leave the
+# symlinks dangling at `docker run`. A disk cache is content-addressed and purely
+# additive: Bazel still materializes every output into the image and only skips
+# the compilation it can prove is unchanged.
+#
+# Why this is worth having. The source copy above is one layer, so editing a
+# single scenario invalidates it and recompiles Arrow C++, MySQL and PostgreSQL
+# from source -- about ten minutes before the first assertion runs, which is how
+# the operator gate came to be run so rarely that it sat red for a week without
+# anyone paying for it. The pinned fixtures above were already placed above the
+# source-copy boundary so an ordinary edit never redownloads them; this extends
+# the same principle from downloading to compiling.
+#
+# Two things this got wrong first, both worth stating because both failed loudly
+# and quickly rather than subtly.
+#
+# The cache lives under `/var/cache` and **not** under `$HOME/.cache`. Mounting
+# `$HOME/.cache/bazel-disk` failed in 35 seconds with
+# `mkdir('/home/yesno-builder/.cache/bazel/_bazel_yesno-builder'): Permission
+# denied`, because a BuildKit cache mount creates any missing **parent** of its
+# target as root -- so it created a root-owned `$HOME/.cache` and Bazel could no
+# longer place its own output base beside it. Different parents, no interference.
+#
+# And the flag is passed through the environment for these two commands only,
+# never through `$HOME/.bazelrc`. That file is global, so it also reached the
+# gate's own `bazel` running inside the finished image, which failed with
+# `/var/cache/yesno-bazel-disk (Permission denied)` -- a build-time mount does not
+# exist at run time. The gates do invoke Bazel in the container, so build-time
+# tuning must not leak into the image's configuration.
+
+# `sharing=locked` because two concurrent image builds must not write one Bazel
+# disk cache or one cargo target directory at the same time. Neither cache is
+# part of the image, so both are prunable with `docker builder prune` if they
+# outgrow their worth -- a Bazel disk cache has no garbage collector.
+RUN --mount=type=cache,target=/var/cache/yesno-bazel-disk,uid=10001,gid=10001,sharing=locked \
+    YESNO_BAZEL_DISK_CACHE=/var/cache/yesno-bazel-disk \
+    ./scripts/build-database-artifacts.sh postgresql
+RUN --mount=type=cache,target=/var/cache/yesno-bazel-disk,uid=10001,gid=10001,sharing=locked \
+    YESNO_BAZEL_DISK_CACHE=/var/cache/yesno-bazel-disk \
+    ./scripts/build-database-artifacts.sh mysql
+# The search step is cargo and Gradle rather than Bazel, and it recompiles the
+# whole workspace because this stage shares no `target/` with the release-binary
+# stage above. Caching it is safe precisely because nothing needs `target/` at
+# run time: the harness runs from `/usr/local/bin/yesno-e2e`, and `.dockerignore`
+# already excludes `target` so no copied directory is shadowed here.
+RUN --mount=type=cache,target=/home/yesno-builder/.gradle,uid=10001,gid=10001,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001,sharing=locked \
+    --mount=type=cache,target=/workspace/target,uid=10001,gid=10001,sharing=locked \
+    ./scripts/build-database-artifacts.sh search
 
 # One harness entrypoint. The operator binary and the KVM guest are workload
 # artifacts, not additional scenario endpoints, so neither is ever the command.

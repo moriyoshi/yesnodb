@@ -8918,3 +8918,67 @@ Two implementation notes that are easy to get backwards:
   guard fails the put-output test on `at version v1`; making `--watch` stop
   re-scanning fails the watch test with `Disconnected`. A test written after a fix
   and never run against the bug is a test that has never been observed to fail.
+
+## 2026-09-30 -- the e2e image recompiled MySQL because one layer held the whole tree
+
+`scripts/gate-operator.sh` was run four times on 2026-09-30 and each run spent
+roughly ten minutes recompiling Arrow C++, MySQL and PostgreSQL before reaching
+its first assertion, although the only change between runs was two edits inside
+one Rust file and one Python scenario. `e2e/Dockerfile` copies the whole tree in a
+single layer and then runs the three `scripts/build-database-artifacts.sh` steps
+with no cache mount on any of them, unlike the release-binary stage above which
+mounts both the cargo registry and `target/`. So any source edit invalidates the
+copy and rebuilds every database toolchain from source.
+
+**This is the cost that kept the gate from being run**, which is how it came to sit
+red for a week ( see the entry above ). The image header already applies the right
+principle one paragraph earlier -- the pinned external fixtures are placed "above
+the source-copy boundary so ordinary yesno edits never redownload them" -- so this
+extends an existing decision from downloading to compiling rather than reversing
+one.
+
+**A disk cache, deliberately not the output base.** `build-database-artifacts.sh`
+runs `bazel build` and copies nothing, so the artifacts every later gate consumes
+live in Bazel's output base and are reached through the
+`.agents-workspace/tmp/bazel-*` symlinks `.bazelrc` configures. Caching *that*
+would put the artifacts outside the image and leave the symlinks dangling at
+`docker run`. A `--disk_cache` is content-addressed and additive: Bazel still
+materializes every output into the image and only skips compilation it can prove
+is unchanged.
+
+**Two attempts failed first, both loudly and cheaply, and both are worth keeping.**
+
+* **A BuildKit cache mount creates any missing parent of its target as root.**
+  Mounting `$HOME/.cache/bazel-disk` therefore created a root-owned
+  `$HOME/.cache`, and Bazel could no longer create its own output base beside it:
+  `mkdir('/home/yesno-builder/.cache/bazel/_bazel_yesno-builder'): Permission
+  denied`, 35 seconds in. The disk cache now lives under `/var/cache`, so the
+  mount cannot interfere with the thing that has to stay in the image.
+* **`$HOME/.bazelrc` is global, and the gates invoke Bazel at run time.** Setting
+  the flag there reached the gate's own in-container `bazel`, which failed with
+  `/var/cache/yesno-bazel-disk (Permission denied)` because a build-time mount does
+  not exist by then. That also settled a question the first design had only
+  assumed: the image is not merely a carrier of prebuilt artifacts, it runs Bazel,
+  which is exactly why the output base must stay inside it. The flag is now passed
+  through `YESNO_BAZEL_DISK_CACHE` for the two build commands only, and is empty
+  everywhere else.
+
+**Reordering the copy was considered and not done.** Copying only the Bazel inputs,
+building, then copying the rest would skip the step entirely rather than cache it,
+but its failure mode is silent staleness: a Bazel input left out of the early copy
+produces artifacts built from a partial tree, and nothing would say so.
+`yesno-e2e/BUILD.bazel` exists, so the set of Bazel-relevant directories is wider
+than it looks and would have to stay correct as targets are added. A cache has no
+such hazard -- Bazel re-analyses everything and reuses actions by content hash --
+so it buys most of the benefit with none of the risk. Revisit only with a
+mechanism that cannot go stale.
+
+**Verified by the three gates that consume the three artifact families**, because
+the operator scenario touches none of them and so cannot prove the artifacts are
+still in the image: `gate-pg.sh` passes ( reporting 1250 action cache hits ),
+`gate-mysql.sh` passes, and `gate-search.sh` passes all three scenarios.
+
+**The benefit is not yet measured.** Both runs so far were cold-cache and paid full
+price; a rebuild after an unrelated source edit is what will show the saving, and
+the number belongs here once it exists rather than now. Host load was 40-52
+throughout from an unrelated session, so any timing taken here is soft.

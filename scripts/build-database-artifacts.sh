@@ -14,12 +14,28 @@ if [[ "$actual_bazel" != "bazel $expected_bazel" ]]; then
     exit 1
 fi
 
+# Extra flags for the `bazel build` invocations below. The image build sets
+# YESNO_BAZEL_DISK_CACHE to a path held in a BuildKit cache mount, so an edit that
+# changes nothing Bazel depends on does not recompile Arrow C++, MySQL and
+# PostgreSQL from source. It is empty everywhere else, deliberately: a disk cache
+# is a build-time optimization and must not change how `bazel` behaves at **run**
+# time, where the gates invoke it inside the finished image.
+#
+# An earlier attempt set the flag through `$HOME/.bazelrc` instead. That file is
+# global, so it reached the gate's own in-container `bazel` too, which then failed
+# with `/var/cache/yesno-bazel-disk (Permission denied)` because a build-time
+# mount no longer exists by then. Scope beats convenience here.
+bazel_flags=()
+if [[ -n "${YESNO_BAZEL_DISK_CACHE:-}" ]]; then
+    bazel_flags+=("--disk_cache=${YESNO_BAZEL_DISK_CACHE}")
+fi
+
 build_postgresql() {
-    bazel build \
+    bazel build "${bazel_flags[@]}" \
         //yesno-pg:yesno_pg \
         //yesno-pg:unit \
         //e2e/postgresql:regress
-    bazel build \
+    bazel build "${bazel_flags[@]}" \
         //yesno-pg:yesno_pg \
         //yesno-pg:unit \
         //e2e/postgresql:regress \
@@ -27,7 +43,7 @@ build_postgresql() {
 }
 
 build_mysql() {
-    bazel build \
+    bazel build "${bazel_flags[@]}" \
         //yesno-c:yesno_c \
         //yesno-flight-c++:unit_tests \
         //third_party/mysql:mysql \
