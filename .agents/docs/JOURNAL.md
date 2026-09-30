@@ -9198,3 +9198,114 @@ through `apply_record`, because a hand-built committed record would need a
 `ChunkPatch` body is decoded by `decode_chunk_patch`, whose length checks predate
 this change and are exercised by `chunk_patch.rs`. No new torn-record case was added
 for the `PutChunk` producer specifically.
+
+## 2026-09-30 -- three set representations on the Flight wire, and where zero-copy stops
+
+Flight answered a set as one `u64` per ordinal and nothing else, so a dense result
+cost `8 * cardinality` bytes. `yesno-arrow` had carried the dense alternative since
+it was written -- `containers.rs` ships payloads byte-identical to the page store,
+`masks.rs` turns a bitmap container into an Arrow `BooleanBuffer` for a refcount bump
+-- and **`yesno-flight` declared `yesno-arrow` as a dependency while importing
+nothing from it**. The representations existed and were unreachable.
+
+`Ticket` now carries a `SetWire`, and there are three:
+
+* `Ordinals` -- one `u64` each, `ordinals_schema`. Still the default, because a
+  consumer that has not asked for anything else may have no decoder for it.
+* `Containers` -- `containers_schema`, the container payload per chunk. **Adaptive
+  rather than merely smaller**: roaring has already chosen per chunk, so an array is
+  `2n` bytes, a bitmap 8192 and a run `4 * intervals`, and the stream is never worse
+  than either fixed choice. A dense chunk is 8 KiB against 512 KiB of ordinals.
+* `Bitvector` -- `mask_chunk_schema`, one bit per ordinal position over the ticket's
+  prefix window, gaps materialized. The easiest to consume of the three: an Arrow
+  selection mask, no roaring decoder, no chunk reassembly, no nested types.
+
+**The representation went in the fixed header rather than behind a magic-marked
+extension block, and that was a correction.** The first implementation here spent a
+`YSNW` magic, an extension version and an "unknown version is an error" rule on
+keeping an already-shipped 40-byte layout byte-identical -- machinery whose only
+purpose is compatibility with a release that does not exist. `TICKET_HEADER_LEN` is
+48 and the field is a sixth `u64`. What survived the simplification is the property
+that actually mattered: the expression stays the unambiguous **tail**, so the
+remainder goes to `AnyExpr::decode` whole with no length prefix and no sniffing.
+
+One rule was kept for a reason that is not compatibility: **an unrecognised
+representation rejects the ticket rather than defaulting to ordinals.** Defaulting
+would answer in a representation the caller did not ask for, and be
+indistinguishable to it from a server that understood the request.
+
+**`Bitvector` is the one representation a server must refuse rather than
+discourage.** Its size tracks the *prefix window*, not the cardinality -- 8 KiB per
+chunk whether that chunk holds one ordinal or 65 535 -- and a whole-key ticket spans
+`2^48` chunks, two pebibytes of bits to describe a set that may hold three ordinals.
+Above `BITVECTOR_MAX_CHUNKS` ( 16 384 chunks: 128 MiB, `2^30` positions ) it is
+refused, **not clipped**, because a clipped bitvector is indistinguishable from a
+sparse one. `Client::fetch_bitvector` takes the window as required arguments, so a
+caller has to have thought about it rather than discover the refusal.
+
+`mask_chunk_schema` puts the base ordinal in schema *metadata* and a Flight stream is
+stamped with exactly one schema, so a per-chunk base could not be expressed. It does
+not need to be: the stream is dense and ordered, so row `n` across the whole stream
+is ordinal `base + n` and batch boundaries carry no meaning. Batching bounds differ
+per arm for the same reason they exist at all -- `CONTAINER_BATCH_ROWS` is 512
+against `BATCH_ROWS`, because one row there is a whole container and `BATCH_ROWS`
+bitmaps would be a half-gigabyte batch.
+
+## Zero-copy: asked for, and the honest boundary
+
+The question was whether this could be zero-serde. **Over Flight it cannot, and the
+blocker is Arrow's layout rather than anything here.** Arrow requires one contiguous
+values buffer per column per batch, and the store's chunks live in separate extents,
+so gathering N containers into one batch is a copy by construction. Zero-copy would
+need one container per batch, where framing dominates, or chunks already adjacent in
+memory, which the store does not give.
+
+**The floor is one copy, and the code was at two.** `codec::encode` allocated a
+`Vec<u8>` per container which the caller then copied out of; for a `BitStore::Shared`
+payload that is 8 192 mmap'd bytes already in Roaring order, so 16 KiB moved to ship
+8 KiB. `codec::encode_into` now holds the logic and `encode` wraps it, with
+`to_le_bytes_into` on `U16Store` and `BitStore` beneath. Guarded by
+`pushing_containers_does_not_allocate_one_temporary_each` -- an allocation count,
+because both paths emit identical bytes and nothing else can tell them apart.
+
+Where genuine zero-copy does live, and it is not Flight: `unstable_arrow::bitmap_words`
+lends the mmap'd words and **refuses rather than copying**; `bitmap_mask` is a
+refcount bump for a store-backed payload ( and an 8 KiB re-encode for a
+memtable-resident one, which its doc claimed was O(1) until 2026-09-13 ); and the
+plugin channel's `memfd` arena writes payloads into pages the peer already maps. A
+memfd cannot cross a network. Two further limits: a **run** container can never be
+lent, because it is stored as `( start, len_minus_1 )` while the wire says
+`[ start, end ]`, and that conversion is the one that was a silent wire bug on
+2026-09-29; and the `BooleanBuffer` identity is little-endian only.
+
+**Composite Arrow types were designed and not built.** A union or three nullable list
+columns would make the stream decoder-free without our code. It was dropped in favour
+of `Bitvector`, which reaches the same goal -- a consumer needing no roaring decoder
+-- with a schema and a stream that already existed and are already tested. Recorded
+because the design points are worth keeping: `FixedSizeList<Boolean, 65536>` reserves
+its child slot for every row, so a batch of array-kind chunks would carry megabytes of
+unused bitmap child data, and a `DenseUnion` fixes that at the cost of uneven support
+across Arrow implementations, which is the wrong trade for a format whose whole point
+is that any consumer can read it.
+
+## What is not done
+
+A **non-Rust client cannot ask for any of this.** The preference rides in the ticket,
+which the server mints and the client re-mints; expressing it in a request would mean
+a field on `QueryRequest`, and that touches `yesno-wire`'s pinned cross-implementation
+hex vector and the Python, Go, Java and CLI clients. A separate change, and a larger
+one.
+
+Three mistakes worth recording, all caught by tools rather than by reading:
+
+* `scripts/gate.sh` failed on `ticket_version.py`, which asserted the ticket is "a
+  fixed 40-byte structure". A correct failure: the scenario encoded the old size. The
+  assertion's purpose -- a *fixed* header, which is what makes a bare ticket seekable
+  and offset-identical on a follower -- is preserved at 48.
+* `U16Store::to_le_bytes` was judged dead and deleted. It had a unit-test caller
+  through a local binding that the grep pattern used to check had excluded. The
+  compiler caught it; the test now exercises `to_le_bytes_into` and asserts that it
+  **appends**, which is the reason the allocating form went away.
+* The allocation fixture's chunks were asserted to be full at 65 536 ordinals;
+  `bitmap_set` fills 20 000. The property actually wanted was bitmap *kind*, since
+  that is the shared-payload arm the removed temporary was copying.

@@ -218,3 +218,62 @@ fn a_batch_costs_a_batch_not_a_whole_container() {
     }
     assert_eq!(all, (0..65_536u64).collect::<Vec<u64>>());
 }
+
+/// A container batch must not allocate a temporary per container.
+///
+/// **Only a count can see this.** `ContainerBatchBuilder::push` used to call
+/// `codec::encode`, which allocates a `Vec<u8>` per container, and then copied out
+/// of it into the values buffer -- so a shared bitmap payload moved 16 KiB to ship
+/// 8 KiB, and every correctness test passed either way because the bytes are
+/// identical. `codec::encode_into` appends straight into the values buffer.
+///
+/// One copy into that buffer is a **floor**, not an inefficiency: Arrow requires one
+/// contiguous values buffer per column and the store's chunks are scattered across
+/// extents, so they must be gathered. This asserts the second copy is gone, not that
+/// there are none.
+///
+/// The bound is per container and deliberately loose. The values buffer and the
+/// offsets vector grow geometrically, so a 64-chunk batch pays a handful of
+/// reallocations in total; one temporary *per chunk* would add at least 64.
+#[test]
+fn pushing_containers_does_not_allocate_one_temporary_each() {
+    use yesno_arrow::ContainerBatchBuilder;
+
+    let chunks = 64u64;
+    let set = bitmap_set(chunks);
+
+    let mut b = ContainerBatchBuilder::new();
+    let (pushed, allocs) = count_allocs(|| {
+        let mut n = 0u64;
+        for (prefix, c) in set.chunks() {
+            b.push(7, prefix, c);
+            n += 1;
+        }
+        n
+    });
+    assert_eq!(pushed, chunks, "the fixture must actually push every chunk");
+    assert!(
+        allocs < chunks,
+        "{allocs} allocations to push {chunks} containers -- at least one temporary \
+         per container is being built, which is what encode_into removed"
+    );
+
+    // And the batch is still correct, which an allocation count alone cannot say.
+    let batch = b.finish().unwrap().expect("64 containers make a batch");
+    assert_eq!(batch.num_rows(), chunks as usize);
+    let back = yesno_arrow::read_containers(&batch).unwrap();
+    assert_eq!(back.len(), chunks as usize);
+    for (key, _prefix, c) in &back {
+        assert_eq!(*key, 7);
+        // Bitmap-kind is the property that matters: it is the arm whose payload is
+        // a shared mmap buffer, so it is the one the removed temporary cost 8 KiB
+        // per chunk to copy. ( `bitmap_set` fills 20 000 of each chunk's 65 536
+        // positions, which is dense enough to promote and not a full chunk -- an
+        // earlier version of this test asserted the latter and failed on it. )
+        assert_eq!(
+            c.kind(),
+            yesno_core::ContainerKind::Bitmap,
+            "the fixture must exercise the shared-payload arm"
+        );
+    }
+}

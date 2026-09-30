@@ -39,16 +39,36 @@ use crate::error::{CodecError, Result};
 use crate::{ARRAY_MAX, BITMAP_BYTES, CHUNK_CARD, RUN_DECODE_MAX};
 
 /// Serialize a container's payload in Roaring spec form.
+///
+/// Allocates. Prefer [`encode_into`] when assembling several payloads into one
+/// buffer, which is the common case for an Arrow batch or a WAL body.
 pub fn encode(c: &Container) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_into(&mut out, c);
+    out
+}
+
+/// Serialize a container's payload, appending to `out`.
+///
+/// **The real implementation; [`encode`] is a wrapper.** Written this way round
+/// because a caller assembling one contiguous buffer out of many containers --
+/// an Arrow `BinaryArray`'s values buffer, a WAL record body -- otherwise pays a
+/// `Vec` allocation and a second copy per container, for bytes that are already
+/// in Roaring order. For a shared bitmap payload that was 16 KiB of memory
+/// traffic to ship 8 KiB.
+///
+/// Arrow's columnar layout requires one contiguous values buffer per column, and
+/// the store's chunks are scattered across extents, so **one** copy into the
+/// destination is a floor rather than an inefficiency. This removes the other one.
+pub fn encode_into(out: &mut Vec<u8>, c: &Container) {
     match c {
-        Container::Array(a) => a.vals.to_le_bytes(),
-        Container::Bitmap(b) => b.bits.to_le_bytes(),
+        Container::Array(a) => a.vals.to_le_bytes_into(out),
+        Container::Bitmap(b) => b.bits.to_le_bytes_into(out),
         Container::Run(r) => {
             let n = r.nruns();
-            let mut out = Vec::with_capacity(2 + 4 * n as usize);
+            out.reserve(2 + 4 * n as usize);
             out.extend_from_slice(&(n as u16).to_le_bytes());
-            out.extend_from_slice(&r.runs.to_le_bytes());
-            out
+            r.runs.to_le_bytes_into(out);
         }
     }
 }

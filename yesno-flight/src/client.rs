@@ -400,6 +400,71 @@ where
         self.flight.do_get(query.ticket.clone()).await
     }
 
+    /// Fetch a planned set query as **container payloads** rather than ordinals.
+    ///
+    /// The stream then carries `containers_schema` -- `{ key, prefix48, kind,
+    /// cardinality, payload }` -- where each payload is byte-identical to what the
+    /// page store and a `.roaring` file hold, and `yesno_arrow::read_containers`
+    /// turns a batch back into containers. A dense chunk is 8 KiB here against
+    /// 512 KiB of ordinals, and because roaring has already chosen a representation
+    /// per chunk the stream is never worse than either fixed choice.
+    ///
+    /// **Opt-in, because the consumer needs a decoder.** Requesting this costs
+    /// nothing but `yesno-flight`; *reading* it needs `yesno-arrow` or an equivalent
+    /// roaring reader, so a server that switched representation on its own -- by
+    /// density, say -- would hand container bytes to a client that cannot read them.
+    ///
+    /// Only sets have a representation choice. On a vector or scalar query the
+    /// server ignores this and answers in that sort's own shape, since neither has a
+    /// container to ship.
+    ///
+    /// Note that the `FlightInfo` this query came from advertises the schema of the
+    /// ticket the **server** minted, which is the ordinal one; this re-mints the
+    /// ticket, so the caller is the authority on what it asked for. The stream
+    /// itself is self-consistent -- `do_get` derives its schema from the ticket it
+    /// receives.
+    pub async fn fetch_containers(&mut self, query: &QueryInfo) -> Result<FlightRecordBatchStream> {
+        let t = query
+            .ticket()
+            .clone()
+            .with_wire(crate::ticket::SetWire::Containers);
+        self.flight.do_get(FlightTicket::new(t.encode())).await
+    }
+
+    /// Fetch a planned set query as a **wholly materialized bitvector** over
+    /// `prefix_lo..prefix_hi`, one bit per ordinal position.
+    ///
+    /// The stream carries a single boolean column, bit-packed, with the window's base
+    /// ordinal in the schema metadata. Chunks the set does not touch arrive as
+    /// all-zero rather than being skipped, so row `n` across the whole stream is
+    /// ordinal `( prefix_lo << 16 ) + n` and batch boundaries mean nothing. That is
+    /// the easiest thing to consume of the three representations: an Arrow selection
+    /// mask, with no roaring decoder, no chunk reassembly and no nested types.
+    ///
+    /// **The window is an argument rather than inherited from the ticket, because its
+    /// size is the whole hazard.** A bitvector costs 8 KiB per chunk whether that
+    /// chunk holds one ordinal or 65 535, so it is sized by the window and not by the
+    /// cardinality -- and a planned ticket spans the entire key, which is `2^48`
+    /// chunks, or two pebibytes of bits. The server refuses that; requiring the
+    /// window here means a caller has to have thought about it rather than discover
+    /// the refusal.
+    ///
+    /// `prefix_hi` is exclusive, matching the ticket's own half-open window.
+    pub async fn fetch_bitvector(
+        &mut self,
+        query: &QueryInfo,
+        prefix_lo: u64,
+        prefix_hi: u64,
+    ) -> Result<FlightRecordBatchStream> {
+        let mut t = query
+            .ticket()
+            .clone()
+            .with_wire(crate::ticket::SetWire::Bitvector);
+        t.prefix_lo = prefix_lo;
+        t.prefix_hi = prefix_hi;
+        self.flight.do_get(FlightTicket::new(t.encode())).await
+    }
+
     /// Fetch opaque ticket bytes previously returned by this yesno server.
     pub async fn fetch_ticket(
         &mut self,

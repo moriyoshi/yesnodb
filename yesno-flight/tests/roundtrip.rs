@@ -279,3 +279,213 @@ async fn cut_surfaces_report_unimplemented() {
         .expect_err("do_exchange is cut");
     assert_eq!(err.code(), tonic::Code::Unimplemented);
 }
+
+/// Container payloads and ordinals must decode to the same set, and be far smaller.
+///
+/// **The ordinal path is the oracle**, which is what makes this a differential test
+/// rather than a test of the dense encoder against itself: the same key, the same
+/// pinned version, two representations, one expected answer. A wrong `kind`, a wrong
+/// prefix or a mis-encoded payload shows up as a set mismatch here rather than as a
+/// plausible-looking batch.
+///
+/// The size assertion is the reason the representation exists at all, so it is
+/// stated as a ratio and left loose: dense chunks are 8 KiB of payload against
+/// 512 KiB of ordinals, so a factor of four is eight times under the ordinal floor
+/// while surviving a legitimate change to framing or to `codec`.
+#[tokio::test]
+async fn container_payloads_decode_to_the_same_set_as_ordinals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+
+    // Deliberately mixed: four dense chunks that must become bitmaps, a contiguous
+    // run, and a sparse scattering that must stay an array. One representation has
+    // to serve all three, which is the whole argument for shipping containers.
+    let mut want: BTreeSet<u64> = (0..4 * 65_536u64).collect();
+    want.extend((10 << 16)..(10 << 16) + 5_000);
+    want.extend((0..200u64).map(|i| (20 << 16) + i * 300));
+    db.insert_many(7, &want.iter().copied().collect::<Vec<_>>())
+        .unwrap();
+    db.checkpoint().unwrap();
+
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = client_for(url).await;
+
+    let d = FlightDescriptor::new_cmd(7u64.to_le_bytes().to_vec());
+    let info = client.get_flight_info(d).await.unwrap().into_inner();
+    let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.clone();
+    let t = Ticket::decode(&raw).expect("the server must issue a well-formed ticket");
+    assert_eq!(
+        t.wire,
+        yesno_flight::SetWire::Ordinals,
+        "a minted ticket must default to ordinals; density must never switch it"
+    );
+
+    // --- the oracle: ordinals, at this exact ticket.
+    let mut ordinal_bytes = 0usize;
+    let mut from_ordinals: BTreeSet<u64> = BTreeSet::new();
+    {
+        let stream = client
+            .do_get(arrow_flight::Ticket::new(raw.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut decoded =
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream.map(|r| {
+                r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))
+            }));
+        while let Some(b) = decoded.next().await {
+            let b = b.unwrap();
+            let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+            ordinal_bytes += col.len() * 8;
+            from_ordinals.extend((0..col.len()).map(|i| col.value(i)));
+        }
+    }
+    assert_eq!(from_ordinals, want, "the oracle itself must be right first");
+
+    // --- the same ticket, asking for containers.
+    let dense = t.with_wire(yesno_flight::SetWire::Containers);
+    let stream = client
+        .do_get(arrow_flight::Ticket::new(dense.encode()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut decoded = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))),
+    );
+
+    let mut from_containers: BTreeSet<u64> = BTreeSet::new();
+    let mut payload_bytes = 0usize;
+    let mut kinds: BTreeSet<u8> = BTreeSet::new();
+    while let Some(b) = decoded.next().await {
+        let b = b.unwrap();
+        assert_eq!(
+            b.schema(),
+            yesno_arrow::containers_schema(),
+            "the dense stream must carry the container schema it declared"
+        );
+        for (key, prefix, c) in yesno_arrow::read_containers(&b).unwrap() {
+            assert_eq!(key, 7, "every row belongs to the key that was asked for");
+            kinds.insert(c.kind() as u8);
+            payload_bytes += yesno_core::container::codec::encode(&c).len();
+            from_containers.extend(c.iter().map(|v| (prefix << 16) | v as u64));
+        }
+    }
+
+    assert_eq!(
+        from_containers, want,
+        "containers decoded to a different set than ordinals did"
+    );
+    assert!(
+        kinds.len() > 1,
+        "this fixture must exercise more than one container kind, got {kinds:?}"
+    );
+    assert!(
+        payload_bytes * 4 < ordinal_bytes,
+        "container payloads were {payload_bytes} bytes against {ordinal_bytes} of \
+         ordinals; the dense representation has stopped paying for itself"
+    );
+}
+
+/// A materialized bitvector agrees with the ordinals, and an unbounded one is refused.
+///
+/// Two properties in one fixture because they are the same design point seen from
+/// either side: a bitvector is sized by its **prefix window** rather than by the
+/// set's cardinality, which is what makes it both the easiest representation to
+/// consume and the only one a server must refuse outright.
+///
+/// The agreement half uses the ordinal path as oracle. Gaps matter here in a way
+/// they do not for containers: the stream carries a bit for every position in the
+/// window, so a chunk the set never touched must arrive as 65 536 zeros rather than
+/// be skipped -- otherwise row `n` stops meaning ordinal `base + n` and every later
+/// bit is shifted.
+#[tokio::test]
+async fn a_materialized_bitvector_agrees_with_ordinals_and_refuses_an_unbounded_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+
+    // Chunks 0 and 3 populated, 1 and 2 deliberately empty, so the window contains
+    // gaps that have to be materialized rather than skipped.
+    let mut want: BTreeSet<u64> = (0..65_536u64).filter(|o| o % 7 == 0).collect();
+    want.extend((3 << 16)..(3 << 16) + 1_000);
+    db.insert_many(7, &want.iter().copied().collect::<Vec<_>>())
+        .unwrap();
+    db.checkpoint().unwrap();
+
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = client_for(url).await;
+
+    let d = FlightDescriptor::new_cmd(7u64.to_le_bytes().to_vec());
+    let info = client.get_flight_info(d).await.unwrap().into_inner();
+    let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.clone();
+    let base = Ticket::decode(&raw).expect("the server must issue a well-formed ticket");
+
+    // --- an unbounded window must be refused, not attempted.
+    let unbounded = base.clone().with_wire(yesno_flight::SetWire::Bitvector);
+    assert_eq!(
+        unbounded.prefix_hi - unbounded.prefix_lo,
+        1 << 48,
+        "a whole-key ticket must span everything, or this half proves nothing"
+    );
+    let err = {
+        let stream = client
+            .do_get(arrow_flight::Ticket::new(unbounded.encode()))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut decoded =
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream.map(|r| {
+                r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))
+            }));
+        let mut seen = None;
+        while let Some(b) = decoded.next().await {
+            if let Err(e) = b {
+                seen = Some(e.to_string());
+                break;
+            }
+        }
+        seen.expect("2^48 chunks of bits must be refused rather than streamed")
+    };
+    assert!(
+        err.contains("bitvector") && err.contains("narrow"),
+        "the refusal must say what to do about it, got {err:?}"
+    );
+
+    // --- bounded: four chunks, and the bits must be the set.
+    let mut windowed = base.with_wire(yesno_flight::SetWire::Bitvector);
+    windowed.prefix_lo = 0;
+    windowed.prefix_hi = 4;
+    let stream = client
+        .do_get(arrow_flight::Ticket::new(windowed.encode()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut decoded = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))),
+    );
+
+    let mut from_bits: BTreeSet<u64> = BTreeSet::new();
+    let mut rows = 0u64;
+    while let Some(b) = decoded.next().await {
+        let b = b.unwrap();
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        for i in 0..col.len() {
+            if col.value(i) {
+                from_bits.insert(rows + i as u64);
+            }
+        }
+        rows += col.len() as u64;
+    }
+    assert_eq!(
+        rows,
+        4 * 65_536,
+        "a bitvector must carry a bit for every position in its window, gaps included"
+    );
+    assert_eq!(
+        from_bits, want,
+        "the bitvector decoded to a different set than the ordinals did"
+    );
+}

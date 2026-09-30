@@ -106,14 +106,27 @@ impl U16Store {
         matches!(self, U16Store::Shared(_))
     }
 
-    /// Bytes as the Roaring spec would serialize them (little-endian `u16`s).
-    pub fn to_le_bytes(&self) -> Vec<u8> {
+    /// Bytes as the Roaring spec would serialize them (little-endian `u16`s),
+    /// appended to `out`.
+    ///
+    /// **There is no allocating `to_le_bytes` beside this one.** There was until
+    /// 2026-09-30, and once `codec::encode_into` existed it had no caller -- the
+    /// only two were the array and run arms of `codec::encode`, which now append
+    /// directly. `BitStore` keeps its allocating form because `BitmapContainer`
+    /// still wants an owned `Vec`; this one would have been carried for nothing.
+    ///
+    /// **One implementation, two destinations**, which is why [`Self::to_le_bytes`]
+    /// delegates here rather than the two existing side by side. A caller
+    /// assembling one contiguous buffer out of many containers -- an Arrow
+    /// `BinaryArray`'s values, a WAL body -- would otherwise allocate a `Vec` per
+    /// container and copy out of it, paying twice for bytes that were already in
+    /// the right order.
+    pub fn to_le_bytes_into(&self, out: &mut Vec<u8>) {
         let s = self.as_slice();
-        let mut out = Vec::with_capacity(s.len() * 2);
+        out.reserve(s.len() * 2);
         for &v in s {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        out
     }
 
     /// Decode little-endian `u16`s from bytes. Copies; used on big-endian hosts
@@ -249,14 +262,26 @@ impl BitStore {
 
     /// Little-endian bytes, exactly as the Roaring spec serializes a bitmap.
     pub fn to_le_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(BITMAP_BYTES);
+        self.to_le_bytes_into(&mut out);
+        out
+    }
+
+    /// The same bytes, appended to `out` rather than into a fresh `Vec`.
+    ///
+    /// **This is where the saving is largest and least obvious.** A `Shared`
+    /// payload is 8 192 mmap'd bytes already in Roaring order, so the old
+    /// `to_le_bytes` copied them into a temporary that the caller then copied
+    /// again into whatever buffer it was assembling -- 16 KiB moved to ship 8. This
+    /// appends once, directly.
+    pub fn to_le_bytes_into(&self, out: &mut Vec<u8>) {
+        out.reserve(BITMAP_BYTES);
         match self {
-            BitStore::Shared(bb) => bb.values().to_vec(),
+            BitStore::Shared(bb) => out.extend_from_slice(bb.values()),
             BitStore::Mut(v) => {
-                let mut bytes = Vec::with_capacity(BITMAP_BYTES);
                 for w in v {
-                    bytes.extend_from_slice(&w.to_le_bytes());
+                    out.extend_from_slice(&w.to_le_bytes());
                 }
-                bytes
             }
         }
     }
@@ -298,8 +323,13 @@ mod tests {
     #[test]
     fn u16_cow_preserves_contents() {
         let mut s = U16Store::from_vec(vec![1, 2, 3]);
-        let bytes = s.to_le_bytes();
+        let mut bytes = Vec::new();
+        s.to_le_bytes_into(&mut bytes);
         assert_eq!(bytes, vec![1, 0, 2, 0, 3, 0]);
+        // Appends rather than replaces, which is the whole reason the allocating
+        // form went away: a caller assembling one buffer out of many containers.
+        s.to_le_bytes_into(&mut bytes);
+        assert_eq!(bytes, vec![1, 0, 2, 0, 3, 0, 1, 0, 2, 0, 3, 0]);
         s.to_mut().push(4);
         assert_eq!(s.as_slice(), &[1, 2, 3, 4]);
     }

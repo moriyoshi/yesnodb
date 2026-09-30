@@ -81,7 +81,10 @@ impl ContainerBatchBuilder {
         self.prefix.push(prefix);
         self.kind.push(c.kind() as u8);
         self.card.push(c.len());
-        self.payload.extend_from_slice(&codec::encode(c));
+        // Straight into the values buffer. `codec::encode` would allocate a `Vec`
+        // per container for this to copy out of, which for a shared bitmap payload
+        // is 16 KiB of traffic to ship 8 KiB.
+        codec::encode_into(&mut self.payload, c);
         self.offsets.push(self.payload.len() as i32);
     }
 

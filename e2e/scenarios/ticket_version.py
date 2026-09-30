@@ -41,7 +41,11 @@ t = flight_ticket(f, 1)
 assert t["total_records"] == len(want), t
 assert t["version"] > 0, "a ticket without a version cannot pin anything"
 assert t["key"] == 1
-assert len(t["raw"]) == 40, "the ticket is a fixed 40-byte structure"
+# 48 since the set representation joined the header on 2026-09-30; it was 40
+# before that. The assertion is that the header is a *fixed* size with no
+# expression attached, which is what makes a bare ticket seekable and
+# offset-identical on a follower -- not that the number is any particular value.
+assert len(t["raw"]) == 48, "the ticket header is a fixed 48-byte structure"
 
 # ---- a write lands while the ticket is in the caller's hand
 #

@@ -111,7 +111,7 @@ enum Request2 {
     Expr(AnyExpr, Option<u64>),
 }
 pub use client::{Ack, QueryInfo, QueryStream, YesnoClient};
-pub use ticket::Ticket;
+pub use ticket::{SetWire, Ticket};
 pub use yesno_wire::{
     AnyExpr, BigBinOp, BigExpr, BigFoldOp, BigLit, BoolExpr, FoldOp, IntExpr, QueryRequest,
     SetExpr, Sort, VecBigExpr, VecIntExpr, VecSetExpr, ViewLayout, ViewSpec, MAX_WORK,
@@ -212,6 +212,25 @@ fn big_batch(values: &[yesno_core::bignum::BigInt]) -> RecordBatch {
 /// why the count is spelled out here.
 #[cfg(feature = "server")]
 fn schema_for(t: &Ticket) -> SchemaRef {
+    // A set has a representation choice; the other sorts do not. A vector answers
+    // one row per constituent and a scalar answers one row, and neither has a
+    // container to ship, so `wire` is meaningless for them rather than merely
+    // unused -- which is why it is matched only on the set arm.
+    if matches!(&t.expr, None | Some(AnyExpr::Set(_))) {
+        match t.wire {
+            SetWire::Containers => return yesno_arrow::containers_schema(),
+            // **One schema for the whole stream, carrying the origin of the whole
+            // bitvector.** `mask_chunk_schema` puts the base ordinal in schema
+            // metadata, and a Flight stream is stamped with exactly one schema, so a
+            // per-chunk base could not be expressed here. It does not need to be:
+            // the stream is dense and ordered, so row `n` across it is ordinal
+            // `base + n` and batch boundaries carry no meaning.
+            SetWire::Bitvector => {
+                return yesno_arrow::mask_chunk_schema(yesno_core::chunk_base(t.prefix_lo))
+            }
+            SetWire::Ordinals => {}
+        }
+    }
     match &t.expr {
         None | Some(AnyExpr::Set(_)) => ordinals_schema(),
         Some(AnyExpr::VecInt(_)) => vec_int_schema(),
@@ -388,6 +407,27 @@ pub const COMMIT_MEMORY: usize = 1024;
 /// Rows per `RecordBatch`. 64 KiB of `u64`, which fits L2 and matches
 /// DataFusion's default `batch_size`.
 const BATCH_ROWS: usize = 8192;
+
+/// The widest prefix window a materialized bitvector may span.
+///
+/// A bitvector costs one bit per ordinal *position*, so its size is a function of
+/// the window and not of the cardinality -- 8 KiB per chunk whether the chunk holds
+/// one ordinal or 65 535. At this cap a stream is 128 MiB of bits covering 2^30
+/// ordinal positions, which is a large answer and a finite one; the `2^48` chunks a
+/// default whole-key ticket names would be two pebibytes.
+///
+/// So this is a **refusal**, not a truncation: answering a narrower window than was
+/// asked for would be a silently wrong answer, and the caller cannot tell a clipped
+/// bitvector from a sparse one.
+const BITVECTOR_MAX_CHUNKS: u64 = 16_384;
+
+/// Containers per batch on the dense arm.
+///
+/// Deliberately far smaller than [`BATCH_ROWS`], because a row here is a whole
+/// container rather than one ordinal: at `BATCH_ROWS` rows a batch of dense bitmaps
+/// would be hundreds of megabytes. 512 bitmap containers is about 4 MiB, which is
+/// the same order as `BATCH_ROWS` ordinals.
+const CONTAINER_BATCH_ROWS: usize = 512;
 
 #[cfg(feature = "server")]
 #[derive(Clone)]
@@ -1312,6 +1352,102 @@ impl FlightService for YesnoFlightService {
                         return;
                     }
                 };
+                // **A wholly materialized bitvector over the ticket's window.**
+                // Every chunk in `[ prefix_lo, prefix_hi )` including the ones the
+                // set does not touch, so the consumer gets one contiguous bit per
+                // ordinal position and needs no decoder at all.
+                if t.wire == SetWire::Bitvector {
+                    let span = t.prefix_hi.saturating_sub(t.prefix_lo);
+                    // Refused rather than clipped: a narrower answer than was asked
+                    // for is indistinguishable to the caller from a sparser set.
+                    if span == 0 || span > BITVECTOR_MAX_CHUNKS {
+                        let _ = tx.blocking_send(Err(Status::invalid_argument(format!(
+                            "a materialized bitvector spans its prefix window, and this \
+                             ticket names {span} chunks against a limit of \
+                             {BITVECTOR_MAX_CHUNKS}; narrow prefix_lo..prefix_hi"
+                        ))));
+                        return;
+                    }
+                    let schema =
+                        yesno_arrow::mask_chunk_schema(yesno_core::chunk_base(t.prefix_lo));
+                    let set = std::sync::Arc::new(set);
+                    // `dense` takes an **inclusive** upper bound where the ticket's
+                    // window is half-open, hence the `- 1`; `span > 0` above is what
+                    // makes that subtraction safe.
+                    let masks =
+                        yesno_arrow::MaskStream::dense(set.stream(), t.prefix_lo, t.prefix_hi - 1);
+                    let mut emitted = 0u64;
+                    for m in masks {
+                        let m = match m {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let _ = tx.blocking_send(Err(engine_status(e)));
+                                return;
+                            }
+                        };
+                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(m.to_array())])
+                            .expect("one boolean column of the declared type");
+                        if tx.blocking_send(Ok(rb)).is_err() {
+                            tracing::debug!(emitted, "Flight bitvector receiver closed early");
+                            return;
+                        }
+                        emitted += 1;
+                    }
+                    tracing::info!(chunks = emitted, "Flight read produced a bitvector");
+                    return;
+                }
+                // **The dense arm, and it is a different walk rather than a
+                // different encoding of the same walk.** The ordinal path below
+                // visits every set bit; this one visits every *chunk* and ships the
+                // payload roaring already chose, so a dense chunk costs 8 KiB where
+                // its ordinals cost 512 KiB. `codec::encode` through
+                // `ContainerBatchBuilder` is the same function the page store and
+                // the `.roaring` writer use, so there is no second encoder here.
+                if t.wire == SetWire::Containers {
+                    let mut b = yesno_arrow::ContainerBatchBuilder::new();
+                    let mut chunks = 0u64;
+                    let mut batches = 0u64;
+                    for (prefix, c) in set.chunks() {
+                        if prefix < t.prefix_lo || prefix >= t.prefix_hi {
+                            continue;
+                        }
+                        b.push(t.key, prefix, c);
+                        chunks += 1;
+                        // Bounded by chunks rather than by rows: one row here is a
+                        // whole container, so `BATCH_ROWS` containers would be up to
+                        // 8 KiB each and a single batch could reach half a gigabyte.
+                        if b.len() >= CONTAINER_BATCH_ROWS {
+                            match b.finish() {
+                                Ok(Some(rb)) => {
+                                    if tx.blocking_send(Ok(rb)).is_err() {
+                                        tracing::debug!(chunks, batches, "receiver closed early");
+                                        return;
+                                    }
+                                    batches += 1;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(engine_status(e)));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    match b.finish() {
+                        Ok(Some(rb)) => {
+                            if tx.blocking_send(Ok(rb)).is_ok() {
+                                batches += 1;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(engine_status(e)));
+                            return;
+                        }
+                    }
+                    tracing::info!(chunks, batches, "Flight read produced containers");
+                    return;
+                }
                 let schema = ordinals_schema();
                 let mut buf: Vec<u64> = Vec::with_capacity(BATCH_ROWS);
                 let mut rows = 0u64;

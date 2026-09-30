@@ -11,17 +11,76 @@
 //! each endpoint would answer from whatever it could see, and the union would be
 //! a set that never existed at any instant.
 
-/// Length of a ticket's **fixed header**.
+/// Length of a ticket's **fixed header**: six little-endian `u64`s, in the order the
+/// struct declares them.
 ///
 /// This was the whole ticket, and its doc read "Fixed, so a short or long one
 /// is rejected outright." That is no longer true and the sentence is replaced
 /// rather than corrected beside: a ticket is now the header followed by an
 /// **optional** encoded [`crate::AnyExpr`], so a longer one is a pushed-down
-/// filter rather than corruption. A bare 40-byte ticket still decodes exactly as
-/// before, which is what keeps existing clients working.
+/// filter rather than corruption. A shorter one is still rejected outright.
 ///
-/// A shorter one is still rejected outright.
-pub const TICKET_HEADER_LEN: usize = 40;
+/// It was 40 bytes until the set representation was added on 2026-09-30. **There is
+/// no published release, so the field went in the header rather than behind a
+/// magic-marked extension block**: a block is what one writes to leave an already
+/// shipped 40-byte layout byte-identical, and nothing here needs that. Widening the
+/// header keeps the expression the unambiguous tail, which is the property that
+/// actually matters -- the remainder can be handed to `AnyExpr::decode` whole, with
+/// no length prefix and no sniffing.
+pub const TICKET_HEADER_LEN: usize = 48;
+
+/// How a **set** result is encoded in the `DoGet` stream.
+///
+/// Only sets have a choice: a vector or a scalar answers one small batch whose
+/// shape no representation question applies to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SetWire {
+    /// One `u64` per ordinal, `ordinals_schema`. The default, because a consumer
+    /// that has not asked for containers may have no decoder for them.
+    #[default]
+    Ordinals,
+    /// Container payloads, `containers_schema` -- byte-identical to what the page
+    /// store and a `.roaring` file hold.
+    ///
+    /// **Not merely smaller: adaptive.** Roaring has already chosen per chunk, so
+    /// an array costs `2n` bytes, a bitmap 8192 and a run `4 * intervals`, and the
+    /// stream is never worse than either fixed choice. A dense chunk is 8 KiB here
+    /// against 512 KiB of ordinals -- 64x -- while a chunk holding a hundred
+    /// ordinals is 200 bytes against 800.
+    ///
+    /// The cost is that the consumer must be able to decode a container payload, so
+    /// this is **opt-in and never inferred from density**: a server that switched
+    /// representation because the data got denser would hand container bytes to a
+    /// client that cannot read them.
+    Containers,
+    /// A **wholly materialized bitvector** over the ticket's prefix window:
+    /// `mask_chunk_schema`, one bit per ordinal position, gaps included.
+    ///
+    /// The simplest thing a consumer can receive -- a boolean column usable as an
+    /// Arrow selection mask with no roaring decoder, no chunk reassembly and no
+    /// nested types. Array and run chunks are expanded to bits, and chunks the set
+    /// does not touch are emitted as all-zero, so row `n` of the whole stream is
+    /// ordinal `( prefix_lo << 16 ) + n` by arithmetic alone.
+    ///
+    /// **Its size is a function of the prefix window, not of the cardinality**, which
+    /// is what makes it the one representation a server must refuse rather than
+    /// merely discourage: a default whole-key ticket spans `2^48` chunks, which is
+    /// two pebibytes of bits to describe a set that may hold three ordinals. The
+    /// window has to be narrowed by the caller -- which is what a coordinator
+    /// handing out prefix ranges is already doing.
+    Bitvector,
+}
+
+impl SetWire {
+    fn from_u64(v: u64) -> Option<SetWire> {
+        match v {
+            0 => Some(SetWire::Ordinals),
+            1 => Some(SetWire::Containers),
+            2 => Some(SetWire::Bitvector),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
@@ -40,6 +99,9 @@ pub struct Ticket {
     /// primary posting list, so a coordinator can route without decoding the
     /// expression. The expression is the authority on *what to return*.
     pub expr: Option<crate::AnyExpr>,
+    /// How a set result is encoded. Carried in the extension block, absent from
+    /// every v1 ticket, and [`SetWire::Ordinals`] when absent.
+    pub wire: SetWire,
 }
 
 impl Ticket {
@@ -51,7 +113,13 @@ impl Ticket {
             prefix_hi: 1 << 48,
             expr_hash: 0,
             expr: None,
+            wire: SetWire::Ordinals,
         }
+    }
+
+    /// The same ticket, answering in `wire`.
+    pub fn with_wire(self, wire: SetWire) -> Self {
+        Ticket { wire, ..self }
     }
 
     /// A ticket carrying a pushed-down filter.
@@ -70,6 +138,7 @@ impl Ticket {
             self.prefix_lo,
             self.prefix_hi,
             self.expr_hash,
+            self.wire as u64,
         ] {
             b.extend_from_slice(&v.to_le_bytes());
         }
@@ -88,6 +157,10 @@ impl Ticket {
         // the client asked for a filter this server cannot apply; answering
         // without it would return a **superset** — more rows than the query
         // asked for, silently. An unparseable expression must reject the ticket.
+        // An unrecognised representation is an **error**, never a fallback to the
+        // default: answering in a representation the caller did not ask for is a
+        // corrupt stream to it, and indistinguishable from a server that understood.
+        let wire = SetWire::from_u64(g(5))?;
         let expr = match &b[TICKET_HEADER_LEN..] {
             [] => None,
             rest => Some(crate::AnyExpr::decode(rest).ok()?),
@@ -99,6 +172,7 @@ impl Ticket {
             prefix_hi: g(3),
             expr_hash: g(4),
             expr,
+            wire,
         };
         // An inverted range would silently return nothing, which is worse than
         // an error: the caller cannot tell it from a genuinely empty key.
@@ -122,6 +196,7 @@ mod tests {
             prefix_hi: 1 << 20,
             expr_hash: 7,
             expr: None,
+            wire: SetWire::Ordinals,
         };
         assert_eq!(Ticket::decode(&t.encode()), Some(t.clone()));
 
@@ -143,6 +218,54 @@ mod tests {
         let bytes = t.encode();
         assert!(bytes.len() > TICKET_HEADER_LEN);
         assert_eq!(Ticket::decode(&bytes), Some(t));
+    }
+
+    /// The representation round-trips inside the fixed header.
+    #[test]
+    fn a_ticket_can_ask_for_container_payloads() {
+        let plain = Ticket::whole_key(3, 42);
+        assert_eq!(plain.wire, SetWire::Ordinals);
+        assert_eq!(plain.encode().len(), TICKET_HEADER_LEN);
+
+        let dense = plain.clone().with_wire(SetWire::Containers);
+        let bytes = dense.encode();
+        assert_eq!(
+            bytes.len(),
+            TICKET_HEADER_LEN,
+            "the representation lives in the header, so it costs no extra bytes"
+        );
+        assert_eq!(Ticket::decode(&bytes), Some(dense));
+    }
+
+    /// The representation and a pushed-down filter coexist.
+    ///
+    /// The header carries the representation and the expression is the tail, so the
+    /// remainder can go to `AnyExpr::decode` whole -- no length prefix, no sniffing.
+    #[test]
+    fn a_ticket_carries_both_a_representation_and_a_filter() {
+        let e = crate::AnyExpr::Set(crate::SetExpr::Key(42));
+        let t = Ticket::with_expr(3, 42, e.clone()).with_wire(SetWire::Containers);
+        let got = Ticket::decode(&t.encode()).expect("both halves must decode");
+        assert_eq!(got.wire, SetWire::Containers);
+        assert_eq!(got.expr, Some(e));
+    }
+
+    /// An unrecognised representation rejects the ticket rather than defaulting.
+    ///
+    /// Defaulting would answer in a representation the caller did not ask for, and
+    /// would be indistinguishable to it from a server that understood the request.
+    #[test]
+    fn an_unknown_representation_is_an_error_not_a_fallback() {
+        let mut bytes = Ticket::whole_key(1, 1).encode();
+        bytes[40..48].copy_from_slice(&200u64.to_le_bytes());
+        assert_eq!(Ticket::decode(&bytes), None);
+
+        // And the two it does know still decode, so the check is not vacuous.
+        for (raw, want) in [(0u64, SetWire::Ordinals), (1, SetWire::Containers)] {
+            let mut ok = Ticket::whole_key(1, 1).encode();
+            ok[40..48].copy_from_slice(&raw.to_le_bytes());
+            assert_eq!(Ticket::decode(&ok).map(|t| t.wire), Some(want));
+        }
     }
 
     /// A trailing payload that will not parse must reject the whole ticket.
