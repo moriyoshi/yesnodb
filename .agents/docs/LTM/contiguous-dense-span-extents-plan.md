@@ -106,6 +106,102 @@ arbitrary payloads, contiguous. No per-chunk trailer, no `ChunkRef` change, no n
 integrity scheme -- the page header's CRC already covers the body, which is exactly why
 packed pages need no trailers.
 
+## Superseded direction, 2026-09-30: move the trailer out of the slot
+
+**The better answer is not a bigger page, it is a smaller slot.** Raised by the
+maintainer after Phase 1 landed, and the arithmetic supports it over everything above.
+
+The trailer sits *after* the payload and the ladder rounds the slot to
+`round_up_64( payload + 8 )`, which is the single cause of **both** problems: slot 8256
+for an 8192 payload is why consecutive dense payloads are 64 bytes apart, and
+`8256 % 4096 == 64` is why each one spans three OS pages instead of two. Move the
+trailer into a per-slab table and the slot becomes exactly 8192.
+
+| | today, slot 8256 | trailer out of line, slot 8192 |
+| --- | --- | --- |
+| slots per slab | 253 | **255** |
+| stride `% 4096` | 64 -- neither adjacent nor aligned | **0 -- both** |
+| writes per 255-chunk slab | 510 | **256** |
+| CRC granularity | per chunk | **per chunk, unchanged** |
+
+There is room: the `SLAB_META` region is 8 192 bytes and uses about 64 of them -- 32
+fixed fields plus a 255-bit occupancy bitmap -- so a 255-entry table of 8-byte trailers
+needs 2 040 of the 8 128 free.
+
+**Three properties this has that the large packed page does not.**
+
+* **It halves the writes.** The checkpointer issues a *separate* 8-byte `write_extent`
+  per standalone chunk for its trailer. Out of line they ride the meta-page write that
+  already happens for occupancy: 510 writes become 256 for a full slab.
+* **It keeps per-chunk checksums.** `PACKED_LARGE_CLASS` bought adjacency by putting
+  eight chunks under one CRC, which widened the torn-write radius and forced
+  `MAX_VERIFIED_SPAN` up eightfold -- a write-path cost on every write in the shard.
+  This needs none of that.
+* **It gains space rather than spending it.** Padding a page for alignment would cost
+  4 056 bytes per page, 5.8%; this adds two slots per slab.
+
+**So `PACKED_LARGE_CLASS` is likely unnecessary** for uniform payloads, which is the
+shape that motivated the work. Phase 1 is not wasted -- `is_packed_class`, the
+`MAX_CLASSES` derivation and the class-aware page-base arithmetic were latent defects in
+the **existing** 4 KiB packed path -- but the class itself should be expected to come
+back out. A large page may still earn its place for runs of *mixed* arbitrary payload
+sizes, where a uniform stride is impossible by construction; that is a separate question
+from the dense one.
+
+**The cost, and it is the thing to design.** A torn meta page affects up to 255 trailers'
+verifiability rather than one. The `ckey_tag` half is re-derivable from the index, which
+says which key owns which cell; the `crc32c` half is not, and recomputing it from the
+payload would be circular. The region is 8 192 bytes, exactly two OS pages, so A/B'ing
+it is natural and is what the superblock already does.
+
+## What the alignment measurement actually said, after three attempts at it
+
+**Conclusion: payload misalignment costs nothing measurable on this kernel, and the
+reason is that the mapping unit is not 4 KiB.** The page cache uses large folios, so one
+minor fault maps up to 2 MiB and whether a payload spans two 4 KiB pages or three is
+invisible.
+
+Evidence. 4 096 payloads of 8 KiB read in a fixed random order out of a freshly mapped
+file, nine interleaved passes per arm:
+
+| arm | OS pages spanned | min | median | max | faults |
+| --- | --- | --- | --- | --- | --- |
+| class-10 slot, stride 8256 | 2.98 | **1.93 ms** | 2.17 ms | 7.52 ms | 21 |
+| inside a packed page, +40 | 3.00 | 2.07 ms | 2.12 ms | 2.24 ms | 17 |
+| padded and page-aligned | 2.00 | 2.04 ms | 2.15 ms | 2.30 ms | 17 |
+
+Medians of 2.17, 2.12 and 2.15 are indistinguishable, and the **misaligned** arm has the
+lowest minimum. 17 faults against 16 predicted for a 32 MiB region at 2 MiB granularity
+is the arithmetic that explains it; `hpage_pmd_size` is 2 097 152 on this host.
+
+**Three mistakes on the way, all mine, and each would have produced a confident wrong
+answer.**
+
+* The first run measured each arm **once** and the write-up called a 0.3 ms gap "within
+  noise" -- an assertion, not a finding, and 0.3 ms on 2.2 ms is 13.6%. Nine interleaved
+  passes show it *was* noise, which is the same claim now supported rather than assumed.
+* The gap was then attributed to fault-around, and `MADV_RANDOM` was added to defeat it.
+  Wrong mechanism: the granularity is folio size, not the fault-around window, and the
+  counts barely moved.
+* Removing the `println!` that consumed the checksum let LLVM delete the read loop
+  entirely, and every arm reported 0.00 ms and **zero faults**. An impossible result is
+  the good case; `black_box` fixed it.
+
+**The alignment that gates zero-copy is 8-byte, and the format already satisfies it** --
+`8256 % 8 == 0`, and a 40-byte header is 8-aligned -- so `bitmap_words` and `bytemuck`'s
+`u64` casts work today.
+
+**Not measured, and any of these would overturn it**: a cold cache, where actual disk I/O
+and readahead granularity replace folio mapping; a working set beyond RAM; a kernel or
+filesystem without large-folio page cache, where the 4 KiB result would be the one that
+matters; and the AVX2 and NEON bitmap arms, where 64-byte alignment may matter and a
+40-byte page-header offset breaks it.
+
+**This does not weaken the case for moving the trailer out of the slot.** Alignment was
+only ever a bonus there. Adjacency, 510 writes becoming 256, two extra slots per slab and
+per-chunk checksums preserved are the reasons, and none of them depends on this result.
+Harness at `.agents-workspace/tmp/alignment`.
+
 ## The three costs, and the second is the design work
 
 1. **Reclamation granularity, bounded to a slab.** A slab of this class frees as the
