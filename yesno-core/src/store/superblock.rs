@@ -107,8 +107,12 @@ const OFF_SLAB_SIZE: usize = 64;
 const OFF_PACK_MAX: usize = 68;
 const OFF_N_CLASSES: usize = 72;
 const OFF_CLASSES: usize = 76; // u32 * n_classes
-const OFF_ROOT: usize = 120;
-const OFF_HEIGHT: usize = 124;
+                               // Moved out of 120/124 on 2026-09-30 to lengthen the class-size field, which had
+                               // reached its true capacity of eleven entries. The tail from `OFF_COMMIT_CLOCK + 8` to
+                               // `OFF_CRC` is otherwise unused, so this costs nothing and no field moved that another
+                               // one is packed against.
+const OFF_ROOT: usize = 184;
+const OFF_HEIGHT: usize = 188;
 const OFF_CKPT_CV: usize = 128;
 const OFF_WAL_LSN: usize = 136;
 const OFF_LIVE_BYTES: usize = 144;
@@ -119,7 +123,27 @@ const OFF_COMMIT_CLOCK: usize = 176;
 const OFF_CRC: usize = PAGE - 4;
 
 /// Maximum classes the fixed-size field can hold.
-pub const MAX_CLASSES: usize = 11;
+///
+/// **Derived from the layout, and the first attempt at deriving it was wrong.** The
+/// hand-written value was `11`, and that was not a coincidence with the ladder's
+/// length -- it was exactly `( OFF_ROOT - OFF_CLASSES ) / 4`, the field's real
+/// capacity. Deriving it against `OFF_CKPT_CV` instead made it 13, so writing a twelfth
+/// class overwrote the B+tree root at `OFF_ROOT` and the damage surfaced two layers
+/// away, as "shard was written with a size-class ladder this build does not implement",
+/// because the decoder then read the root's bytes back as a class size.
+///
+/// So the bound is against the field that actually follows, and the assertion below is
+/// what would have caught the mistake at compile time rather than in a reopen.
+pub const MAX_CLASSES: usize = (OFF_ROOT - OFF_CLASSES) / 4;
+
+const _: () = assert!(
+    OFF_CLASSES + MAX_CLASSES * 4 <= OFF_ROOT,
+    "the class-size field must not overrun the B+tree root"
+);
+const _: () = assert!(
+    MAX_CLASSES >= crate::store::extent::CLASS_SIZES.len(),
+    "the superblock cannot persist the ladder this build compiles"
+);
 
 /// One superblock image.
 #[derive(Clone, Debug, PartialEq, Eq)]

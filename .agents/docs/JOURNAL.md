@@ -9309,3 +9309,75 @@ Three mistakes worth recording, all caught by tools rather than by reading:
 * The allocation fixture's chunks were asserted to be full at 65 536 ordinals;
   `bitmap_set` fills 20 000. The property actually wanted was bitmap *kind*, since
   that is the shared-payload arm the removed temporary was copying.
+
+## 2026-09-30 -- dense spans, Phase 1: the read path, and four latent assumptions
+
+Phase 1 of `LTM/contiguous-dense-span-extents-plan.md`. A `PACKED_LARGE_CLASS` exists,
+the reader resolves a packed page's base and size from the slab's class rather than from
+a global constant, and `fsck` carries each page's size so it can verify one without an
+allocator to ask. **No writer yet**, so nothing produces a large page and the adjacency
+harness still reports "not contiguous" -- Phase 1 buys the ability to read one, not the
+contiguity itself. Do not read this entry as zero-copy having landed.
+
+**The page is 65 600 bytes, and the obvious 65 536 was wrong.** `capacity` is
+`page_size - HEADER`, so the 40-byte header comes out of the payload space and a flat
+64 KiB holds **seven** full bitmaps, not eight. Sized instead so eight fit exactly,
+rounded to the ladder's 64-byte rule -- the same reasoning the ladder already applies in
+"2112 ... exact for 2048". Caught by the fixture asserting eight would fit, which is
+why that assertion is there.
+
+**A compile-time assertion stopped an unsound version of this.**
+`MAX_VERIFIED_SPAN must cover the widest size class, or invalidation can miss an entry`.
+That constant bounds the **backward scan** in the verified-region cache's invalidation,
+and a region wider than it is not cached at all -- so an oversized page would re-CRC on
+every read, and a write might fail to invalidate a stale verification, which is the
+unsound half. **This is what makes a packed page's size a write-path cost and not only a
+read-path one**, and it is the real argument for 64 KiB over the 2 MiB a slab body would
+allow. The assertion also checked only `CLASS_SIZES.last()`, which was the right
+invariant only while every class ascended; it now checks `ladder_max()`, because a packed
+class added anywhere but the end would have satisfied the old form while leaving
+invalidation able to miss an entry.
+
+**`MAX_CLASSES` was derived against the wrong field, and the damage surfaced two layers
+away.** The hand-written `11` was not a coincidence with the ladder's length: it was
+exactly `( OFF_ROOT - OFF_CLASSES ) / 4`, the field's true capacity. Deriving it against
+`OFF_CKPT_CV` made it 13, so writing a twelfth class **overwrote the B+tree root**, and
+the failure reported was "shard was written with a size-class ladder this build does not
+implement" -- because the decoder then read the root's bytes back as a class size. A
+superblock field overrun presenting as a ladder mismatch is worth remembering: the
+symptom named the field *after* the one that was damaged. `OFF_ROOT` and `OFF_HEIGHT`
+moved into the tail, which is unused from `OFF_COMMIT_CLOCK + 8` to `OFF_CRC`, and the
+bound is now asserted against the field that actually follows.
+
+**Four places encoded "packed is class 0, everything else ascends".** Each was correct
+with one packed class and silently wrong with two:
+
+* `class_for`'s `skip( 1 )` -- would have handed a 9 KiB payload a 65 600-byte slot.
+* `validate_ladder`'s `sizes[ 1.. ]` ascending check, and its `last()` test for whether
+  the top class can hold a bitmap: with a packed class appended, that check passed for
+  the wrong reason. Both now filter by `is_packed_class`.
+* The ladder test's adjacent-ratio bound, which exists to limit **internal
+  fragmentation** and therefore only applies to classes a payload can round up into.
+* Three allocator tests taking `CLASS_SIZES.len() - 1` as "the widest class". One then
+  allocated a *page* and waited for a slab that can never empty, because a packed page's
+  frees go through page reclamation rather than slot reclamation. A fourth expressed
+  "past the ladder" as `last + 1`, which had become a class that exists.
+
+**The generalisation worth keeping**: a predicate beats an index. `is_packed_class( c )`
+replaced five sites that each spelled the same idea as a position, and a position is what
+goes stale when the collection grows. The ladder test now also asserts that `class_for`
+cannot reach a packed class, which is what makes the exemptions sound rather than merely
+convenient.
+
+**Two fixtures, both deliberate because nothing produces a large page yet** -- the lesson
+from `RecType::ChunkImage`, whose replay arm lost its producer the same day and needed
+its own test. `a_large_packed_page_lays_bitmaps_out_adjacently` asserts the payload
+**stride** is exactly `BITMAP_BYTES`, which is a test of contiguity rather than of
+capacity, and reads the sealed bytes back at the reported offsets so the offsets describe
+the page and not the builder's bookkeeping.
+`a_large_packed_page_resolves_its_own_base_and_size` probes the start, the first payload
+and the last byte of two adjacent pages, and **asserts that the old `cell % PAGE`
+modulus disagrees** with the correct base -- so it cannot pass vacuously. That modulus
+was right only while every packed page was 4 KiB *and* that size divided `SLAB_META`;
+65 600 satisfies neither, and the failure would have been a header parsed out of payload
+bytes, which is a wrong answer rather than an error.

@@ -322,6 +322,57 @@ mod tests {
         assert!(b.push(key(1, 1), &[0, 0]).unwrap().is_none());
     }
 
+    /// A large page lays bitmap payloads out **adjacently**, which is the whole point.
+    ///
+    /// Zero-copy transmission of a dense set needs a region Arrow can reference without
+    /// a gather, and a standalone extent can never provide one: its 8-byte trailer sits
+    /// after the payload and the ladder rounds the slot to 8256, so consecutive dense
+    /// payloads are 64 bytes apart. Measured before this class existed: 0 of 63 adjacent
+    /// pairs on a 64-chunk key.
+    ///
+    /// A packed page has no per-payload trailer, so the offsets must come out exactly
+    /// `BITMAP_BYTES` apart. Asserting the *stride* rather than the count is what makes
+    /// this a test of contiguity and not merely of capacity.
+    #[test]
+    fn a_large_packed_page_lays_bitmaps_out_adjacently() {
+        let page_size = crate::store::extent::class_size(crate::store::extent::PACKED_LARGE_CLASS)
+            .unwrap() as usize;
+        let mut b = PackedPageBuilder::new(page_size);
+        let payload = vec![0xAAu8; crate::BITMAP_BYTES];
+
+        let mut offs = Vec::new();
+        for i in 0..8u64 {
+            let off = b
+                .push(key(1, i), &payload)
+                .unwrap()
+                .expect("eight bitmaps must fit a large page");
+            offs.push(off);
+        }
+        assert_eq!(offs[0], HEADER, "the first payload follows the header");
+        for w in offs.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                crate::BITMAP_BYTES,
+                "payloads must be exactly one bitmap apart, with nothing between them"
+            );
+        }
+        // Eight is not the capacity, so the page is not merely full by luck.
+        assert!(
+            capacity(page_size) >= 8 * crate::BITMAP_BYTES,
+            "the fixture must not be at the page's limit"
+        );
+        // And the sealed bytes really do hold the payload at that offset, so the offsets
+        // describe the page rather than only the builder's bookkeeping.
+        let sealed = b.seal().unwrap();
+        for (i, &off) in offs.iter().enumerate() {
+            assert_eq!(
+                &sealed[off..off + crate::BITMAP_BYTES],
+                &payload[..],
+                "payload {i} is not at the offset the builder reported"
+            );
+        }
+    }
+
     #[test]
     fn capacity_matches_the_documented_figure() {
         // 4096 - 40 = 4056, the number the PACK_MAX analysis is built on.

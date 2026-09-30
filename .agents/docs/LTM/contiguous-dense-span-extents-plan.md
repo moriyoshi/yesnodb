@@ -127,11 +127,24 @@ packed pages need no trailers.
 
 ## Phases
 
-* **Phase 1 -- read path, no writer.** Span header type, its CRC, and
-  `read_container_for` learning `enc = 1`. Verified by hand-built spans; nothing
-  produces one yet, so a deliberate test is the only coverage ( the lesson from
-  `RecType::ChunkImage`, whose arm lost its producer and needed
-  `an_old_chunk_image_record_still_replays` ).
+* **Phase 1 -- read path, no writer. DONE 2026-09-30.** Landed as a
+  `PACKED_LARGE_CLASS` of 65 600 bytes ( eight bitmaps plus the page header, rounded to
+  the ladder's 64-byte rule -- a flat 65 536 holds only seven, because `capacity` is
+  `page_size - HEADER` ), a reader that resolves a page's base and size from the slab's
+  class instead of a global `PAGE` modulus, and `fsck` carrying each page's size so it
+  can verify one without an allocator to ask. **Nothing is contiguous yet**: there is no
+  writer, so the adjacency harness still reports "not contiguous". Phase 1 buys the
+  ability to *read* a large page.
+  Two deliberate fixtures, since nothing produces one incidentally --
+  `a_large_packed_page_lays_bitmaps_out_adjacently` asserts the payload **stride** is
+  exactly `BITMAP_BYTES`, and `a_large_packed_page_resolves_its_own_base_and_size`
+  asserts the old modulus *disagrees* with the correct base so it cannot pass vacuously.
+  The written description above is superseded in one respect: no span header type and no
+  `enc` bit were needed, for the reasons in the layout section.
+  Four latent assumptions surfaced and are recorded in the JOURNAL entry of the same
+  date -- `MAX_VERIFIED_SPAN` as a compile-time bound that makes page size a *write*-path
+  cost, `MAX_CLASSES` derived against the wrong field and overwriting the B+tree root,
+  and four sites spelling "packed is class 0" as an index rather than a predicate.
 * **Phase 2 -- writer at checkpoint**, behind the admission rule, with the allocator
   placing a span contiguously. Gate: `crash_matrix` gains a torn-span case;
   `differential` and the roaring byte-identity tests must be untouched, which is the

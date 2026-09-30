@@ -421,7 +421,36 @@ pub const PACK_MAX: usize = 2028;
 /// 2112 not 2048 ) so that a power-of-two payload plus its 8-byte trailer still
 /// fits exactly. Without the shift a 2048-byte payload would round to 3072 and
 /// waste 33%.
-pub const CLASS_SIZES: [u32; 11] = [
+/// Class of a **large** packed page, for a run of consecutive chunks of one key.
+///
+/// The reason it exists: a standalone extent carries its 8-byte trailer *after* its
+/// payload, and the ladder is sized so "payload plus trailer" fits, so
+/// `CLASS_SIZES[ 10 ]` is 8256 for an 8192-byte bitmap. **That 64 bytes of slack per
+/// chunk is the only reason consecutive dense payloads are not adjacent**, measured as
+/// 0 of 63 adjacent pairs on a 64-chunk key. A packed page has no per-payload trailer,
+/// so payloads inside one are contiguous -- which is what makes a region lendable to
+/// Arrow without a gather.
+///
+/// Packed rather than a new mechanism because [`PACKED_CLASS`] already does all of
+/// this at 4 KiB: `PackedPageBuilder::new` takes the page size as a parameter, payloads
+/// are appended in ascending `ChunkKey` order, and the header's CRC covers the body.
+/// Only the size and the checkpointer's admission rule differ.
+pub const PACKED_LARGE_CLASS: u8 = 11;
+
+/// Is `class` a packed page rather than a slot for one payload?
+///
+/// Both packed classes sit **outside** the ascending size ladder and are never chosen
+/// by [`class_for`]: a packed page is selected by the checkpointer's admission rule, by
+/// payload size and locality, not by looking up a size class. Written as a predicate
+/// rather than tested against `PACKED_CLASS` at each site, because there are now two
+/// and a site that checks only the first silently treats a large page as a standalone
+/// extent -- which would read its first eight bytes as a trailer.
+#[inline]
+pub const fn is_packed_class(class: u8) -> bool {
+    class == PACKED_CLASS || class == PACKED_LARGE_CLASS
+}
+
+pub const CLASS_SIZES: [u32; 12] = [
     4096, // 0  PACKED
     576,  // 1  payload <=  568
     704,  // 2           <=  696
@@ -433,6 +462,25 @@ pub const CLASS_SIZES: [u32; 11] = [
     4160, // 8           <= 4152   exact for 4096
     6208, // 9           <= 6200
     8256, // 10          <= 8248   exact for 8192
+    // 11  PACKED_LARGE. Outside the ladder's ordering, like class 0.
+    //
+    // **Sized so a whole number of bitmaps fits, not to a round power of two.** Eight
+    // payloads plus the 40-byte page header is 65 576, rounded to 65 600 for the
+    // ladder's 64-byte rule. A flat 65 536 was tried first and holds only **seven**:
+    // `capacity` is `page_size - HEADER`, so the header comes out of the payload space
+    // and eight bitmaps overrun it by 40 bytes. The ladder already reasons this way --
+    // 2112 is annotated "exact for 2048" for the same reason.
+    //
+    // Deliberately much smaller than a slab. The page's CRC is verified as a unit, so
+    // reading *one* chunk re-checksums the whole page, and `read_container_for` already
+    // records that this amplification is unmeasured even at 4 KiB. For a run read whole
+    // -- the shape this exists for -- one 64 KiB checksum is no more work than eight
+    // 8 KiB ones, so the cost falls only on point reads into a packed run. It also sets
+    // `MAX_VERIFIED_SPAN`, which bounds a backward scan on every write, so growing this
+    // is a write-path cost as well. Raising it to a slab body would give 254 bitmaps in
+    // one 2 MiB region; that is a one-line change once Phase 2's writer can measure
+    // both costs.
+    65600,
 ];
 
 /// Smallest class whose slot holds `payload_len` plus a trailer, or `None` if
@@ -442,9 +490,32 @@ pub fn class_for(payload_len: usize) -> Option<u8> {
     CLASS_SIZES
         .iter()
         .enumerate()
-        .skip(1) // class 0 is packed pages, never chosen by payload size
+        // Packed classes are never chosen by payload size -- see `is_packed_class`.
+        // This used to `skip( 1 )`, which was the same statement while class 0 was the
+        // only packed one; with two, skipping a prefix would admit the large page here
+        // and hand a 9 KiB payload a 64 KiB slot.
+        .filter(|(i, _)| !is_packed_class(*i as u8))
         .find(|(_, &sz)| sz as usize >= need)
         .map(|(i, _)| i as u8)
+}
+
+/// The widest entry in the ladder, packed classes included.
+///
+/// Not `CLASS_SIZES.last()`. Packed classes sit outside the ascending order, so the
+/// last entry is only the maximum by coincidence of where they were appended -- and a
+/// bound that is *accidentally* correct is one a later edit breaks silently. Used by
+/// `segment`'s verified-region cache, whose invalidation scan must reach back past the
+/// widest region anything will ask it to verify.
+pub const fn ladder_max() -> u32 {
+    let mut m = 0u32;
+    let mut i = 0usize;
+    while i < CLASS_SIZES.len() {
+        if CLASS_SIZES[i] > m {
+            m = CLASS_SIZES[i];
+        }
+        i += 1;
+    }
+    m
 }
 
 #[inline]
@@ -472,14 +543,26 @@ pub fn validate_ladder(sizes: &[u32]) -> Result<()> {
             ));
         }
     }
-    // Classes 1.. must ascend; class 0 (packed) sits outside that ordering.
-    if sizes[1..].windows(2).any(|w| w[0] >= w[1]) {
+    // The **standalone** classes must ascend; packed pages sit outside that ordering.
+    // Filtered rather than sliced: this was `sizes[ 1.. ]`, which was the same thing
+    // while class 0 was the only packed class, and would now demand that a 64 KiB page
+    // ascend from an 8256-byte slot.
+    let standalone: Vec<u32> = sizes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !is_packed_class(*i as u8))
+        .map(|(_, &s)| s)
+        .collect();
+    if standalone.windows(2).any(|w| w[0] >= w[1]) {
         return Err(CodecError::Invariant("size classes must strictly ascend"));
     }
-    let top = *sizes.last().unwrap() as usize;
+    // **The largest standalone class**, not the largest entry. Every container must be
+    // storable in a slot of its own, and a packed page being bigger than any of them
+    // would satisfy a `last()` check for the wrong reason.
+    let top = standalone.last().copied().unwrap_or(0) as usize;
     if top < crate::BITMAP_BYTES + EXT_TRAILER_BYTES {
         return Err(CodecError::Invariant(
-            "top class cannot hold a bitmap payload",
+            "top standalone class cannot hold a bitmap payload",
         ));
     }
     Ok(())
@@ -705,10 +788,34 @@ mod tests {
         for &s in &CLASS_SIZES {
             assert_eq!(s % 64, 0, "class size {s} breaks 64-byte alignment");
         }
-        // Adjacent ratio bounds internal fragmentation.
-        for w in CLASS_SIZES[1..].windows(2) {
+        // Adjacent ratio bounds internal fragmentation -- **over the standalone
+        // classes only**. A payload rounds up to the next class and wastes the
+        // difference, which is what this bounds; a packed class is never selected by
+        // payload size ( see `is_packed_class` ), so no payload can round up into one
+        // and it has no fragmentation to bound. Written as `CLASS_SIZES[ 1.. ]` while
+        // class 0 was the only packed class, which made "skip the packed classes" and
+        // "skip the first" the same sentence.
+        let standalone: Vec<u32> = CLASS_SIZES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !is_packed_class(*i as u8))
+            .map(|(_, &s)| s)
+            .collect();
+        for w in standalone.windows(2) {
             let ratio = w[1] as f64 / w[0] as f64;
             assert!(ratio <= 1.5, "adjacent class ratio {ratio} exceeds 1.5");
+        }
+        // And no payload can reach a packed class, which is what makes the exemption
+        // above sound rather than merely convenient.
+        for class in 0..CLASS_SIZES.len() as u8 {
+            if is_packed_class(class) {
+                let sz = class_size(class).unwrap() as usize;
+                assert_ne!(
+                    class_for(sz - EXT_TRAILER_BYTES),
+                    Some(class),
+                    "class_for reached packed class {class}"
+                );
+            }
         }
     }
 

@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::extent::{class_size, CLASS_SIZES, PACKED_CLASS};
+use super::extent::{class_size, is_packed_class, CLASS_SIZES, PACKED_CLASS};
 use crate::error::{CodecError, Result};
 use crate::store::{SLAB_BODY, SLAB_META, SLAB_SIZE};
 
@@ -727,11 +727,32 @@ impl Allocator {
     /// the caller needs this to tell "packed, handle differently" from "not
     /// freeable at all".
     pub fn is_packed_cell(&self, cell: u64) -> bool {
+        self.packed_page(cell).is_some()
+    }
+
+    /// The page holding `cell`, as `( base, page_size )`, if it is a packed one.
+    ///
+    /// **The size comes from the slab's class, and the base from slab arithmetic.**
+    /// `read_container_for` used to compute the base as `cell - ( cell % store::PAGE )`,
+    /// which is correct only while every packed page is the same size *and* that size
+    /// divides `SLAB_META`. Neither holds once a second packed class exists: 64 KiB does
+    /// not divide the 8 KiB slab header, so the modulus would name an address inside the
+    /// previous page and the header parse would read payload bytes as a header.
+    pub fn packed_page(&self, cell: u64) -> Option<(u64, usize)> {
         let id = slab_of(cell);
-        matches!(
-            self.slabs.get(id as usize).map(|s| s.state),
-            Some(SlabState::InUse { class, .. }) if class == PACKED_CLASS
-        )
+        let SlabState::InUse { class, .. } = self.slabs.get(id as usize)?.state else {
+            return None;
+        };
+        if !is_packed_class(class) {
+            return None;
+        }
+        let page = class_size(class)? as u64;
+        let body = id as u64 * SLAB_SIZE + SLAB_META;
+        if cell < body {
+            return None;
+        }
+        let base = body + ((cell - body) / page) * page;
+        Some((base, page as usize))
     }
 
     /// Note that a packed chunk is superseded, and queue its **page** once every
@@ -885,7 +906,10 @@ impl Allocator {
         let SlabState::InUse { class, .. } = slab.state else {
             return None;
         };
-        if class == PACKED_CLASS {
+        // Any packed class, not just the first. A site that tested `== PACKED_CLASS`
+        // would hand a large page's cell back as a standalone slot, and its caller
+        // would then read the eight bytes at the slot end as an extent trailer.
+        if is_packed_class(class) {
             return None;
         }
         let sz = class_size(class)? as u64;
@@ -1313,6 +1337,78 @@ mod tests {
         assert_eq!(a.owning_class(taken), Some(new));
     }
 
+    /// A large page's base and size resolve from the slab, not from a modulus.
+    ///
+    /// **This is the arithmetic that would misread silently.** `read_container_for`
+    /// computed a packed page's base as `cell - ( cell % store::PAGE )`, which is right
+    /// only while every packed page is 4 KiB *and* that size divides `SLAB_META`. A
+    /// 65 600-byte page satisfies neither, so the modulus would name an address inside
+    /// the previous page and the header parse would read payload bytes as a header --
+    /// a wrong answer, not an error, which is why this is asserted rather than assumed.
+    ///
+    /// There is no producer of large pages until Phase 2, so nothing exercises this
+    /// incidentally. Deliberate coverage now, for the reason `RecType::ChunkImage`'s
+    /// replay arm needed its own test the day it lost its producer.
+    #[test]
+    fn a_large_packed_page_resolves_its_own_base_and_size() {
+        let mut a = Allocator::new();
+        let page = class_size(crate::store::extent::PACKED_LARGE_CLASS).unwrap() as u64;
+
+        // Two pages, so the second one's base is not the slab body's start and a
+        // modulus against the page size cannot land on it by coincidence.
+        let first = a.alloc(crate::store::extent::PACKED_LARGE_CLASS).unwrap();
+        let second = a.alloc(crate::store::extent::PACKED_LARGE_CLASS).unwrap();
+        assert_eq!(second - first, page, "consecutive pages must be adjacent");
+
+        for base in [first, second] {
+            // Every offset inside the page must resolve to the same base: its start, a
+            // payload just past the header, and its last byte.
+            for probe in [
+                base,
+                base + crate::store::packed::HEADER as u64,
+                base + page - 1,
+            ] {
+                assert_eq!(
+                    a.packed_page(probe),
+                    Some((base, page as usize)),
+                    "cell {probe} did not resolve to page {base}"
+                );
+            }
+        }
+
+        // The modulus the old code used disagrees, which is what makes this test about
+        // the fix rather than about arithmetic in general.
+        let inside = second + crate::store::packed::HEADER as u64;
+        assert_ne!(
+            inside - (inside % page),
+            second,
+            "if a modulus happened to work here the test would prove nothing"
+        );
+
+        // And a standalone cell is not a packed page, so the two paths stay disjoint.
+        let plain = a.alloc(widest_standalone_class()).unwrap();
+        assert_eq!(a.packed_page(plain), None);
+        assert!(a.owning_class(plain).is_some());
+        assert!(
+            a.owning_class(first).is_none(),
+            "a packed cell must not report a standalone class, or its caller reads a \
+             trailer out of payload bytes"
+        );
+    }
+
+    /// The widest class a payload can actually be allocated into.
+    ///
+    /// **Not `CLASS_SIZES.len() - 1`.** Three tests took the last entry as "the widest
+    /// class", which was the same thing while every packed class sat at index 0. It is
+    /// not once a packed class is appended: `alloc` on one yields a page whose frees go
+    /// through page reclamation rather than slot reclamation, so a slab of them never
+    /// empties and the test's premise silently stops holding.
+    fn widest_standalone_class() -> u8 {
+        (0..CLASS_SIZES.len() as u8)
+            .rfind(|c| !is_packed_class(*c))
+            .expect("the ladder has standalone classes")
+    }
+
     /// A class outside the ladder is refused rather than silently indexed.
     ///
     /// A refusal path, found at **zero** coverage by the 2026-09-16 branch
@@ -1322,11 +1418,15 @@ mod tests {
     #[test]
     fn allocating_an_unknown_size_class_is_refused() {
         let mut a = Allocator::new();
-        let last = (CLASS_SIZES.len() - 1) as u8;
+        let last = widest_standalone_class();
         assert!(a.alloc(last).is_ok(), "the top class must be allocatable");
+        // The first index **past the ladder**, which is what this asserts. Written as
+        // `last + 1` while the widest standalone class was also the last entry; with a
+        // packed class appended, `last + 1` names a class that exists and allocates.
+        let past = CLASS_SIZES.len() as u8;
         assert!(
             matches!(
-                a.alloc(last + 1),
+                a.alloc(past),
                 Err(CodecError::Invariant("unknown size class"))
             ),
             "a class past the ladder must be refused"
@@ -1543,7 +1643,7 @@ mod tests {
         let mut a = Allocator::new();
         // Fill one slab's worth of the widest class and free it all, so the slab
         // empties and is offered.
-        let class = (CLASS_SIZES.len() - 1) as u8;
+        let class = widest_standalone_class();
         let cap = slab_capacity(class);
         assert!(cap > 1, "the widest class must hold several slots");
         let cells: Vec<u64> = (0..cap).map(|_| a.alloc(class).unwrap()).collect();
@@ -1599,7 +1699,7 @@ mod tests {
     #[test]
     fn a_recycled_slab_is_not_offered_for_punching() {
         let mut a = Allocator::new();
-        let class = (CLASS_SIZES.len() - 1) as u8;
+        let class = widest_standalone_class();
         let cap = slab_capacity(class);
         let cells: Vec<u64> = (0..cap).map(|_| a.alloc(class).unwrap()).collect();
         let id = slab_of(cells[0]);

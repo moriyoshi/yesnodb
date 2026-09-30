@@ -57,7 +57,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::alloc::{slab_of, Allocator};
 use super::checksum::crc32c;
-use super::extent::{class_size, ChunkKey, ChunkRef, ExtTrailer, EXT_TRAILER_BYTES, PACKED_CLASS};
+use super::extent::{
+    class_size, is_packed_class, ChunkKey, ChunkRef, ExtTrailer, EXT_TRAILER_BYTES,
+};
 use super::packed::PackedHeader;
 use super::{SLAB_META, SLAB_SIZE};
 use crate::container::Container;
@@ -90,6 +92,18 @@ pub fn slot_index(cell: u64, class: u8) -> Option<u32> {
     Some(((cell - body) / sz) as u32)
 }
 
+/// Live bytes in one packed page, and **how big that page is**.
+///
+/// The size is carried rather than looked up because `Rebuilt` verifies pages without
+/// an allocator to ask, and it could not be a constant once a second packed class
+/// existed: the scan took `class_size( PACKED_CLASS )` as *the* page size, so a 64 KiB
+/// page would have been checksummed over its first 4 KiB and reported corrupt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackedPageLive {
+    pub live: u32,
+    pub page_size: u32,
+}
+
 /// Liveness derived purely from the index.
 #[derive(Debug, Default)]
 pub struct Rebuilt {
@@ -100,7 +114,7 @@ pub struct Rebuilt {
     /// chunk points at freed space, not merely that one does.
     pub used: BTreeMap<u32, BTreeMap<u32, ChunkKey>>,
     /// `packed page slot base -> live payload bytes`.
-    pub packed_live: BTreeMap<u64, u32>,
+    pub packed_live: BTreeMap<u64, PackedPageLive>,
     /// `slab -> slots` occupied by the index's **own** nodes.
     ///
     /// Kept apart from [`Rebuilt::used`] because these slots have no
@@ -244,12 +258,8 @@ impl Rebuilt {
     ) -> Vec<String> {
         let mut out = Vec::new();
 
-        let Some(page_size) = class_size(PACKED_CLASS).map(|s| s as usize) else {
-            out.push("the packed size class is missing from the ladder".to_string());
-            return out;
-        };
-        for &base in self.packed_live.keys() {
-            match read(base, page_size) {
+        for (&base, entry) in &self.packed_live {
+            match read(base, entry.page_size as usize) {
                 // `verify` is parse-then-CRC, and both halves belong here: a
                 // page whose magic or version no longer reads is corrupt in a
                 // way the checksum would also catch, and reporting whichever
@@ -478,7 +488,7 @@ pub fn rebuild(
 
         out.used.entry(slab).or_default().entry(slot).or_insert(key);
 
-        if class == PACKED_CLASS {
+        if is_packed_class(class) {
             // A packed chunk's cell points into the page, not at its start, and
             // a run's length is a dependent read of its own `nruns` prefix.
             // Shared with the two supersede paths through `payload_len_with`:
@@ -496,7 +506,16 @@ pub fn rebuild(
                 errors.push(format!("{key:?}: a bitmap must never be packed"));
                 continue;
             }
-            *out.packed_live.entry(base).or_default() += len as u32;
+            let page_size = match class_size(class) {
+                Some(sz) => sz,
+                None => {
+                    errors.push(format!("{key:?}: unknown packed class {class}"));
+                    continue;
+                }
+            };
+            let e = out.packed_live.entry(base).or_default();
+            e.live += len as u32;
+            e.page_size = page_size;
         } else {
             // Standalone: the trailer's CRC32C covers exactly the payload, so
             // the length has to be resolved here, while `nruns_at` is in scope.
@@ -595,7 +614,8 @@ pub fn verify(rebuilt: &Rebuilt, alloc: &Allocator, errors: Vec<String>) -> Fsck
         }
     }
 
-    for (&page, &live) in &rebuilt.packed_live {
+    for (&page, entry) in &rebuilt.packed_live {
+        let live = entry.live;
         if let Some(claimed) = alloc.packed_live_bytes(page) {
             if claimed != live {
                 rep.packed_live_mismatch.push((page, claimed, live));
@@ -623,6 +643,7 @@ pub fn verify(rebuilt: &Rebuilt, alloc: &Allocator, errors: Vec<String>) -> Fsck
 
 #[cfg(test)]
 mod tests {
+    use super::super::extent::PACKED_CLASS;
     use super::*;
     use crate::container::codec;
     use crate::index::tree::{NodeReader, NodeWriter, PageId};
@@ -877,8 +898,8 @@ mod tests {
         // 20 standalone slots, plus the one packed page slot shared by 10 chunks.
         assert_eq!(rb.slot_count(), 21, "packed chunks must share one slot");
         assert_eq!(
-            rb.packed_live.get(&f.packed_page),
-            Some(&60),
+            rb.packed_live.get(&f.packed_page).map(|e| e.live),
+            Some(60),
             "10 chunks x 6 bytes"
         );
     }
@@ -1034,7 +1055,13 @@ mod tests {
         let (rb, errs) = rebuild(&tree, &nodes, |_| Some(PACKED_CLASS), |_| Ok(7)).unwrap();
         assert!(errs.is_empty(), "{errs:?}");
         // 2 + 4*7 = 30
-        assert_eq!(rb.packed_live.get(&page), Some(&30));
+        assert_eq!(rb.packed_live.get(&page).map(|e| e.live), Some(30));
+        // And the page's own size is carried, which is what lets a page be verified
+        // without an allocator to ask its class.
+        assert_eq!(
+            rb.packed_live.get(&page).map(|e| e.page_size),
+            class_size(PACKED_CLASS)
+        );
     }
 
     // -----------------------------------------------------------------------

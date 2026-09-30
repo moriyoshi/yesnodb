@@ -306,14 +306,26 @@ impl VerifiedCache {
 /// The widest region [`SegmentedMmap::verify_once`] will ever be asked about.
 ///
 /// Bounds the backward scan in invalidation: an entry starting more than this
-/// far below a write cannot reach it. It is the top size class, which covers
-/// every family — an extent payload is at most a slot, a packed page is class 0
-/// at 4096, and an index node is allocated through the same ladder.
-const MAX_VERIFIED_SPAN: u64 = 8256;
+/// far below a write cannot reach it. It is the widest entry in the size-class
+/// ladder, which covers every family — an extent payload is at most a slot, a
+/// packed page is a class of its own, and an index node is allocated through the
+/// same ladder.
+///
+/// **This is what makes a packed page's size a write-path cost, not just a read-path
+/// one.** Widening the largest page widens this scan for every write, and a region
+/// *larger* than this is not cached at all ( see the length test in `verify_once` ),
+/// so an oversized page would re-checksum on every read rather than once. It was 8256
+/// — the top standalone slot — until `PACKED_LARGE_CLASS` arrived at 65 600 bytes on
+/// 2026-09-30, and that eightfold widening is the reason that class is 64 KiB rather
+/// than the 2 MiB a slab body would allow.
+const MAX_VERIFIED_SPAN: u64 = 65600;
 
+// Against the **maximum** of the ladder, not its last entry. The assertion here read
+// `CLASS_SIZES[ len - 1 ]`, which was the same thing only while every class ascended;
+// packed classes sit outside that order, so a packed class added anywhere but the end
+// would have satisfied it while leaving invalidation able to miss an entry.
 const _: () = assert!(
-    MAX_VERIFIED_SPAN
-        >= crate::store::extent::CLASS_SIZES[crate::store::extent::CLASS_SIZES.len() - 1] as u64,
+    MAX_VERIFIED_SPAN >= crate::store::extent::ladder_max() as u64,
     "MAX_VERIFIED_SPAN must cover the widest size class, or invalidation can miss an entry"
 );
 

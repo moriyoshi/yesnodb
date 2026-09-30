@@ -420,8 +420,7 @@ impl ShardStore {
             return self.read_container(cref);
         };
 
-        if self.alloc.is_packed_cell(cell) {
-            let base = cell - (cell % crate::store::PAGE as u64);
+        if let Some((base, page)) = self.alloc.packed_page(cell) {
             let hdr = self.seg.read_at(base, crate::store::packed::HEADER)?;
             let h = crate::store::packed::PackedHeader::parse(&hdr)?;
             if !h.may_contain(key) {
@@ -452,9 +451,11 @@ impl ShardStore {
             // single-key benchmark cannot see it by construction. Tracked as
             // `packed-page-sharing-may-contend-across-keys`; do not treat the
             // once-per-page framing as a pure win until that is measured.
-            self.seg.verify_once(base, crate::store::PAGE, || {
-                let page = self.seg.read_at(base, crate::store::PAGE)?;
-                crate::store::packed::PackedHeader::verify(&page).map(|_| ())
+            // Sized from the slab's class rather than from a global constant, so a
+            // large page is checksummed whole rather than in its first 4 KiB.
+            self.seg.verify_once(base, page, || {
+                let bytes = self.seg.read_at(base, page)?;
+                crate::store::packed::PackedHeader::verify(&bytes).map(|_| ())
             })?;
         } else if let Some(class) = self.alloc.owning_class(cell) {
             let slot = crate::store::extent::class_size(class)
