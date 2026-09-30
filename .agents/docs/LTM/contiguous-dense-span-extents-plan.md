@@ -64,27 +64,47 @@ class survives reopen.
 So: **no `ChunkRef` change, no bit overloading, and no file a current reader must
 refuse.**
 
-## Proposed layout, corrected: a size class rather than a span type
+## Proposed layout, corrected twice: a larger packed page, not a new mechanism
 
-The blocker is visible in one line of the ladder. `CLASS_SIZES[ 10 ] = 8256`, annotated
-"exact for 8192", because a slot must hold the payload *plus its 8-byte trailer* rounded
-to a multiple of 64. **That 64 bytes of slack per chunk is what breaks adjacency**, and
-nothing else does.
+**Payload size must be arbitrary**, and that requirement does not cost adjacency. It
+costs only the uniform-stride reading, and those are different properties that the
+first two versions of this plan ran together:
 
-A new class whose slot is **exactly 8192 with no trailer**, admitting only full bitmap
-payloads and taking its integrity from the slab header as `PACKED_CLASS` does, makes
-consecutive slots adjacent by construction -- `slot_offset` arithmetic then *is* the
-contiguity. With `SLAB_BODY = SLAB_SIZE - SLAB_META = 2 097 152 - 8 192`, a slab holds
-**255 such slots**: one contiguous 2 MiB bitvector covering 16 711 680 ordinals.
+* **Adjacency** -- no gaps between payloads -- is all that zero-copy needs for the
+  `Containers` wire. An Arrow `BinaryArray` is offsets plus **one** contiguous values
+  buffer, so if payloads are adjacent the offsets can point into the lent mapping and
+  nothing is copied. The offsets are already in hand: `ChunkRef::cell` is a byte offset
+  and each payload's length follows from its kind ( array `2 * card`, bitmap 8192, run
+  self-describing from its leading interval count ). **Arbitrary sizes are fine here.**
+* **Uniform stride** -- every member exactly 8192 bytes for a full chunk -- is needed
+  only to read a region *as one bitvector*, because bit `i` must be ordinal `base + i`.
+  That becomes an **opportunistic fast path**, detected when a run happens to be all
+  full bitmaps, rather than the mechanism.
 
-**And 2 MiB is enough, which is the reframing that makes this small.** Zero-copy does
-not require the whole set to be one buffer; it requires **each Arrow batch** to be one
-contiguous slice, because Arrow's constraint is one contiguous values buffer per column
-per *batch*. A 2 MiB slab yields a 16 711 680-row boolean batch, which is an ordinary
-batch size. So cross-slab contiguity is unnecessary and no allocator change beyond the
-new class is needed -- the existing policy already claims "a contiguous run of slabs"
-per checkpoint and bump-allocates within it, so a bulk-loaded key's chunks already land
-in one file window.
+**And the mechanism already exists, at the wrong size.** `PackedPageBuilder::new(
+page_size )` takes the size as a **parameter**, `capacity( page_size ) = page_size -
+HEADER`, payloads are appended back-to-back in ascending `ChunkKey` order -- "the order
+the checkpointer already writes in, which is also what makes the header's `[ first,
+last ]` range a valid index-scan bound" -- and a packed page carries **no per-payload
+trailer**. Adjacency for arbitrary sizes is what packed pages have always done.
+
+Only two conditions keep dense data out, both at the checkpointer's admission test:
+
+```text
+if payload.len() <= PACK_MAX && c.kind() != ContainerKind::Bitmap
+```
+
+`PACK_MAX` is 2028, which is `capacity( 4096 ) / 2`: packing is admitted only when at
+least two payloads fit one page, so that it always saves an extent. The `kind` test is
+**redundant today** -- a bitmap payload is always 8192 and already fails the size test
+-- so it documents intent rather than excluding anything the size test admits.
+
+So the work is a **larger page class** plus a relaxed admission rule for a run of
+consecutive chunks of one key, and *no structural change to the packed-page format*.
+At a 2 MiB page, `capacity` is 2 097 112 bytes: 255 full bitmaps, or any mix of
+arbitrary payloads, contiguous. No per-chunk trailer, no `ChunkRef` change, no new
+integrity scheme -- the page header's CRC already covers the body, which is exactly why
+packed pages need no trailers.
 
 ## The three costs, and the second is the design work
 
