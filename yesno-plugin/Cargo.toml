@@ -13,6 +13,7 @@ yesno-core = { path = "../yesno-core" }
 # `ipc.rs` in this crate and pulls in neither.
 memmap2 = "0.9"
 libc = "0.2"
+bytemuck.workspace = true
 
 [dev-dependencies]
 # The scan test maps the arena as a peer would, through the descriptor.

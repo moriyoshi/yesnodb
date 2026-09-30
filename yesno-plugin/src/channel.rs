@@ -192,6 +192,27 @@ impl Arena {
         self.write_at(off, bytes)
     }
 
+    /// Encode a container **directly into** the lane slot at `off`.
+    ///
+    /// Bounds are the session's arithmetic, checked here rather than trusted for the
+    /// same reason [`Arena::write_at`] checks them: a slot offset is derived from a
+    /// handle index this crate assigned, so a failure means this file is wrong and
+    /// not that a peer sent something. An out-of-range slot yields an `Absent` lane
+    /// rather than panicking or -- as the `write_at` path did -- describing a lane
+    /// whose bytes were silently never written, which would have the peer read
+    /// whatever the slot held before.
+    fn encode_at(&mut self, off: usize, c: &Container) -> Lane {
+        let end = off + LANE_BYTES;
+        debug_assert!(end <= self.map.len(), "a lane wrote past the arena");
+        if end > self.map.len() {
+            return Lane {
+                kind: LaneKind::Absent,
+                count: 0,
+            };
+        }
+        encode_into(&mut self.map[off..end], c)
+    }
+
     fn write_at(&mut self, off: usize, bytes: &[u8]) {
         let end = off + bytes.len();
         // Bounds are the session's arithmetic, checked here rather than trusted: a
@@ -561,37 +582,43 @@ impl Session {
         let arity = h.arity;
         // Collected before touching the arena, because writing needs `&mut self`
         // while the containers are borrowed from the handle.
-        let mut descs = Vec::with_capacity(arity);
-        for i in 0..arity {
-            match h.lanes.lane(i) {
-                None => descs.push((
-                    Lane {
-                        kind: LaneKind::Absent,
-                        count: 0,
-                    },
-                    Vec::new(),
-                )),
-                Some(c) => descs.push(encode_lane(c)),
-            }
-        }
+        // Encoded straight into the destination. `self.handles` and `self.arena` are
+        // different fields of `self`, so the handle's containers stay borrowed across
+        // a write through the arena without an intermediate payload vector.
+        let absent = Lane {
+            kind: LaneKind::Absent,
+            count: 0,
+        };
+        let mut lanes = Vec::with_capacity(arity);
         match self.arena.as_mut() {
             Some(arena) => {
-                for (i, (_, bytes)) in descs.iter().enumerate() {
-                    if !bytes.is_empty() {
-                        arena.write_at(base + i * LANE_BYTES, bytes);
-                    }
+                for i in 0..arity {
+                    lanes.push(match h.lanes.lane(i) {
+                        None => absent,
+                        Some(c) => arena.encode_at(base + i * LANE_BYTES, c),
+                    });
                 }
-                Frame::Block {
-                    prefix,
-                    lanes: descs.into_iter().map(|(l, _)| l).collect(),
-                }
+                Frame::Block { prefix, lanes }
             }
             None => {
                 let mut payload = Vec::new();
-                let mut lanes = Vec::with_capacity(descs.len());
-                for (l, bytes) in descs {
-                    payload.extend_from_slice(&bytes);
-                    lanes.push(l);
+                // `[u64; _]` viewed as bytes, so the destination is word-aligned and
+                // `encode_into`'s bitmap fast path is taken deterministically. A
+                // `[u8; LANE_BYTES]` has alignment 1 by type yet may still land 8-aligned
+                // by luck, which would make *which arm runs* a property of the stack
+                // rather than of this file.
+                let mut words = [0u64; LANE_BYTES / 8];
+                let scratch: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
+                for i in 0..arity {
+                    lanes.push(match h.lanes.lane(i) {
+                        None => absent,
+                        Some(c) => {
+                            let lane = encode_into(scratch, c);
+                            let n = lane.kind.payload_bytes(lane.count);
+                            payload.extend_from_slice(&scratch[..n]);
+                            lane
+                        }
+                    });
                 }
                 Frame::BlocksInline {
                     blocks: vec![WireBlock { prefix, lanes }],
@@ -617,9 +644,29 @@ impl Session {
         let base = h.index * slot_bytes;
         let arity = h.arity;
         let mut out: Vec<WireBlock> = Vec::with_capacity(cap);
-        // Payloads are collected before the arena is touched, because writing needs
-        // `&mut self` while the containers are borrowed from the handle.
-        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let absent = Lane {
+            kind: LaneKind::Absent,
+            count: 0,
+        };
+        // Encoded into the destination as each container is reached, rather than
+        // collected first. The comment here used to say payloads had to be gathered
+        // before the arena was touched "because writing needs `&mut self` while the
+        // containers are borrowed from the handle" -- but `self.handles` and
+        // `self.arena` are *different fields*, so borrowing both at once is allowed
+        // and the intermediate `Vec<( usize, Vec<u8> )>` bought nothing. Removing it
+        // is what a haiiie measurement attributed about 20% of `yesnod`'s CPU and
+        // some 9 MiB of peak RSS to, on a 265-lane arena workload.
+        //
+        // Inline order stays ( block, lane ), which is the order the walk visits, so
+        // concatenating needs no sort and no offsets.
+        let mut payload = Vec::new();
+        // `[u64; _]` viewed as bytes, so the destination is word-aligned and
+        // `encode_into`'s bitmap fast path is taken deterministically. A
+        // `[u8; LANE_BYTES]` has alignment 1 by type yet may still land 8-aligned
+        // by luck, which would make *which arm runs* a property of the stack
+        // rather than of this file.
+        let mut words = [0u64; LANE_BYTES / 8];
+        let scratch: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
         for j in 0..cap {
             let advanced = match h.lanes.advance() {
                 Ok(a) => a,
@@ -628,19 +675,18 @@ impl Session {
             let Some(prefix) = advanced else { break };
             let mut lanes = Vec::with_capacity(arity);
             for i in 0..arity {
-                match h.lanes.lane(i) {
-                    None => lanes.push(Lane {
-                        kind: LaneKind::Absent,
-                        count: 0,
-                    }),
-                    Some(c) => {
-                        let (lane, bytes) = encode_lane(c);
-                        if !bytes.is_empty() {
-                            writes.push((base + j * block_bytes + i * LANE_BYTES, bytes));
+                lanes.push(match h.lanes.lane(i) {
+                    None => absent,
+                    Some(c) => match self.arena.as_mut() {
+                        Some(arena) => arena.encode_at(base + j * block_bytes + i * LANE_BYTES, c),
+                        None => {
+                            let lane = encode_into(scratch, c);
+                            let n = lane.kind.payload_bytes(lane.count);
+                            payload.extend_from_slice(&scratch[..n]);
+                            lane
                         }
-                        lanes.push(lane);
-                    }
-                }
+                    },
+                });
             }
             out.push(WireBlock { prefix, lanes });
         }
@@ -648,28 +694,14 @@ impl Session {
         // the next request, which is what `block_open` records for the single-block
         // path and what the implicit release handles here.
         if !out.is_empty() {
-            if let Some(h) = self.handles.get_mut(&id) {
-                h.block_open = true;
-            }
+            h.block_open = true;
         }
-        match self.arena.as_mut() {
-            Some(arena) => {
-                for (off, bytes) in writes {
-                    arena.write_at(off, &bytes);
-                }
-                Frame::Blocks { blocks: out }
-            }
-            None => {
-                // Inline order is ( block, lane ), which is the order `writes` was
-                // built in, so concatenating it needs no sort and no offsets.
-                let mut payload = Vec::new();
-                for (_, bytes) in writes {
-                    payload.extend_from_slice(&bytes);
-                }
-                Frame::BlocksInline {
-                    blocks: out,
-                    payload,
-                }
+        if self.arena.is_some() {
+            Frame::Blocks { blocks: out }
+        } else {
+            Frame::BlocksInline {
+                blocks: out,
+                payload,
             }
         }
     }
@@ -686,24 +718,35 @@ impl Session {
     }
 }
 
-/// A lane's descriptor and the bytes to place in its arena slot.
+/// Encode one lane's payload into `dst` and describe it.
 ///
-/// Copies, and that is the honest cost of the process boundary: the in-process ABI
-/// lends the mapping's own bytes, and nothing can be lent across an address space
-/// that the peer does not already map. What the arena buys is that the copy is one
-/// `memcpy` into a page the peer already sees, rather than a write and a read
-/// through a socket.
-fn encode_lane(c: &Container) -> (Lane, Vec<u8>) {
+/// **One encoder, two destinations.** `dst` is either the peer's arena slot -- so
+/// the container is serialized straight into a page the peer already maps, with no
+/// intermediate `Vec` and no second copy -- or a scratch buffer whose bytes are
+/// then concatenated into an inline frame. It used to return `( Lane, Vec<u8> )`
+/// and every caller copied out of that vector; the direct-to-arena form came from
+/// a haiiie measurement ( 2026-09-30 ) showing about 20% less `yesnod` CPU and
+/// roughly 9 MiB less peak RSS on a 265-lane arena workload.
+///
+/// The conversion is here rather than duplicated per transport **because it is
+/// where a silent wire bug already lived once**: see the run arm below.
+///
+/// `dst` must be at least [`LANE_BYTES`] long, which is a true upper bound for
+/// every container kind rather than a convention -- `ipc`'s header does that
+/// arithmetic ( 8192, 8192 and 8128 bytes ). Returns the number of bytes written
+/// implicitly, as `lane.kind.payload_bytes( lane.count )`.
+fn encode_into(dst: &mut [u8], c: &Container) -> Lane {
+    debug_assert!(dst.len() >= LANE_BYTES, "a lane slot is LANE_BYTES");
     match c {
         Container::Array(a) => {
-            let s = a.as_slice();
-            (
-                Lane {
-                    kind: LaneKind::Array,
-                    count: s.len() as u32,
-                },
-                s.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            )
+            let values = a.as_slice();
+            for (slot, value) in dst.chunks_exact_mut(2).zip(values) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+            Lane {
+                kind: LaneKind::Array,
+                count: values.len() as u32,
+            }
         }
         Container::Run(r) => {
             // **Converted, not copied.** In memory a run is `( start, len_minus_1 )`
@@ -715,34 +758,43 @@ fn encode_lane(c: &Container) -> (Lane, Vec<u8>) {
             // short, and a run whose start exceeds its length reads as a reversed
             // interval.
             let flat = r.as_flat();
-            let mut bytes = Vec::with_capacity(flat.len() * 2);
-            for pair in flat.chunks_exact(2) {
+            for (slot, pair) in dst.chunks_exact_mut(4).zip(flat.chunks_exact(2)) {
                 let (start, len_minus_1) = (pair[0], pair[1]);
-                bytes.extend_from_slice(&start.to_le_bytes());
-                bytes.extend_from_slice(&(start + len_minus_1).to_le_bytes());
+                slot[..2].copy_from_slice(&start.to_le_bytes());
+                slot[2..].copy_from_slice(&(start + len_minus_1).to_le_bytes());
             }
-            (
-                Lane {
-                    kind: LaneKind::Run,
-                    count: (flat.len() / 2) as u32,
-                },
-                bytes,
-            )
+            Lane {
+                kind: LaneKind::Run,
+                count: (flat.len() / 2) as u32,
+            }
         }
         Container::Bitmap(b) => {
-            let mut words = vec![0u64; yesno_core::BITMAP_WORDS];
-            // `copy_words_into` rather than `try_words`, because the unaligned arm
-            // has to work too and a borrow here would only save a copy that the
-            // arena write makes anyway.
-            let ok = b.copy_words_into(&mut words);
-            debug_assert!(ok, "a bitmap payload is always BITMAP_WORDS long");
-            (
-                Lane {
-                    kind: LaneKind::Bitmap,
-                    count: yesno_core::BITMAP_WORDS as u32,
-                },
-                words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            )
+            let words = &mut dst[..yesno_core::BITMAP_WORDS * 8];
+            // **Alignment is a property of the destination, not of this function.**
+            // An arena slot begins at a multiple of `LANE_BYTES` inside a
+            // page-aligned mapping and is always word-aligned; a scratch `Vec<u8>`
+            // is aligned to 1. So the fast path is attempted and the portable one
+            // is the fallback, rather than the alignment being asserted -- an
+            // assertion here would hold for the arena and panic the server on the
+            // inline path.
+            match bytemuck::try_cast_slice_mut::<u8, u64>(words) {
+                Ok(native) if cfg!(target_endian = "little") => {
+                    let ok = b.copy_words_into(native);
+                    debug_assert!(ok, "a bitmap payload is always BITMAP_WORDS long");
+                }
+                _ => {
+                    let mut buf = [0u64; yesno_core::BITMAP_WORDS];
+                    let ok = b.copy_words_into(&mut buf);
+                    debug_assert!(ok, "a bitmap payload is always BITMAP_WORDS long");
+                    for (slot, word) in words.chunks_exact_mut(8).zip(buf) {
+                        slot.copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+            Lane {
+                kind: LaneKind::Bitmap,
+                count: yesno_core::BITMAP_WORDS as u32,
+            }
         }
     }
 }
@@ -1049,4 +1101,61 @@ fn load_page(
         values: out,
         more: u8::from(more),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lane encodes to the same bytes whether or not its destination is aligned.
+    ///
+    /// [`encode_into`]'s bitmap arm casts the slot to `u64` words when it can and
+    /// goes byte by byte when it cannot, and which arm runs is a property of the
+    /// destination address rather than of this file. Both call sites now hand it an
+    /// aligned buffer, so the fallback is there for a big-endian host and for any
+    /// future caller that does not -- which means nothing would otherwise exercise
+    /// it, and a defect in it would surface only on hardware nobody runs the gate
+    /// on. This pins the two arms against each other directly.
+    #[test]
+    fn a_lane_is_the_same_bytes_at_any_alignment() {
+        // Above ARRAY_MAX so `from_sorted` yields a bitmap, then a run and an array,
+        // so the loop is not only the arm that casts.
+        let dense: Vec<u16> = (0..=(yesno_core::ARRAY_MAX as u16 + 1000)).collect();
+        for c in [
+            Container::from_sorted(&dense),
+            Container::from_sorted(&[1000, 1001, 1002, 1003, 1004]),
+            Container::from_sorted(&[7, 9, 11]),
+        ] {
+            let mut words = [0u64; LANE_BYTES / 8];
+            let aligned: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
+            let lane_a = encode_into(aligned, &c);
+            let n = lane_a.kind.payload_bytes(lane_a.count);
+            let from_aligned = aligned[..n].to_vec();
+
+            // Offset so the slice cannot be word-aligned, whatever the stack did.
+            let mut raw = [0u8; LANE_BYTES + 8];
+            // An odd address cannot be word-aligned, and needs at most two bytes of
+            // slack -- the first attempt computed `8 - ptr % 8 + 1`, which reaches 9
+            // and ran off the end of the buffer.
+            let off = if (raw.as_ptr() as usize).is_multiple_of(2) {
+                1
+            } else {
+                2
+            };
+            let misaligned = &mut raw[off..off + LANE_BYTES];
+            assert!(
+                !(misaligned.as_ptr() as usize).is_multiple_of(8),
+                "this test is vacuous unless the destination really is misaligned"
+            );
+            let lane_b = encode_into(misaligned, &c);
+
+            assert_eq!(lane_a, lane_b, "the descriptors must agree");
+            assert_eq!(
+                from_aligned,
+                misaligned[..n].to_vec(),
+                "{:?} encoded differently when the destination was misaligned",
+                lane_a.kind
+            );
+        }
+    }
 }

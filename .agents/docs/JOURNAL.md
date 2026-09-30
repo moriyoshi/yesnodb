@@ -9022,3 +9022,74 @@ these 526 s are paid for a doc-only change to a scenario as surely as for a chan
 `yesno-core`. Reordering the copy would skip the steps outright, and the reason it
 was not done is in the entry above: silent staleness, with `yesno-e2e/BUILD.bazel`
 showing the Bazel-relevant set is wider than it looks.
+
+## 2026-09-30 -- one encoder, two destinations: integrating the haiiie direct-arena patch
+
+haiiie handed over a reviewable patch against pinned `5b3613b` ( sha256
+`1e561748...`, verified; `channel.rs` was unchanged between that revision and HEAD,
+so it applied clean ) encoding container payloads straight into the arena instead of
+through a per-lane `Vec`. Their separate-process measurement at D=256, 262 144 docs,
+265 lanes, 600 searches per arm, A-B-B-A: `yesnod` arena CPU 4.12/4.04 s against
+3.27/3.23 s, whole-process VmHWM 41248/40492 KiB against 31460/32076 KiB, with the
+inline control flat at 3.52/3.52 against 3.55/3.56. **The flat control is what makes
+that more than host drift.** All 3200 full-hit comparisons matched embedded. They
+correctly refused a latency claim: every wall-clock cell failed their quiet-host
+gate.
+
+**Taken, but reshaped, and the reshaping is the point.** The patch added
+`write_container` beside `encode_lane` and forked `block_advance_many` into a
+`_direct` twin. That leaves **two implementations of the container-to-wire
+conversion**, including the run `[ start, end ]` conversion that was a live silent
+wire bug on 2026-09-29 -- with its explanatory comment on only one of the two copies.
+This tree has repeatedly found that shape rotting: a checker with two implementations
+decays to whichever one anybody runs. There is now a single
+`encode_into( dst, container ) -> Lane`, whose destination is either the mapped arena
+slot or a scratch buffer that the inline path concatenates.
+
+**Unifying also covered the path the patch left behind.** `block_advance` -- the
+single-block arm -- still went through `encode_lane` and paid the temporary `Vec` and
+the second copy. It no longer does, and no third copy of the conversion was needed to
+get that.
+
+**The comment that justified the old shape was false, which is why the intermediate
+vector existed at all.** It read: payloads are collected before the arena is touched
+"because writing needs `&mut self` while the containers are borrowed from the
+handle". But `self.handles` and `self.arena` are *different fields*, and borrowing two
+disjoint fields at once is allowed. The peer's patch is what demonstrated it. A
+plausible reason not to do something, written into a comment, outlives the five
+minutes it would take to test -- this one outlived it by months.
+
+**Two defects that unification introduces and the patch does not have.** Worth
+recording because both are invisible until the inline path shares the encoder.
+
+* The patch's bitmap arm does `try_cast_slice_mut::<u8, u64>( .. ).expect( "arena
+  bitmap slot must be word aligned" )`. Sound for an arena slot, which starts at a
+  multiple of `LANE_BYTES` inside a page-aligned mapping. **A scratch `Vec<u8>` is
+  aligned to 1**, so sharing the encoder would panic the server. It now attempts the
+  word-wise path and falls back to a byte-wise one.
+* Then the fallback became *non-deterministically* reachable, which is worse than
+  either branch being wrong: a `[u8; LANE_BYTES]` has alignment 1 by type but may
+  still land 8-aligned by luck, so which arm ran was a property of the stack. Both
+  call sites now pass a `[u64; _]` viewed as bytes.
+
+`a_lane_is_the_same_bytes_at_any_alignment` pins the two arms against each other,
+because with both call sites aligned nothing else exercises the fallback and a defect
+in it would surface only on big-endian hardware no gate runs on. Checked against a
+regression: `to_le_bytes` swapped for `to_be_bytes` in the fallback fails it with
+"Bitmap encoded differently when the destination was misaligned". The test's first
+version overran its own buffer -- `8 - ptr % 8 + 1` reaches 9 -- and its own bounds
+check caught that.
+
+**A process note.** `gate.sh` failed on a clippy lint in that new test
+( `manual_is_multiple_of` ) because I had run per-crate clippy on the refactor and
+then added the test module afterwards. The local lint gate is worth nothing run
+before the last edit rather than after it.
+
+**No performance claim is made here.** haiiie's figures are theirs, on their host;
+this machine sat at load 35-52 throughout from an unrelated session, so a
+re-measurement taken here would be noise dressed as confirmation. What is verified is
+behavioural: 55 plugin tests pass, including
+`a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports`,
+`a_batched_scan_sees_exactly_what_the_unbatched_one_sees` and
+`a_wide_block_of_dense_lanes_is_served_in_both_transports`, plus `gate.sh` and
+`gate-operator.sh`. A matched re-measurement on a quiet host is still owed.
