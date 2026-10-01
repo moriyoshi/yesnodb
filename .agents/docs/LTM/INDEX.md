@@ -57,6 +57,7 @@ Documents arrive here two ways:
 | [Measurement and Investigation Methodology](./measurement-and-investigation-methodology.md) | Experimental controls, evaluation frames, repeated sweeps, benchmark provenance, instrument canaries, and durable evidence. |
 | [Context Eligibility Product Direction](./context-eligibility-product-direction.md) | Candidate filtering, governed shares, identity namespaces, disclosure controls, versioned receipts, and the BYOC-first product boundary. |
 | [Chunk-Local Patch Writes](./chunk-local-patch-writes.md) | The `patch_chunk` operation and its WAL record, the live/replay agreement it is designed around, and the durable ingest measurement that justified it. |
+| [Contiguous Dense Span Extents](./contiguous-dense-span-extents-plan.md) | DONE for the dense case: shrinking the bitmap slot to exactly its payload and moving the extent trailer to a table at the slab-body tail made consecutive payloads adjacent and page-aligned ( 0 of 63 adjacent pairs to 63 of 63 ), so a dense window is lent rather than gathered. Records why both deferred decisions turned out moot, and why the larger shared-region variant is closed -- first for the wrong reason, then correctly. |
 
 ## Preserved Source
 
