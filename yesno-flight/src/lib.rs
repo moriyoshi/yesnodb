@@ -1401,15 +1401,30 @@ impl FlightService for YesnoFlightService {
                     // not vouch for ( a gap, a memtable override, a non-bitmap chunk ) comes
                     // back `None` and falls through to the staging walk below, which is
                     // correct for every window.
+                    //
+                    // **Only for a bare-key ticket.** `dense_span` lends what the *key* holds
+                    // on disk, and an expression's answer is computed -- so lending here for
+                    // a filtered ticket returns the unfiltered key, which is a wrong answer
+                    // and a superset. This file already warned about the shape eighty lines
+                    // above: "when the ticket carries a filter it is the authority, not
+                    // `t.key`", and the borrow loop was added ignoring it. Found by a review
+                    // from a neighbouring session, not by a test: every bitvector test was a
+                    // bare-key one, so the whole borrow path was exercised only where
+                    // `t.key` happened to be the right answer.
                     let mut lent = t.prefix_lo;
-                    while lent < t.prefix_hi {
+                    while t.expr.is_none() && lent < t.prefix_hi {
                         let end = (lent + BITVECTOR_CHUNKS_PER_BATCH as u64).min(t.prefix_hi);
-                        let Some(buf) =
+                        // The store says how far it could go, which is not always `end`: a
+                        // slab body holds 254 chunks, so a fixed window straddles a boundary
+                        // roughly every fourth time and comes back short. Advancing by what
+                        // was covered keeps every later slab borrowable, where treating a
+                        // short answer as a refusal gathered all of them.
+                        let Some((buf, covered)) =
                             yesno_core::unstable_arrow::dense_span(&snap, t.key, lent, end)
                         else {
                             break;
                         };
-                        let n = (end - lent) as usize;
+                        let n = (covered - lent) as usize;
                         let offsets: Vec<i32> = (0..=n)
                             .map(|i| (i * yesno_core::BITMAP_BYTES) as i32)
                             .collect();
@@ -1426,7 +1441,7 @@ impl FlightService for YesnoFlightService {
                             tracing::debug!(lent, "Flight bitvector receiver closed early");
                             return;
                         }
-                        lent = end;
+                        lent = covered;
                     }
                     if lent >= t.prefix_hi {
                         tracing::info!(
@@ -1437,11 +1452,25 @@ impl FlightService for YesnoFlightService {
                     }
 
                     let set = std::sync::Arc::new(set);
-                    // `dense` takes an **inclusive** upper bound where the ticket's
-                    // window is half-open, hence the `- 1`. Resumed from where the borrow
-                    // stopped: restarting at `prefix_lo` would resend the chunks already
-                    // lent, and a consumer counts values from the stream's start.
-                    let masks = yesno_arrow::MaskStream::dense(set.stream(), lent, t.prefix_hi - 1);
+                    // `dense` takes an **inclusive** upper bound where the ticket's window is
+                    // half-open, hence the `- 1`. Resumed from where the borrow stopped,
+                    // because restarting at `prefix_lo` would resend chunks already lent and
+                    // a consumer counts values from the stream's start.
+                    //
+                    // **The inner stream has to be sought, not only the mask's lower bound.**
+                    // `MaskStream::dense` decides which prefixes it *emits*; it pulls the
+                    // stream from wherever that stream happens to be. A resumed bound over an
+                    // unsought stream shifted every value by the number of chunks already
+                    // lent, which the differential test caught: its chunk 3 holds a
+                    // contiguous range and is therefore a *run*, so the borrow stopped after
+                    // chunk 0 and the staging walk re-emitted chunk 0's bits as value 1.
+                    // `seek` gallops, so this costs O( log delta ).
+                    let mut inner = set.stream();
+                    if let Err(e) = yesno_core::stream::ChunkStream::seek(&mut inner, lent) {
+                        let _ = tx.blocking_send(Err(engine_status(e)));
+                        return;
+                    }
+                    let masks = yesno_arrow::MaskStream::dense(inner, lent, t.prefix_hi - 1);
                     let mut emitted = 0u64;
                     let mut staged: Vec<u8> = Vec::new();
                     let mut offsets: Vec<i32> = vec![0];

@@ -13,12 +13,27 @@ bump-allocates within a contiguous slab run -- the locality policy `alloc.rs` al
 A threshold and a mode flag were artifacts of the packed-page design, not of the goal.
 `PACKED_LARGE_CLASS` is deleted and `MAX_VERIFIED_SPAN` is back to 8192.
 
-**What remains open is only B**, and only as a throughput question: A gives contiguous
-regions of 2 080 768 bytes, which is 16 646 144 boolean rows per Arrow batch, so the
-capability is delivered. B would make batches fewer and larger, and deciding it needs one
-measurement -- whether one 128 MiB batch beats sixty-four of 2 MiB for a consumer. Its cost
-is unchanged and is recorded below: a payload-only slab is not self-describing, which is
-the hazard `slabmeta` exists to prevent.
+**B is closed as of 2026-10-01, and the first attempt to close it used the wrong argument.**
+That attempt measured Arrow *batch size* -- finding 64 KiB to 2 MiB a plateau and one 128 MiB
+batch 30 to 50 times worse -- and concluded that B's larger regions were therefore useless.
+**That conflated two independent things**, as the maintainer pointed out: batch size is how
+much goes in one `RecordBatch`, while B is about how long a contiguous *region* exists on
+disk. Sixty-four-chunk batches can be cut from a 128 MiB region as easily as from a 2 MiB
+one, each borrowing a slice, so the batch-size curve says nothing about B.
+
+**What B actually buys is that more windows qualify for a borrow**, and the correct reason it
+is now uninteresting is a different one. `unstable_arrow::dense_span` reports **how far it
+could lend** rather than demanding the whole window, so a slab boundary truncates one batch
+slightly and the caller continues from there. A longer region would only make batch lengths
+more uniform. Before that contract existed the boundary was far from harmless -- a body holds
+254 chunks, a fixed 64-chunk window straddles roughly every fourth time, and the Flight arm
+stopped borrowing at the first straddle and gathered **every later slab**, each of which is
+contiguous within itself. Pinned by
+`a_key_spanning_a_slab_boundary_is_lent_in_full`, which asserts both that every chunk is lent
+and that at least one call came back short, so it cannot pass without crossing a boundary.
+
+So: B is not worth its cost -- a payload-only slab is not self-describing, the hazard
+`slabmeta` exists to prevent -- but the reason is partial coverage, not batch size.
 
 Read the phases below as the record of how this was argued, not as a description of the
 code. Phase 1's large packed page is gone; Phases 2 to 4 as written no longer apply.

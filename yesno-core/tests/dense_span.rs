@@ -58,7 +58,9 @@ fn a_contiguous_window_is_lent_and_not_copied() {
     db.checkpoint().unwrap();
 
     let snap = db.snapshot().unwrap();
-    let span = dense_span(&snap, 1, 0, chunks).expect("a fully dense window must be lendable");
+    let (span, covered) =
+        dense_span(&snap, 1, 0, chunks).expect("a fully dense window must be lendable");
+    assert_eq!(covered, chunks, "a window inside one slab is covered whole");
     assert_eq!(
         span.len(),
         chunks as usize * BITMAP_BYTES,
@@ -93,7 +95,7 @@ fn a_contiguous_window_is_lent_and_not_copied() {
 
 /// Each refusal, because `None` is what keeps a wrong answer off the fast path.
 #[test]
-fn a_gap_is_refused() {
+fn a_gap_stops_the_run_rather_than_refusing_it() {
     let d = dir("gap");
     let _c = CleanDir(d.clone());
 
@@ -106,13 +108,17 @@ fn a_gap_is_refused() {
     db.checkpoint().unwrap();
 
     let snap = db.snapshot().unwrap();
-    assert!(
-        dense_span(&snap, 1, 0, 3).is_none(),
-        "a gap must be refused"
-    );
-    // The dense prefix on its own still qualifies, so the refusal is about the hole rather
-    // than about the key.
-    assert!(dense_span(&snap, 1, 0, 1).is_some());
+    // **Stopped at, not refused.** Chunk 0 is lendable and the run ends at the hole, so a
+    // caller borrows what is there and asks again past it -- which is what keeps a key with
+    // one interior gap from gathering everything after it.
+    let (span, covered) = dense_span(&snap, 1, 0, 3).expect("the dense prefix is lendable");
+    assert_eq!(covered, 1, "the run must stop at the gap, not span it");
+    assert_eq!(span.len(), BITMAP_BYTES);
+    // Asking from inside the hole yields nothing, since not one chunk qualifies.
+    assert!(dense_span(&snap, 1, 1, 3).is_none());
+    // And past it, the far side is lendable on its own.
+    let (_, covered) = dense_span(&snap, 1, 2, 3).expect("chunk 2 is lendable");
+    assert_eq!(covered, 3);
 }
 
 #[test]
@@ -143,7 +149,7 @@ fn a_memtable_override_is_refused() {
 }
 
 #[test]
-fn a_sparse_chunk_is_refused() {
+fn a_sparse_chunk_stops_the_run() {
     let d = dir("sparse");
     let _c = CleanDir(d.clone());
 
@@ -160,8 +166,60 @@ fn a_sparse_chunk_is_refused() {
     db.checkpoint().unwrap();
 
     let snap = db.snapshot().unwrap();
+    // The bitmap prefix is lendable and the run stops at the array chunk.
+    let (_, covered) = dense_span(&snap, 1, 0, 2).expect("chunk 0 is a lendable bitmap");
+    assert_eq!(covered, 1, "the run must stop at the non-bitmap chunk");
+}
+
+/// A key spanning a slab boundary is lent **in full**, across several calls.
+///
+/// This is the regression test for the defect the partial-coverage contract exists to fix.
+/// A slab body holds 254 chunks of the bitmap class, so a fixed window straddles a boundary
+/// roughly every fourth time; while a straddle was reported as a refusal, a caller stopped
+/// borrowing at the first one and gathered every later slab even though each is contiguous
+/// within itself.
+///
+/// The second assertion is what stops this passing vacuously: if no call ever came back
+/// short, the fixture never reached a boundary and the test proves nothing about it.
+#[test]
+fn a_key_spanning_a_slab_boundary_is_lent_in_full() {
+    let d = dir("boundary");
+    let _c = CleanDir(d.clone());
+    // Comfortably past one slab body's 254 chunks.
+    let chunks = 300u64;
+
+    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    db.insert_many(1, &dense(chunks)).unwrap();
+    db.checkpoint().unwrap();
+    let snap = db.snapshot().unwrap();
+
+    let window = 64u64;
+    let mut at = 0u64;
+    let mut short_answers = 0;
+    let mut bytes = 0usize;
+    while at < chunks {
+        let end = (at + window).min(chunks);
+        let (span, covered) =
+            dense_span(&snap, 1, at, end).unwrap_or_else(|| panic!("nothing lendable at {at}"));
+        assert!(covered > at, "a lend must make progress");
+        assert_eq!(
+            span.len(),
+            (covered - at) as usize * BITMAP_BYTES,
+            "the buffer must cover exactly the chunks reported"
+        );
+        if covered < end {
+            short_answers += 1;
+        }
+        bytes += span.len();
+        at = covered;
+    }
+    assert_eq!(
+        bytes,
+        chunks as usize * BITMAP_BYTES,
+        "every chunk must be lent, across however many calls it takes"
+    );
     assert!(
-        dense_span(&snap, 1, 0, 2).is_none(),
-        "a non-bitmap chunk must be refused"
+        short_answers > 0,
+        "the fixture never crossed a slab boundary, so it does not test one"
     );
 }

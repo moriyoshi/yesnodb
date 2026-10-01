@@ -45,10 +45,12 @@ pub use arrow_buffer;
 /// standalone bitmap's slot is now exactly its payload, so chunks written in one checkpoint
 /// are adjacent rather than 64 bytes apart.
 ///
-/// **It refuses readily and `None` is not an error.** The memtable holding any opinion in
-/// the window, a missing prefix, a chunk that is not a store-backed bitmap, or cells that
-/// are not adjacent all yield `None`, and the caller is expected to have a gathering path.
-/// Every chunk's trailer is verified before its bytes are lent.
+/// **Returns the buffer and the first prefix it does not cover**, so a caller borrows what
+/// is there and asks again from that point. A fixed window straddles a slab boundary every
+/// 254 chunks of this class, and reporting that as a refusal made callers gather everything
+/// after the first straddle. `None` means not one chunk qualified; a memtable opinion
+/// anywhere in the window takes it outright, since an overridden chunk says nothing about
+/// where the disk run ends. Every chunk's trailer is verified before its bytes are lent.
 ///
 /// The returned buffer pins the extents it covers while it lives, which is the third
 /// reclamation condition; `Buffer` is `'static`, so an in-process holder can pin a slab
@@ -58,7 +60,7 @@ pub fn dense_span(
     key: u64,
     lo: crate::Prefix48,
     hi: crate::Prefix48,
-) -> Option<Buffer> {
+) -> Option<(Buffer, crate::Prefix48)> {
     snap.dense_span_buffer(key, lo, hi)
 }
 

@@ -598,3 +598,103 @@ async fn a_borrowed_bitvector_agrees_with_ordinals() {
         "the borrowed bitvector decoded to a different set than the ordinals did"
     );
 }
+
+/// A **filtered** bitvector must be the expression's answer, not the key's.
+///
+/// # The bug this pins
+///
+/// `do_get`'s bitvector arm evaluates the ticket's expression into a set and then, for a
+/// contiguous window, used to lend the **key's** bytes straight off disk -- so a ticket
+/// carrying a filter was answered with the unfiltered key. A superset, silently, which is
+/// precisely what a comment eighty lines earlier in that file warns about: "when the ticket
+/// carries a filter it is the authority, not `t.key`".
+///
+/// **Every bitvector test was a bare-key test**, so the borrow path was only ever exercised
+/// where `t.key` happened to be the right answer, and the whole suite passed. Reported by
+/// review from a neighbouring session rather than caught here, which is the lesson: a fast
+/// path added beside a slow one needs a case where the two *disagree*, and a fixture that
+/// cannot tell them apart will not.
+///
+/// The fixture is built so the filter genuinely changes the contents -- it removes ordinals
+/// the key has -- and the expression's own ordinal stream is the oracle.
+#[tokio::test]
+async fn a_filtered_bitvector_is_the_expression_not_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+
+    // Four dense chunks, so every one is a bitmap on disk and the borrow would fire.
+    let whole: BTreeSet<u64> = (0..4 * 65_536u64).filter(|o| o % 2 == 0).collect();
+    db.insert_many(7, &whole.iter().copied().collect::<Vec<_>>())
+        .unwrap();
+    db.checkpoint().unwrap();
+
+    // A filter that keeps only part of what the key holds, so lending the key's bytes is
+    // detectable ordinal-for-ordinal rather than only by a count.
+    let lo = 65_536u64;
+    let hi = 3 * 65_536u64 - 1;
+    let expr = yesno_flight::SetExpr::And(vec![
+        yesno_flight::SetExpr::Key(7),
+        yesno_flight::SetExpr::Range(lo, hi),
+    ]);
+    let want: BTreeSet<u64> = whole
+        .iter()
+        .copied()
+        .filter(|o| *o >= lo && *o <= hi)
+        .collect();
+    assert!(
+        want.len() < whole.len(),
+        "the filter must actually remove something, or this proves nothing"
+    );
+
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = client_for(url).await;
+    let info = client
+        .get_flight_info(FlightDescriptor::new_cmd(expr.encode()))
+        .await
+        .unwrap()
+        .into_inner();
+    let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.clone();
+    let base = Ticket::decode(&raw).expect("the server must issue a well-formed ticket");
+    assert!(base.expr.is_some(), "the ticket must carry the filter");
+    assert_eq!(base.key, 7, "the routing key is still the dense key");
+
+    let mut t = base.with_wire(yesno_flight::SetWire::Bitvector);
+    t.prefix_lo = 0;
+    t.prefix_hi = 4;
+    let stream = client
+        .do_get(arrow_flight::Ticket::new(t.encode()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut decoded = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        stream.map(|r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))),
+    );
+
+    let mut got: BTreeSet<u64> = BTreeSet::new();
+    let mut values = 0u64;
+    while let Some(b) = decoded.next().await {
+        let b = b.unwrap();
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        for i in 0..col.len() {
+            let bytes = col.value(i);
+            let origin = values * 65_536;
+            for (byte, &v) in bytes.iter().enumerate() {
+                for bit in 0..8u32 {
+                    if v & (1 << bit) != 0 {
+                        got.insert(origin + byte as u64 * 8 + bit as u64);
+                    }
+                }
+            }
+            values += 1;
+        }
+    }
+    assert_eq!(values, 4, "the window still covers four chunks");
+    assert_eq!(
+        got, want,
+        "the bitvector answered the bare key instead of the expression"
+    );
+}

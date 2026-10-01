@@ -9571,3 +9571,50 @@ shape that was forgotten at eleven sites.
 **I contributed to the pile.** Killing a gate mid-run earlier in the session skips every
 `Drop`, so any scratch those tests held leaked. A guard-based scheme cannot survive `SIGKILL`
 by construction, which is a further argument for a reaper rather than for more guards.
+
+## 2026-10-02 -- three bugs in one borrow path, and only one of them found by me
+
+The `dense_span` borrow added to Flight's bitvector arm carried three defects. Each surfaced
+a different way, and the differences are the useful part.
+
+**One: a straddled window abandoned every later slab.** A slab body holds 254 chunks of the
+bitmap class, so a fixed 64-chunk window straddles a boundary at 192..256 -- and the loop
+treated a straddle as a refusal and stopped borrowing entirely. Every chunk past 192 was
+gathered though each later slab is contiguous within itself. Found by *computing* where the
+boundaries fall rather than by any test, and fixed by changing the contract: `dense_span`
+reports how far it could lend, so a boundary truncates one batch instead of ending the
+borrow. Pinned by `a_key_spanning_a_slab_boundary_is_lent_in_full`, which asserts both that
+every chunk is lent and that at least one call came back short -- without the second
+assertion it would pass on a fixture that never reached a boundary.
+
+**Two: the resumed mask stream was not sought.** `MaskStream::dense` decides which prefixes
+it *emits* but pulls its inner stream from wherever that stream happens to be, so handing it
+a resumed lower bound over an unsought stream shifted every value by the number of chunks
+already lent. Found by the differential test whose gaps I had earlier called a weakness --
+its chunk 3 holds a contiguous range and is therefore a *run*, so the borrow stopped after
+chunk 0 and the staging walk re-emitted chunk 0's bits as value 1. **The awkward fixture was
+the valuable one**: a test that straddles two paths is what tests the seam between them, and
+I had that backwards.
+
+**Three: the borrow ignored the ticket's expression**, and this is the one that produced a
+wrong answer rather than a slow one. `dense_span` lends what the *key* holds on disk, so a
+ticket carrying a filter was answered with the **unfiltered key** -- a silent superset.
+`yesno-flight/src/lib.rs` already warns about exactly this about eighty lines above the code
+I added: "when the ticket carries a filter it is the authority, not `t.key`. Falling back to
+the bare key here would return a superset -- every row the client asked to exclude -- and
+nothing downstream would notice." I added a path that did precisely that.
+
+**Found by review from a neighbouring session, not by a test**, and the reason is structural:
+**every bitvector test was a bare-key test**, so the borrow was only ever exercised where
+`t.key` happened to be the right answer. Both fixtures I had written -- one fully dense, one
+gapped -- carried no filter at all, so neither could distinguish the key's bits from the
+expression's. The borrow is now gated on `t.expr.is_none()`, which sends expression tickets
+through the already materialized set, and
+`a_filtered_bitvector_is_the_expression_not_the_key` asserts the filter removes ordinals
+before comparing, so it cannot pass vacuously. Verified against the unguarded version, which
+fails it.
+
+**The rule worth carrying: a fast path added beside a slow one needs a fixture where the two
+disagree.** Covering the fast path is not the same as distinguishing it from the slow one,
+and a suite can be thorough about the first while blind to the second. All three bugs here
+lived in the gap between "this path runs" and "this path answers what the other one would".

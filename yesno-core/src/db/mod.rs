@@ -4948,15 +4948,22 @@ impl Snapshot {
     /// slot is exactly its payload, so consecutive chunks written in one checkpoint *are*
     /// adjacent, and the gather is avoidable rather than structural.
     ///
-    /// # Why it refuses so readily
+    /// # What it reports, and when it declines
     ///
-    /// `None` is the safe answer and every doubt takes it, because the caller has a correct
-    /// slower path and lending the wrong bytes is a wrong answer. It refuses when the
-    /// memtable has **any** opinion in the window ( including a tombstone ), when a prefix
-    /// is missing, when any chunk is not a store-backed bitmap, and when the cells are not
-    /// adjacent at `BITMAP_BYTES`. A window with a gap can never qualify: the stride is what
-    /// makes bit `j` of value `i` addressable, so a hole would silently shift every later
-    /// bit.
+    /// **It reports how far it got rather than insisting on the whole window**, returning the
+    /// buffer and the first prefix *not* covered. A fixed window will straddle a slab
+    /// boundary -- a body holds 254 chunks of this class -- and treating that as a refusal
+    /// made the caller gather everything after the first straddle, though each later slab is
+    /// contiguous within itself. The run ends at a missing prefix, a chunk that is not a
+    /// store-backed bitmap, or cells that are not adjacent at `BITMAP_BYTES`; the stride is
+    /// what makes bit `j` of value `i` addressable, so a hole cannot be spanned, only stopped
+    /// at.
+    ///
+    /// `None` means not one chunk qualified, and is the safe answer whenever there is doubt,
+    /// because the caller has a correct slower path and lending the wrong bytes is a wrong
+    /// answer. The memtable holding **any** opinion in the window -- a tombstone included --
+    /// takes it for the whole window rather than truncating it, since an overridden chunk
+    /// says nothing about where the disk run ends.
     ///
     /// Each chunk is still read through `read_container_for`, so its trailer is verified
     /// before any of its bytes are lent. Skipping that to save the reads would hand out
@@ -4973,7 +4980,7 @@ impl Snapshot {
         key: u64,
         lo: Prefix48,
         hi: Prefix48,
-    ) -> Option<arrow_buffer::Buffer> {
+    ) -> Option<(arrow_buffer::Buffer, Prefix48)> {
         let want = hi.checked_sub(lo)?;
         if want == 0 {
             return None;
@@ -4997,25 +5004,26 @@ impl Snapshot {
         let store = shard.store.as_ref()?.lock().unwrap();
 
         let mut first_cell = None;
-        let mut expect_prefix = lo;
+        let mut covered = lo;
         let scan = tree.range(&*store, ChunkKey::new(key, lo), ChunkKey::new(key, hi));
         for item in scan {
             let (ck, cref) = item.ok()?;
-            // Strictly consecutive: the walk is ordered, so a prefix that is not the one
-            // expected means a hole, and a hole has no stride.
-            if ck.prefix() != expect_prefix {
-                return None;
+            // **Stop, do not refuse.** Anything that breaks the run ends the span here and the
+            // prefix reached is reported, so the caller borrows what it can and asks again
+            // from there. Refusing the whole window was a real defect: a slab body holds 254
+            // chunks of this class, so a fixed 64-chunk window straddles a boundary roughly
+            // every fourth time, and the caller then gathered *everything* after the first
+            // straddle though each later slab is contiguous within itself.
+            if ck.prefix() != covered || cref.kind() != crate::ContainerKind::Bitmap {
+                break;
             }
-            if cref.kind() != crate::ContainerKind::Bitmap {
-                return None;
-            }
-            let cell = cref.cell()?;
+            let Some(cell) = cref.cell() else { break };
             match first_cell {
                 None => first_cell = Some(cell),
                 Some(base) => {
-                    let offset = (expect_prefix - lo) * crate::BITMAP_BYTES as u64;
+                    let offset = (covered - lo) * crate::BITMAP_BYTES as u64;
                     if cell != base + offset {
-                        return None;
+                        break;
                     }
                 }
             }
@@ -5023,17 +5031,21 @@ impl Snapshot {
             // it is read for its trailer check, not for its payload.
             match store.read_container_for(ck, cref) {
                 Ok(Some(c)) if c.kind() == crate::ContainerKind::Bitmap => {}
-                _ => return None,
+                _ => break,
             }
-            expect_prefix += 1;
+            covered += 1;
         }
-        if expect_prefix != hi {
+        if covered == lo {
             return None;
         }
 
         let base = first_cell?;
-        let len = want as usize * crate::BITMAP_BYTES;
-        store.segment().buffer_at(base, len).ok()
+        let len = (covered - lo) as usize * crate::BITMAP_BYTES;
+        store
+            .segment()
+            .buffer_at(base, len)
+            .ok()
+            .map(|b| (b, covered))
     }
 
     fn merged_chunks(&self, key: u64) -> Result<Vec<(Prefix48, Container)>> {
