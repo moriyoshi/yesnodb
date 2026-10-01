@@ -5690,6 +5690,7 @@ mod tests {
     #[test]
     fn routing_follows_the_persisted_map_rather_than_a_modulo() {
         let dir = tmpdir("route_by_map");
+        let _clean = CleanDir(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
         const N: usize = 4;
         {

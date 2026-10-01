@@ -9519,3 +9519,55 @@ kinds and memtable-resident chunks; that is the correct behaviour rather than a 
 wire still carries the bytes once through TLS, which no arrangement here avoids -- the
 vectored-I/O question is a separate prototype ( pane `%735`, gated on an strace of whether
 h2 and tokio-rustls emit `writev` at all ).
+
+## 2026-10-01 -- the test scratch leak, which filled the disk and failed a gate
+
+`scripts/gate.sh` failed with `Invariant( "write-ahead log I/O error" )` across several
+durability tests. Not a logic failure and not the change under test: **the filesystem was
+100% full**, 7.7 GB free of 3.7 TB, with **215 GB in `/tmp` across 4 343 leftover
+`yesno-*` directories** dating from 2026-09-23. WAL writes were failing for want of space.
+The maintainer reclaimed it; this entry is about why it accumulated.
+
+**Two distinct causes, and the second is the interesting one.**
+
+**Eleven unguarded directories.** `tmpdir()` hands back a bare `PathBuf` and the `CleanDir`
+guard is a **separate line**, so forgetting it leaks silently and for ever.
+`a_shard_file_from_another_database_is_refused` created two directories and guarded neither,
+leaking 2 x 1.1 GB per run -- which is why dozens of `yesno-dur-identity_one-*` had piled up.
+Ten more across `durability.rs`, `concurrency.rs` and `db/mod.rs`.
+
+Found by writing a detector rather than by reading: for each `let x = tmpdir( .. )`, look for
+a guard naming `x` within the next few lines. It reported thirteen, of which **two were false
+positives** -- helpers that return the directory for the *caller* to guard -- and checking
+those before editing is the only reason they were not "fixed" into double cleanup.
+
+**`readers.rs` leaked by construction rather than by oversight**, and that distinction is the
+finding. Its helper returned a `PathBuf` and **the module had no guard type at all**, so all
+sixteen of its tests leaked every run since the file was written. There was nothing to
+forget; the API offered no way to succeed.
+
+Fixed structurally: the helper now returns a `Scratch` guard that `Deref`s to `Path`, so a
+caller **cannot obtain the path without the thing that removes it**. Not one call site
+changed -- deref coercion handles `&d` where `&Path` is wanted -- which is the measure of how
+cheap the safe shape was. `manifest_crash.rs` already did exactly this and never leaked; the
+pattern everywhere else returns a path and leaves the guard to a separate line, which is the
+shape that was forgotten at eleven sites.
+
+**Verified by counting, not by reading**: the full 21-binary `yesno-core` suite leaves
+**zero** leftovers, where it left thirteen before.
+
+**Two things deliberately left alone.**
+
+* **The e2e harness retains scenario roots on purpose**, named to be greppable and to sort by
+  age because "the retention this name exists for happens on paths that skip the drop
+  entirely". That is forensics by design. But **nothing reaps them**, which is how a single
+  3.3 GB root survives, and the sort-by-age naming implies a reaper that does not exist.
+  Choosing an age cutoff unilaterally could delete a *running* scenario's root, so it is a
+  design question rather than a quick fix. Filed.
+* **The forgettable two-step survives** in `durability.rs`, `concurrency.rs` and `db/mod.rs`
+  -- about a hundred sites. Converting them is the actual prevention and deserves its own
+  change rather than being buried in a fix. Filed.
+
+**I contributed to the pile.** Killing a gate mid-run earlier in the session skips every
+`Drop`, so any scratch those tests held leaked. A guard-based scheme cannot survive `SIGKILL`
+by construction, which is a further argument for a reaper rather than for more guards.

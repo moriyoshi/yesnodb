@@ -659,7 +659,34 @@ fn write_u64(map: &mut [u8], off: usize, v: u64) {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> std::path::PathBuf {
+    /// A scratch directory that removes itself, so a test **cannot** leave one behind.
+    ///
+    /// `tmp` used to hand back a bare `PathBuf` with no guard type in this module at all, so
+    /// every test here leaked its directory **by construction** rather than by oversight --
+    /// one per test per run, found on 2026-10-01 among 215 GB of accumulated scratch in
+    /// `/tmp` dating back eight days, which filled the disk and failed a gate with
+    /// `write-ahead log I/O error`.
+    ///
+    /// Returning the guard is what makes that unrepeatable: a caller cannot obtain the path
+    /// without also obtaining the thing that cleans it up. `manifest_crash.rs` already does
+    /// this; the pattern elsewhere in the tree hands back a path and leaves the guard to a
+    /// separate line, which is the shape that was forgotten at eleven sites.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn tmp(tag: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!(
             "yesno-readers-{tag}-{}-{:?}",
             std::process::id(),
@@ -667,7 +694,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
     }
 
     #[test]

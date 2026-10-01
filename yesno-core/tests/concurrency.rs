@@ -1089,6 +1089,7 @@ fn a_read_modify_write_through_store_set_loses_a_concurrent_update() {
 #[test]
 fn readers_are_correct_while_a_checkpoint_syncs() {
     let dir = tmpdir("read-during-ckpt");
+    let _clean = CleanDir(dir.clone());
     let db = Arc::new(
         Db::open_with(
             &dir,

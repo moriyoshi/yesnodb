@@ -2527,6 +2527,7 @@ fn extents_pending_at_shutdown_are_not_orphaned_by_a_reopen() {
 #[test]
 fn reopening_with_a_different_shard_count_keeps_every_key() {
     let dir = tmpdir("shard_count_mismatch");
+    let _clean = CleanDir(dir.clone());
     let keys: Vec<u64> = (0..64u64).map(|k| k * 7 + 1).collect();
 
     let opts_at = |n: usize| DbOptions {
@@ -2566,6 +2567,7 @@ fn reopening_with_a_different_shard_count_keeps_every_key() {
 #[test]
 fn a_torn_manifest_slot_still_opens_from_its_sibling() {
     let dir = tmpdir("torn_manifest");
+    let _clean = CleanDir(dir.clone());
     {
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(1, &[10, 20, 30]).unwrap();
@@ -2601,7 +2603,9 @@ fn a_torn_manifest_slot_still_opens_from_its_sibling() {
 #[test]
 fn a_shard_file_from_another_database_is_refused() {
     let one = tmpdir("identity_one");
+    let _clean_one = CleanDir(one.clone());
     let two = tmpdir("identity_two");
+    let _clean_two = CleanDir(two.clone());
     for (d, key) in [(&one, 1u64), (&two, 2u64)] {
         let db = Db::open_with(d, DbOptions::default()).unwrap();
         db.insert_many(key, &[key * 10, key * 10 + 1]).unwrap();
@@ -2631,6 +2635,7 @@ fn a_shard_file_from_another_database_is_refused() {
 #[test]
 fn a_wholly_unreadable_manifest_is_refused_rather_than_recreated() {
     let dir = tmpdir("manifest_unreadable");
+    let _clean = CleanDir(dir.clone());
     {
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(1, &[10, 20, 30]).unwrap();
@@ -3203,6 +3208,7 @@ fn a_prefix_bounded_key_stream_matches_persisted_mvcc_oracle() {
 #[test]
 fn key_enumeration_agrees_with_an_oracle_across_a_reopen() {
     let dir = tmpdir("keys");
+    let _clean = CleanDir(dir.clone());
     let mut live: BTreeSet<u64> = BTreeSet::new();
 
     {
@@ -3304,6 +3310,7 @@ fn key_enumeration_agrees_with_an_oracle_across_a_reopen() {
 #[test]
 fn a_reader_opens_alongside_a_live_writer_and_sees_the_last_checkpoint() {
     let dir = tmpdir("reader");
+    let _clean = CleanDir(dir.clone());
 
     let writer = Db::open_with(&dir, opts()).unwrap();
     writer.insert_many(1, &[1, 2, 3]).unwrap();
