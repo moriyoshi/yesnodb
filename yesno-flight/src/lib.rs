@@ -52,6 +52,49 @@ use tonic::{Request, Response, Status, Streaming};
 #[cfg(feature = "server")]
 use yesno_core::{CodecError, Db};
 
+/// The chunk source a windowed read walks, for one ticket.
+///
+/// **A bare key reads a prefix-restricted stream.** `key_stream_prefix_range` restricts both
+/// the index cursor and the memtable iterator before the plan is collected and leaves
+/// payloads lazy, so a narrow window of a large key costs the window and not the key -- a
+/// 64-chunk window of a 1024-chunk key used to carry a 0.21-0.32 ms penalty for data the
+/// client never asked for ( measured 2026-10-02 ). **An expression is materialized and
+/// sought** instead, because its answer is computed and there is nothing on disk to window;
+/// `seek` gallops, so that costs O( log delta ).
+///
+/// `from` is where to start, which is not always `t.prefix_lo`: the bitvector arm lends what
+/// it can first and resumes here at the first prefix it could not lend.
+///
+/// **One function, because these two call sites drifted once already.** The borrow loop added
+/// a day earlier ignored `t.expr` and answered a filtered ticket with the bare key -- a
+/// silent superset, found by review rather than by a test -- precisely because it was a
+/// second, parallel construction of this same choice. Keeping the choice in one place is what
+/// stops a third copy repeating it.
+#[cfg(feature = "server")]
+fn windowed_source(
+    snap: &yesno_core::Snapshot,
+    t: &Ticket,
+    from: yesno_core::Prefix48,
+) -> std::result::Result<yesno_core::stream::BoxedStream, Status> {
+    match &t.expr {
+        Some(AnyExpr::Set(e)) => {
+            let set = Arc::new(
+                expr::lower(e, snap)
+                    .and_then(|lowered| lowered.collect_set())
+                    .map_err(engine_status)?,
+            );
+            let mut s = set.stream();
+            yesno_core::stream::ChunkStream::seek(&mut s, from).map_err(engine_status)?;
+            Ok(Box::new(s))
+        }
+        // A bare key, or a sort already answered above.
+        _ => Ok(Box::new(
+            snap.key_stream_prefix_range(t.key, from, t.prefix_hi)
+                .map_err(engine_status)?,
+        )),
+    }
+}
+
 /// Map an engine error to a status a client can act on.
 ///
 /// **`internal` is the wrong answer for a refusal.** A client that writes to a
@@ -1354,31 +1397,21 @@ impl FlightService for YesnoFlightService {
                     }
                     _ => {}
                 }
-                let loaded = match &t.expr {
-                    Some(AnyExpr::Set(e)) => {
-                        expr::lower(e, &snap).and_then(|lowered| lowered.collect_set())
-                    }
-                    // A bare key, or a sort already answered above.
-                    _ => snap.load(t.key),
-                };
-                let set = match loaded {
-                    Ok(s) => s,
-                    // Through `engine_status`, not `Status::internal(format!(…))`.
-                    // A snapshot evicted under `AbortOldestReader` lands here, and
-                    // it is the one read failure a client can genuinely recover from
-                    // — the error even carries the last key it reached so a long
-                    // scan can resume. Reporting it as an internal fault throws that
-                    // away.
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Flight read evaluation failed");
-                        let _ = tx.blocking_send(Err(engine_status(e)));
-                        return;
-                    }
-                };
                 // **A wholly materialized bitvector over the ticket's window.**
                 // Every chunk in `[ prefix_lo, prefix_hi )` including the ones the
                 // set does not touch, so the consumer gets one contiguous bit per
                 // ordinal position and needs no decoder at all.
+                //
+                // **Before the load below, and that placement is the point.** This arm
+                // answers a *window*, and for a bare key it can answer one without
+                // materializing the key at all -- the borrow lends the window's bytes and
+                // the staging fallback reads a prefix-restricted stream. Loading first made
+                // a 64-chunk read of a 1024-chunk key cost 0.89 ms against 0.56 ms for the
+                // same bytes from a key that held only them, a 0.33 ms penalty for data the
+                // client did not ask for and the server then dropped unused ( measured
+                // 2026-10-02, with the gap first identified against Redis `GETRANGE` by a
+                // neighbouring session ). An invalid window is now also refused before any
+                // read, rather than after an 8 MiB one.
                 if t.wire == SetWire::Bitvector {
                     let span = t.prefix_hi.saturating_sub(t.prefix_lo);
                     // Refused rather than clipped: a narrower answer than was asked
@@ -1451,25 +1484,35 @@ impl FlightService for YesnoFlightService {
                         return;
                     }
 
-                    let set = std::sync::Arc::new(set);
                     // `dense` takes an **inclusive** upper bound where the ticket's window is
                     // half-open, hence the `- 1`. Resumed from where the borrow stopped,
                     // because restarting at `prefix_lo` would resend chunks already lent and
                     // a consumer counts values from the stream's start.
                     //
-                    // **The inner stream has to be sought, not only the mask's lower bound.**
-                    // `MaskStream::dense` decides which prefixes it *emits*; it pulls the
-                    // stream from wherever that stream happens to be. A resumed bound over an
-                    // unsought stream shifted every value by the number of chunks already
-                    // lent, which the differential test caught: its chunk 3 holds a
+                    // **The inner stream has to be positioned, not only the mask's lower
+                    // bound.** `MaskStream::dense` decides which prefixes it *emits*; it pulls
+                    // the stream from wherever that stream happens to be. A resumed bound over
+                    // an unpositioned stream shifted every value by the number of chunks
+                    // already lent, which the differential test caught: its chunk 3 holds a
                     // contiguous range and is therefore a *run*, so the borrow stopped after
                     // chunk 0 and the staging walk re-emitted chunk 0's bits as value 1.
-                    // `seek` gallops, so this costs O( log delta ).
-                    let mut inner = set.stream();
-                    if let Err(e) = yesno_core::stream::ChunkStream::seek(&mut inner, lent) {
-                        let _ = tx.blocking_send(Err(engine_status(e)));
-                        return;
-                    }
+                    //
+                    // **A bare key is staged from a prefix-restricted stream rather than from
+                    // the whole set**, which is what keeps the cost of a windowed read
+                    // proportional to the window instead of to the key. `key_stream_prefix_range`
+                    // restricts both the index cursor and the memtable iterator before the plan
+                    // is collected and leaves payloads lazy, so it is already positioned and
+                    // needs no seek. An expression has no such shortcut: its answer is
+                    // computed, so it is materialized here and sought ( `seek` gallops, so that
+                    // costs O( log delta ) ).
+                    let inner = match windowed_source(&snap, &t, lent) {
+                        Ok(s) => s,
+                        Err(st) => {
+                            tracing::warn!(error = %st, "Flight read evaluation failed");
+                            let _ = tx.blocking_send(Err(st));
+                            return;
+                        }
+                    };
                     let masks = yesno_arrow::MaskStream::dense(inner, lent, t.prefix_hi - 1);
                     let mut emitted = 0u64;
                     let mut staged: Vec<u8> = Vec::new();
@@ -1523,6 +1566,51 @@ impl FlightService for YesnoFlightService {
                     tracing::info!(chunks = emitted, "Flight read produced a bitvector");
                     return;
                 }
+                // **One windowed chunk source for the two remaining arms.** A bare key reads
+                // a prefix-restricted stream, so a narrow window of a large key costs the
+                // window and not the key: `key_stream_prefix_range` restricts both the index
+                // cursor and the memtable iterator before the plan is collected, and leaves
+                // payloads lazy. An expression has no such shortcut -- its answer is
+                // computed -- so it is materialized and sought, exactly as the bitvector arm
+                // above does.
+                //
+                // Both arms used to load the whole key and discard the out-of-window part
+                // with a `continue`. On the bitvector path that cost a 64-chunk read of a
+                // 1024-chunk key 0.52-0.65 ms against 0.25-0.35 ms for the same bytes from a
+                // key holding only them, and scoping the read removed the penalty entirely
+                // ( measured 2026-10-02 ).
+                //
+                // **An unmodified ticket is unaffected, which is what makes this safe for the
+                // default wire.** `Ticket::whole_key` spans `0..2^48`, so a restricted stream
+                // over it covers everything and the walk is the one it always was. Only a
+                // client that narrowed the window itself reads less -- and such a client has
+                // departed from the endpoint `get_flight_info` advertised, so the
+                // `total_records` minted for that endpoint was never a promise about it.
+                let mut src = match windowed_source(&snap, &t, t.prefix_lo) {
+                    Ok(s) => s,
+                    Err(st) => {
+                        tracing::warn!(error = %st, "Flight read evaluation failed");
+                        let _ = tx.blocking_send(Err(st));
+                        return;
+                    }
+                };
+                // Positioned at or past `prefix_lo` by construction -- the restricted stream
+                // starts there and the materialized one was sought -- so only the upper bound
+                // needs enforcing here. The expression arm's stream is not bounded above at
+                // all, which is why this is a `break` rather than an invariant.
+                macro_rules! next_chunk {
+                    () => {
+                        match yesno_core::stream::ChunkStream::next_chunk(&mut src) {
+                            Ok(Some((prefix, _))) if prefix >= t.prefix_hi => None,
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Flight read evaluation failed");
+                                let _ = tx.blocking_send(Err(engine_status(e)));
+                                return;
+                            }
+                        }
+                    };
+                }
                 // **The dense arm, and it is a different walk rather than a
                 // different encoding of the same walk.** The ordinal path below
                 // visits every set bit; this one visits every *chunk* and ships the
@@ -1534,11 +1622,8 @@ impl FlightService for YesnoFlightService {
                     let mut b = yesno_arrow::ContainerBatchBuilder::new();
                     let mut chunks = 0u64;
                     let mut batches = 0u64;
-                    for (prefix, c) in set.chunks() {
-                        if prefix < t.prefix_lo || prefix >= t.prefix_hi {
-                            continue;
-                        }
-                        b.push(t.key, prefix, c);
+                    while let Some((prefix, c)) = next_chunk!() {
+                        b.push(t.key, prefix, &c);
                         chunks += 1;
                         // Bounded by chunks rather than by rows: one row here is a
                         // whole container, so `BATCH_ROWS` containers would be up to
@@ -1579,24 +1664,26 @@ impl FlightService for YesnoFlightService {
                 let mut buf: Vec<u64> = Vec::with_capacity(BATCH_ROWS);
                 let mut rows = 0u64;
                 let mut batches = 0u64;
-                for o in set.iter() {
-                    let prefix = o >> 16;
-                    if prefix < t.prefix_lo || prefix >= t.prefix_hi {
-                        continue;
-                    }
-                    buf.push(o);
-                    rows += 1;
-                    if buf.len() == BATCH_ROWS {
-                        let b = std::mem::replace(&mut buf, Vec::with_capacity(BATCH_ROWS));
-                        // `UInt64Array::new(.., None)` and not `from(vec)`: the
-                        // latter builds a validity buffer this schema forbids.
-                        let arr = UInt64Array::new(b.into(), None);
-                        let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
-                        if tx.blocking_send(Ok(rb)).is_err() {
-                            tracing::debug!(rows, batches, "Flight read receiver closed early");
-                            return;
+                while let Some((prefix, c)) = next_chunk!() {
+                    // The ordinals of one chunk, which is what the container already holds:
+                    // `chunk_base` supplies the high 48 bits and the iterator the low 16.
+                    let base = yesno_core::chunk_base(prefix);
+                    for v in c.iter() {
+                        buf.push(base | v as u64);
+                        rows += 1;
+                        if buf.len() == BATCH_ROWS {
+                            let b = std::mem::replace(&mut buf, Vec::with_capacity(BATCH_ROWS));
+                            // `UInt64Array::new(.., None)` and not `from(vec)`: the
+                            // latter builds a validity buffer this schema forbids.
+                            let arr = UInt64Array::new(b.into(), None);
+                            let rb =
+                                RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+                            if tx.blocking_send(Ok(rb)).is_err() {
+                                tracing::debug!(rows, batches, "receiver closed early");
+                                return;
+                            }
+                            batches += 1;
                         }
-                        batches += 1;
                     }
                 }
                 if !buf.is_empty() {

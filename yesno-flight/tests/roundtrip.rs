@@ -698,3 +698,210 @@ async fn a_filtered_bitvector_is_the_expression_not_the_key() {
         "the bitvector answered the bare key instead of the expression"
     );
 }
+
+/// Find the start of a standalone bitmap payload whose every byte is `fill`.
+///
+/// Confirmed against the stored trailer checksum rather than trusted from the byte pattern
+/// alone, so this fails loudly if the framing moves instead of corrupting something else.
+/// The trailer's address is **computed**: it lives in a table at the tail of the slab body,
+/// not beside the payload.
+fn find_bitmap_filled_with(file: &[u8], fill: u8) -> Option<usize> {
+    use yesno_core::store::checksum::crc32c_append;
+    const PAYLOAD: usize = 8192;
+    let mut run = 0usize;
+    for i in 0..file.len() {
+        run = if file[i] == fill { run + 1 } else { 0 };
+        if run < PAYLOAD {
+            continue;
+        }
+        let at = i + 1 - PAYLOAD;
+        let want = crc32c_append(0, &file[at..at + PAYLOAD]);
+        let class = yesno_core::store::extent::class_for(PAYLOAD)?;
+        let slot = yesno_core::store::alloc::slot_of_cell(at as u64, class)?;
+        let crc_at = yesno_core::store::alloc::trailer_offset(
+            yesno_core::store::alloc::slab_of(at as u64),
+            class,
+            slot,
+        ) as usize
+            + 4;
+        if crc_at + 4 <= file.len()
+            && u32::from_le_bytes(file[crc_at..crc_at + 4].try_into().unwrap()) == want
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// A windowed read is **not** held hostage to damage outside its window -- and a whole-key
+/// read still is.
+///
+/// # The behaviour this pins, and why it is the right one
+///
+/// Until 2026-10-02 the worker ran `snap.load( t.key )` before it branched on the wire, so
+/// every bare-key read decoded **every** chunk of the key and then discarded whatever fell
+/// outside the ticket's window -- on the bitvector path, often without using the result at
+/// all. One consequence was cost: a 64-chunk window of a 1024-chunk key took 0.52-0.65 ms
+/// against 0.25-0.35 ms for the same bytes from a key holding only them. The other was
+/// this: a single corrupt chunk anywhere made the key unreadable at *every* window.
+///
+/// Scoping each read to its window reverses that, and it is the behaviour a range API should
+/// have. Damage at prefix 900 is not a reason to refuse prefix 2, and refusing it removes
+/// the one thing an operator most wants during recovery -- the ability to read around the
+/// damage. What is served is still fully verified: `dense_span` checks each chunk's trailer
+/// before lending its bytes, and every other path decodes through the ordinary read path.
+/// "Is this key intact" is a question for `fsck`, not a side effect of a range read.
+///
+/// **Two assertions per wire, and each is load-bearing.** The whole-key read must still
+/// fail: that is what shows the fixture's corruption is live, and -- more importantly -- that
+/// narrowing is *by window* rather than a blanket loss of verification. The windowed read
+/// must then answer the window's own set. Without the first assertion the test would pass
+/// against a fixture whose corruption did nothing; without the second it would pass against
+/// a server that refused everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windowed_read_ignores_corruption_outside_its_window() {
+    const IN_LO: u64 = 2;
+    const IN_HI: u64 = 4;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Out-of-window chunks hold the **odd** ordinals, so every byte of their payload is
+    // 0xAA; in-window chunks hold the even ones and read 0x55. That is what makes a byte
+    // scan able to name an out-of-window payload specifically -- with one pattern
+    // throughout, every chunk looks alike and the corruption could land anywhere.
+    let mut want: BTreeSet<u64> = BTreeSet::new();
+    let mut all: Vec<u64> = Vec::new();
+    for p in 0..IN_LO {
+        all.extend(((p << 16)..((p + 1) << 16)).filter(|o| o % 2 == 1));
+    }
+    for p in IN_LO..IN_HI {
+        want.extend(((p << 16)..((p + 1) << 16)).filter(|o| o % 2 == 0));
+    }
+    all.extend(want.iter().copied());
+    all.sort_unstable();
+
+    let opts = || DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+    {
+        let db = Db::open_with(dir.path(), opts()).unwrap();
+        db.insert_many(9, &all).unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // Flip a byte of one out-of-window payload, so its stored checksum no longer matches
+    // it. The database is closed first: a live `Db` holds the exclusive file lock.
+    let shard = dir.path().join("shard-0000.yno");
+    let mut bytes = std::fs::read(&shard).unwrap();
+    let at = find_bitmap_filled_with(&bytes, 0xAA)
+        .expect("an out-of-window bitmap payload, or the fixture or framing moved");
+    bytes[at] ^= 0xFF;
+    std::fs::write(&shard, &bytes).unwrap();
+
+    let db = Arc::new(Db::open_with(dir.path(), opts()).unwrap());
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = client_for(url).await;
+
+    let d = FlightDescriptor::new_cmd(9u64.to_le_bytes().to_vec());
+    let info = client.get_flight_info(d).await.unwrap().into_inner();
+    let raw = info.endpoint[0].ticket.as_ref().unwrap().ticket.clone();
+    let base = Ticket::decode(&raw).expect("the server must issue a well-formed ticket");
+
+    for wire in [
+        yesno_flight::SetWire::Ordinals,
+        yesno_flight::SetWire::Containers,
+        yesno_flight::SetWire::Bitvector,
+    ] {
+        // --- the whole key must still fail, or the corruption proves nothing.
+        //
+        // An unmodified ticket spans 0..2^48, so the restricted stream covers the damage and
+        // the read surfaces it exactly as before. Bitvector is the one exception: it refuses
+        // an unbounded window outright, and that refusal is already covered elsewhere.
+        if wire != yesno_flight::SetWire::Bitvector {
+            let whole = base.clone().with_wire(wire);
+            let stream = client
+                .do_get(arrow_flight::Ticket::new(whole.encode()))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut decoded =
+                arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream.map(
+                    |r| r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e))),
+                ));
+            let mut failed = false;
+            while let Some(b) = decoded.next().await {
+                if b.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert!(
+                failed,
+                "{wire:?}: a whole-key read must surface the corrupt chunk, or this \
+                 fixture is inert and the window half proves nothing"
+            );
+        }
+
+        // --- the window, which does not contain the damage, must answer it in full.
+        let mut windowed = base.clone().with_wire(wire);
+        windowed.prefix_lo = IN_LO;
+        windowed.prefix_hi = IN_HI;
+        let stream = client
+            .do_get(arrow_flight::Ticket::new(windowed.encode()))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut decoded =
+            arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream.map(|r| {
+                r.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))
+            }));
+        let mut got: BTreeSet<u64> = BTreeSet::new();
+        let mut values = 0u64;
+        while let Some(b) = decoded.next().await {
+            let b = b.unwrap_or_else(|e| {
+                panic!("{wire:?}: the window is intact, so it must not fail: {e}")
+            });
+            match wire {
+                yesno_flight::SetWire::Ordinals => {
+                    let col = b.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    got.extend((0..col.len()).map(|i| col.value(i)));
+                }
+                yesno_flight::SetWire::Containers => {
+                    for (key, prefix, c) in yesno_arrow::read_containers(&b).unwrap() {
+                        assert_eq!(key, 9);
+                        got.extend(c.iter().map(|v| (prefix << 16) | v as u64));
+                    }
+                }
+                yesno_flight::SetWire::Bitvector => {
+                    let col = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::BinaryArray>()
+                        .unwrap();
+                    for i in 0..col.len() {
+                        let origin = (IN_LO + values) * 65_536;
+                        for (byte, &v) in col.value(i).iter().enumerate() {
+                            for bit in 0..8u32 {
+                                if v & (1 << bit) != 0 {
+                                    got.insert(origin + byte as u64 * 8 + bit as u64);
+                                }
+                            }
+                        }
+                        values += 1;
+                    }
+                }
+            }
+        }
+        if wire == yesno_flight::SetWire::Bitvector {
+            assert_eq!(
+                values,
+                IN_HI - IN_LO,
+                "every chunk of the window must arrive"
+            );
+        }
+        assert_eq!(
+            got, want,
+            "{wire:?}: the window's bits are not the window's set"
+        );
+    }
+}

@@ -9618,3 +9618,146 @@ fails it.
 disagree.** Covering the fast path is not the same as distinguishing it from the slow one,
 and a suite can be thorough about the first while blind to the second. All three bugs here
 lived in the gap between "this path runs" and "this path answers what the other one would".
+
+## 2026-10-02 -- a windowed read that first read everything
+
+A neighbouring session benchmarking yesno against Redis as a cache found a 512 KiB range
+read costing roughly three times `GETRANGE`, traced most of it to `do_get`, and handed over
+the diagnosis: the worker runs `snap.load( t.key )` **before** it branches on the wire, so a
+bare-key bitvector ticket materializes every chunk of the key and then, whenever the borrow
+covers the window, returns without ever touching the result. Their findings are in
+`LTM/redis-backed-cache-performance-20261002.md`.
+
+**The diagnosis was right and reading the code was enough to confirm it**, but I measured it
+myself rather than inheriting the numbers, because the fix had to be judged against a
+before-and-after on this host. A scratch harness puts two keys in one database holding the
+*same* 64 dense chunks at prefixes 512..576, one of them also holding 960 more, and asks
+both for exactly that window -- so the answer is byte-identical 512 KiB and the only
+difference is how much of the key the server touches. Interleaved arms, pinned to two cores,
+medians of 150 requests, three runs. Harness at `.agents-workspace/tmp/rangegap`; the
+before arm was taken by writing the pre-change `lib.rs` back from a saved copy and
+rebuilding, so both arms came from the same harness binary's source.
+
+| | before | after |
+|---|---:|---:|
+| 512 KiB window of a 1024-chunk key | 0.522-0.653 ms | 0.231-0.288 ms |
+| the same window of a 64-chunk key | 0.249-0.353 ms | 0.226-0.260 ms |
+| local `snap.load` of 1024 chunks | 0.181 ms | -- |
+| local `dense_span` of 64 chunks | 0.011 ms | -- |
+
+So the **key-size penalty is gone**: 0.268-0.300 ms before, 0.004-0.028 ms after. The small
+key is unchanged, which is the control -- its own eager load costs 0.012 ms, so there was
+nothing there to save.
+
+**A note on my own first measurement, because it nearly became a claim.** The very first
+baseline run read 0.893 / 0.564 ms, and from that one pair I would have reported the small
+key improving by 0.19 ms as well. Re-running the baseline three times gave 0.522-0.653 /
+0.249-0.353, matching the other session's figures closely. **The first run after a build is
+not a sample**, and a single pair cannot distinguish an effect from a cold cache -- the same
+mistake as the alignment harness earlier in this session, where one 0.3 ms reading was
+called noise without evidence and nine interleaved passes were what settled it.
+
+**The fix is placement, not new machinery.** The bitvector arm is terminal -- every path
+through it returns -- so it moves above the load wholesale. Inside it, the staging fallback
+for a bare key reads `Snapshot::key_stream_prefix_range( key, lent, prefix_hi )` rather than
+`set.stream()`: that restricts the index cursor and the memtable iterator before the plan is
+collected, leaves payloads lazy, implements `ChunkStream`, and is already positioned, so the
+`seek` the resumed walk needed disappears with it. An expression ticket keeps the old path
+exactly, because its answer is computed and there is nothing on disk to window; the two arms
+are boxed into a `BoxedStream`. An invalid window is now also refused before any read rather
+than after an 8 MiB one.
+
+**The behaviour change, which the handoff flagged as needing a decision rather than an
+assumption.** The eager load incidentally detected corruption anywhere in the key, so a
+windowed read used to fail for damage outside its window. It no longer does, and that is the
+right answer: a range read is scoped, one bad chunk should not make a key unreadable at
+*every* window, and reading around damage is precisely what an operator wants during
+recovery. What is served stays fully verified -- `dense_span` checks each chunk's trailer
+before lending its bytes and the staging fallback decodes through the ordinary read path.
+"Is this key intact" is a question for `fsck`, not a side effect of a range read.
+
+**Pinned by a corruption fixture rather than by a timing assertion**, which is the part worth
+carrying. No correctness test can see this change -- the bytes are identical either way --
+and a wall-clock assertion in the suite would be flaky. What *is* observable is the
+narrowing itself: `a_windowed_bitvector_ignores_corruption_outside_its_window` fills the
+out-of-window chunks with odd ordinals ( payload 0xAA ) and the in-window ones with even
+( 0x55 ), so a byte scan can name an out-of-window payload specifically, flips a byte in it,
+and asserts both that a whole-key read still fails and that the window answers. The first
+assertion is what stops the fixture being inert. Verified against the pre-change server,
+which fails the second.
+
+**Not in conflict with the other 2026-10-02 entry in the dense-span plan document**, which
+found no stable end-to-end speedup for lending on a *whole-key* bitvector read. That arm
+varies copying against borrowing at a fixed amount of work; this one varies how much work is
+done at all. Nothing here claims the borrow is faster on the wire.
+
+**I first filed the ordinal and container arms as deferred**, on the grounds that the
+ordinal wire is the default and that `total_records` is an exact whole-key count a windowed
+ordinal stream would not deliver. The next entry is what happened when that was examined
+instead of assumed.
+
+## 2026-10-02 -- a blocker that was not one, and the other two arms
+
+Having fixed the bitvector path, I filed the ordinal and container arms as deferred behind
+two objections. **One of them did not survive being checked, and it was the one doing the
+deferring.**
+
+**The `total_records` objection was wrong.** I claimed a windowed ordinal read would
+advertise an exact whole-key count its own stream did not deliver. But
+`get_flight_info` mints `Ticket::whole_key`, which spans `0..2^48`, and the count it
+advertises is that ticket's own cardinality -- consistent. A window exists **only** when a
+client mutates the ticket it was handed, and such a client has departed from the advertised
+endpoint, so there was never a promise to break. One look at `Ticket::whole_key` settles it;
+I wrote the objection from memory of the shape of the problem instead.
+
+**The "default wire" objection inverted on inspection too.** Narrowing the default read
+sounded like a change affecting every client. It is the opposite: because an unmodified
+ticket spans everything, a prefix-restricted stream over it covers everything and the walk
+is byte-for-byte the one it always was. The only clients who read less are the ones who
+asked to. **What I had called the risky part is precisely the part that makes it safe.**
+
+The lesson is not that I was over-cautious. It is that **both objections were about code I
+had not read** -- one function and one constructor -- and either would have taken a minute to
+check. A blocker stated from memory is a guess with the authority of a decision, and this one
+would have left a measured 0.3 ms penalty in the default read path indefinitely.
+
+**The change.** Both arms now drive from one windowed chunk source, built exactly as the
+bitvector arm's: a bare key reads `Snapshot::key_stream_prefix_range( key, prefix_lo,
+prefix_hi )`, an expression is materialized and sought. The container arm pushes containers
+straight off the stream; the ordinal arm expands each one with `chunk_base( prefix ) | v`,
+which is what `OrdSet::iter` was doing anyway. The per-chunk `continue` that discarded
+out-of-window work is gone from both. Only the upper bound needs enforcing in the loop, since
+the materialized arm's stream is not bounded above -- hence a `break` rather than an
+invariant.
+
+**Measured, four arms interleaved in one process, medians of 150 requests, three runs.** Same
+512 KiB answer in every arm; the two keys hold the same 64 chunks at prefixes 512..576 and
+one of them holds 960 more. Reported as the **within-run penalty for the larger key**,
+because run-to-run variance here ( 0.23-0.80 ms ) swamps the effect while the paired
+difference does not:
+
+| wire | before | after |
+|---|---:|---:|
+| bitvector | +0.209, +0.225, +0.252 ms | +0.005, -0.029, -0.002 ms |
+| containers | +0.274, +0.281, +0.319 ms | +0.007, -0.033, +0.001 ms |
+
+The penalty is gone on both, and the after-column changing sign is the point: what is left is
+noise, not a smaller effect.
+
+**The test generalized rather than being copied.** `a_windowed_bitvector_ignores_corruption_
+outside_its_window` became `a_windowed_read_ignores_corruption_outside_its_window` and now
+loops over all three wires, asserting per wire that the **whole-key** read still fails and
+the windowed one answers. That pairing is what makes it a test of *scoping* rather than of
+leniency -- a server that simply stopped verifying would pass the second assertion and fail
+the first. Verified against both earlier revisions: each fails with `Ordinals: the window is
+intact, so it must not fail: Invariant( "extent payload fails its stored checksum" )`, which
+names the mechanism exactly.
+
+**Afterword: the two call sites became one function.** Having written the second windowed
+source, I had ~30 lines of near-identical construction and error handling twice over,
+differing only in the lower bound. That is the precise shape of the defect `%712` found in
+this same file a day earlier -- a parallel path that failed to carry a rule the first one had.
+`windowed_source( snap, t, from )` now owns the bare-key-versus-expression choice, and the
+bitvector arm passes the prefix it resumed at where the other two pass `prefix_lo`. **The
+duplication was commented before it was removed, and a comment was not enough**: the thing
+that drifted last time was also well commented, eighty lines above the code that ignored it.
