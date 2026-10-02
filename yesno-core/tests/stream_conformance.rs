@@ -30,7 +30,7 @@
 //! Both production paths ( `next_chunk` and `next_cardinality` ), both lowerings
 //! ( `open`, which plans first, and `open_planned`, which does not ), all eight
 //! `Expr` variants, and the three combinators `Expr` cannot express — `Restrict`,
-//! `Concat`, `UnionAll` — which §5.5 of the article counts inside the closure and
+//! `ConcatAll`, `UnionAll` — which §5.5 of the article counts inside the closure and
 //! which an `Expr`-only corpus would silently omit.
 //!
 //! This file is **not** a correctness oracle. It checks the *shape* of a
@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use yesno_core::stream::nary::UnionAll;
-use yesno_core::stream::{ChunkStream, ChunkStreamExt, Concat, Restrict};
+use yesno_core::stream::{ChunkStream, ChunkStreamExt, ConcatAll, Restrict};
 use yesno_core::{Container, Db, DbOptions, Expr, OrdSet, Prefix48, Result};
 
 /// What a conforming stream may not do.
@@ -288,14 +288,14 @@ fn planning_preserves_the_denotation() {
 /// §5.5 lists the closure as $\cap, \cup, \triangle, \setminus$, complement,
 /// **restriction to a prefix window, ordered concatenation, and an $n$-ary
 /// union**. `Expr` has eight variants and none of the last three: `Restrict`,
-/// `Concat` and `UnionAll` are `ChunkStream` combinators built directly, and
+/// `ConcatAll` and `UnionAll` are `ChunkStream` combinators built directly, and
 /// `expressions()` above therefore says nothing about them. Without this test
 /// `every_operator_produces_a_conforming_stream` names more than it checks.
 ///
-/// `Concat` is the interesting one: its operands must already be ordered and
+/// `ConcatAll` is the interesting one: its parts must already be ordered and
 /// disjoint, so it is the one combinator whose conformance is a *precondition*
-/// on the caller rather than a property it establishes. A `Concat` over
-/// overlapping operands would emit a descending prefix, which is exactly
+/// on the caller rather than a property it establishes. A `ConcatAll` over
+/// overlapping parts would emit a descending prefix, which is exactly
 /// `NotAscending`.
 #[test]
 fn the_combinators_outside_expr_conform_too() {
@@ -312,8 +312,8 @@ fn the_combinators_outside_expr_conform_too() {
     let mut r = Restrict::new(open(&lo_set), 50, 150);
     assert_eq!(violation_of(&mut r).unwrap(), None, "Restrict");
 
-    let mut k = Concat::new(open(&lo_set), open(&hi_set));
-    assert_eq!(violation_of(&mut k).unwrap(), None, "Concat");
+    let mut k = ConcatAll::new(vec![open(&lo_set), open(&hi_set)], vec![199, 399]);
+    assert_eq!(violation_of(&mut k).unwrap(), None, "ConcatAll");
 
     let mut u = UnionAll::new(vec![open(&a), open(&c), open(&hi_set)]);
     assert_eq!(violation_of(&mut u).unwrap(), None, "UnionAll");
@@ -329,8 +329,12 @@ fn the_combinators_outside_expr_conform_too() {
         "Restrict counts"
     );
 
-    let mut k = Concat::new(open(&lo_set), open(&hi_set));
-    assert_eq!(violations_of_counts(&mut k).unwrap(), None, "Concat counts");
+    let mut k = ConcatAll::new(vec![open(&lo_set), open(&hi_set)], vec![199, 399]);
+    assert_eq!(
+        violations_of_counts(&mut k).unwrap(),
+        None,
+        "ConcatAll counts"
+    );
 
     let mut u = UnionAll::new(vec![open(&a), open(&c), open(&hi_set)]);
     assert_eq!(
@@ -345,11 +349,14 @@ fn the_combinators_outside_expr_conform_too() {
     let fresh = |which: usize| -> Box<dyn ChunkStream> {
         match which {
             0 => Box::new(Restrict::new(open(&lo_set), 50, 150)),
-            1 => Box::new(Concat::new(open(&lo_set), open(&hi_set))),
+            1 => Box::new(ConcatAll::new(
+                vec![open(&lo_set), open(&hi_set)],
+                vec![199, 399],
+            )),
             _ => Box::new(UnionAll::new(vec![open(&a), open(&c)])),
         }
     };
-    for (which, name) in ["Restrict", "Concat", "UnionAll"].iter().enumerate() {
+    for (which, name) in ["Restrict", "ConcatAll", "UnionAll"].iter().enumerate() {
         let mut s = fresh(which);
         let mut chunks = 0usize;
         while s.next_chunk().unwrap().is_some() {

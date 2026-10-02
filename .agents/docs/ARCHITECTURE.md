@@ -48,10 +48,10 @@ yesno/
       stream/
         mod.rs                  # ChunkStream / ChunkStreamExt traits
         leaf.rs                 # SetStream, EmptyStream, RangeStream
-        ops.rs                  # And / Or / Xor / AndNot operators, and Not
+        ops.rs                  # And / Or / Xor / AndNot operators, Restrict, and Not
         plan.rs                 # cost-guided Expr rewriting
         sketch.rs               # chunk-level prefix statistics for overlap
-        nary.rs                 # UnionAll: lazy k-way union; Expr routes >= 3 ORs here
+        nary.rs                 # UnionAll: lazy k-way union, Expr routes >= 3 ORs here; ConcatAll: flat ordered concatenation of prefix-disjoint parts
         dynamic.rs              # Expr + BoxedStream: runtime-constructed plans
       pack/
         mod.rs                  # Packing: where a strided object's bits live; the shared addressing
@@ -585,7 +585,7 @@ terminal's answer.
 
 A union of operands whose chunk ranges only partly overlap was charged for a full merge across the **whole** domain, even where a region has one contributor. `Or` peeks both sides once per prefix, so `Or( small_set, huge_range )` costs a step per chunk of the range and does not finish — to produce a result that is, over most of its extent, simply one stream after the other.
 
-**Segmentation** cuts the prefix domain at every point where the contributing set changes — the operands' span endpoints — so within a segment that set is constant. Each segment is then either **one contributor** ( a pass-through, no merge, and its `cardinality` is the operand's own: `O(1)` for a range ) or **several** ( a real merge, confined to the region that needs it ). Segments are ordered and disjoint by construction, so `Concat` reassembles them with no comparisons at all.
+**Segmentation** cuts the prefix domain at every point where the contributing set changes — the operands' span endpoints — so within a segment that set is constant. Each segment is then either **one contributor** ( a pass-through, no merge, and its `cardinality` is the operand's own: `O(1)` for a range ) or **several** ( a real merge, confined to the region that needs it ). Segments are ordered and disjoint by construction, so `ConcatAll` reassembles them with no comparisons at all.
 
 Split and concatenate are inverses, which is what makes the rewrite obviously meaning-preserving: every chunk lands in exactly one segment. Measured against a 3 000-chunk set:
 
@@ -595,7 +595,7 @@ Split and concatenate are inverses, which is what makes the rewrite obviously me
   Or( small, huge partial overlap )       > 5 s  ->  751 µs
 ```
 
-Two operators support it. `Concat` requires its operands to be prefix-disjoint **and ordered** — violating that yields chunks out of order, which every operator above silently mis-merges, so it is selected only from the opened streams' reported spans and carries a `debug_assert`. `Restrict` clips a stream to a prefix window, and **delegates `cardinality_dyn` when the window does not actually clip** — without that the segmentation built the right plan and then executed it the slow way, walking `2^48` chunks to count a segment that contained a whole operand.
+Two operators support it. `ConcatAll` requires its parts to be prefix-disjoint **and ordered** — violating that yields chunks out of order, which every operator above silently mis-merges, so it is selected only from the opened streams' reported spans and carries a `debug_assert`. It is **n-ary and carries an inclusive upper bound per part**, which is what keeps `seek` cheap: it skips a part by comparing against that number instead of descending into it. The binary `Concat` it replaced ( removed 2026-10-02 ) forwarded every `seek` to both children with no bound to consult, so a `k`-part fold re-sought every leaf and a consumer that seeks per prefix paid `O( k · p )` — `And::cardinality_dyn` is exactly such a consumer, and on a 399-range union against 511 selected chunks it spent 0.92 ms seeking to perform 0.08 ms of kernels. The count walk behind that filter went 1.86 ms → 0.198 ms, below the 0.218 ms a materialized bitmap mask costs for the same answer. **The bound is the load-bearing part, not the flatness**: a pairwise nesting that knew each subtree's bound also meets the seek budget, which is why the regression test asserts "a seek does not descend into a part its bound excludes". The bound may be wider than a part's real extent, never narrower — it is taken from the same `prefix_span` the disjointness test already trusts. `Restrict` clips a stream to a prefix window, and **delegates `cardinality_dyn` when the window does not actually clip** — without that the segmentation built the right plan and then executed it the slow way, walking `2^48` chunks to count a segment that contained a whole operand.
 
 Segmentation declines when it cannot pay: unknown spans, identical spans ( every segment has every contributor, so there is nothing to save ), or an operand too expensive to re-open. Re-opening is the cost model here — a segment opens each contributor separately, which is free for a leaf and would duplicate a whole evaluation for a composite subtree, so it is restricted to `Set` / `Range` / `Empty` operands.
 

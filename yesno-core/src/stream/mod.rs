@@ -27,7 +27,8 @@ pub mod sketch;
 
 pub use dynamic::{BoxedStream, ChunkSource, Expr};
 pub use leaf::{EmptyStream, ErrStream, RangeStream, SetStream};
-pub use ops::{And, AndNot, Concat, Not, Or, Restrict, Xor};
+pub use nary::ConcatAll;
+pub use ops::{And, AndNot, Not, Or, Restrict, Xor};
 
 use crate::container::Container;
 use crate::{Prefix48, Result};

@@ -249,6 +249,223 @@ impl ChunkStream for UnionAll {
     }
 }
 
+/// Ordered concatenation of many prefix-disjoint streams, driven by one cursor.
+///
+/// # Why this is n-ary and not a chain of binary concatenations
+///
+/// Folding `k` parts pairwise built `Concat( Concat( .. ), r )`, and that operator forwarded
+/// `seek` to **both** children with nothing to compare the target against. A `seek` on the
+/// root therefore re-sought every leaf, so one seek cost `O(k)` and a walk that seeks once
+/// per prefix cost `O(k · p)`. `And::cardinality_dyn` does exactly that -- it seeks its other
+/// side once per candidate prefix -- which is how a 399-range union against 511 selected
+/// chunks spent 0.92 ms seeking to perform 0.08 ms of kernels. The cursor here only moves
+/// forward, so the whole walk advances it `k` times in total and each seek is `O(1)`
+/// amortized.
+///
+/// **The load-bearing part is `ends`, not the flatness**, and that is worth stating because
+/// it is easy to get backwards. A *chain* of pairs that each knew their left subtree's upper
+/// bound would skip in `O(log k)` and be perfectly adequate -- measured while checking that
+/// the seek-budget test could see the defect at all: nesting this very operator pairwise
+/// still met the budget, because each level could skip its left subtree arithmetically.
+/// What was quadratic was descending into a subtree to ask it a question its bound already
+/// answered. The flat form is preferred because it needs no tree, not because a tree could
+/// not be fixed.
+///
+/// Measured on that shape, 399 ranges and 511 chunks: seeking once per selected prefix went
+/// from 0.93 ms to 0.020 ms ( 47x ), and draining every chunk from 0.61 ms to 0.018 ms
+/// ( 34x ). At 102 ranges, 11x and 8x -- the gap scales with `k`, as a quadratic term does.
+/// End to end, the planned count walk behind Flight's cache-page filter went from 1.86 ms to
+/// 0.198 ms, which is now *below* the 0.218 ms a materialized bitmap mask costs for the same
+/// answer, and within 2.4x of the 0.083 ms the kernels alone need.
+///
+/// **At small `k` it is a wash, and that was checked rather than assumed**: against the
+/// chain it replaced, `k = 2` measured 0.86x ( a hair slower, at a 100 ns measurement ),
+/// `k = 4` parity, `k = 8` 1.5x, `k = 16` 2.4x, `k = 64` 7.9x. Nothing regresses at the
+/// sizes where the chain was fine.
+///
+/// # The precondition, and why it is worth having
+///
+/// **Every prefix of part `i` must be strictly less than every prefix of part `i + 1`.**
+/// Given that, a union needs no merge at all: drain each part in turn. No per-prefix peek
+/// across `k` cursors, no comparison, no kernel call -- and `cardinality` is a plain sum, so
+/// a part that can count itself arithmetically ( a `RangeStream` ) contributes in `O(1)`
+/// instead of being walked.
+///
+/// That is not a micro-optimization. `Or`'s cardinality loop peeks every side once per
+/// prefix, so `Or( small_set, huge_disjoint_range )` costs one step per chunk **of the
+/// range** and does not finish. Concatenated, it is instant.
+///
+/// # `ends` is what makes `seek` cheap, and it must bound from above
+///
+/// `ends[ i ]` is an **inclusive upper bound** on the prefixes part `i` can yield. `seek`
+/// skips a part by comparing against that number rather than by descending into the part, so
+/// skipping 300 ranges costs 300 integer comparisons and not 300 stream seeks.
+///
+/// The bound must be sound in one direction only: it may be *wider* than the part's real
+/// extent, never narrower. A bound that is too low would skip a part that still had chunks
+/// at or above the target, silently dropping them. The callers take it from the planner's own
+/// `prefix_span` walk, which is the same bound their disjointness test already relies on -- a
+/// span that did not contain every prefix an operand can produce would make *that* conclusion
+/// wrong too, so this adds no new obligation.
+///
+/// # It is selected, never assumed
+///
+/// Violating the ordering yields chunks out of order, which every operator above silently
+/// mis-merges. So this is not something callers are asked to get right:
+/// [`crate::stream::Expr::open`] builds it only where the parts are *shown* prefix-disjoint
+/// -- from the segmentation it just computed, or from a `prefix_span` test over the union's
+/// parts -- and the `debug_assert` below fails loudly if it is ever constructed by hand over
+/// overlapping parts.
+///
+/// Both tests are on **prefixes**. `{0, 2}` and `{3, 5}` are disjoint and ordered as *sets*
+/// and still share chunk 0, so an ordinal-level test would admit them and the concatenation
+/// would emit that chunk twice.
+pub struct ConcatAll {
+    parts: Vec<Box<dyn ChunkStream>>,
+    /// Inclusive upper bound on each part's prefixes, parallel to `parts`.
+    ends: Vec<Prefix48>,
+    /// Parts below this are finished: drained, or skipped by a `seek` past them.
+    at: usize,
+    #[cfg(debug_assertions)]
+    last: Option<Prefix48>,
+}
+
+impl ConcatAll {
+    /// `parts` in ascending prefix order, with `ends[ i ]` bounding part `i` from above.
+    pub fn new(parts: Vec<Box<dyn ChunkStream>>, ends: Vec<Prefix48>) -> Self {
+        debug_assert_eq!(
+            parts.len(),
+            ends.len(),
+            "every part needs its own upper bound"
+        );
+        debug_assert!(
+            ends.windows(2).all(|w| w[0] < w[1]),
+            "ConcatAll parts are not in strictly ascending prefix order: {ends:?}"
+        );
+        ConcatAll {
+            parts,
+            ends,
+            at: 0,
+            #[cfg(debug_assertions)]
+            last: None,
+        }
+    }
+
+    #[inline]
+    fn check(&mut self, p: Prefix48) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.last.is_none_or(|prev| prev < p),
+                "ConcatAll parts are not prefix-disjoint and ordered: {:?} then {p}",
+                self.last
+            );
+            self.last = Some(p);
+        }
+        let _ = p;
+    }
+
+    /// The index of the first part that is not finished, having retired any that are.
+    #[inline]
+    fn live(&self) -> usize {
+        self.at.min(self.parts.len())
+    }
+}
+
+impl ChunkStream for ConcatAll {
+    fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        while self.at < self.parts.len() {
+            if let Some(c) = self.parts[self.at].next_chunk()? {
+                self.check(c.0);
+                return Ok(Some(c));
+            }
+            self.at += 1;
+        }
+        Ok(None)
+    }
+
+    fn next_cardinality(&mut self) -> Result<Option<(Prefix48, u64)>> {
+        while self.at < self.parts.len() {
+            if let Some(c) = self.parts[self.at].next_cardinality()? {
+                self.check(c.0);
+                return Ok(Some(c));
+            }
+            self.at += 1;
+        }
+        Ok(None)
+    }
+
+    /// Skip whole parts arithmetically, then seek only the one that can hold the target.
+    ///
+    /// Seeks are monotonic, so the cursor never rewinds and the total advance across a walk
+    /// is `k`. This is the whole reason the operator exists.
+    fn seek(&mut self, prefix: Prefix48) -> Result<()> {
+        while self.at < self.parts.len() && self.ends[self.at] < prefix {
+            self.at += 1;
+        }
+        if self.at < self.parts.len() {
+            self.parts[self.at].seek(prefix)?;
+        }
+        Ok(())
+    }
+
+    fn peek_prefix(&mut self) -> Result<Option<Prefix48>> {
+        while self.at < self.parts.len() {
+            if let Some(p) = self.parts[self.at].peek_prefix()? {
+                return Ok(Some(p));
+            }
+            self.at += 1;
+        }
+        Ok(None)
+    }
+
+    fn cardinality_hint(&self) -> (u64, Option<u64>) {
+        let mut lo = 0u64;
+        let mut hi = Some(0u64);
+        for s in &self.parts[self.live()..] {
+            let (a, b) = s.cardinality_hint();
+            lo = lo.saturating_add(a);
+            hi = hi.zip(b).map(|(x, y)| x.saturating_add(y));
+        }
+        (lo, hi)
+    }
+
+    /// Spans the remaining parts' extremes, which are already ordered.
+    fn stats(&self) -> super::StreamStats {
+        let mut chunks = Some(0u64);
+        let mut span: Option<(Prefix48, Prefix48)> = None;
+        let mut backing = super::Backing::Computed;
+        for s in &self.parts[self.live()..] {
+            let st = s.stats();
+            chunks = chunks.zip(st.chunks).map(|(a, b)| a.saturating_add(b));
+            span = match (span, st.prefix_span) {
+                (Some((la, _)), Some((_, hb))) => Some((la, hb)),
+                (x, y) => x.or(y),
+            };
+            backing = backing.worse(st.backing);
+        }
+        super::StreamStats {
+            chunks,
+            prefix_span: span,
+            backing,
+        }
+    }
+
+    /// A sum, not a merge. This is the other half of the point of the operator.
+    ///
+    /// Parts the cursor has passed contribute nothing: a drained part has nothing left, and
+    /// one skipped by `seek` was deliberately stepped over. That matches what a chain did,
+    /// where a seeked-past side simply counted zero.
+    fn cardinality_dyn(&mut self) -> Result<u64> {
+        let mut n = 0u64;
+        let from = self.live();
+        for s in &mut self.parts[from..] {
+            n = n.saturating_add(s.cardinality_dyn()?);
+        }
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod counting_tests {
     use std::sync::atomic::{AtomicU64, Ordering};

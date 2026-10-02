@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use super::{ChunkStream, ChunkStreamExt, Concat, EmptyStream, RangeStream, Restrict, SetStream};
+use super::{ChunkStream, ChunkStreamExt, EmptyStream, RangeStream, Restrict, SetStream};
 use crate::container::Container;
 use crate::stream::sketch::{Bucketing, PrefixOccupancy};
 use crate::{OrdSet, Prefix48, Result};
@@ -65,7 +65,7 @@ fn decomposing_is_cheaper(a: &Expr, b: &Expr, inter: &Expr) -> bool {
     //
     // This used to inline `( yield a + yield b ) * MERGE_STEP`, a **second
     // copy** of the rule in `plan::cardinality_cost`'s `Or` arm. When that arm
-    // learned that a prefix-disjoint union lowers to `Concat` and costs a plain
+    // learned that a prefix-disjoint union lowers to `ConcatAll` and costs a plain
     // sum, this copy did not, and would have kept overcharging exactly the shape
     // the fix was about. One implementation, asked directly.
     //
@@ -469,12 +469,12 @@ fn compute_segments(parts: &[&Expr]) -> Option<Vec<(Prefix48, Prefix48, Vec<usiz
     Some(segments)
 }
 
-/// Lower a union whose parts cannot share a chunk to [`Concat`], skipping the
+/// Lower a union whose parts cannot share a chunk to [`ConcatAll`], skipping the
 /// merge entirely.
 ///
 /// # The test is on prefixes, not on ordinals
 ///
-/// `Concat`'s precondition is that *every prefix of the left is below every
+/// `ConcatAll`'s precondition is that *every prefix of a part is below every
 /// prefix of the right*, so the test is `π(max a) < π(min b)` — never
 /// `max a < min b`. Two operands can be disjoint as sets while sharing a chunk:
 /// `{0, 2}` and `{3, 5}` are ordinal-disjoint and ordinal-ordered, and both live
@@ -518,12 +518,18 @@ fn concat_disjoint_or(parts: &[&Expr]) -> Option<BoxedStream> {
         return None;
     }
 
-    let mut it = spans.into_iter().map(|(_, _, i)| parts[i].open_planned());
-    let mut acc = it.next()?;
-    for s in it {
-        acc = Box::new(Concat::new(acc, s));
+    // **Flat, not folded.** The parts are already sorted and their spans already computed, so
+    // `ConcatAll` gets its upper bounds for nothing -- and a flat cursor is what keeps `seek`
+    // `O(1)` amortized. Folding these pairwise made one `seek` re-seek every leaf, so a
+    // consumer that seeks per prefix ( `And::cardinality_dyn` does ) paid `O(k · p)`: 399
+    // ranges against 511 chunks spent 0.92 ms seeking to do 0.08 ms of kernels.
+    let mut streams: Vec<BoxedStream> = Vec::with_capacity(spans.len());
+    let mut ends: Vec<Prefix48> = Vec::with_capacity(spans.len());
+    for (_, hi, i) in spans {
+        streams.push(parts[i].open_planned());
+        ends.push(hi);
     }
-    Some(acc)
+    Some(Box::new(crate::stream::nary::ConcatAll::new(streams, ends)))
 }
 
 /// Split a union into prefix segments, so each is merged only where it must be.
@@ -546,7 +552,7 @@ fn concat_disjoint_or(parts: &[&Expr]) -> Option<BoxedStream> {
 ///   the operand's own ( `O(1)` for a range ); or
 /// - **several** — a real merge, but confined to the region that needs it.
 ///
-/// The segments are ordered and disjoint by construction, so [`Concat`]
+/// The segments are ordered and disjoint by construction, so [`ConcatAll`]
 /// reassembles them with no comparisons at all. Splitting and concatenating are
 /// inverses here, which is what makes the rewrite obviously meaning-preserving:
 /// every chunk lands in exactly one segment.
@@ -579,13 +585,16 @@ fn segmented_or(parts: &[&Expr]) -> Option<BoxedStream> {
         });
     }
 
-    // Segments are ordered and disjoint, so this needs no merge.
-    let mut it = built.into_iter();
-    let mut acc = it.next()?;
-    for s in it {
-        acc = Box::new(Concat::new(acc, s));
+    // Segments are ordered and disjoint, so this needs no merge -- and flat rather than
+    // folded, for the same reason as `concat_disjoint_or`: a chain forwards every `seek` to
+    // every segment. A segment's own `hi` is the upper bound `ConcatAll` needs, so this is
+    // free here too.
+    if built.is_empty() {
+        return None;
     }
-    Some(acc)
+    let ends: Vec<Prefix48> = segments.iter().map(|&(_, hi, _)| hi).collect();
+    debug_assert_eq!(built.len(), ends.len());
+    Some(Box::new(crate::stream::nary::ConcatAll::new(built, ends)))
 }
 
 /// Should a flattened `Or` go through the shared n-ary accumulator?
@@ -1185,7 +1194,7 @@ mod segment_tests {
     ///
     /// `{0, 2}` and `{3, 5}` are disjoint **and** ordered as sets — `max a < min
     /// b` — and they live in the same chunk. Concatenating them emits prefix 0
-    /// twice, and every operator above a `Concat` assumes strictly increasing
+    /// twice, and every operator above a concatenation assumes strictly increasing
     /// prefixes, so it mis-merges silently rather than failing.
     ///
     /// The assertion is on the decision function itself because the wrong answer
@@ -1225,7 +1234,7 @@ mod segment_tests {
     /// here 2^30 of them, for an answer that is a sum of two numbers each already
     /// known in a few steps.
     ///
-    /// The timeout is the assertion: without the `Concat` lowering this does not
+    /// The timeout is the assertion: without the `ConcatAll` lowering this does not
     /// finish, and with it the work is proportional to the *inputs* rather than to
     /// the complement's width. `open_planned` is called directly so the test
     /// pins the lowering and not whatever `plan()` happens to rewrite.
@@ -1428,12 +1437,17 @@ mod segment_tests {
         assert_eq!(got, (10..20).collect::<Vec<_>>());
     }
 
+    /// Overlapping parts pass the cheap bound check and are caught on emission.
+    ///
+    /// The ends here *are* ascending ( 9 then 14 ), so the constructor's own assertion cannot
+    /// see the problem -- the parts' contents overlap, not their bounds. Only the per-chunk
+    /// ordering check catches that, which is why both assertions exist.
     #[test]
     #[should_panic(expected = "not prefix-disjoint and ordered")]
     fn concat_rejects_overlapping_operands_in_debug() {
         let a = chunks_at(0..10).open_planned();
         let b = chunks_at(5..15).open_planned();
-        let mut c = Concat::new(a, b);
+        let mut c = crate::stream::nary::ConcatAll::new(vec![a, b], vec![9, 14]);
         while c.next_chunk().unwrap().is_some() {}
     }
 }

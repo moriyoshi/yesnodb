@@ -1392,3 +1392,160 @@ mod jit_admission_work {
         assert_eq!(other_reads.load(Ordering::Relaxed), 1);
     }
 }
+
+/// A disjoint union's leaves must be sought a bounded number of times, not once per part
+/// per prefix.
+///
+/// # Why a work counter and not a timer
+///
+/// `concat_disjoint_or` folded `k` prefix-disjoint parts into a left-deep chain of binary
+/// concatenations, and every link forwarded `seek` to **both** children -- so one `seek` on
+/// the root re-sought every leaf. `And::cardinality_dyn` seeks its other side once per
+/// candidate prefix, which made the whole walk `O( k · p )`. Measured on Flight's 399-range
+/// cache-page filter, that was 0.92 ms of seeking to perform 0.08 ms of kernels; the flat
+/// cursor took the same seek walk to 0.020 ms.
+///
+/// **No correctness test can see this.** The chain and the cursor emit exactly the same
+/// chunks in the same order, so the oracle, property and equivalence layers all pass against
+/// either -- which is why the quadratic survived in the tree. A wall-clock assertion would be
+/// flaky and would not say *what* went wrong. Counting leaf seeks names the mechanism
+/// directly, and is the same reasoning as the counted-source budgets above.
+///
+/// **What this test is actually sensitive to**, established by trying to break it: nesting
+/// `ConcatAll` pairwise still *passes*, because each level skips its left subtree by its
+/// recorded bound. Only the removed `Concat`, which descended into both children with no
+/// bound to consult, fails it -- at 2143 leaf seeks against this budget of 256. So the
+/// property under test is "a seek does not descend into a part its bound excludes", not
+/// "the operator is flat".
+mod disjoint_union_seek_work {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use yesno_core::stream::{And, BoxedStream, ChunkSource, ChunkStream, SetStream};
+    use yesno_core::{Container, Expr, OrdSet, Prefix48, Result};
+
+    /// One chunk at `prefix`, counting every `seek` that reaches it.
+    #[derive(Debug)]
+    struct SeekCounted {
+        set: Arc<OrdSet>,
+        seeks: Arc<AtomicUsize>,
+    }
+
+    struct SeekCountedStream {
+        inner: SetStream,
+        seeks: Arc<AtomicUsize>,
+    }
+
+    impl ChunkStream for SeekCountedStream {
+        fn next_chunk(&mut self) -> Result<Option<(Prefix48, Container)>> {
+            self.inner.next_chunk()
+        }
+        fn seek(&mut self, prefix: Prefix48) -> Result<()> {
+            self.seeks.fetch_add(1, Ordering::Relaxed);
+            self.inner.seek(prefix)
+        }
+        fn peek_prefix(&mut self) -> Result<Option<Prefix48>> {
+            self.inner.peek_prefix()
+        }
+        fn cardinality_dyn(&mut self) -> Result<u64> {
+            self.inner.cardinality_dyn()
+        }
+    }
+
+    impl ChunkSource for SeekCounted {
+        fn open(&self) -> BoxedStream {
+            Box::new(SeekCountedStream {
+                inner: SetStream::new(self.set.clone()),
+                seeks: self.seeks.clone(),
+            })
+        }
+        fn chunk_count(&self) -> Option<u64> {
+            Some(self.set.chunk_count() as u64)
+        }
+        /// Required, or `concat_disjoint_or` cannot prove disjointness and never fires.
+        fn prefix_span(&self) -> Option<(Prefix48, Prefix48)> {
+            let lo = self.set.chunk_at(0)?.0;
+            let hi = self.set.chunk_at(self.set.chunk_count() - 1)?.0;
+            Some((lo, hi))
+        }
+        fn cardinality(&self) -> Option<u64> {
+            Some(self.set.len())
+        }
+    }
+
+    const K: u64 = 64;
+
+    /// `K` single-chunk parts at prefixes `0, 2, 4, ..`, strictly prefix-disjoint.
+    fn parts() -> (Expr, Vec<Arc<AtomicUsize>>) {
+        let mut counters = Vec::new();
+        let mut acc: Option<Expr> = None;
+        for i in 0..K {
+            let prefix = i * 2;
+            let set = Arc::new(OrdSet::from_sorted_slice(
+                &(0..40u64)
+                    .map(|v| (prefix << 16) | (v * 3))
+                    .collect::<Vec<_>>(),
+            ));
+            let seeks = Arc::new(AtomicUsize::new(0));
+            counters.push(seeks.clone());
+            let leaf = Expr::Source(Arc::new(SeekCounted { set, seeks }));
+            acc = Some(match acc {
+                None => leaf,
+                Some(a) => a.or(leaf),
+            });
+        }
+        (acc.unwrap(), counters)
+    }
+
+    #[test]
+    fn a_disjoint_union_is_not_reseeked_once_per_part() {
+        let (union, counters) = parts();
+        let planned = union.plan();
+
+        // The union itself must be right, or the budget below is a budget on nonsense.
+        let whole = planned.open_planned().cardinality_dyn().unwrap();
+        assert_eq!(
+            whole,
+            K * 40,
+            "the disjoint union lost or duplicated chunks"
+        );
+        for c in &counters {
+            c.store(0, Ordering::Relaxed);
+        }
+
+        // One ordinal in every part, so the intersection has to visit all `K` prefixes.
+        // `And::new` rather than `Expr::and` so the union is deterministically the *seeked*
+        // side: `And::cardinality_dyn` peeks the left and seeks the right, and letting the
+        // planner choose could put the union on the left, where it is walked and never
+        // sought -- the test would then pass without exercising anything.
+        let probe = Arc::new(OrdSet::from_sorted_slice(
+            &(0..K).map(|i| ((i * 2) << 16) | 3).collect::<Vec<_>>(),
+        ));
+        let narrow: BoxedStream = Box::new(SetStream::new(probe));
+        let mut a = And::new(narrow, planned.open_planned());
+        assert_eq!(
+            a.cardinality_dyn().unwrap(),
+            K,
+            "the probe must hit every part"
+        );
+
+        let total: usize = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        // Not vacuous: the walk must really have sought the union.
+        assert!(
+            total > 0,
+            "no leaf was sought at all, so this budget proves nothing"
+        );
+        // **The budget.** A flat cursor advances once per part across the whole walk, so the
+        // leaf seeks are O( K ). The left-deep chain this replaced re-sought every live leaf
+        // on every one of the K seeks -- about K^2 / 2 = 2048 here. Four times K separates
+        // those two by an order of magnitude and leaves room for an implementation that
+        // seeks a part twice.
+        let budget = 4 * K as usize;
+        assert!(
+            total <= budget,
+            "leaf seeks for a {K}-part disjoint union were {total}, over a budget of \
+             {budget}; a left-deep concatenation costs about {} here",
+            K * K / 2
+        );
+    }
+}

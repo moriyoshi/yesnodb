@@ -9761,3 +9761,86 @@ this same file a day earlier -- a parallel path that failed to carry a rule the 
 bitvector arm passes the prefix it resumed at where the other two pass `prefix_lo`. **The
 duplication was commented before it was removed, and a comment was not enough**: the thing
 that drifted last time was also well commented, eighty lines above the code that ignored it.
+
+## 2026-10-02 -- the quadratic was not the fold, it was the unbounded seek
+
+A neighbouring session profiled Flight's 399-range cache-page filter down to the core and
+handed over the numbers: a planned `And( Key7, Or( 399 disjoint ranges ) )` count walk cost
+1.84-1.92 ms, of which seeking the range union accounted for 0.92 ms and the 511
+`bitmap x run` cardinality kernels for 0.083 ms. A stored bitmap mask selecting the same
+chunks answered in 0.22 ms, so the range form was the *slower* way to ask.
+
+**Reproduced before touching anything**, by running their harness unchanged: 1.862 ms for the
+walk, 0.922 ms for the seek, 0.083 ms for the kernels, 0.223 ms for the mask. The diagnosis
+also reads straight off the code -- `concat_disjoint_or` folded the parts into
+`Concat( Concat( .. ), r )`, `Concat::seek` forwarded to **both** children, and
+`And::cardinality_dyn` seeks its other side once per candidate prefix.
+
+**A scratch prototype settled the design before any production edit.** A flat cursor over the
+same parts, with the same leaves, measured against a faithful copy of the chain:
+
+| 399 ranges / 511 chunks | chain | flat |
+|---|---:|---:|
+| seek once per selected prefix | 0.932 ms | 0.0199 ms |
+| drain every chunk | 0.610 ms | 0.0180 ms |
+| count arithmetically | 0.0152 ms | 0.0074 ms |
+
+**Then the finding that changed what I wrote down.** Having implemented `ConcatAll` and the
+seek-budget test, I reverted the production fold to a chain to confirm the test could see the
+defect -- and **it passed**. The reason is that I had rebuilt the chain out of `ConcatAll`
+pairs, and each level skipped its left subtree by consulting the bound it carries. Only a
+faithful copy of the removed `Concat`, descending into both children with no bound at all,
+fails the budget: 2143 leaf seeks against 256.
+
+So **the load-bearing part is the per-part upper bound, not the flatness.** A pairwise tree
+that knew each subtree's bound would skip in `O( log k )` and be entirely adequate. What was
+quadratic was descending into a subtree to ask a question its bound already answered. The
+flat form is preferable because it needs no tree, not because a tree could not be fixed --
+and the regression test now asserts the property that actually matters: *a seek does not
+descend into a part its bound excludes*. Had the first teeth check passed quietly, I would
+have shipped a doc comment and a test name that both named the wrong cause.
+
+The bound must be sound in one direction only: wider than a part's real extent is harmless,
+narrower would silently skip chunks. Both callers take it from `plan::prefix_span`, which is
+the same bound their disjointness test already relies on -- so this adds no new obligation to
+anything.
+
+**`Concat` is gone rather than left beside its replacement.** Both production sites now build
+`ConcatAll`, which would have left a public generic operator with no callers -- the `stats.rs`
+situation, and a standing invitation to fold pairwise again. The two tests that constructed it
+and the conformance suite's third combinator moved over; `ARCHITECTURE.md` records what
+replaced it and why.
+
+**Measured end to end on the handoff's own harness, unchanged:**
+
+| 50% resident, 399 ranges | before | after |
+|---|---:|---:|
+| `And( Key, Or( ranges ) )` count walk | 1.862 ms | 0.198 ms |
+| the same, streaming every chunk | 1.953 ms | 0.284 ms |
+| collecting the result | 3.602 ms | 1.635 ms |
+| seeking the union per selected prefix | 0.922 ms | 0.0232 ms |
+| stored bitmap mask, for comparison | 0.223 ms | 0.218 ms |
+| kernels alone, the floor | 0.083 ms | 0.083 ms |
+
+| 90% resident, 102 ranges | before | after |
+|---|---:|---:|
+| count walk | 0.1307 ms | 0.0426 ms |
+| streaming | 0.1464 ms | 0.0583 ms |
+
+The range form is now **faster than the materialized mask** it used to lose to, and within
+2.4x of what the kernels alone require.
+
+**Controls, because a speedup on one shape is not a result.** Against the chain it replaced:
+`k = 2` measured 0.86x ( marginally slower, on a 100 ns measurement ), `k = 4` parity,
+`k = 8` 1.5x, `k = 16` 2.4x, `k = 64` 7.9x -- so nothing regresses at the sizes where a chain
+was fine, and the gap grows linearly in `k` as a quadratic term does. The overlap control
+covers the *other* site that concatenates: `segmented_or` cuts an overlapping union into
+segments, and over 256 `Restrict` segments of a stored set the same walk went 0.321 ms to
+0.0197 ms ( 16x ). That case is worse for a chain, not better, because each part's seek is a
+real binary search rather than arithmetic.
+
+Semantics are unchanged and the whole `yesno-core` suite says so -- oracle, property,
+differential, `expr_equivalence`, allocation and the Proposition 6' conformance layer, 979 unit
+tests plus every integration binary. That is also exactly why the defect survived: **the chain
+and the cursor emit the same chunks in the same order**, so no correctness layer could tell
+them apart, and only a work counter can.

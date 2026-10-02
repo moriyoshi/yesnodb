@@ -460,148 +460,6 @@ impl<S: ChunkStream> ChunkStream for Restrict<S> {
     }
 }
 
-/// Ordered concatenation of two prefix-disjoint streams.
-///
-/// # The precondition, and why it is worth having
-///
-/// **Every prefix of `l` must be strictly less than every prefix of `r`.** Given
-/// that, a union needs no merge at all: drain the left, then the right. No
-/// per-prefix `peek` on both sides, no comparison, no kernel call — and
-/// `cardinality` is a plain sum, so a side that can count itself arithmetically
-/// ( a `RangeStream` ) contributes in `O(1)` instead of being walked.
-///
-/// That is not a micro-optimization. `Or`'s cardinality loop peeks both sides
-/// once per prefix, so `Or( small_set, huge_disjoint_range )` costs one step per
-/// chunk **of the range** and does not finish. As `Concat` it is instant.
-///
-/// # It is selected, never assumed
-///
-/// Violating the precondition yields chunks out of order, which every operator
-/// above silently mis-merges. So this is not something callers are asked to get
-/// right: [`crate::stream::Expr::open`] builds it only where the operands are
-/// *shown* prefix-disjoint — from the segmentation it just computed, or from a
-/// `prefix_span` test over the union's parts — and the `debug_assert` below
-/// fails loudly if it is ever constructed by hand over overlapping operands.
-///
-/// Both tests are on **prefixes**. `{0, 2}` and `{3, 5}` are disjoint and
-/// ordered as *sets* and still share chunk 0, so an ordinal-level test would
-/// admit them and the concatenation would emit that chunk twice.
-pub struct Concat<L, R> {
-    l: L,
-    r: R,
-    l_done: bool,
-    #[cfg(debug_assertions)]
-    last: Option<Prefix48>,
-}
-
-impl<L: ChunkStream, R: ChunkStream> Concat<L, R> {
-    pub fn new(l: L, r: R) -> Self {
-        Concat {
-            l,
-            r,
-            l_done: false,
-            #[cfg(debug_assertions)]
-            last: None,
-        }
-    }
-
-    #[inline]
-    fn check(&mut self, p: Prefix48) {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.last.is_none_or(|prev| prev < p),
-                "Concat operands are not prefix-disjoint and ordered: {:?} then {p}",
-                self.last
-            );
-            self.last = Some(p);
-        }
-        let _ = p;
-    }
-}
-
-impl<L: ChunkStream, R: ChunkStream> ChunkStream for Concat<L, R> {
-    fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        if !self.l_done {
-            if let Some(c) = self.l.next_chunk()? {
-                self.check(c.0);
-                return Ok(Some(c));
-            }
-            self.l_done = true;
-        }
-        let out = self.r.next_chunk()?;
-        if let Some((p, _)) = &out {
-            self.check(*p);
-        }
-        Ok(out)
-    }
-
-    fn seek(&mut self, prefix: Prefix48) -> Result<()> {
-        if !self.l_done {
-            self.l.seek(prefix)?;
-        }
-        // Seeks are monotonic, so advancing the right side early cannot rewind
-        // it, and every prefix it holds is above the left's anyway.
-        self.r.seek(prefix)
-    }
-
-    fn peek_prefix(&mut self) -> Result<Option<Prefix48>> {
-        if !self.l_done {
-            if let Some(p) = self.l.peek_prefix()? {
-                return Ok(Some(p));
-            }
-        }
-        self.r.peek_prefix()
-    }
-
-    fn cardinality_hint(&self) -> (u64, Option<u64>) {
-        let (la, lb) = self.l.cardinality_hint();
-        let (ra, rb) = self.r.cardinality_hint();
-        (
-            la.saturating_add(ra),
-            lb.zip(rb).map(|(x, y)| x.saturating_add(y)),
-        )
-    }
-
-    fn stats(&self) -> StreamStats {
-        let (a, b) = (self.l.stats(), self.r.stats());
-        let span = match (a.prefix_span, b.prefix_span) {
-            (Some((la, _)), Some((_, hb))) => Some((la, hb)),
-            (x, y) => x.or(y),
-        };
-        StreamStats {
-            chunks: a.chunks.zip(b.chunks).map(|(x, y)| x.saturating_add(y)),
-            prefix_span: span,
-            backing: a.backing.worse(b.backing),
-        }
-    }
-
-    fn next_cardinality(&mut self) -> Result<Option<(Prefix48, u64)>> {
-        if !self.l_done {
-            if let Some(c) = self.l.next_cardinality()? {
-                self.check(c.0);
-                return Ok(Some(c));
-            }
-            self.l_done = true;
-        }
-        let out = self.r.next_cardinality()?;
-        if let Some((p, _)) = &out {
-            self.check(*p);
-        }
-        Ok(out)
-    }
-
-    /// A sum, not a merge. This is the whole point of the operator.
-    fn cardinality_dyn(&mut self) -> Result<u64> {
-        let l = if self.l_done {
-            0
-        } else {
-            self.l.cardinality_dyn()?
-        };
-        Ok(l.saturating_add(self.r.cardinality_dyn()?))
-    }
-}
-
 /// Complement within a range: yields `[lo, hi) \ S`.
 ///
 /// # Why this is an operator and not `AndNot<RangeStream, S>`
@@ -1250,9 +1108,12 @@ pub(crate) mod counting_tests {
             (
                 "concat",
                 Box::new(|| {
-                    Box::new(Concat::new(
-                        SetStream::new(spread(0, 10)),
-                        SetStream::new(spread(100, 10)),
+                    Box::new(crate::stream::nary::ConcatAll::new(
+                        vec![
+                            Box::new(SetStream::new(spread(0, 10))),
+                            Box::new(SetStream::new(spread(100, 10))),
+                        ],
+                        vec![9, 109],
                     ))
                 }),
             ),
