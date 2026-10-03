@@ -11,7 +11,12 @@ repository.workspace = true
 
 [features]
 default = ["server"]
-server = ["dep:yesno-core", "dep:yesno-arrow", "dep:tracing", "yesno-core/tracing"]
+# The container wire, which needs `yesno-arrow`'s schema. Separated from `server` so a
+# client can send container batches without linking the engine -- and so that the schema
+# stays the single definition in `yesno-arrow` rather than being copied here, which is how
+# two spellings of one wire format start to drift.
+containers = ["dep:yesno-arrow"]
+server = ["dep:yesno-core", "dep:yesno-arrow", "dep:tracing", "yesno-core/tracing", "containers"]
 jit = ["server", "yesno-core/jit"]
 
 [dependencies]

@@ -674,6 +674,51 @@ where
             .await
     }
 
+    /// Apply container batches atomically: one commit, one version.
+    ///
+    /// Each row is one chunk's Roaring payload and unions its ordinals into whatever is
+    /// there, so this is `insert` in a denser encoding rather than a different operation.
+    /// Build the batches with `yesno_arrow::ContainerBatchBuilder`, which emits the same
+    /// bytes the page store and a `.roaring` file hold.
+    ///
+    /// # Why this is worth reaching for
+    ///
+    /// The pair wire costs one row per **set bit**. On a 64-chunk half-dense page -- 2 097 152
+    /// set bits over 512 KiB of actual bitmap -- it is 34 126 004 bytes against 526 948 as
+    /// containers, **64.8x less wire**, and the pair form took 1012.8 ms to put where the
+    /// payload is half a megabyte ( measured 2026-10-03 ).
+    ///
+    /// Check [`Self::supports`] with `FEATURE_CONTAINER_PUT` first: a server that predates
+    /// this rejects the batch, because `apply` accepts only schemas it knows.
+    ///
+    /// # The acknowledgement is a checksum of the decode
+    ///
+    /// `sent` here is the **ordinal** total rather than the row count, matching what the
+    /// server reports for the same write on either wire. The existing acknowledgement check
+    /// therefore compares the cardinality the client encoded against the cardinality the
+    /// server decoded, and refuses a mismatch -- so a payload that decoded to a different
+    /// set than it was built from fails the call instead of landing quietly.
+    #[cfg(feature = "containers")]
+    pub async fn apply_containers(&mut self, batches: Vec<RecordBatch>) -> Result<Ack> {
+        let mut sent = 0u64;
+        for b in &batches {
+            let cards = b
+                .column_by_name("cardinality")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>())
+                .ok_or_else(|| {
+                    FlightError::protocol(
+                        "a container batch needs a UInt32 `cardinality` column; build it \
+                         with yesno_arrow::ContainerBatchBuilder",
+                    )
+                })?;
+            sent += (0..cards.len())
+                .map(|i| u64::from(cards.value(i)))
+                .sum::<u64>();
+        }
+        self.put_batches_with(batches, sent, PUT_APPLY, yesno_arrow::containers_schema())
+            .await
+    }
+
     /// Atomically remove every ordinal under `key`, returning its commit version.
     pub async fn clear(&mut self, key: u64) -> Result<u64> {
         self.u64_action(ACTION_CLEAR, key.to_le_bytes().to_vec())

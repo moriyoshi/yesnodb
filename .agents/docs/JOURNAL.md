@@ -322,3 +322,90 @@ Added [Query Acceleration Admission](LTM/query-acceleration-admission-synthesis.
 All source documents remain intact. The older hosted-ABI assessment and design, Flight write transactions, dense-span extents, chunk-local patches, the Redis comparison, and other cohesive source investigations remain separate; the [LTM index](LTM/INDEX.md) is the current synthesis map. The standalone list in the preceding consolidation record describes the state before these two syntheses.
 
 Candidates for a later `distill-memories` pass: `ARCHITECTURE.md` still says `yesno-server/src/plugin.rs` owns both plugin shapes and describes the removed in-process facility; it also says the local gate misses the server crate, despite the workspace-wide Clippy gate. The current same-Pod socket ownership and peer UID rule should be checked against canonical architecture and quality guidance. No canonical document was edited in this pass.
+
+## 2026-10-03 -- the write wire, and a bound that refused the case it was built for
+
+The read side got a dense wire on 2026-09-30 ( `flight-dense-set-results` ); the write side
+still carried **one row per set bit**. Measured before changing anything, on a 64-chunk
+half-dense page -- 2 097 152 ordinals over 512 KiB of actual bitmap:
+
+| | bytes | per set bit | vs. the data |
+|---|---:|---:|---:|
+| pair wire `{ key, ordinal }` | 34 126 004 | 16.3 | 65x |
+| container payloads | 526 948 | 0.251 | 1.005x |
+
+**64.8x**, and `do_put` took 1012-1212 ms to move half a megabyte of real data. At the
+1024-chunk, 8 MiB page the backlog names: 546 013 364 bytes and 16.6-18.8 s, against
+8 421 388 bytes.
+
+**The fix needed no new encoder and no new schema.** `apply` and a write transaction now
+accept a batch carrying `yesno_arrow::containers_schema` -- the *same* schema the read side
+already ships, payloads byte-identical to the page store and to a `.roaring` file -- and each
+row becomes `patch_chunk( key, prefix, empty, c )`, which is `( old \ {} ) union c`: exactly
+what `insert` means. So this is an **encoding** change to an existing operation, which is why
+the whole correctness claim is one differential test against the wire that already worked,
+rather than a round trip that would only prove the new encoding agrees with itself.
+
+End to end, both wires landing the identical set ( verified ordinal by ordinal ):
+
+| | pairs | containers |
+|---|---:|---:|
+| 64 chunks, 512 KiB | 1058-1212 ms | 41.0-42.1 ms |
+| 1024 chunks, 8 MiB | 16.6-17.1 s | 29.2-48.5 ms |
+
+**The container arm is essentially flat across a 16x size range**, which is the real shape of
+the result: it is no longer wire-bound. The larger page measuring slightly *faster* than the
+smaller one is **unexplained** -- consistently 41 ms at 64 chunks against 32 ms median at
+1024 -- and I did not chase it, because both are two to three orders of magnitude under the
+pair arm and a cause I had not verified is worth less than saying so.
+
+### The defect, and why a convenient fixture hid it
+
+A container row reports the **ordinals** it carries rather than one row, so the same logical
+write reports the same figure on either wire and the client's acknowledgement check compares
+the cardinality it encoded against the cardinality the server decoded. That is right for
+reporting. I also counted it against `MAX_TRANSACTION_ROWS` -- and **that bound exists to
+limit memory**, in rows, because a mutation row costs a few dozen bytes.
+
+So the 8 MiB page was refused: `apply exceeded 16777216 staged rows`. **The bound rejected
+precisely the case the dense wire exists to make possible.** The 64-chunk page is 2 097 152
+ordinals, comfortably under, and passed every time.
+
+It surfaced only on measuring at the size the backlog actually names. I had a working feature,
+a passing differential test and a 64.8x wire number before discovering that the headline case
+returned an error -- **the fixture that was convenient to build was also the one that could
+not fail.**
+
+The repair separates three quantities that had been two: ordinals written ( reported ),
+operations staged ( bounded by `MAX_TRANSACTION_ROWS` ), and container payload bytes behind
+them ( bounded by a new `MAX_TRANSACTION_CONTAINER_BYTES`, 256 MiB ). Any one standing in for
+another lets a bound refuse work it was not meant to refuse, or admit memory it was meant to
+refuse. `a_dense_page_past_the_row_bound_in_ordinals_is_still_accepted` pins it at 257 full
+chunks -- one past the bound -- and `Container::full()` is what makes that affordable, since a
+whole chunk is one run interval and 16 777 217 ordinals cost a few hundred bytes to express
+rather than a 134 MB vector. Verified against the unfixed version, which fails it with the
+same message the measurement produced.
+
+### Two things stated rather than covered
+
+**The byte bound is not exercised end to end.** Reaching `MAX_TRANSACTION_CONTAINER_BYTES`
+costs 256 MiB of payload, which is not a test. It is the same code shape as the row bound,
+which *is* tested, and it is checked before anything is staged so a crossing leaves the
+transaction holding exactly what was accepted -- but no test demonstrates that, and a bound
+whose wiring rests on inspection should say so.
+
+**A container row cannot remove.** `containers_schema` has no `op` column, and adding one
+would fork it from the read side's schema -- the single property that made this cheap. Dense
+removal is `remove_range` on the mutation wire at one row; a scattered one is the pair wire's
+case. Both encodings may be mixed in one `apply` stream and stay ordered, so a caller needing
+both sends both kinds of batch.
+
+### A client build nearly broke
+
+`yesno-arrow` is an optional dependency pulled in by the `server` feature, and `client.rs` is
+not gated by it -- so calling `yesno_arrow::containers_schema()` from the client broke
+`--no-default-features` outright. Copying the five-field schema into `yesno-flight` would have
+fixed the build and created a second spelling of one wire format, which is how two
+definitions start to drift. A `containers` feature gates the client method instead and
+`server` implies it, so the schema stays the single definition in `yesno-arrow`. All three
+combinations build.

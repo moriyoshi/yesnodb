@@ -643,3 +643,156 @@ async fn a_failure_in_a_later_batch_poisons_the_transaction() {
         "no row from the first batch may become visible"
     );
 }
+
+/// A container batch and a pair batch of the same set must land the same database.
+///
+/// # Why this is the only assertion that matters for the container wire
+///
+/// The container wire is an **encoding** change, not a new operation: a container row unions
+/// its ordinals into whatever is there, which is what `insert` already means. So the whole
+/// correctness claim is interchangeability, and the test for it is a differential one
+/// against the wire that already worked -- not a round trip, which would only prove the new
+/// encoding agrees with itself.
+///
+/// The fixture is deliberately **mixed in container kind**: dense chunks that must become
+/// bitmaps, a contiguous run, and a sparse scattering that must stay an array. One payload
+/// column has to serve all three, and `kind` and `cardinality` are not derivable from the
+/// payload alone -- an array of `n` values and a run of `n / 2` intervals can be the same
+/// length in bytes -- so a fixture of one kind would not exercise the decode at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_container_batch_lands_the_same_set_as_the_pairs_it_encodes() {
+    use std::collections::BTreeSet;
+
+    // Four dense chunks (bitmaps), a run, and a scattering (array).
+    let mut want: BTreeSet<u64> = (0..4 * 65_536u64).filter(|o| o % 2 == 0).collect();
+    want.extend((10 << 16)..(10 << 16) + 5_000);
+    want.extend((0..200u64).map(|i| (20 << 16) + i * 300));
+    let vals: Vec<u64> = want.iter().copied().collect();
+
+    // --- the oracle: the same ordinals through the pair wire.
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let oracle = open(oracle_dir.path());
+    {
+        let (url, _stop) = serve(oracle.clone()).await;
+        let mut client = YesnoClient::connect(url).await.unwrap();
+        client
+            .insert_batch(vals.iter().map(|&o| (7u64, o)))
+            .await
+            .unwrap();
+    }
+    let oracle_set = oracle.snapshot().unwrap().load(7).unwrap();
+    assert_eq!(
+        oracle_set.iter().collect::<BTreeSet<_>>(),
+        want,
+        "the oracle itself must be right first"
+    );
+
+    // --- the same set, as containers, through `apply`.
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = YesnoClient::connect(url).await.unwrap();
+    assert_ne!(
+        client.stats().await.unwrap().features & yesno_flight::FEATURE_CONTAINER_PUT,
+        0,
+        "a server that accepts container batches must advertise it"
+    );
+
+    let set = yesno_core::OrdSet::from_sorted_slice(&vals);
+    let mut kinds: BTreeSet<u8> = BTreeSet::new();
+    let mut b = yesno_arrow::ContainerBatchBuilder::new();
+    for (prefix, c) in set.chunks() {
+        kinds.insert(c.kind() as u8);
+        b.push(7, prefix, c);
+    }
+    assert!(
+        kinds.len() > 1,
+        "this fixture must exercise more than one container kind, got {kinds:?}"
+    );
+    let batch = b.finish().unwrap().expect("the fixture has chunks");
+    client.apply_containers(vec![batch]).await.unwrap();
+
+    let got = db.snapshot().unwrap().load(7).unwrap();
+    assert_eq!(
+        got.iter().collect::<BTreeSet<_>>(),
+        want,
+        "the container wire landed a different set than the pair wire did"
+    );
+
+    // And byte-for-byte the same chunks, not merely the same ordinals: the payloads were
+    // the store's own encoding on the way in, so nothing should have been re-encoded.
+    for ((pa, ca), (pb, cb)) in oracle_set.chunks().zip(got.chunks()) {
+        assert_eq!(pa, pb, "chunk prefixes diverged");
+        assert_eq!(
+            yesno_core::container::codec::encode(ca),
+            yesno_core::container::codec::encode(cb),
+            "chunk {pa} encodes differently through the two wires"
+        );
+    }
+}
+
+/// A dense page past [`MAX_TRANSACTION_ROWS`] **ordinals** must still be accepted.
+///
+/// # The defect this pins
+///
+/// `MAX_TRANSACTION_ROWS` bounds what the server holds in memory until commit, and it is
+/// expressed in rows because a mutation row costs a few dozen bytes. When the container wire
+/// landed, a container row reported the *ordinals* it carried -- which is right for the
+/// acknowledgement, since the same write should report the same figure on either wire -- and
+/// that figure was also counted against the row bound. So an 8 MiB page, 1024 bitmap chunks
+/// holding 33 554 432 ordinals, was refused with "apply exceeded 16777216 staged rows":
+/// **the bound rejected precisely the case the dense wire exists to make possible.**
+///
+/// It was found by measuring at the size the backlog names rather than at a convenient one.
+/// A 64-chunk page is 2 097 152 ordinals, comfortably under the bound, and passed throughout.
+///
+/// The fix separates three quantities that had been two: ordinals written, operations staged
+/// ( bounded by `MAX_TRANSACTION_ROWS` ), and container payload bytes behind them ( bounded
+/// by `MAX_TRANSACTION_CONTAINER_BYTES` ).
+///
+/// `Container::full()` is what makes this affordable: a whole chunk is one run interval, so
+/// 256 chunks carry 16 777 216 ordinals in a few hundred bytes of payload and the test needs
+/// no 134 MB vector to express them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dense_page_past_the_row_bound_in_ordinals_is_still_accepted() {
+    // One past the bound, so this is a test of the boundary and not merely of a large page.
+    const CHUNKS: u64 = 257;
+    let ordinals = CHUNKS * 65_536;
+    assert!(
+        ordinals > yesno_flight::MAX_TRANSACTION_ROWS,
+        "the fixture must exceed the row bound in ordinals, or it proves nothing: \
+         {ordinals} against {}",
+        yesno_flight::MAX_TRANSACTION_ROWS
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let (url, _stop) = serve(db.clone()).await;
+    let mut client = YesnoClient::connect(url).await.unwrap();
+
+    let full = yesno_core::Container::full();
+    let mut batches = Vec::new();
+    let mut b = yesno_arrow::ContainerBatchBuilder::new();
+    for prefix in 0..CHUNKS {
+        b.push(9, prefix, &full);
+        if b.len() >= 128 {
+            if let Some(rb) = b.finish().unwrap() {
+                batches.push(rb);
+            }
+        }
+    }
+    if let Some(rb) = b.finish().unwrap() {
+        batches.push(rb);
+    }
+
+    let ack = client.apply_containers(batches).await.unwrap();
+    assert_eq!(
+        ack.rows, ordinals,
+        "the acknowledgement reports ordinals written, on either wire"
+    );
+    assert_eq!(
+        db.snapshot().unwrap().cardinality(9).unwrap(),
+        ordinals,
+        "every ordinal of every chunk must have landed"
+    );
+}

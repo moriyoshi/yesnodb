@@ -428,9 +428,11 @@ pub const ACTION_ABORT_WRITE: &str = "abort_write";
 /// anywhere.
 pub const FEATURE_MIXED_PUT: u64 = 1 << 0;
 pub const FEATURE_WRITE_TRANSACTIONS: u64 = 1 << 1;
+/// `apply` and a write transaction accept [`yesno_arrow::containers_schema`] batches.
+pub const FEATURE_CONTAINER_PUT: u64 = 1 << 2;
 
 /// Everything this build implements.
-pub const FEATURES: u64 = FEATURE_MIXED_PUT | FEATURE_WRITE_TRANSACTIONS;
+pub const FEATURES: u64 = FEATURE_MIXED_PUT | FEATURE_WRITE_TRANSACTIONS | FEATURE_CONTAINER_PUT;
 
 /// Live write transactions a server will hold at once.
 pub const MAX_OPEN_TRANSACTIONS: usize = 256;
@@ -442,6 +444,22 @@ pub const MAX_OPEN_TRANSACTIONS: usize = 256;
 /// leaves the transaction open to be aborted: silently splitting into two
 /// commits would break the one guarantee the caller asked for.
 pub const MAX_TRANSACTION_ROWS: u64 = 16 * 1024 * 1024;
+
+/// Container payload bytes a single write transaction may stage.
+///
+/// **A second bound is needed because a container row is not a row-sized thing.**
+/// [`MAX_TRANSACTION_ROWS`] bounds staged memory only while a row costs a few dozen bytes;
+/// a bitmap container costs 8 KiB, so 16 Mi of them would be 128 GiB of staged payload and
+/// the row bound would permit it. Rows are still counted -- a container row counts the
+/// ordinals it carries, so the two wires report the same figure for the same write -- and
+/// this bounds the bytes behind them.
+///
+/// Sized for the case this exists for: a dense page of 1024 bitmap chunks is 8 MiB, so 256
+/// MiB holds a bundle of thirty-two such pages in one atomic commit. Exceeding it fails the
+/// `do_put` that crossed it and leaves the transaction open to be aborted, exactly as the row
+/// bound does, because silently splitting into two commits would break the one guarantee the
+/// caller asked for.
+pub const MAX_TRANSACTION_CONTAINER_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Committed transaction outcomes remembered for idempotent retry.
 ///
@@ -670,6 +688,16 @@ enum Staged {
     InsertRange(u64, u64, u64),
     RemoveRange(u64, u64, u64),
     DeleteKey(u64),
+    /// One chunk's worth of ordinals, unioned into whatever is there.
+    ///
+    /// **Boxed, and that is not a style choice.** `yesno_core::db::Op::PatchChunk` held two
+    /// containers inline, which took `Op` from 72 to 128 bytes and cost a measured 1.763 s
+    /// to 2.471 s on an isolated point-ingest benchmark -- a 40% regression on a path that
+    /// never patches a chunk, because every variant pays for the widest one. `patch_chunk`'s
+    /// own documentation records that it then happened a second time in a downstream
+    /// consumer that mirrored the interface into its own batch enum. This enum is that same
+    /// shape, so it takes the same precaution.
+    PatchChunk(u64, yesno_core::Prefix48, Box<yesno_core::Container>),
 }
 
 #[cfg(feature = "server")]
@@ -691,8 +719,140 @@ fn apply_staged(wb: &mut yesno_core::WriteBatch, ops: Vec<Staged>) {
             Staged::DeleteKey(key) => {
                 wb.delete_key(key);
             }
+            Staged::PatchChunk(key, prefix, c) => {
+                // `patch_chunk` computes `( old \ clear ) union set`, so an empty `clear`
+                // makes this a union -- the same meaning `insert` has, which is what lets a
+                // container batch and a pair batch of the same set be interchangeable.
+                wb.patch_chunk(key, prefix, &EMPTY_CONTAINER, &c);
+            }
         }
     }
+}
+
+/// The `clear` half of an additive patch.
+///
+/// Built once rather than per row: `patch_chunk` takes it by reference and does not keep it.
+#[cfg(feature = "server")]
+static EMPTY_CONTAINER: std::sync::LazyLock<yesno_core::Container> =
+    std::sync::LazyLock::new(yesno_core::Container::new_array);
+
+/// Decode a batch for `apply` or a write transaction, from whichever declared schema it
+/// carries.
+///
+/// # Why this dispatches on the schema and [`put_mode`] refuses to guess
+///
+/// Those look like the same decision and are not. `put_mode` rejects an absent or unknown
+/// *command* because a command names the **operation**, and defaulting one silently turned a
+/// mixed batch's removals into insertions. Here the operation is already named -- the caller
+/// said `apply` -- and what varies is only the **encoding** of the rows. Arrow IPC carries
+/// the schema with the data, so the batch states its own encoding; nothing is inferred from
+/// what the server happens to recognise, and a batch matching neither schema is an error
+/// rather than a default.
+///
+/// # Why a container batch is worth a second encoding at all
+///
+/// The pair and mutation wires cost one row per **set bit**. Measured on a 64-chunk
+/// half-dense page -- 2 097 152 set bits over 512 KiB of actual bitmap -- the pair wire is
+/// 34 126 004 bytes, 16.3 bytes per bit and 65x the data it carries, and `do_put` took
+/// 1012.8 ms to move it. The same set as container payloads is 526 948 bytes, 0.251 bytes
+/// per bit and 1.005x the raw bitmap: **64.8x less wire** ( measured 2026-10-03 ). The
+/// 8 MiB page this exists for would be ~546 MB of pairs against ~8.4 MB of containers.
+///
+/// It costs no new encoder and no new schema. The payload column is the container's
+/// Roaring-spec bytes, byte-identical to what the page store holds, to what a `.roaring`
+/// file holds, and to what [`yesno_arrow::containers_schema`] already ships on the **read**
+/// side -- so this is the write half of a wire that was already round-trip tested.
+///
+/// # Insert only, deliberately
+///
+/// A container row unions into whatever is there. There is no removal form because
+/// `containers_schema` has no `op` column, and giving it one would fork it from the read
+/// side's schema, which is the single property that makes this cheap. A dense removal is
+/// `remove_range` on the mutation wire and costs one row; a scattered one is the pair wire's
+/// case. Mixing both encodings in one `apply` stream is allowed and ordered, so a caller
+/// needing both sends both kinds of batch.
+#[cfg(feature = "server")]
+fn decode_put_batch(b: &RecordBatch) -> Result<(Vec<Staged>, u64), Status> {
+    if b.schema() == yesno_arrow::containers_schema() {
+        return decode_containers(b);
+    }
+    Ok((decode_mutations(b)?, 0))
+}
+
+/// Decode a [`yesno_arrow::containers_schema`] batch into additive chunk patches.
+///
+/// **Decoded in full before anything is applied**, which is the same all-or-nothing
+/// discipline [`Staged`] exists for -- and it is free here, because `read_containers`
+/// already returns a vector. It also validates: every payload goes through
+/// `codec::decode`, which is a fuzz target by contract and must return `Err` or a container
+/// satisfying its invariants for **any** input, never panic. So a malformed payload from an
+/// untrusted client is an `invalid_argument`, not a crash, and that property is inherited
+/// rather than re-implemented here.
+#[cfg(feature = "server")]
+fn decode_containers(b: &RecordBatch) -> Result<(Vec<Staged>, u64), Status> {
+    let rows = yesno_arrow::read_containers(b).map_err(|e| {
+        Status::invalid_argument(format!("containers batch could not be decoded: {e}"))
+    })?;
+    // **The payload bytes as they arrived**, read off the column rather than re-derived from
+    // the decoded containers. Re-deriving would need a byte-length function in
+    // `yesno-core`'s codec, which has no other caller and would therefore be public API
+    // carried for one accounting line -- and it would answer a slightly different question,
+    // since a decoded container may re-encode to a different length than it was sent as.
+    // What the bound cares about is what the server was asked to hold.
+    //
+    // The downcast cannot fail: `read_containers` above has already established the schema.
+    let bytes = b
+        .column(4)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .map(|p| p.value_data().len() as u64)
+        .unwrap_or(0);
+    Ok((
+        rows.into_iter()
+            .map(|(key, prefix, c)| Staged::PatchChunk(key, prefix, Box::new(c)))
+            .collect(),
+        bytes,
+    ))
+}
+
+/// Ordinals a staged batch writes, for **reporting**.
+///
+/// A container row reports the ordinals it holds rather than one row, so the same logical
+/// write reports the same figure whichever wire carried it -- a client comparing the two
+/// encodings is told it wrote the same thing, because it did. The client's
+/// `apply_containers` sums the same column, so the acknowledgement check compares the
+/// cardinality encoded against the cardinality decoded.
+///
+/// **This is not what the bounds count, and conflating the two was a real defect.** Counted
+/// against [`MAX_TRANSACTION_ROWS`], an 8 MiB page -- 1024 bitmap chunks, 33 554 432
+/// ordinals -- was refused with "apply exceeded 16777216 staged rows", which is precisely
+/// the case the dense wire exists to make possible. A 64-chunk page passed and hid it; only
+/// measuring at the size the backlog actually names surfaced it.
+#[cfg(feature = "server")]
+fn staged_rows(ops: &[Staged]) -> u64 {
+    ops.iter()
+        .map(|op| match op {
+            Staged::PatchChunk(_, _, c) => c.len() as u64,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Staged operations, for the **memory bound**.
+///
+/// [`MAX_TRANSACTION_ROWS`] exists to bound what the server holds until commit, and what it
+/// holds is one `Staged` per row of the batch -- so that is what gets counted, whatever a
+/// row happens to mean. For a container row the payload behind it is bounded separately by
+/// [`MAX_TRANSACTION_CONTAINER_BYTES`], because one chunk is 8 KiB whether it carries one
+/// ordinal or 65 536 and an operation count cannot see that.
+///
+/// Three quantities, deliberately not two: what the caller wrote ( ordinals ), how many
+/// operations hold it, and how many payload bytes those operations point at. Any one of them
+/// standing in for another lets a bound reject work it was not meant to reject, or admit
+/// memory it was meant to refuse.
+#[cfg(feature = "server")]
+fn staged_ops(ops: &[Staged]) -> u64 {
+    ops.len() as u64
 }
 
 #[cfg(feature = "server")]
@@ -793,6 +953,20 @@ fn range_bounds(row: usize, lo: u64, hi: u64) -> Result<(), Status> {
 struct PendingWrite {
     batch: yesno_core::WriteBatch,
     rows: u64,
+    /// Staged operations so far, bounded by [`MAX_TRANSACTION_ROWS`].
+    ///
+    /// Distinct from `rows`, which is the ordinal total this transaction will write. For the
+    /// pair and mutation wires the two are equal; for a container wire one operation carries
+    /// up to 65 536 ordinals, and bounding the ordinals would refuse a dense page outright.
+    ops: u64,
+    /// Container payload bytes staged so far, bounded by
+    /// [`MAX_TRANSACTION_CONTAINER_BYTES`].
+    ///
+    /// Tracked beside `rows` rather than folded into it, because the two bound different
+    /// things: `rows` is what the caller wrote and `container_bytes` is what the server is
+    /// holding to write it. A container row is one chunk of up to 65 536 ordinals, so the
+    /// row total cannot bound the memory and the byte total cannot bound the work.
+    container_bytes: u64,
     deadline: std::time::Instant,
     /// Why this transaction may no longer be committed, if it may not.
     ///
@@ -1761,6 +1935,11 @@ impl FlightService for YesnoFlightService {
         let mut rows = 0u64;
         let mut batch_count = 0u64;
         let mut version = 0u64;
+        // `apply`'s own running totals, the counterparts of `tx.ops` and
+        // `tx.container_bytes`. `rows` is what the caller wrote; `ops` is what the server is
+        // holding to write it, and only the latter is a memory bound.
+        let mut ops = 0u64;
+        let mut container_bytes = 0u64;
 
         // One accumulating batch for the whole stream, for the modes whose
         // point is that every row becomes visible at the same instant.
@@ -1821,18 +2000,29 @@ impl FlightService for YesnoFlightService {
                     version = version.max(n.1);
                 }
                 PutMode::Apply => {
-                    let staged = decode_mutations(&b)?;
+                    let (staged, batch_bytes) = decode_put_batch(&b)?;
+                    let staged_rows = staged_rows(&staged);
+                    let staged_ops = staged_ops(&staged);
                     // Checked before applying. `apply` discards its batch on
                     // any error, so the ordering matters less here than in a
                     // transaction, but the two paths should not differ in when
                     // a bound is enforced.
-                    if rows + staged.len() as u64 > MAX_TRANSACTION_ROWS {
+                    if ops + staged_ops > MAX_TRANSACTION_ROWS {
                         return Err(Status::resource_exhausted(format!(
                             "apply exceeded {MAX_TRANSACTION_ROWS} staged rows; \
                              split the work or use a write transaction"
                         )));
                     }
-                    rows += staged.len() as u64;
+                    if container_bytes + batch_bytes > MAX_TRANSACTION_CONTAINER_BYTES {
+                        return Err(Status::resource_exhausted(format!(
+                            "apply exceeded {MAX_TRANSACTION_CONTAINER_BYTES} staged \
+                             container payload bytes; split the work across several \
+                             apply calls"
+                        )));
+                    }
+                    rows += staged_rows;
+                    ops += staged_ops;
+                    container_bytes += batch_bytes;
                     apply_staged(pending.as_mut().expect("created for this mode"), staged);
                 }
                 PutMode::Txn(id) => {
@@ -1862,9 +2052,21 @@ impl FlightService for YesnoFlightService {
                     // re-checks neither -- so a caller could commit a
                     // transaction the server had told it was invalid or
                     // over-limit, and an audit demonstrated exactly that.
-                    let staged = decode_mutations(&b)?;
-                    let staged_rows = staged.len() as u64;
-                    if tx.rows + staged_rows > MAX_TRANSACTION_ROWS {
+                    let (staged, batch_bytes) = decode_put_batch(&b)?;
+                    let staged_rows = staged_rows(&staged);
+                    let staged_ops = staged_ops(&staged);
+                    if tx.container_bytes + batch_bytes > MAX_TRANSACTION_CONTAINER_BYTES {
+                        // Same treatment as the row bound below, and for the same reason:
+                        // nothing from this batch was staged, so what is open is exactly
+                        // what was accepted.
+                        return Err(Status::resource_exhausted(format!(
+                            "write transaction {id} would exceed \
+                             {MAX_TRANSACTION_CONTAINER_BYTES} staged container payload \
+                             bytes; nothing from this batch was staged, so it can be \
+                             committed as it stands or aborted"
+                        )));
+                    }
+                    if tx.ops + staged_ops > MAX_TRANSACTION_ROWS {
                         // Left open rather than aborted: the client asked for
                         // atomicity, so silently discarding half of it is worse
                         // than telling it to abort. Nothing from this batch was
@@ -1877,6 +2079,8 @@ impl FlightService for YesnoFlightService {
                     }
                     apply_staged(&mut tx.batch, staged);
                     tx.rows += staged_rows;
+                    tx.ops += staged_ops;
+                    tx.container_bytes += batch_bytes;
                     rows += staged_rows;
                 }
             }
@@ -1989,6 +2193,8 @@ impl FlightService for YesnoFlightService {
                     PendingWrite {
                         batch: self.db.batch(),
                         rows: 0,
+                        ops: 0,
+                        container_bytes: 0,
                         poisoned: None,
                         deadline: now + self.write_ttl,
                         staging: false,
