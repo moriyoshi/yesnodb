@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/moriyoshi/yesnodb/actions/workflows/ci.yml/badge.svg)](https://github.com/moriyoshi/yesnodb/actions/workflows/ci.yml)
 
+<img src="./assets/yesnodb-logo.png" />
+
 A persistent database for mapping 64-bit keys to sets of 64-bit ordinals.
 
 [yesnodb](https://github.com/moriyoshi/yesnodb) is a persistent inverted index
