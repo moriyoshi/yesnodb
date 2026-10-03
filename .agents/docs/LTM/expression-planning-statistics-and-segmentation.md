@@ -129,3 +129,56 @@ The missing dimension is materialized **cardinality**, not chunk count, and the 
 
 **Method note.** The first run put `open_planned()` inside the timing loop and showed per-chunk cost *falling* with size — 47 us for one chunk against 13 us per chunk for thirty-two. Per-chunk cost that improves with size is the signature of a fixed per-call overhead dominating, not of the work under test. Hoisting planning out changed the numbers and did not change the conclusion, which is the only reason the conclusion is trustworthy.
 
+
+## 2026-10-02: many disjoint ranges make repeated Concat seeks costly
+
+A Flight cache-page request provided a concrete yesno-core shape: `And( Key(7),
+Or( 399 disjoint ranges ) )` over a persisted 1024-chunk, half-dense bitmap
+key. Its 50% missing-page selection returns 511 chunks. The 90% selection
+has 102 disjoint ranges and returns 102 chunks. Each wire range was built as
+`Range( lo << 16, ( hi << 16 ) - 1 )`; `SetExpr::Range` is half-open, so each
+range omits its final ordinal. That ordinal is zero in the alternating-bit
+payload, and the selected output cardinality and bitmap content were checked
+against the stored-mask route.
+
+A release-mode standalone profile under
+`.agents-workspace/tmp/flight-bitvector-bench/src/bin/kernel_profile.rs`
+reused the benchmark's checkpointed database and pinned execution to CPU
+16-17. Each phase had ten warmups and 101 timed repetitions; the container
+kernel had 100001 repetitions. Two successive profiles, `kernel-profile-3.log`
+and `kernel-profile-4.log`, agreed on the main result ( medians, 50% case ):
+
+| Operation | Median |
+| --- | ---: |
+| Lower 399-range wire expression | 0.010 ms |
+| Plan lowered expression | 0.031 ms |
+| Open planned stream | 0.016 ms |
+| Count planned intersection stream | 1.84-1.87 ms |
+| Count planned range union alone | 0.018 ms |
+| Walk planned range union as chunks | 0.64-0.65 ms |
+| Seek once per selected prefix through range union and take chunk | 0.92-0.93 ms |
+| 511 direct bitmap x run `and_cardinality` calls | 0.066 ms |
+| 511 `and_cardinality` calls on distinct persisted bitmap chunks | 0.083 ms |
+| Count stored-mask intersection stream ( same selected chunks ) | 0.22-0.24 ms |
+
+The bitmap x run cardinality kernel is only about 4-5% of the 399-range
+intersection count walk. The repeated-input microbench took 0.066 ms and a
+follow-up over the actual 511 distinct persisted bitmap chunks took 0.083 ms
+( `kernel-profile-5.log` ). Its input kinds were verified as `Bitmap` and `Run`.
+The dominant cost is **stream shape and cursor traversal**, not planning or
+container arithmetic. `concat_disjoint_or` in `stream/dynamic.rs` opens the
+sorted range parts and folds them into a left-deep `Concat` chain. `Concat::seek`
+in `stream/ops.rs` seeks both children recursively, and `And::cardinality_dyn`
+seeks its range-union operand once for each candidate prefix. The seek probe
+shows substantial cost even without any bitmap intersection. The range union's
+cheap `cardinality_dyn` sums child cardinalities and hides that traversal cost;
+its own chunk walk already takes 0.64 ms.
+
+This is a measured bottleneck for a large number of disjoint ranges, not proof
+that one replacement representation wins generally. A flat ordered-concat
+stream or a coalesced prefix mask should be compared against the present path
+on 102 and 399 ranges, overlap cases, sparse output, and wide ranges. Preserve
+strict prefix ordering and the exact range-end semantics; a flat cursor must
+still honor `seek`, `peek_prefix`, `next_chunk`, and cardinality equivalence.
+The over-wire request also repeats the expression in `GetFlightInfo` and
+`DoGet`, and Arrow/Flight costs remain outside this core-only profile.

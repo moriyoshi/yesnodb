@@ -13,6 +13,111 @@ bump-allocates within a contiguous slab run -- the locality policy `alloc.rs` al
 A threshold and a mode flag were artifacts of the packed-page design, not of the goal.
 `PACKED_LARGE_CLASS` is deleted and `MAX_VERIFIED_SPAN` is back to 8192.
 
+## 2026-10-02: measured cost of lending on the Flight bitvector path
+
+**The direct batch-building step improves, but a loopback Flight request has no stable
+end-to-end speedup at these sizes.** The earlier 9x result ( 57.7 versus 529 GiB/s )
+isolated copying bytes into an Arrow batch. This measurement includes the indexed
+`dense_span` walk and trailer checks in the local comparison, then includes the server,
+Arrow IPC, HTTP/2 loopback transport and client Arrow decoding in the wire comparison.
+
+Construction: scratch crate and raw samples at
+`.agents-workspace/tmp/flight-bitvector-bench/`, run in release mode against commit
+`7276ddf` ( containing the fix in `644ca48` ) on this 20-core aarch64 host. The
+scratch crate uses the shared workspace `target`. **Version correction:** the initial
+timings in the two tables below resolved `arrow-array`, Flight and IPC at 59.2.0 but
+`arrow-buffer`, data and schema at 59.3.0, although the repository lockfile has
+59.2.0 for all of them. The scratch manifest now pins every Arrow crate at 59.2.0;
+the fully pinned socket A/B below reproduces the 40 ms finding. One checkpointed
+key holds 1024 or 2048 consecutive 8 KiB
+bitmap chunks ( 8 or 16 MiB ), each with alternating bits (`0x55`, cardinality
+32 768 per chunk). Every run uses one Flight server and client on `127.0.0.1`, one
+connection, warm page cache, three warmup requests per arm, and rotated arm order.
+Ticket planning and database setup are outside each timed request. The client times
+`do_get` through the last decoded `BinaryArray`, checks every value's length and its
+edge bytes, and consumes a middle byte through `black_box`.
+
+Arms: `bare_borrow` is a bare-key bitvector ticket; `identity_staged` uses the
+expression `Key(7)`, which returns the **same bytes** but disables the borrow; and
+`filtered_staged` intersects the key with the middle half of its range. The last arm
+tests the required fallback but is not a same-work speed comparison: it evaluates a
+different expression. `identity_staged` also pays expression evaluation, so its wire
+time is not a pure measure of the gather alone. The direct local comparison uses one
+preloaded set on both sides and constructs `BinaryArray` batches with 64 chunks per
+batch; the borrowing side performs the real `dense_span` scan and checksum verification.
+
+| Payload | Local `load_set` | Local borrowed batches | Local staged batches |
+| --- | ---: | ---: | ---: |
+| 8 MiB | 0.201 ms | **0.183 ms** | 0.235 ms |
+| 16 MiB | 0.411 ms | **0.363 ms** | 0.608 ms |
+
+These are medians of 25 interleaved, warmed local samples. Borrowing saves 0.052 ms
+at 8 MiB ( 1.28x batch-building speedup ) and 0.245 ms at 16 MiB ( 1.67x ). The
+`load_set` cost precedes either batch builder in the current Flight implementation.
+
+Flight wall time is bimodal: a fast cluster below 20 ms and a second cluster near
+45 to 53 ms, present in **every** arm. A single median can land in either cluster
+depending on how often the long delay occurs, so the table reports the median of
+the fast cluster and the number of slow requests separately. The threshold separates
+two observed clusters; it is not a trimmed benchmark score.
+
+| Payload and run | Bare borrow, fast median ( fast / total ) | Identity staged, fast median ( fast / total ) | Filtered staged, fast median ( fast / total ) |
+| --- | ---: | ---: | ---: |
+| 8 MiB, 24 requests per arm | 4.682 ms ( 16 / 24 ) | 4.821 ms ( 12 / 24 ) | 5.729 ms ( 19 / 24 ) |
+| 16 MiB, 24 requests per arm | 9.421 ms ( 22 / 24 ) | 9.041 ms ( 20 / 24 ) | 9.635 ms ( 19 / 24 ) |
+| 16 MiB repeat, 15 per arm | 10.264 ms ( 13 / 15 ) | 11.008 ms ( 13 / 15 ) | 11.138 ms ( 9 / 15 ) |
+
+At 16 MiB, the bare-key result changes from 0.380 ms slower to 0.744 ms faster
+than the staged identity control across the two runs. **No reproducible Flight
+speedup is established**, although the local batch-building saving is real. The
+roughly 40 ms extra delay is visible in all three arms and must not be credited
+to either implementation. Its cause was subsequently identified below. These
+measurements are loopback, warm-cache, without TLS, and do not include shifou's
+encode/decode or GPU upload. They therefore say nothing about a remote network
+or a cold cache.
+
+### 2026-10-02: the 40 ms tail is a TCP socket setting on custom incoming streams
+
+Phase timing found the missing interval **at the tail**, not in the indexed read:
+of 55 requests with a 35-75 ms total in three balanced runs, 43 waited about 41 ms
+before the final decoded batch and 12 waited after the last batch for end-of-stream.
+Headers and earlier batches arrived normally. It occurred in bare, identity and
+filtered arms.
+
+The scratch server uses `Server::serve_with_incoming` with a
+`TcpListenerStream`. Its accepted socket reported `TCP_NODELAY=false`. Tonic 0.14.6
+defaults its own server `tcp_nodelay` option to true, but documents in its local
+`transport/server/mod.rs` that **the option is ignored for `serve_with_incoming`**;
+the caller owns the incoming socket settings. That is also the shape used by
+`yesno-server`'s plaintext and TLS listeners; neither sets `TCP_NODELAY` on an
+accepted socket. A small last write held by Nagle until the peer's delayed ACK is
+the mechanism consistent with both the location and the approximately 41 ms gap.
+
+To test causality, the scratch incoming stream set `TCP_NODELAY` on each accepted
+socket while leaving the database, Flight service, client, payload and arm order
+unchanged. With **all Arrow crates pinned at 59.2.0**, one paired 8 MiB experiment
+issued 100 requests per arm, 300 per socket setting:
+
+| Accepted server socket | 35-75 ms requests | At least 150 ms requests | Median total |
+| --- | ---: | ---: | ---: |
+| `TCP_NODELAY=false` | **97 / 300** | 0 / 300 | 5.713 ms |
+| `TCP_NODELAY=true` | **0 / 300** | 1 / 300 | 5.252 ms |
+
+Of the 97 slow default-socket requests, 91 waited before the final batch and six
+waited for end-of-stream after it. Three earlier paired runs with the mixed Arrow
+resolution agreed on the mechanism: 55 of 780 default-socket requests had the
+40 ms mode, against zero of 780 with NODELAY. Thus the original 40 ms mode
+disappears under the socket intervention. **Simply
+enabling NODELAY is not yet a latency fix**: the true arm exposed a different
+roughly 200 ms mode, sometimes longer. In one paired 300-request-per-setting run,
+host-wide TCP counters rose by 368 retransmitted segments and 20 timeouts with
+NODELAY, against 13 and 0 with the default; this host reports a 200 000 us TCP
+minimum retransmission timeout. Those counters are system-wide and cannot assign
+every event to this connection, but their change and the phase gaps indicate a
+transport retransmission problem in the faster-sending arm. No production socket
+setting was changed. Raw phase samples and the controlled socket A/B are under
+`.agents-workspace/tmp/flight-bitvector-bench/`.
+
 **B is closed as of 2026-10-01, and the first attempt to close it used the wrong argument.**
 That attempt measured Arrow *batch size* -- finding 64 KiB to 2 MiB a plateau and one 128 MiB
 batch 30 to 50 times worse -- and concluded that B's larger regions were therefore useless.
