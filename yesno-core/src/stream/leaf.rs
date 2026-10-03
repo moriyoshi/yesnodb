@@ -93,7 +93,7 @@ impl ChunkStream for SetStream {
     /// makes counting a whole `Set` leaf `O(chunks)` where it is `O(1)`, and the
     /// planner's rewrites produce bare `Set` leaves constantly —
     /// `AndNot(a, b) -> a` when the operands are disjoint, and every part of the
-    /// `Concat` a prefix-disjoint union lowers to.
+    /// `ConcatAll` a prefix-disjoint union lowers to.
     ///
     /// `idx == 0` is the whole precondition, and it is sufficient because
     /// this stream has no other state: `seek` only moves `idx`, and there is no

@@ -383,7 +383,7 @@ fn a_chain_of_ors_uses_the_nary_accumulator_not_a_pairwise_fold() {
 /// **The test above cannot see this shape.** It builds all `k` operands over
 /// the *same* 400 chunks, so their prefix spans overlap completely. That is the
 /// case where a union really is a merge, and the cost model priced it correctly
-/// all along. A chain of *disjoint* operands lowers to `Concat` — no merge, no
+/// all along. A chain of *disjoint* operands lowers to `ConcatAll` — no merge, no
 /// per-prefix compare — and `cardinality_cost` used to charge it `MERGE_STEP`
 /// anyway, which made `decomposing_is_cheaper` prefer the `|A| + |B| - |A ∩ B|`
 /// route. A chain decomposes **recursively**, which is precisely the pathology
@@ -397,7 +397,7 @@ fn a_disjoint_chain_of_ors_also_avoids_the_pairwise_fold() {
     let per = 50u64;
     let k = 8usize;
     // Operand `j` occupies prefixes `[j*per, (j+1)*per)` — strictly separated,
-    // so every `Or` in the chain is `Concat`-able.
+    // so every `Or` in the chain is `ConcatAll`-eligible.
     let sets: Vec<Arc<OrdSet>> = (0..k)
         .map(|j| {
             let base = j as u64 * per;

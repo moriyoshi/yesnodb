@@ -1180,7 +1180,7 @@ fn union_gate(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("union_gate");
     for n in [10u64, 1_000] {
-        // Prefix-disjoint: lowers to `Concat`, so counting is a plain sum and
+        // Prefix-disjoint: lowers to `ConcatAll`, so counting is a plain sum and
         // `MERGE_STEP` must not be charged.
         let d = leaf(0, n).or(leaf(n, n));
         // Overlapping spans: a real merge, where `MERGE_STEP` is right.
@@ -1255,7 +1255,7 @@ fn load_vs_statistics(c: &mut Criterion) {
 /// cardinality terminal and losing on `collect_set` over **overlapping** large
 /// ones ( `or16/overlap/100000c` +10.5%, +17.4 ms ). Then a span-only pre-check
 /// landed, and `concat_disjoint_or` began lowering prefix-disjoint unions to
-/// `Concat` before `segmented_or` is reached — so segmentation's best case no
+/// ordered concatenation before `segmented_or` is reached — so segmentation's best case no
 /// longer goes through it at all, and **the entry says the overlapping
 /// `collect_set` boundary is unmeasured since that change.**
 ///

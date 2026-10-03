@@ -318,7 +318,7 @@ pub fn cardinality_cost(e: &Expr) -> u64 {
 /// side, a compare and a kernel call, which is what [`MERGE_STEP`] prices.
 ///
 /// **But a union whose parts are disjoint in prefix order is not merged at
-/// all.** `concat_disjoint_or` lowers it straight to `Concat`, which drains one
+/// all.** `concat_disjoint_or` lowers it straight to `ConcatAll`, which drains one
 /// side and then the other — no per-prefix comparison, and `cardinality` is a
 /// plain sum. Charging `MERGE_STEP` for that overstates the cheapest union shape
 /// in the language by a factor of two.
@@ -331,7 +331,7 @@ pub fn cardinality_cost(e: &Expr) -> u64 {
 /// undercharge.
 ///
 /// See `disjoint-or-is-overcharged` in `JOURNAL.md` for why this matters beyond
-/// tidiness: a split engine's acceptance gate compares against a `Concat`, so it
+/// tidiness: a split engine's acceptance gate compares against a `ConcatAll`, so it
 /// would systematically undervalue every split by this factor.
 pub(crate) fn union_cost(a: &Expr, b: &Expr) -> u64 {
     let concatenable = match (prefix_span(a), prefix_span(b)) {
@@ -1220,9 +1220,9 @@ mod tests {
     /// The gap is that `cardinality_cost` does not charge `And` for
     /// materializing operands that cannot be counted arithmetically. See
     /// `cost-model-cannot-see-materialization` in `TODO.md`.
-    /// A union that lowers to `Concat` must not be charged for a merge.
+    /// A union that lowers to `ConcatAll` must not be charged for a merge.
     ///
-    /// `concat_disjoint_or` turns a prefix-disjoint union into `Concat`, which
+    /// `concat_disjoint_or` turns a prefix-disjoint union into `ConcatAll`, which
     /// drains one side then the other: no per-prefix compare, no kernel call,
     /// and `cardinality` is a plain sum. Charging `MERGE_STEP` for it overstated
     /// the cheapest union shape in the language by exactly 2x.
@@ -1246,7 +1246,7 @@ mod tests {
         assert_eq!(
             cardinality_cost(&disjoint),
             walked(&disjoint),
-            "a Concat-able union costs a plain sum"
+            "a ConcatAll-eligible union costs a plain sum"
         );
 
         // Overlapping spans: both [0,9]. Still a merge, still weighted.
