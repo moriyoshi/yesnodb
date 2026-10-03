@@ -14,14 +14,17 @@ which is why the server mirrors the struct instead of deriving on it.
 | | |
 |---|---|
 | `yesno-core` | containers, kernels, page store, WAL, MVCC, the sharded `Db`, and opt-in Cranelift bitmap-DAG cardinality |
+| `yesno-opencl` | optional device backend for batched blocked-view intersection counts; core owns the accelerator interface |
 | `yesno-wire` | the on-wire encoding shared by `yesno-flight` and `yesno-pg` |
-| `yesno-arrow` | zero-copy Arrow surface |
+| `yesno-arrow` | in-process zero-copy Arrow surface |
 | `yesno-datafusion` | predicate lowering |
-| `yesno-flight` | Arrow Flight for query results and `DoPut` ingest |
+| `yesno-flight` | Arrow Flight for query results, mixed one-shot writes, and staged write transactions |
 | `yesno-flight-c++` | the synchronous native Arrow C++ Flight client used by remote hosts |
 | `yesno-tantivy` | generation-bound Tantivy filters from embedded or Flight results |
 | `yesno-server` | `yesnod` + `yesno`: daemon, data CLI, TLS, auth, lifecycle, failover, and gRPC WAL replication |
+| `yesno-plugin` | read-only Unix-socket protocol and session engine for separately running plugin peers |
 | `yesno-server-utils` | `yesnoctl` + `yesno-archive`: checkpoint, hot backup, restore, and continuous object archive |
+| `yesno-operator` | Kubernetes controller for retained-storage clusters, failover, and same-Pod plugin peers |
 | `yesno-e2e` | the scenario harness; Python driven by `monty` |
 | `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.95 floor |
 | `yesno-mysql` | the embedded or remote MySQL 8.4 storage engine. Built and tested with pinned MySQL and Arrow source by Bazel |
@@ -97,11 +100,11 @@ Alongside them, `tests/allocation.rs` asserts allocation budgets as *tests, not 
 
 ## Current Shape
 
-- `yesno-core` is roughly 45k lines of source plus 13k of tests and benches.
-- **Kernels are specialized, and measured against the `roaring` crate rather than against our own past numbers.** All nine kind-pairs are specialized in both `ops::apply` and `ops::card`; the AArch64 NEON array intersect is in. The x86_64 arm is deliberately unwritten because there is no machine here to measure it on, and an unmeasured kernel would put a number in a table nobody has seen.
+- **Kernels are specialized, and measured against the `roaring` crate rather than against our own past numbers.** All nine kind-pairs are specialized in both `ops::apply` and `ops::card`; AArch64 NEON and x86_64 vector arms have native correctness and timing evidence. Unsupported CPU features retain scalar fallbacks.
 - Streaming operators keep a one-slot lookahead so `peek_prefix` is exact, and each overrides `cardinality_dyn` with a non-materializing walk.
 - Serialization covers the 32-bit portable format and CRoaring's 64-bit map layout.
 - **It runs on a network.** `yesnod` serves Arrow Flight and ships its WAL over gRPC, with TLS, a role-based permission table, a leader/follower deployment, `SIGUSR1` promotion, and a leadership term that fences a superseded leader out. A standby can serve reads while it follows.
+- **Plugin peers run outside `yesnod`.** The daemon serves a read-only Unix-socket channel, owns their snapshots, and releases them when a peer connection closes. The operator can place a peer beside it in one Pod with a shared socket volume and no database-directory mount. The former in-process `cdylib` plugin ABI has been removed.
 - **The PostgreSQL integration is complete through its original phases 0-9.** `yesno-pg` provides a Flight-backed foreign data wrapper with qual, aggregate and join pushdown plus transactional writes; an index access method over ordinary heaps; and a single-column `bigint` table access method. Its separate Bazel gate runs the complete SQL and isolation corpus against pinned PostgreSQL 17 and 18. Isolation within yesno follows PostgreSQL's transaction and statement lifetimes; cross-engine commit atomicity and xid-clock agreement remain explicit follow-on tradeoffs in `TODO.md`.
 - **There is a host-independent C boundary, native C++ and Go Flight clients, and an experimental MySQL edge.** `yesno-c` owns explicit opaque database and materialized snapshot-cursor handles, catches Rust panics at every exported boundary, and supports multiple independent databases. `yesno-flight-c++` and `yesno-flight-go` use their ecosystems' native Arrow Flight APIs without a Rust bridge. `yesno-mysql` selects either backend at startup and maps a `CONNECTION` key to a one-column unsigned ordinal table. Its writes are transactional: buffered per connection and applied as one yesnodb version when MySQL commits, so `ROLLBACK` discards them and `SAVEPOINT` unwinds, while each scan retains one stable yesno snapshot. It deliberately implements no two-phase `prepare`, so cross-engine commit atomicity is the same open tradeoff `TODO.md` records for PostgreSQL. Its Bazel gate builds Arrow, MySQL 8.4.0, and the plugin from pinned source, then runs the checked mysqltest fixture in a throwaway server.
 - **Backup and recovery are shipped subsystems.** `yesnod` owns renewable provider snapshots across portable, ZFS, Btrfs, LVM, and EBS backends; `yesno-snapshot-agent` isolates privileged LVM and local-EBS work; `yesno-archive` publishes fenced immutable history; and `yesno-restore` selects a commit-version, wall-clock, or durable-tip prefix. The Kubernetes operator resolves EBS identity from each bound PersistentVolume and rolls the resulting per-instance configuration.

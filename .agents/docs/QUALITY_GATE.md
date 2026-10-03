@@ -1,6 +1,6 @@
 # Quality Gate
 
-The checklist a change to `yesno-core` must pass before it is reported as done, plus the implementation conventions the checks encode. The `quality-gate` skill walks these sections in order and emits a verdict per check.
+The checklist a workspace change must pass before it is reported as done, plus the implementation conventions the checks encode. The `quality-gate` skill walks these sections in order and emits a verdict per check.
 
 Sections are referenced as `QG §N` elsewhere in the docs.
 
@@ -135,6 +135,8 @@ installation.
 A Rust change that satisfies Cargo can still break a Bazel dependency graph
 or a server build. No gate above subsumes another.
 
+For a plugin channel or sidecar change, the workspace gate covers Rust suites, but the guarantee crosses process and Pod boundaries. `yesno-server/tests/plugin_channel.rs` must exercise the real socket and credential or disconnect behavior, `yesno-plugin/tests/peer_process.rs` must exercise a peer in another process, and a changed `spec.plugin` resource path also needs `./scripts/gate-operator.sh` to prove the CRD reaches a working sidecar. A session-only test cannot establish server wiring, and a connected socket alone cannot establish database readiness.
+
 **A SQL fixture that asserts the right rows does not prove PostgreSQL
 pushdown happened.** Every pushdown and access-method fixture pairs its query
 with an `EXPLAIN`, so the expected plan is part of the assertion. PostgreSQL
@@ -252,6 +254,9 @@ A change must land coverage in the layer that could structurally catch its failu
 | A `ChunkStream` operator or `Expr` | `expr_equivalence.rs` — lazy vs eager vs oracle |
 | A `cardinality_dyn` override, or any "fast path" that avoids materializing | `allocation.rs` — an allocation budget, not a benchmark |
 | `rank` / `select` / `min` / `max` | `proptest_oracle.rs` mutual-inverse property |
+| Flight mixed writes or staged transactions | Ordered mixed-operation oracle plus separate-RPC commit and retry in `yesno-server/tests/write_transactions.rs`; absent or unknown commands must fail closed |
+| Plugin channel protocol or lifecycle | Real socket, separate-process peer, concurrent admission, and disconnect/rebootstrap coverage; include the operator gate when `spec.plugin` wiring changes |
+| Deferred accelerator counting | CPU-result differential plus forced decline, flush error, and cancellation paths; measure the complete public terminal separately from the kernel |
 
 Additional rules:
 

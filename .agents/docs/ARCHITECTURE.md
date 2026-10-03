@@ -216,29 +216,15 @@ yesno/
                                 #   EBS may publish a provisional lease whose materialization is
                                 #   explicitly deferred, but yesnod never launches ECS or EKS work;
                                 #   a core backup barrier excludes concurrent checkpoints.
-                                #   plugin.rs owns both plugin shapes. Channel is the
-                                #   out-of-process one: a Unix socket, one arena and one
-                                #   Session per connection, and notifications pushed to live
-                                #   peers. Closing a connection releases that peer's
-                                #   snapshots, so reclamation needs no pid, no timeout and no
-                                #   cooperation -- the property the in-process shape cannot
-                                #   have. Listeners bundles the two so the replication path
-                                #   threads one value, in the order notify-act-notify.
-                                #   plugin::wire is what main.rs calls: it builds the slot,
-                                #   the facility and the channel together, because a Host must
-                                #   read the SAME slot the startup path fills -- and it refuses
-                                #   a plugin on a standby without follower.serve_reads, which
-                                #   would bind and then answer UNAVAILABLE for the life of the
-                                #   process.
-                                #   Facility is the in-process one: when to load, and the
-                                #   ordering of the callbacks around a rebootstrap. The drain is
-                                #   why it exists -- a plugin's lease holds Arc<DbInner> and so
-                                #   the directory lock, and NO host call takes one back, so
-                                #   before_close drains and then verifies against the facility's
-                                #   own lease count rather than Db::live_readers(), which both
-                                #   over- and under-counts what a plugin holds.
-                                #   Outside default-members, so gate.sh's clippy misses it —
-                                #   run `cargo clippy -p yesno-server` explicitly.
+                                #   plugin.rs owns the served, read-only plugin channel: one
+                                #   Unix socket, one Session and optional arena per peer.
+                                #   Closing a connection releases that peer's snapshots;
+                                #   Listeners carries channel notifications and revocation
+                                #   through replication replacement. plugin::wire builds the
+                                #   channel and the SAME database slot main.rs later fills;
+                                #   it refuses a cold standby without follower.serve_reads.
+                                #   The in-process facility was removed 2026-09-29.
+                                #   gate.sh's workspace-wide Clippy includes yesno-server.
                                 #   dist/ holds the deployment artifacts: systemd unit,
                                 #   Dockerfile, annotated example configs, a dev-only
                                 #   certificate script and two-node.sh — a runnable
@@ -264,7 +250,8 @@ yesno/
                                 #   requires confirmed old-Pod absence and fails closed when that
                                 #   Kubernetes fence cannot be established. Generates the EBS
                                 #   snapshot backend per instance, resolving each volume id from
-                                #   the PersistentVolume its claim bound to.
+                                #   the PersistentVolume its claim bound to. spec.plugin adds a
+                                #   same-Pod peer with a shared socket volume but no data mount.
   yesno-pg/                     # PostgreSQL extension: FDW + index AM + table AM.
                                 #   Outside the cargo workspace AND
                                 #   built by Bazel, not cargo — a cdylib PostgreSQL dlopens is
@@ -507,6 +494,12 @@ It measures whole-query work, not merely generated instructions. The scalar core
 remains the correctness oracle, and the independent opaque-source test guards
 the planner's `None == proven empty` rule: an unreported source span must use
 the full-universe conservative bound, not `None`.
+
+### Accelerator and recurrence evidence
+
+`yesno-core::accel::Accelerator` is a host-supplied, device-neutral interface for blocked-view intersection counts; core never opens a GPU. `enqueue` either accepts a chunk's work or declines it so the caller counts on CPU. Accepted work must be returned by a fallible `flush` at `ViewIntersectionCounter::finish`; failure is an error, never a plausible undercount. `yesno-opencl` implements the backend and keeps queued residency pinned until completion or cancellation. The deferred contract exists because one launch per chunk made a correct wired implementation slower than CPU; a batched kernel timing by itself does not price the public terminal.
+
+`yesno-core::hotspot` emits a bounded, contiguous `yesno::hotspot` TRACE capture from the Flight query path. Posting-list keys come from the wire expression before lowering; shape fingerprints retain worker-thread identity because the JIT cache is thread-local. Sampling intervening accesses would invalidate reuse distance. Synthetic cache studies do not establish a production hit rate, so changing JIT or device-residency admission requires a real captured workload and a whole-query comparison against the core fallback.
 
 ### Unary NOT
 
@@ -811,11 +804,11 @@ Everything below is on-disk state for one shard. The full rationale for each dec
 
 ### The size-class ladder
 
-Eleven classes ( `MAX_CLASSES`, and the superblock's class array ends where `OFF_ROOT` begins — adding one is a format change, not a tweak ). Every entry is ≡ 0 mod 64, and slab bases are 2 MiB-aligned, so **every slot in every class is 64-byte aligned by construction**. Bitmap alignment is therefore a property of the ladder rather than a per-kind rule an allocator change could silently break.
+The current ladder has eleven classes; `MAX_CLASSES` is the superblock field capacity derived from `( OFF_ROOT - OFF_CLASSES ) / 4`, not the current ladder length. Adding a class beyond that capacity is a format change. Every entry is ≡ 0 mod 64, and slab bases are 2 MiB-aligned, so **every slot in every class is 64-byte aligned by construction**. Bitmap alignment is therefore a property of the ladder rather than a per-kind rule an allocator change could silently break. Packed classes are selected by `is_packed_class`, not by assuming they occupy a particular position; `class_for` must never return one.
 
 Two properties to preserve when editing `CLASS_SIZES`:
 
-- **8256 is exact-fit for a bitmap** ( 8192 + 8-byte trailer ) — zero internal fragmentation for the class that dominates dense data.
+- **8192 is exact-fit for a bitmap payload.** Standalone extent trailers live in a table at the slab body's tail, so bitmap slots are adjacent and OS-page aligned. The 8192-byte class holds 254 payloads per slab; the older 8256-byte inline-trailer class held 253 and left a 64-byte gap between payloads.
 - That same class also holds a full 4096-element array, so **`Array(4096) → Bitmap` promotion stays a same-class rewrite** with no slab migration. This is the hottest conversion in the system; segregating heaps by container kind would turn it into a cross-heap move, which is the main reason grouping is by *size class* and not by kind.
 
 The ladder is persisted in the superblock, not compiled in. Retuning it is therefore not a format break, and a file written by a differently-tuned binary stays readable.
@@ -823,6 +816,8 @@ The ladder is persisted in the superblock, not compiled in. Retuning it is there
 ### Packed pages
 
 Arrays and runs with payload ≤ `PACK_MAX` share a page rather than each taking a slot; bitmaps are never packed. `ChunkRef.cell` points *directly* at a payload — no per-chunk directory, no length field — because length is derivable from the reference alone. The page carries no `live_bytes` counter and is **immutable after write**, which makes it structurally incapable of violating I2 rather than merely careful about it.
+
+The standalone bitmap layout lets `unstable_arrow::dense_span` lend consecutive stored bitmap payloads as one guarded `Buffer` after checking their trailers. The read returns the contiguous prefix it can prove, stopping at a slab boundary or any non-adjacent or non-bitmap chunk; a caller may continue with another span. A memtable opinion or failed verification declines lending. This is an in-process borrowing guarantee, not a promise that an Arrow Flight request avoids network encoding or copying.
 
 **The checkpoint must `prune` before it evicts.** `evict_durable` only drops a chain reduced to a single durable version, and `prune` is the only thing that reduces one. Without it, `delete_key` followed by `insert_many` leaves `[value, tombstone]` for ever — never evicted, permanently dirty, and rewritten on every later checkpoint along with its extent. Measured at 2.57x aged amplification against 1.14x.
 
@@ -885,6 +880,18 @@ Three cost properties hold here that no correctness test can see, so all three a
 There are **no nulls anywhere**, structurally: every field is `nullable = false` and every array is built with `nulls: None`. A posting list is a set of present values, and absence is already a zero bit — a validity buffer would double the mask allocation and destroy the zero-copy handoff.
 
 Stated here, in the README and in `ChunkRef::cardinality`'s own doc — and **not implemented** until 2026-08-25. `Snapshot::cardinality` summed `merged_chunks(key)`, decoding every container first: 2 129 allocations for a 500-chunk key, against 122 for the index walk. No correctness test could see it, since both return the same number. Now guarded by `cardinality_is_answered_from_the_index_not_by_materializing` in `tests/allocation.rs`. A property this document calls headline needs a test that fails when it stops holding, or it is a wish.
+
+## Flight edge — `yesno-flight`
+
+A read `Ticket` names an immutable version and prefix range. A bare-key window reads only that range through `Snapshot::key_stream_prefix_range`; expression tickets evaluate their expression. For a whole-key request, `GetFlightInfo` mints a whole-key ticket, so its advertised count remains consistent even when a client later narrows its own ticket. The bitvector wire sends one Arrow `Binary` payload per chunk; a bare stored bitmap span can be lent to batch construction, while an expression or non-contiguous input may need a gather. Arrow IPC and the network still encode and transport the bytes.
+
+Writes have a separate lifetime. `PUT_APPLY` sends mixed point, inclusive-range, and whole-key mutations as one commit. `begin_write`, staged `DoPut` streams, and `commit_write` or `abort_write` let several requests become one `WriteBatch` and one version; operations preserve arrival order within a key, with only one staging stream active per transaction. A successful commit retry returns the original version. Absent or unknown `DoPut` commands are errors, not implicit inserts. A `WriteTxn` handle is mutable, expiring staged state rather than a read ticket, and currently acts as a bearer capability without principal binding or leader-term fencing. `yesno-server` retains one Flight service per live database instance so transactions and read leases survive separate RPCs, then replaces it on rebootstrap.
+
+## Plugin channel — `yesno-plugin`, `yesno-server`, `yesno-operator`
+
+`yesnod` alone opens the database and owns plugin snapshots. `yesno-plugin` defines the read-only frame and session protocol; `yesno-server/src/plugin.rs` binds the Unix socket, authenticates peer credentials, and manages channel lifetime. Each connection owns its snapshot handles and, when available, a sealed `memfd` arena with fixed 8,192-byte lanes; inline frames are the fallback when the arena cannot be made. The socket's mode and `SO_PEERCRED` both constrain access. Peer and per-session snapshot caps bound resource use. A notification alone is not revocation: before replacing a database, the daemon empties the slot, notifies and disconnects peers, and their sessions release their snapshots. A cold standby with `follower.serve_reads = false` refuses a configured channel.
+
+The operator's `spec.plugin` places a peer in the same Pod as `yesnod` with a shared socket `emptyDir` at `/run/yesno`; it does not mount the database directory in the peer. The peer retries `UNAVAILABLE` while the daemon starts or rebootstrap runs, and its readiness probe describes the peer's own service. A non-default peer UID requires an allow-list entry and a socket mode that admits it. Touched arena pages can count in full against both containers' cgroups, so both memory limits must cover them. The removed in-process `cdylib` table and the separate checkpoint-visible `Db::open_reader` path have different ownership and liveness contracts; neither describes a served plugin peer.
 
 ## WAL, Checkpointing, and Recovery
 
