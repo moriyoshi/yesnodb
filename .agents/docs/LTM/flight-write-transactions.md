@@ -149,3 +149,12 @@ separate finding -- that one `DoGet` per key/block is unsuitable as a scoring
 transport -- is about a remote block-read protocol and is deliberately not
 coupled to this work. Write atomicity and scoring transport are different
 questions.
+## The deployed service and the audit that made the contract true
+
+`GuardedFlight::current` originally constructed a new `YesnoFlightService` for every RPC. Its `writes` and `leases` tables were therefore discarded after `begin_write` or `GetFlightInfo`; a later `commit_write` found no transaction, and `DoGet` quietly reopened by version instead of honoring a ticket lease. The server now caches one service per database, compared by `Arc::ptr_eq` so a replica rebootstrap cannot inherit state from the previous instance. `yesno-server/tests/write_transactions.rs` sends begin, two stages, read, commit, and retry as separate RPCs through the real server and fails when the cache is removed.
+
+An external audit found that a staging call could partially apply rows before rejecting a later invalid row, and could stage rows before checking the total row bound. Decode and validation now finish before application, and the bound is checked before any row lands. Handles also used to restart at one with each service; a delayed retry after restart could then name a *different* transaction. Handles are now drawn with per-service `RandomState` to avoid that correctness collision. This does not authenticate a caller or fence a superseded leader.
+
+Committed outcomes remain a bounded in-memory `VecDeque`, so retry idempotency survives only a prompt lost response against a still-running service. It does not survive restart or eviction and cannot provide one durable yesno version per source transaction. `durable-write-transaction-idempotency` and `flight-write-transaction-ownership` remain open in `TODO.md`; state convergence from replaying idempotent set mutations is a weaker guarantee than recovering the original commit identity.
+
+The corrected `ticket_version.py` scenario asserts both that a live lease keeps a ticket valid across checkpoint and that an unpinned version is refused after the floor advances. Its old assertion expected the leased version to disappear, and passed only because leasing was unreachable in the daemon. To establish an unpinned old version, it restarts, writes a newer version, and checkpoints; restart alone does not undo the earlier lease's effect on the stored floor. This is a concrete example of a fixture encoding the bug it meant to test.

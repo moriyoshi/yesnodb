@@ -15,9 +15,9 @@
 # `libc` was added to `yesno-core` for one `fallocate` call, taking the counts to
 # 6 and 37. CI went red and stayed red for 25 commits, because the local gate
 # that everyone actually runs before reporting a change had no equivalent check
-# and could not see it. The repair is one implementation with two callers; see
-# `gate-clippy-saw-two-crates` in .agents/docs/JOURNAL.md for the same shape,
-# where the tool was fixed and its written instructions were not.
+# and could not see it. The repair is one implementation with two callers.
+# The same drift once affected Clippy: its script was fixed to cover the whole
+# workspace while the written hand-run command still covered only two crates.
 #
 # # Do not raise these to make a change pass
 #

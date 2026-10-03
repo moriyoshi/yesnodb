@@ -1,11 +1,17 @@
-# An Out-of-Process Plugin: What Is Already Built, and the One Thing That Is Not
+# Out-of-Process Plugin and Foreign-Reader Boundary
+
+**Current state:** the shared-directory exploration below was superseded by a
+`yesnod`-served Unix-socket plugin channel; the in-process `cdylib` ABI was
+removed. The PID-namespace liveness defect on the separate foreign-reader path
+was fixed with per-slot locks. Read the original exploration as the reasoning
+that led to the served channel, not as a description of what remains to build.
 
 Explored 2026-09-28, against the in-process design in
 [`hosted-plugin-abi-design.md`](./hosted-plugin-abi-design.md). The question asked
 was whether a shared-memory IPC plugin infrastructure could let a third-party
 server run in a separate process, even a separate container.
 
-## The short answer
+## Original short answer ( historical )
 
 **For a separate process on one host, almost nothing needs building, and shared
 memory is the wrong tool for the data plane.** The data is already file-backed:
@@ -75,7 +81,7 @@ process boundary dissolves all three.
 Against that, in-process keeps two things: reads as fresh as the memtable, and no
 IPC on the control path.
 
-## The container problem
+## The container problem as first assessed ( historical )
 
 Liveness is `kill( pid, 0 )` followed by a start-time comparison read from
 `/proc/<pid>/stat`. **Both are PID-namespace-relative**, so across containers:
@@ -165,7 +171,7 @@ encodings, not a margin -- so a handle's arena is `lanes * 8192` with no allocat
 and that **lane `i` always lives at `arena_off + i * LANE_BYTES`**, so no offset
 travels on the wire and the two sides cannot disagree about where a lane is.
 
-## Recommendation
+## Original recommendation ( superseded )
 
 **Prefer the out-of-process shape, and do not build an SHM data plane.** The data
 plane already exists through the filesystem, the control plane already exists over
@@ -177,3 +183,17 @@ more honest surface than a shared-memory protocol.
 Keep the in-process ABI: it is built, gated and the right answer where
 checkpoint lag is unacceptable. But it should be the exception rather than the
 default, and the in-process design document should say so.
+
+The served channel replaced this recommendation: the peer does not open or map
+the database directory, payloads travel through a sealed `memfd` arena or inline
+frames, and the in-process ABI no longer exists. See
+[Plugin Channel Protocol and Security](plugin-channel-protocol-and-security.md)
+and [Removed cdylib Plugin ABI](removed-cdylib-plugin-abi.md).
+
+## Foreign-reader liveness after the PID-namespace defect
+
+The served plugin channel does not register a foreign reader: `yesnod` owns each snapshot, and closing the peer socket drops the session. The separate shared-directory reader path still needs a liveness test that works across PID namespaces. `kill( pid, 0 )` and `/proc/<pid>/stat` use namespace-relative pids and could falsely declare a live container reader dead, releasing its reclamation floor.
+
+`db::readers` now holds a `flock` on `READERS.locks/<slot>` for each registration. A slot is live if the old pid test **or** the lock says it is live, preserving compatibility with readers from older builds. A failed open or lock probe answers "held"; only an absent lock file or a successfully acquired probe lock proves no holder. Lock files are never unlinked, because unlinking creates a new inode that a probe could lock while the original holder still owns the old one. Separate opens in one process conflict under `flock`, unlike classic per-process `fcntl` record locks. Advisory locking requires a reliable local filesystem; the code keeps pid-only protection when locking is unavailable rather than refusing an otherwise working reader.
+
+Tests forge a pid identity that positively refutes while a lock remains held, then show that the slot stays live. Companion cases cover registration drop, a leftover unlocked file, and an older registration with no lock file. The refuted-pid test fails when the lock half is removed. This closes the recorded PID-namespace defect for the foreign-reader path; the plugin channel's own socket-close reclamation remains the simpler and stronger mechanism for served peers.

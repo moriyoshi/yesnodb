@@ -577,3 +577,12 @@ wrong timing. The Mac probe is
 `clang -O3 -march=native -Wno-deprecated-declarations mac.c -framework OpenCL`;
 OpenCL is deprecated on macOS and still functional, and was chosen because this
 is a probe rather than a product.
+## Production-shaped offload and the deferred contract
+
+The satellite with the OpenCL backend is named `yesno-opencl` ( earlier journal entries call it `yesno-gpu` ). It plugs into `ViewIntersectionCounter::count_blocked`. The first synchronous hook was correct but slower than CPU for five of six measured shapes. At 256 chunks and 64 filters, CPU took 8.71 ms and the wired OpenCL path took 10.01 ms ( 0.87x ), despite a batched kernel taking only 0.245 ms. A controlled one-launch-per-chunk kernel took 4.082 ms, isolating 3.8 ms of launch granularity; the remaining roughly 5.9 ms came from per-chunk host plumbing. The earlier 6.71x-11.08x kernel result was never an end-to-end claim.
+
+The first repair kept filters resident by `filters_epoch`, removing a redundant 8 KiB copy per chunk. The decisive repair changed `Accelerator` to enqueue-and-flush: `enqueue` either accepts ownership of a chunk or declines, and a fallible `flush` returns all accepted counts at `finish`. A failed flush must error rather than silently undercount. Residency pins queued slots; eviction skips pins and a full pinned cache declines. Dropping an unfinished counter cancels the scan and releases pins.
+
+On the same 256-chunk, 64-filter corpus, the deferred path measured CPU 8.60 ms, warm OpenCL 3.35 ms median ( 2.56x ), host-backend control 11.28 ms, and cold fill 8.15 ms. The warm range was 1.61-4.71 ms, so the ratio should not be quoted without its spread. A first version appeared to take 31 ms because `flush` allocated a fresh 4 MiB output on each call; driver readback faulted the new pages, and glibc's changing mmap threshold produced a repeatable slow-then-fast pattern. Reusing the buffer made `run_batch` steady at 0.32-0.39 ms. The `u32`-to-`u64` accumulation already compiles to four-wide NEON `uaddw` at about 0.33 ns per element; rewriting it as `zip` did not help.
+
+This result is specific to a blocked-view batch on the GB10 host. The core constraint for future device backends is the deferred ownership and error contract; a kernel timing alone does not price the scan. CUDA and OpenCL measured within 0.99x-1.03x on that device, so the API choice was about reach rather than throughput.

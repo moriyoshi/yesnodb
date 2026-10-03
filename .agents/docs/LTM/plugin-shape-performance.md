@@ -203,3 +203,10 @@ cache, and the `memfd` handshake, which happens once per connection.
 The machine was noisy throughout: arm A varied 95 to 150 us for identical work
 across runs. Between-arm comparisons within one run are sound; comparisons of
 absolute numbers across runs are not.
+## Direct encoding into the arena
+
+A consumer patch measured encoding container payloads directly into mapped arena slots instead of allocating a per-lane `Vec` and copying it. In a separate-process D=256, 262,144-document, 265-lane, 600-search A-B-B-A experiment, daemon arena CPU moved from 4.12/4.04 to 3.27/3.23 s and whole-process VmHWM from 41,248/40,492 to 31,460/32,076 KiB. Its inline control stayed near 3.5 s, supporting attribution to the arena path; all 3,200 full-hit comparisons matched embedded. Wall-clock cells failed the quiet-host gate, so those data support a CPU and memory finding, not a latency claim.
+
+The integration uses one `encode_into( dst, container ) -> Lane` for arena and inline destinations and for single and batched advances. Keeping a separate direct encoder would duplicate the run `( start, len_minus_1 )` to inclusive-end conversion that had already produced a silent wrong answer. A byte scratch destination may be unaligned even when arena slots are word-aligned, so the bitmap writer has an aligned word path and a byte fallback; `a_lane_is_the_same_bytes_at_any_alignment` forces both and was sabotage-checked by reversing endianness in the fallback. The previous comment claiming disjoint `handles` and `arena` fields could not be borrowed together was false.
+
+The final integration passed 55 plugin tests, `gate.sh`, and `gate-operator.sh`. A matched local latency re-measurement on a quiet host remains open; the source patch's wall-clock readings did not meet that condition.
