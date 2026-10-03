@@ -338,3 +338,58 @@ fn a_watching_peer_sees_a_write_that_came_after_it_started() {
         "a watching peer must re-open a snapshot and see the later write"
     );
 }
+
+/// A peer in its own process **writes**, and the host's database has the ordinals.
+///
+/// # Why this is worth a second process
+///
+/// `yesno-server`'s `a_peer_writes_and_reads_over_one_socket` already proves the frame
+/// survives a real socket. This proves the *worked example* does, which is a different
+/// claim: `yesno-channel-peer` is the artefact a consumer is pointed at, and until
+/// 2026-10-04 it could only scan -- so anyone modelling a peer on it would have concluded
+/// the socket cannot write and reached for a second transport. A broken example is worse
+/// than none, because it is copied.
+///
+/// The assertion is against the **host's** database rather than the peer's output, so a peer
+/// that printed a plausible version without committing anything would fail.
+#[test]
+fn a_separate_process_writes_and_the_host_sees_it() {
+    let (_c, sock, db) = serve("write", &[10]);
+    let before = db.snapshot().unwrap().cardinality(55).unwrap();
+    assert_eq!(before, 0, "key 55 is untouched by the fixture");
+
+    let out = std::process::Command::new(peer_binary())
+        .arg("--write")
+        .arg(&sock)
+        .arg("55")
+        .args(["7", "11", "13"])
+        .output()
+        .expect("the peer binary must run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "peer failed: {}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("committed version") && stdout.contains("changed 3"),
+        "the peer must report what it committed, got {stdout:?}"
+    );
+    // The scan it runs afterwards is over the key it just wrote, on the same connection.
+    assert!(
+        stdout.contains("cardinality 3"),
+        "a snapshot opened after the commit must see it, got {stdout:?}"
+    );
+
+    assert_eq!(
+        db.snapshot().unwrap().cardinality(55).unwrap(),
+        3,
+        "the host's database must hold what another process wrote"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.live_readers() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(db.live_readers(), 0, "and it released its snapshot on exit");
+}

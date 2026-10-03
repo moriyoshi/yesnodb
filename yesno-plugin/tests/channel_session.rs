@@ -70,7 +70,7 @@ fn setup(tag: &str) -> (Clean, Host, Session) {
 fn greet(s: &mut Session) {
     assert_eq!(
         s.handle(Frame::ClientHello {
-            protocol: 1,
+            protocol: yesno_plugin::ipc::VERSION as u32,
             name: "t".into()
         }),
         Frame::Done
@@ -100,7 +100,7 @@ fn the_greeting_declares_the_arena_and_the_limits() {
             max_handles,
             max_blocks,
         } => {
-            assert_eq!(protocol, 1);
+            assert_eq!(protocol, yesno_plugin::ipc::VERSION as u32);
             assert_eq!(generation, 1);
             assert_eq!(role, yesno_plugin::ipc::Role::Leader);
             assert_eq!(shards, 1);
@@ -692,7 +692,11 @@ fn the_arena_descriptor_crosses_the_socket_and_names_the_same_memory() {
 
     send_fd(&tx, arena.as_fd()).unwrap();
     let (got, version) = recv_fd(&rx).unwrap();
-    assert_eq!(version, 1, "the byte carries the protocol version");
+    assert_eq!(
+        version,
+        yesno_plugin::ipc::VERSION,
+        "the byte carries the protocol version"
+    );
 
     // Write through the sender's mapping after the descriptor was sent.
     arena.write_at_for_test(0, &[0xAB, 0xCD]);
@@ -1432,5 +1436,299 @@ fn a_session_may_not_open_snapshots_without_bound() {
     assert!(
         matches!(s.handle(Frame::SnapshotOpen), Frame::SnapshotOpened { .. }),
         "a released snapshot must free its slot"
+    );
+}
+
+// ---------------------------------------------------------------- writes
+
+use yesno_plugin::ipc::{Write, WriteOp};
+
+fn w(key: u64, lo: u64, hi: u64, op: WriteOp) -> Write {
+    Write { key, lo, hi, op }
+}
+
+/// A peer writes ordinals and reads back exactly what it wrote.
+///
+/// This is the capability the channel lacked until 2026-10-04: a peer could read everything
+/// and write nothing, so a consumer binding this socket still needed Flight to be useful.
+///
+/// Every operation is exercised in one batch, because the server maps each discriminant by
+/// hand and a batch of inserts alone would not notice four of the five being wrong. The
+/// ordering within a batch is load-bearing and asserted: `DeleteKey` followed by `Insert`
+/// on the same key must mean replacement, which is only true if entries are applied in
+/// arrival order rather than grouped by operation.
+#[test]
+fn a_peer_writes_ordinals_and_reads_them_back() {
+    let (_c, _host, mut s) = setup("write");
+    greet(&mut s);
+
+    let committed = s.handle(Frame::Apply {
+        writes: vec![
+            w(100, 5, 5, WriteOp::Insert),
+            w(100, 9, 9, WriteOp::Insert),
+            w(100, 5, 5, WriteOp::Remove),
+            w(101, 1_000, 1_100, WriteOp::InsertRange),
+            w(101, 1_050, 1_060, WriteOp::RemoveRange),
+            // Replacement, not addition: the delete must take effect before the insert.
+            w(10, 0, 0, WriteOp::DeleteKey),
+            w(10, 42, 42, WriteOp::Insert),
+        ],
+    });
+    let version = match committed {
+        Frame::Committed { version, changed } => {
+            assert!(changed > 0, "the batch changed something");
+            version
+        }
+        other => panic!("expected Committed, got {other:?}"),
+    };
+    assert!(version > 0, "a commit names a version");
+
+    // Read it back through the channel's own read path, which is the point: one socket.
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("expected SnapshotOpened, got {other:?}"),
+    };
+    let count =
+        |s: &mut Session, key: u64| match s.handle(Frame::SnapshotCardinality { snapshot, key }) {
+            Frame::Count { value } => value,
+            other => panic!("expected Count, got {other:?}"),
+        };
+    let has = |s: &mut Session, key: u64, ordinal: u64| match s.handle(Frame::SnapshotContains {
+        snapshot,
+        key,
+        ordinal,
+    }) {
+        Frame::Bool { value } => value == 1,
+        other => panic!("expected Bool, got {other:?}"),
+    };
+
+    assert_eq!(count(&mut s, 100), 1, "one insert survived the removal");
+    assert!(has(&mut s, 100, 9));
+    assert!(!has(&mut s, 100, 5), "the removal applied in order");
+    assert_eq!(count(&mut s, 101), 101 - 11, "the range minus the hole");
+    assert!(has(&mut s, 101, 1_000) && has(&mut s, 101, 1_100));
+    assert!(!has(&mut s, 101, 1_055));
+    assert_eq!(
+        count(&mut s, 10),
+        1,
+        "DeleteKey then Insert is replacement; the fixture's nine ordinals are gone"
+    );
+    assert!(has(&mut s, 10, 42));
+}
+
+/// Replaying a batch leaves the same state, which is what lets this channel have no
+/// transaction identity.
+///
+/// The recorded objection to writes here was that extending the channel "requires a
+/// transaction identity, an unambiguous commit point, and a response for a disconnect after
+/// commit". Identity exists to make a retry safe when the first attempt may already have
+/// landed. Every `WriteOp` is idempotent and a frame's entries are ordered, so a replayed
+/// frame leaves the state it would have left anyway -- asserted here on a batch containing
+/// all five operations, including the `DeleteKey`-then-`Insert` pair that is the least
+/// obviously idempotent.
+///
+/// **This test is the argument.** If the state check ever fails, the no-identity design is
+/// wrong, not the test.
+///
+/// # `changed` is not a state-equality signal, and assuming it was cost a wrong assertion
+///
+/// This test first asserted `changed == 0` on the replay and failed with `changed == 5`.
+/// That reading was wrong: `changed` counts operations that altered the set **as they were
+/// applied**, and on a replay the leading `DeleteKey` really does remove what the previous
+/// run inserted, after which the inserts really do add it back. Five operations each change
+/// something and the net state is untouched. Idempotence is a claim about the state a frame
+/// leaves, not about the work it does getting there -- so the state comparison below is the
+/// assertion that matters, and the additive batch is where `changed == 0` is a real
+/// property.
+#[test]
+fn replaying_a_write_batch_changes_nothing_the_second_time() {
+    let (_c, _host, mut s) = setup("replay");
+    greet(&mut s);
+
+    let batch = || Frame::Apply {
+        writes: vec![
+            w(10, 0, 0, WriteOp::DeleteKey),
+            w(10, 42, 42, WriteOp::Insert),
+            w(10, 7, 7, WriteOp::Insert),
+            w(10, 42, 42, WriteOp::Remove),
+            w(11, 100, 200, WriteOp::InsertRange),
+            w(11, 150, 150, WriteOp::RemoveRange),
+        ],
+    };
+
+    let first = s.handle(batch());
+    let v1 = match first {
+        Frame::Committed { version, .. } => version,
+        other => panic!("expected Committed, got {other:?}"),
+    };
+    let fingerprint = |s: &mut Session| {
+        let snapshot = match s.handle(Frame::SnapshotOpen) {
+            Frame::SnapshotOpened { snapshot, .. } => snapshot,
+            other => panic!("{other:?}"),
+        };
+        // The ordinals themselves, not their count: two different sets of the same size
+        // would compare equal and the replay could have moved a bit without being noticed.
+        let mut out: Vec<(u64, Vec<u64>)> = Vec::new();
+        for key in [10u64, 11] {
+            let mut ords = Vec::new();
+            let mut after = None;
+            loop {
+                let frame = s.handle(Frame::SnapshotLoad {
+                    snapshot,
+                    key,
+                    after: after.unwrap_or(0),
+                    has_after: u8::from(after.is_some()),
+                    limit: 4096,
+                });
+                match frame {
+                    Frame::Ordinals { values, more } => {
+                        after = values.last().copied();
+                        ords.extend(values);
+                        if more == 0 {
+                            break;
+                        }
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            out.push((key, ords));
+        }
+        s.handle(Frame::SnapshotClose { snapshot });
+        out
+    };
+    let after_first = fingerprint(&mut s);
+
+    let second = s.handle(batch());
+    match second {
+        Frame::Committed { version, .. } => {
+            assert!(version >= v1, "versions do not go backwards")
+        }
+        other => panic!("expected Committed, got {other:?}"),
+    }
+    assert_eq!(
+        fingerprint(&mut s),
+        after_first,
+        "the replay altered the database"
+    );
+
+    // **Where `changed == 0` *is* the property**: a batch that only adds. Replaying it
+    // touches nothing at all, which is the common retry shape -- a peer re-sending ordinals
+    // it is not sure landed.
+    let additive = || Frame::Apply {
+        writes: vec![
+            w(12, 1, 1, WriteOp::Insert),
+            w(12, 2, 2, WriteOp::Insert),
+            w(12, 500, 600, WriteOp::InsertRange),
+        ],
+    };
+    match s.handle(additive()) {
+        Frame::Committed { changed, .. } => assert!(changed > 0, "the first apply writes"),
+        other => panic!("{other:?}"),
+    }
+    match s.handle(additive()) {
+        Frame::Committed { changed, .. } => assert_eq!(
+            changed, 0,
+            "replaying an additive batch must change nothing, got {changed}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A follower refuses writes, and says why.
+///
+/// A replica that applied a local write would diverge from its leader with nothing able to
+/// detect it: replication ships the leader's log, so the extra data is neither overwritten
+/// nor reported. `Status::WrongRole` already existed for this shape.
+///
+/// The role is flipped on the live `Host`, not configured at setup, because that is how it
+/// changes in production -- a failover moves it under a connected peer, which then gets this
+/// refusal and the `RoleChanged` notification.
+#[test]
+fn a_follower_refuses_a_write_and_a_promotion_allows_it() {
+    let (_c, host, mut s) = setup("role");
+    greet(&mut s);
+
+    host.set_role(Role::Follower);
+    match s.handle(Frame::Apply {
+        writes: vec![w(100, 5, 5, WriteOp::Insert)],
+    }) {
+        Frame::Fault { status, message } => {
+            assert_eq!(
+                status,
+                yesno_plugin::abi::Status::WrongRole as u32,
+                "a follower's refusal must be WRONG_ROLE, not a generic error"
+            );
+            assert!(
+                message.contains("follower"),
+                "the refusal must say what is wrong, got {message:?}"
+            );
+        }
+        other => panic!("a follower must refuse a write, got {other:?}"),
+    }
+
+    // Nothing landed.
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        s.handle(Frame::SnapshotCardinality { snapshot, key: 100 }),
+        Frame::Count { value: 0 },
+        "the refused write must not have been applied"
+    );
+    s.handle(Frame::SnapshotClose { snapshot });
+
+    // Promotion makes the same batch work, so the refusal was the role and not the batch.
+    host.set_role(Role::Leader);
+    match s.handle(Frame::Apply {
+        writes: vec![w(100, 5, 5, WriteOp::Insert)],
+    }) {
+        Frame::Committed { changed, .. } => assert_eq!(changed, 1),
+        other => panic!("a leader must accept the write, got {other:?}"),
+    }
+}
+
+/// Each malformed entry is refused by its own rule, and nothing from the batch is applied.
+///
+/// `WriteBatch` has no rollback, so validation has to complete before anything is staged --
+/// the same discipline the Flight path needed after an audit found a caller could commit
+/// work the server had reported as refused.
+#[test]
+fn a_malformed_write_is_refused_and_stages_nothing() {
+    let (_c, _host, mut s) = setup("malformed");
+    greet(&mut s);
+
+    let cases: Vec<(&str, Write)> = vec![
+        ("point with a range", w(100, 5, 9, WriteOp::Insert)),
+        ("point removal with a range", w(100, 5, 9, WriteOp::Remove)),
+        ("inverted range", w(100, 9, 5, WriteOp::InsertRange)),
+        ("inverted range removal", w(100, 9, 5, WriteOp::RemoveRange)),
+        (
+            "whole-key delete with bounds",
+            w(100, 1, 1, WriteOp::DeleteKey),
+        ),
+    ];
+    for (what, bad) in cases {
+        // A good entry first, so a refusal that staged it would be visible below.
+        match s.handle(Frame::Apply {
+            writes: vec![w(100, 1, 1, WriteOp::Insert), bad],
+        }) {
+            Frame::Fault { status, .. } => assert_eq!(
+                status,
+                yesno_plugin::abi::Status::InvalidArgument as u32,
+                "{what} must be INVALID_ARGUMENT"
+            ),
+            other => panic!("{what} must be refused, got {other:?}"),
+        }
+    }
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        s.handle(Frame::SnapshotCardinality { snapshot, key: 100 }),
+        Frame::Count { value: 0 },
+        "a refused batch must stage none of itself, including its valid entries"
     );
 }

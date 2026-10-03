@@ -2,7 +2,7 @@
 
 ## Summary
 
-`yesnod` serves read-only plugin peers over a Unix socket while retaining sole ownership of the database directory and snapshots. Each connection owns a session and, when available, a sealed `memfd` arena; socket closure lets the daemon revoke its snapshots even if the peer does not cooperate. The protocol, admission limits, and cutover order are part of the correctness boundary, not merely deployment settings.
+`yesnod` serves plugin peers over a Unix socket -- reads throughout, and writes as one atomic frame since 2026-10-04 -- while retaining sole ownership of the database directory and snapshots. Each connection owns a session and, when available, a sealed `memfd` arena; socket closure lets the daemon revoke its snapshots even if the peer does not cooperate. The protocol, admission limits, and cutover order are part of the correctness boundary, not merely deployment settings.
 
 ## Key Facts
 
@@ -29,7 +29,17 @@ The inline fallback sends payloads in frames when an arena cannot be created, in
 
 `ipc::MAX_LANES = 4096` bounds decode structure; it is distinct from the server's advertised lane budget, whose default is 1024. A 265-lane query can use three 128-lane handles on **one** snapshot, preserving a single version. Using a second snapshot for overflow could straddle a checkpoint. The inline greeting instead advertises the smaller limit its frame capacity supports.
 
-The channel is read-only. Write batches still enter through Flight `PUT_APPLY` and control `Checkpoint`. Extending this channel to writes requires a transaction identity, an unambiguous commit point, and a response for a disconnect after commit; socket-close reclamation does not answer those questions.
+**The channel serves writes as of 2026-10-04**, as a single `Apply` frame carrying up to `MAX_WRITES` entries and answered by `Committed { version, changed }`. The three prerequisites recorded here previously -- a transaction identity, an unambiguous commit point, and a response for a disconnect after commit -- are answered by that shape rather than waived:
+
+- **Identity** exists so a retry is safe when the first attempt may already have landed. Every write op is idempotent and a frame's entries are applied in arrival order, so replaying a frame leaves the state it would have left anyway. There is no non-idempotent retry for an identity to make safe.
+- **The commit point** is the frame: one `Apply` is one `WriteBatch::commit`, and the version it produced is in the reply. Nothing is staged, so no commit point can be in doubt.
+- **A disconnect after commit** needs no stored reply: the peer retries, which is safe by the first point, or reads the key back, since the same socket serves reads and `SnapshotOpened` carries a version.
+
+What the shape does **not** offer is atomicity across frames -- a batch wider than one frame is several commits, as Flight's `PUT_INSERT` is per record batch. A caller needing one atomic bundle wider than a frame still wants Flight `PUT_APPLY`. That is the deliberate price of not needing the three answers above; a multi-frame transaction here would reintroduce every one of them.
+
+Two refusals are part of the boundary. A **follower** refuses with `WRONG_ROLE`: a replica that applied a local write would diverge from its leader with nothing able to detect it, since replication ships the leader's log and the extra data is neither overwritten nor reported. An **empty slot** refuses with `UNAVAILABLE` rather than waiting, because blocking would hold a serving thread across an unbounded operation. Admission remains the uid check at connect time: a peer permitted to connect may write, on the same footing as its existing permission to read everything.
+
+A replay changes state zero times but `changed` is not zero -- it counts operations that altered the set as they were applied, so a replayed `DeleteKey` followed by inserts reports work done while leaving the state untouched. Idempotence is a claim about the state a frame leaves, not the work it does getting there. For a purely additive batch, which is the common retry shape, `changed` is zero.
 
 ### Admission, access, and cutover
 

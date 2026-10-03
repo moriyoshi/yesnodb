@@ -22,9 +22,18 @@
 //! # Usage
 //!
 //! ```text
-//! yesno-channel-peer <socket> <key>...          # scan, print the cardinality
-//! yesno-channel-peer --hold <socket> <key>...   # scan, then hold and wait
+//! yesno-channel-peer <socket> <key>...                  # scan, print the cardinality
+//! yesno-channel-peer --hold <socket> <key>...           # scan, then hold and wait
+//! yesno-channel-peer --write <socket> <key> <ord>...    # insert, then scan that key
 //! ```
+//!
+//! `--write` exists because the worked example should show the whole surface: the channel
+//! served reads only until 2026-10-04, and a consumer reading this file would otherwise
+//! still conclude it needs a second transport to be useful. It inserts each ordinal under
+//! `key` in **one** `Apply` frame, prints the version the commit produced, and then scans
+//! the same key over the same connection -- which is the shape worth copying, because it
+//! shows the two directions sharing one descriptor and a snapshot opened after a commit
+//! seeing it.
 //!
 //! `--hold` keeps the snapshot open and blocks for ever, so a caller can kill the
 //! process and observe what the server does about it. It prints `holding` first,
@@ -52,9 +61,10 @@ impl Peer {
     fn connect(path: &str) -> std::io::Result<Peer> {
         let sock = std::os::unix::net::UnixStream::connect(path)?;
         let (fd, version) = recv_fd(&sock)?;
-        if version != 1 {
+        if version != yesno_plugin::ipc::VERSION {
             return Err(std::io::Error::other(format!(
-                "server speaks protocol {version}, this peer speaks 1"
+                "server speaks protocol {version}, this peer speaks {}",
+                yesno_plugin::ipc::VERSION
             )));
         }
         let file = std::fs::File::from(fd);
@@ -158,6 +168,8 @@ fn open_snapshot(peer: &mut Peer) -> std::io::Result<u64> {
 enum Mode {
     /// Scan once, print the total, exit.
     Once,
+    /// Insert the given ordinals under the key in one frame, then scan it.
+    Write,
     /// Scan once and keep the snapshot open until the socket closes.
     Hold,
     /// Re-open a snapshot on an interval, announcing each answer.
@@ -180,11 +192,15 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mode, rest) = match args.split_first() {
         Some((first, rest)) if first == "--hold" => (Mode::Hold, rest),
+        Some((first, rest)) if first == "--write" => (Mode::Write, rest),
         Some((first, rest)) if first == "--watch" => (Mode::Watch, rest),
         _ => (Mode::Once, &args[..]),
     };
     let Some((path, keys)) = rest.split_first() else {
-        eprintln!("usage: yesno-channel-peer [--hold|--watch] <socket> <key>...");
+        eprintln!(
+            "usage: yesno-channel-peer [--hold|--watch] <socket> <key>...\n\
+             \x20      yesno-channel-peer --write <socket> <key> <ordinal>..."
+        );
         return std::process::ExitCode::from(2);
     };
     let keys: Vec<u64> = match keys.iter().map(|k| k.parse()).collect() {
@@ -194,6 +210,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    if mode == Mode::Write && keys.len() < 2 {
+        eprintln!("--write needs a key and at least one ordinal");
+        return std::process::ExitCode::from(2);
+    }
 
     match run(path, &keys, mode) {
         Ok(total) => {
@@ -210,7 +230,7 @@ fn main() -> std::process::ExitCode {
 fn run(path: &str, keys: &[u64], mode: Mode) -> std::io::Result<u64> {
     let mut peer = Peer::connect(path)?;
     match peer.recv()? {
-        Frame::ServerHello { protocol: 1, .. } => {}
+        Frame::ServerHello { protocol, .. } if protocol == yesno_plugin::ipc::VERSION as u32 => {}
         other => {
             return Err(std::io::Error::other(format!(
                 "unexpected greeting {other:?}"
@@ -218,12 +238,42 @@ fn run(path: &str, keys: &[u64], mode: Mode) -> std::io::Result<u64> {
         }
     }
     peer.ask(Frame::ClientHello {
-        protocol: 1,
+        protocol: yesno_plugin::ipc::VERSION as u32,
         name: "yesno-channel-peer".into(),
     })?;
 
+    // The write comes first and the scan that follows is the demonstration: a snapshot
+    // opened after the commit must see it.
+    let keys = if mode == Mode::Write {
+        let (key, ordinals) = keys.split_first().expect("checked in main");
+        let writes = ordinals
+            .iter()
+            .map(|&o| yesno_plugin::ipc::Write {
+                key: *key,
+                lo: o,
+                hi: o,
+                op: yesno_plugin::ipc::WriteOp::Insert,
+            })
+            .collect();
+        match peer.ask(Frame::Apply { writes })? {
+            Frame::Committed { version, changed } => {
+                println!("committed version {version}, changed {changed}");
+            }
+            // `WRONG_ROLE` here is the interesting failure and deserves to be legible: it
+            // means this peer is talking to a follower, and the write belongs at the leader.
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "the write was refused: {other:?}"
+                )))
+            }
+        }
+        vec![*key]
+    } else {
+        keys.to_vec()
+    };
+
     loop {
-        let total = scan_once(&mut peer, keys, mode)?;
+        let total = scan_once(&mut peer, &keys, mode)?;
         if mode != Mode::Watch {
             return Ok(total);
         }
@@ -274,7 +324,9 @@ fn scan_once(peer: &mut Peer, keys: &[u64], mode: Mode) -> std::io::Result<u64> 
     }
 
     match mode {
-        Mode::Once => {}
+        // `Write` has already printed its commit; the scan it then runs behaves like
+        // `Once`, which is the whole point -- the read path is unchanged by the write.
+        Mode::Once | Mode::Write => {}
         Mode::Hold => {
             // Snapshot deliberately still open. Announce it, then block: whoever
             // started this wants to kill it and watch the server clean up.

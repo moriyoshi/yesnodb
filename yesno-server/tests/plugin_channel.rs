@@ -36,7 +36,11 @@ impl Peer {
         let sock = std::os::unix::net::UnixStream::connect(path).unwrap();
         // The descriptor arrives first, before any frame.
         let (fd, version) = recv_fd(&sock).unwrap();
-        assert_eq!(version, 1, "the handoff byte carries the protocol version");
+        assert_eq!(
+            version,
+            yesno_plugin::ipc::VERSION,
+            "the handoff byte carries the protocol version"
+        );
         let f = std::fs::File::from(fd);
         let view = unsafe { memmap2::Mmap::map(&f) }.unwrap();
         Peer {
@@ -143,7 +147,7 @@ fn a_peer_scans_through_the_socket_and_the_arena() {
 
     assert_eq!(
         peer.ask(Frame::ClientHello {
-            protocol: 1,
+            protocol: yesno_plugin::ipc::VERSION as u32,
             name: "test-peer".into()
         }),
         Frame::Done
@@ -243,7 +247,7 @@ fn a_vanished_peer_releases_its_snapshots() {
     let mut peer = Peer::connect(&sock);
     assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
     peer.ask(Frame::ClientHello {
-        protocol: 1,
+        protocol: yesno_plugin::ipc::VERSION as u32,
         name: "doomed".into(),
     });
     let snapshot = match peer.ask(Frame::SnapshotOpen) {
@@ -281,7 +285,7 @@ fn stopping_the_channel_releases_a_well_behaved_peer_too() {
     let mut peer = Peer::connect(&sock);
     assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
     peer.ask(Frame::ClientHello {
-        protocol: 1,
+        protocol: yesno_plugin::ipc::VERSION as u32,
         name: "polite".into(),
     });
     peer.ask(Frame::SnapshotOpen);
@@ -381,7 +385,7 @@ fn a_peer_is_served_inline_when_the_host_has_no_arena() {
         &mut sock_raw,
         &mut buf,
         Frame::ClientHello {
-            protocol: 1,
+            protocol: yesno_plugin::ipc::VERSION as u32,
             name: "inline-peer".into(),
         },
     );
@@ -554,7 +558,7 @@ fn a_rebootstrap_disconnects_a_peer_that_ignores_the_announcement() {
     let mut peer = Peer::connect(&sock);
     assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
     peer.ask(Frame::ClientHello {
-        protocol: 1,
+        protocol: yesno_plugin::ipc::VERSION as u32,
         name: "silent".into(),
     });
     peer.ask(Frame::SnapshotOpen);
@@ -738,7 +742,7 @@ fn a_peer_arriving_during_a_cutover_cannot_open_a_snapshot() {
     let mut late = Peer::connect(&sock);
     assert!(matches!(late.read_frame(), Frame::ServerHello { .. }));
     late.ask(Frame::ClientHello {
-        protocol: 1,
+        protocol: yesno_plugin::ipc::VERSION as u32,
         name: "late".into(),
     });
     match late.ask(Frame::SnapshotOpen) {
@@ -800,5 +804,87 @@ fn simultaneous_connects_cannot_exceed_the_peer_cap() {
     }
     assert!(worst <= 3, "peak admitted was {worst}");
     drop(held);
+    channel.stop();
+}
+
+/// A peer writes and reads over **one real socket**, which is the point of the change.
+///
+/// The session tests call `Session::handle` directly and so prove the semantics; this proves
+/// the wiring. It matters separately because the frame has to survive encoding, the socket's
+/// bounded writer, and the generic serving loop -- and because the claim being made is that
+/// a consumer can bind this socket and need nothing else, which is a statement about the
+/// socket rather than about the session object.
+///
+/// The read-back goes through the same connection, so a passing run demonstrates both
+/// directions on one descriptor.
+#[test]
+fn a_peer_writes_and_reads_over_one_socket() {
+    let (_c, cfg, host, sock, _slot) = setup("rw");
+    let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+
+    let mut peer = Peer::connect(&sock);
+    assert!(matches!(peer.read_frame(), Frame::ServerHello { .. }));
+    peer.ask(Frame::ClientHello {
+        protocol: yesno_plugin::ipc::VERSION as u32,
+        name: "writer".into(),
+    });
+
+    use yesno_plugin::ipc::{Write, WriteOp};
+    let version = match peer.ask(Frame::Apply {
+        writes: vec![
+            Write {
+                key: 77,
+                lo: 1,
+                hi: 1,
+                op: WriteOp::Insert,
+            },
+            Write {
+                key: 77,
+                lo: 1_000,
+                hi: 1_010,
+                op: WriteOp::InsertRange,
+            },
+        ],
+    }) {
+        Frame::Committed { version, changed } => {
+            assert_eq!(changed, 12, "one ordinal plus eleven in the range");
+            version
+        }
+        other => panic!("expected Committed, got {other:?}"),
+    };
+
+    // A snapshot opened *after* the commit must see it, and its version must not predate
+    // the write -- which is what makes the two directions usable together rather than
+    // merely both present.
+    let snapshot = match peer.ask(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened {
+            snapshot,
+            version: v,
+        } => {
+            assert!(
+                v >= version,
+                "a snapshot taken after the commit must not predate it: {v} < {version}"
+            );
+            snapshot
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        peer.ask(Frame::SnapshotCardinality { snapshot, key: 77 }),
+        Frame::Count { value: 12 },
+        "the write is visible to a read on the same socket"
+    );
+
+    // And it is durable in the host's own database, not merely in the session's view.
+    assert_eq!(
+        host.db()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .cardinality(77)
+            .unwrap(),
+        12
+    );
+
     channel.stop();
 }

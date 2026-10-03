@@ -265,7 +265,7 @@ fn a_configured_plugin_channel_is_bound_by_the_daemon() {
         .expect("a bound socket must accept a connection");
     let (fd, version) =
         yesno_plugin::channel::recv_fd(&peer).expect("the arena descriptor comes first");
-    assert_eq!(version, 1);
+    assert_eq!(version, yesno_plugin::ipc::VERSION);
     drop(fd);
 
     let mut buf = Vec::new();
@@ -294,7 +294,7 @@ fn a_configured_plugin_channel_is_bound_by_the_daemon() {
     // Write something, so the connection is real in both directions.
     peer.write_all(
         &yesno_plugin::ipc::Frame::ClientHello {
-            protocol: 1,
+            protocol: yesno_plugin::ipc::VERSION as u32,
             name: "smoke".into(),
         }
         .encode()

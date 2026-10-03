@@ -133,7 +133,7 @@
 pub const MAGIC: &[u8; 4] = b"YSNL";
 
 /// Protocol version. Bumped when a field changes meaning, never for a new kind.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Magic, version, flags, kind, reserved, length.
 pub const HEADER_LEN: usize = 12;
@@ -244,6 +244,61 @@ pub enum LaneKind {
     /// peer's lane indices never shift under it.
     Absent = 3,
 }
+
+/// What one entry of a [`Frame::Apply`] does.
+///
+/// Discriminants match Flight's `OP_*` constants and `yesno-wire`'s mutation ops for the
+/// same reason [`Role`] and [`LaneKind`] match the in-process ABI: a peer that speaks both
+/// transports should not need two tables, and a mismatched table is the kind of error that
+/// shows up as the wrong operation rather than as a decode failure.
+///
+/// Every one of these is **idempotent**: applying it twice is applying it once. That is not
+/// an incidental property, it is what makes a write channel possible here at all -- see
+/// [`Frame::Apply`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WriteOp {
+    /// One ordinal. `lo == hi`.
+    Insert = 0,
+    /// One ordinal. `lo == hi`.
+    Remove = 1,
+    /// `lo ..= hi`, inclusive and ascending.
+    InsertRange = 2,
+    /// `lo ..= hi`, inclusive and ascending.
+    RemoveRange = 3,
+    /// The whole key. `lo == hi == 0`, because a whole-key delete names no range.
+    DeleteKey = 4,
+}
+
+impl WriteOp {
+    fn from_raw(v: u8) -> Result<WriteOp, IpcError> {
+        Ok(match v {
+            0 => WriteOp::Insert,
+            1 => WriteOp::Remove,
+            2 => WriteOp::InsertRange,
+            3 => WriteOp::RemoveRange,
+            4 => WriteOp::DeleteKey,
+            _ => return Err(IpcError::Malformed),
+        })
+    }
+}
+
+/// One entry of a write batch: 25 bytes on the wire, matching the Flight mutation row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Write {
+    pub key: u64,
+    pub lo: u64,
+    pub hi: u64,
+    pub op: WriteOp,
+}
+
+/// Entries one [`Frame::Apply`] may carry.
+///
+/// A write is 25 bytes, so this is about 400 KiB of frame -- comfortably inside
+/// [`MAX_INLINE_PAYLOAD`] with room for the header, and large enough that a peer writing
+/// ordinal by ordinal is not paying a round trip per thousand. The bound exists because the
+/// server builds the whole batch in memory before committing it.
+pub const MAX_WRITES: usize = 16 * 1024;
 
 impl LaneKind {
     fn from_raw(v: u8) -> Result<LaneKind, IpcError> {
@@ -357,6 +412,7 @@ pub enum Kind {
     SnapshotMax = 11,
     SnapshotLoad = 12,
     SnapshotKeyRange = 13,
+    Apply = 14,
     // responses, 64..127
     ServerHello = 64,
     SnapshotOpened = 65,
@@ -372,6 +428,7 @@ pub enum Kind {
     Ordinal = 75,
     Ordinals = 76,
     Keys = 77,
+    Committed = 78,
     // notifications, 128..191
     Unavailable = 128,
     Available = 129,
@@ -395,6 +452,7 @@ impl Kind {
             11 => Kind::SnapshotMax,
             12 => Kind::SnapshotLoad,
             13 => Kind::SnapshotKeyRange,
+            14 => Kind::Apply,
             64 => Kind::ServerHello,
             65 => Kind::SnapshotOpened,
             66 => Kind::LanesAcquired,
@@ -409,6 +467,7 @@ impl Kind {
             75 => Kind::Ordinal,
             76 => Kind::Ordinals,
             77 => Kind::Keys,
+            78 => Kind::Committed,
             128 => Kind::Unavailable,
             129 => Kind::Available,
             130 => Kind::GenerationChanged,
@@ -436,6 +495,40 @@ pub enum Frame {
         name: String,
     },
     SnapshotOpen,
+    /// Apply a batch of writes as **one commit**, answered by [`Frame::Committed`].
+    ///
+    /// # Why this is one frame and not a transaction
+    ///
+    /// The channel was read-only until 2026-10-04, and the recorded reason was that
+    /// extending it to writes "requires a transaction identity, an unambiguous commit point,
+    /// and a response for a disconnect after commit; socket-close reclamation does not
+    /// answer those questions". A single-frame batch of idempotent operations answers all
+    /// three, which is the whole argument for this shape:
+    ///
+    /// * **Identity** exists so that retrying a write that may already have landed is safe.
+    ///   Every [`WriteOp`] is idempotent and a frame's entries are ordered and
+    ///   deterministic, so replaying a frame leaves the same state as applying it once --
+    ///   `[ DeleteKey, Insert ]` twice is `[ DeleteKey, Insert ]`. There is no
+    ///   non-idempotent retry for an identity to make safe.
+    /// * **The commit point** is this frame. One `Apply` is one `WriteBatch::commit`, and
+    ///   the version it produced comes back in the response. There is no staging, so there
+    ///   is nothing whose commit point could be in doubt.
+    /// * **A disconnect after commit** is recoverable without a reply: the peer retries,
+    ///   which is safe by the first point, or reads the key back, because this channel also
+    ///   serves reads and [`Frame::SnapshotOpened`] carries a version.
+    ///
+    /// **What this shape does not offer is atomicity across frames.** A batch larger than
+    /// [`MAX_WRITES`] is several commits, exactly as Flight's `PUT_INSERT` is per record
+    /// batch. A caller needing one atomic bundle wider than a frame still wants Flight
+    /// `PUT_APPLY`. That is the price of not needing the three answers above, and it is
+    /// deliberate: a multi-frame transaction here would reintroduce every one of them.
+    ///
+    /// Refused with [`crate::abi::Status::WrongRole`] on a follower -- a replica that
+    /// accepted a local write would diverge from its leader with nothing to detect it --
+    /// and with `Unavailable` while the slot is empty during a rebootstrap.
+    Apply {
+        writes: Vec<Write>,
+    },
     SnapshotClose {
         snapshot: u64,
     },
@@ -643,6 +736,15 @@ pub enum Frame {
         values: Vec<u64>,
         more: u8,
     },
+    /// What an [`Frame::Apply`] committed.
+    ///
+    /// `changed` is how many of the batch's operations actually altered the set, which is
+    /// what the engine reports; a peer can use it to tell "already present" from "written"
+    /// without reading back.
+    Committed {
+        version: u64,
+        changed: u64,
+    },
     /// A request failed. `status` is a [`crate::abi::Status`] discriminant.
     Fault {
         status: u32,
@@ -673,6 +775,7 @@ impl Frame {
         match self {
             Frame::ClientHello { .. } => Kind::ClientHello,
             Frame::SnapshotOpen => Kind::SnapshotOpen,
+            Frame::Apply { .. } => Kind::Apply,
             Frame::SnapshotClose { .. } => Kind::SnapshotClose,
             Frame::LanesAcquire { .. } => Kind::LanesAcquire,
             Frame::LanesRelease { .. } => Kind::LanesRelease,
@@ -698,6 +801,7 @@ impl Frame {
             Frame::Ordinal { .. } => Kind::Ordinal,
             Frame::Ordinals { .. } => Kind::Ordinals,
             Frame::Keys { .. } => Kind::Keys,
+            Frame::Committed { .. } => Kind::Committed,
             Frame::Unavailable => Kind::Unavailable,
             Frame::Available { .. } => Kind::Available,
             Frame::GenerationChanged { .. } => Kind::GenerationChanged,
@@ -719,6 +823,18 @@ impl Frame {
             }
             Frame::SnapshotOpen | Frame::BlockDone | Frame::Done | Frame::Unavailable => {}
             Frame::SnapshotClose { snapshot } => p.extend_from_slice(&snapshot.to_le_bytes()),
+            Frame::Apply { writes } => {
+                if writes.len() > MAX_WRITES {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&(writes.len() as u32).to_le_bytes());
+                for w in writes {
+                    p.extend_from_slice(&w.key.to_le_bytes());
+                    p.extend_from_slice(&w.lo.to_le_bytes());
+                    p.extend_from_slice(&w.hi.to_le_bytes());
+                    p.push(w.op as u8);
+                }
+            }
             Frame::LanesAcquire { snapshot, keys } => {
                 if keys.len() > MAX_LANES {
                     return Err(IpcError::TooLarge);
@@ -754,6 +870,10 @@ impl Frame {
             Frame::SnapshotOpened { snapshot, version } => {
                 p.extend_from_slice(&snapshot.to_le_bytes());
                 p.extend_from_slice(&version.to_le_bytes());
+            }
+            Frame::Committed { version, changed } => {
+                p.extend_from_slice(&version.to_le_bytes());
+                p.extend_from_slice(&changed.to_le_bytes());
             }
             Frame::LanesAcquired { lanes, arena_off } => {
                 p.extend_from_slice(&lanes.to_le_bytes());
@@ -973,6 +1093,29 @@ impl Frame {
                 Frame::LanesAcquire { snapshot, keys }
             }
             Kind::LanesRelease => Frame::LanesRelease { lanes: r.u64()? },
+            Kind::Apply => {
+                let n = r.u32()? as usize;
+                // Checked before allocating, like every other counted field here: a
+                // declared length is attacker-controlled and `with_capacity` on it is the
+                // allocation an `an_enormous_declared_length_is_refused_before_allocating`
+                // test exists to prevent.
+                if n > MAX_WRITES {
+                    return Err(IpcError::TooLarge);
+                }
+                let mut writes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let key = r.u64()?;
+                    let lo = r.u64()?;
+                    let hi = r.u64()?;
+                    let op = WriteOp::from_raw(r.u8()?)?;
+                    writes.push(Write { key, lo, hi, op });
+                }
+                Frame::Apply { writes }
+            }
+            Kind::Committed => Frame::Committed {
+                version: r.u64()?,
+                changed: r.u64()?,
+            },
             Kind::BlockAdvance => Frame::BlockAdvance { lanes: r.u64()? },
             Kind::BlockRelease => Frame::BlockRelease { lanes: r.u64()? },
             Kind::ServerHello => Frame::ServerHello {
@@ -1234,6 +1377,47 @@ mod tests {
                 name: "haiiie".into(),
             },
             Frame::SnapshotOpen,
+            // Every op, because the decoder maps each discriminant by hand, and both
+            // bounds of the batch: empty is legal and the loop must not assume otherwise.
+            Frame::Apply { writes: vec![] },
+            Frame::Apply {
+                writes: vec![
+                    Write {
+                        key: 10,
+                        lo: 5,
+                        hi: 5,
+                        op: WriteOp::Insert,
+                    },
+                    Write {
+                        key: 10,
+                        lo: 6,
+                        hi: 6,
+                        op: WriteOp::Remove,
+                    },
+                    Write {
+                        key: 11,
+                        lo: 100,
+                        hi: 200,
+                        op: WriteOp::InsertRange,
+                    },
+                    Write {
+                        key: 11,
+                        lo: 150,
+                        hi: 160,
+                        op: WriteOp::RemoveRange,
+                    },
+                    Write {
+                        key: 12,
+                        lo: 0,
+                        hi: 0,
+                        op: WriteOp::DeleteKey,
+                    },
+                ],
+            },
+            Frame::Committed {
+                version: 42,
+                changed: 7,
+            },
             Frame::SnapshotClose { snapshot: 7 },
             Frame::LanesAcquire {
                 snapshot: 7,
@@ -1467,7 +1651,8 @@ mod tests {
                 | Kind::SnapshotContains
                 | Kind::SnapshotMax
                 | Kind::SnapshotLoad
-                | Kind::SnapshotKeyRange => Direction::Request,
+                | Kind::SnapshotKeyRange
+                | Kind::Apply => Direction::Request,
                 Kind::ServerHello
                 | Kind::SnapshotOpened
                 | Kind::LanesAcquired
@@ -1481,7 +1666,8 @@ mod tests {
                 | Kind::Bool
                 | Kind::Ordinal
                 | Kind::Ordinals
-                | Kind::Keys => Direction::Response,
+                | Kind::Keys
+                | Kind::Committed => Direction::Response,
                 Kind::Unavailable
                 | Kind::Available
                 | Kind::GenerationChanged

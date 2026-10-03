@@ -409,3 +409,90 @@ fixed the build and created a second spelling of one wire format, which is how t
 definitions start to drift. A `containers` feature gates the client method instead and
 `server` implies it, so the schema stays the single definition in `yesno-arrow`. All three
 combinations build.
+
+## 2026-10-04 -- the peer socket can write, and the objection that said it could not
+
+A consumer binding the plugin channel could read everything and write nothing. Every request
+kind was a read -- `SnapshotCardinality`, `Contains`, `Max`, `Load`, `KeyRange`, plus the
+lane and block paging -- so a peer still needed Flight to be useful, which defeats the point
+of giving it a socket.
+
+**The reason was recorded, not accidental**, and it is the part worth reading twice.
+`LTM/plugin-channel-protocol-and-security.md` said: "The channel is read-only. Write batches
+still enter through Flight `PUT_APPLY` and control `Checkpoint`. Extending this channel to
+writes requires a transaction identity, an unambiguous commit point, and a response for a
+disconnect after commit; socket-close reclamation does not answer those questions."
+
+That is a real objection and it is answerable, but **only for one shape**. A single `Apply`
+frame of idempotent operations, committed as a unit:
+
+* **Identity** exists so a retry is safe when the first attempt may already have landed.
+  Every write op here is idempotent and a frame's entries are applied in arrival order, so
+  replaying a frame leaves the state it would have left anyway. There is no non-idempotent
+  retry for an identity to make safe.
+* **The commit point** is the frame: one `Apply` is one `WriteBatch::commit`, and the version
+  it produced is in the reply. Nothing is staged, so no commit point can be in doubt.
+* **A disconnect after commit** needs no stored reply. The peer retries, safe by the first
+  point, or reads the key back -- the same socket serves reads, and `SnapshotOpened` carries
+  a version.
+
+**So the design is a consequence of the objection rather than a way around it.** What it
+gives up is atomicity wider than a frame: a large write is several commits, as Flight's
+`PUT_INSERT` is per record batch, and a caller needing one atomic bundle still wants
+`PUT_APPLY`. A multi-frame transaction here would reintroduce all three questions, which is
+exactly why there is not one.
+
+### What landed
+
+`Kind::Apply` / `Kind::Committed`, a `WriteOp` enum whose discriminants match Flight's `OP_*`
+and `yesno-wire`'s mutation ops -- for the reason `Role` and `LaneKind` already give, that a
+peer speaking both transports should not need two tables -- and `Write { key, lo, hi, op }`,
+the same 25-byte row shape. Validation mirrors the Flight path and completes before anything
+is staged, because `WriteBatch` has no rollback. `VERSION` 1 -> 2, which needs no capability
+negotiation: `ClientHello` already demands exact equality, so a peer that connects knows the
+server speaks writes.
+
+Two refusals are the boundary. A **follower** answers `WRONG_ROLE`: a replica that applied a
+local write would diverge from its leader with nothing able to detect it, since replication
+ships the leader's log and the extra data is neither overwritten nor reported. An **empty
+slot** answers `UNAVAILABLE` rather than waiting, because blocking holds a serving thread
+across an unbounded operation. Admission stays the uid check at connect time -- a peer
+allowed to connect may write, on the same footing as its existing permission to read
+everything.
+
+### The test that was wrong, and what it taught
+
+`replaying_a_write_batch_changes_nothing_the_second_time` is the idempotence argument, so it
+is the one test here that must be right. It first asserted `changed == 0` on the replay and
+failed with `changed == 5`.
+
+**The test was wrong, not the design.** `changed` counts operations that altered the set *as
+they were applied*; on a replay the leading `DeleteKey` really does remove what the previous
+run inserted, after which the inserts really do add it back. Five operations each change
+something and the net state is untouched. **Idempotence is a claim about the state a frame
+leaves, not about the work it does getting there** -- and I had written an assertion about
+the work. The test now compares the ordinals themselves before and after, which is the actual
+property, and separately asserts `changed == 0` for a purely additive batch, where it *is* a
+real property and is the common retry shape.
+
+The weaker version of that fingerprint was also worth fixing: it compared cardinalities, and
+two different sets of the same size would have compared equal, so a replay that moved a bit
+would have passed.
+
+### Six hardcoded protocol numbers
+
+Bumping `VERSION` broke eleven tests across three crates and the reference peer, every one of
+them a literal `1`. They are now `ipc::VERSION`, so the next bump breaks nothing that is
+merely restating the constant. The peer binary carried one in an error message too, which is
+how "server speaks protocol 2, this peer speaks 1" came to be printed by a peer that had
+just been recompiled.
+
+### The worked example was part of the defect
+
+`yesno-channel-peer` is documented as "the artefact a consumer asks for", and it could only
+scan -- so anyone modelling a peer on it would have concluded the socket cannot write and
+reached for a second transport. **A broken example is worse than no example, because it is
+copied.** It has a `--write` mode now, which inserts in one frame, prints the version and
+then scans the key it wrote over the same connection; `a_separate_process_writes_and_the_host_sees_it`
+runs it as a real process and asserts against the *host's* database, so a peer that printed a
+plausible version without committing would fail.

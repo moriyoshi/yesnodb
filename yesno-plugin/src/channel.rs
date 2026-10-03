@@ -382,6 +382,7 @@ impl Session {
                 "the first frame must be ClientHello",
             ),
             Frame::SnapshotOpen => self.snapshot_open(),
+            Frame::Apply { writes } => self.apply(&writes),
             Frame::SnapshotClose { snapshot } => self.snapshot_close(snapshot),
             Frame::LanesAcquire { snapshot, keys } => self.lanes_acquire(snapshot, &keys),
             Frame::LanesRelease { lanes } => self.lanes_release(lanes),
@@ -450,6 +451,97 @@ impl Session {
                 Status::Internal,
                 &format!("unhandled request kind {:?}", other.kind()),
             ),
+        }
+    }
+
+    /// Apply a batch of writes as one commit.
+    ///
+    /// # The two refusals, and why they are refusals rather than best effort
+    ///
+    /// **A follower does not accept writes.** A replica that applied a local write would
+    /// diverge from its leader with nothing in the system able to detect it: replication
+    /// ships the leader's log, so the extra data is neither overwritten nor reported, it
+    /// simply exists on one side. `Status::WrongRole` already exists for exactly this and
+    /// the peer already learns about changes through the `RoleChanged` notification, so a
+    /// peer that was a writer and stops being one finds out.
+    ///
+    /// **An empty slot is `Unavailable`, not a wait.** The slot is empty while a follower
+    /// rebootstraps, and the honest answer is that the write did not happen. Blocking would
+    /// hold a serving thread across an operation with no bound.
+    ///
+    /// # Validated in full, then applied
+    ///
+    /// Nothing reaches the batch until every entry has passed, which matters more here than
+    /// the equivalent on the Flight path: `WriteBatch` has no rollback, so a half-validated
+    /// batch would have to be committed or dropped, and dropping it after reporting an error
+    /// is the behaviour that let a Flight caller commit work the server had refused. The
+    /// bounds `insert`/`remove` themselves reject -- an out-of-range ordinal -- are left to
+    /// the engine, which reports them through the batch's own error.
+    fn apply(&mut self, writes: &[crate::ipc::Write]) -> Frame {
+        use crate::ipc::WriteOp;
+
+        if self.host.role() != crate::abi::Role::Leader {
+            return Self::fault(
+                Status::WrongRole,
+                "a follower does not accept writes; send them to the leader",
+            );
+        }
+        if writes.len() > crate::ipc::MAX_WRITES {
+            return Self::fault(
+                Status::InvalidArgument,
+                "write batch exceeds the advertised maximum",
+            );
+        }
+        let Some(db) = self.host.db() else {
+            return Self::fault(
+                Status::Unavailable,
+                "no database in the slot; the write did not happen",
+            );
+        };
+
+        // Validation first, so an invalid entry cannot leave earlier ones staged.
+        for (i, w) in writes.iter().enumerate() {
+            let bad = |why: &str| -> Option<Frame> {
+                Some(Self::fault(
+                    Status::InvalidArgument,
+                    &format!("write {i}: {why}"),
+                ))
+            };
+            let refusal = match w.op {
+                WriteOp::Insert | WriteOp::Remove if w.lo != w.hi => {
+                    bad("a point operation must have lo == hi; use a range op for a range")
+                }
+                WriteOp::InsertRange | WriteOp::RemoveRange if w.lo > w.hi => {
+                    // The engine would treat an inverted range as empty and do nothing,
+                    // which is a silent no-op for what is almost always a transposed pair.
+                    bad("an inverted range; bounds are inclusive and ascending")
+                }
+                WriteOp::DeleteKey if w.lo != 0 || w.hi != 0 => {
+                    bad("a whole-key delete names no range; send lo == hi == 0")
+                }
+                _ => None,
+            };
+            if let Some(f) = refusal {
+                return f;
+            }
+        }
+
+        let mut wb = db.batch();
+        for w in writes {
+            match w.op {
+                WriteOp::Insert => wb.insert(w.key, w.lo),
+                WriteOp::Remove => wb.remove(w.key, w.lo),
+                WriteOp::InsertRange => wb.insert_range(w.key, w.lo, w.hi),
+                WriteOp::RemoveRange => wb.remove_range(w.key, w.lo, w.hi),
+                WriteOp::DeleteKey => wb.delete_key(w.key),
+            };
+        }
+        match wb.commit() {
+            Ok(c) => Frame::Committed {
+                version: c.version,
+                changed: c.changed,
+            },
+            Err(e) => Self::fault(Status::from_core(&e), "the write failed"),
         }
     }
 
