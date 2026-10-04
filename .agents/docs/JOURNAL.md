@@ -599,3 +599,62 @@ be over their threshold if the metrics were the same.
 **No claim is made that the cap alone is a speedup**, which is what they asked. The claim is
 narrower: at a fixed operation count, 6.25x fewer commits cost 5.6x less writer time on this
 fixture, and the mechanism is per-commit amortisation rather than anything about frame size.
+
+## 2026-10-04 -- the consumer's own measurement, and what my caveat got right and wrong
+
+The consumer integrated `52ab729` and re-ran their qualified harness on the real corpus:
+8 192 COCO-512 documents, the same 2 094 049 point operations, 32 shards, three runs per cap,
+CPU and `vmstat` I/O gates sampled at both edges.
+
+| cap | commits | writer |
+|---|---:|---:|
+| 2 621 | 913 | 5.190-5.482 s |
+| 16 384 | 131 | 0.835-0.847 s |
+
+**Median 6.27x**, checkpoint ranges overlapping, and all 64 FWD blocks and 8 192 LIVE IDs
+matching the fixture after reopen in all six runs. They read `ServerHello.max_writes` rather
+than the constant, cover arena and inline at 16 384 and at a configured 127, and their full
+gate passed on a clean snapshot pinned to this SHA. They explicitly decline to rank
+transports, because the Flight one-commit figure in the original handoff came from an earlier
+revision -- the right call, and worth copying.
+
+**They did not ask for a higher ceiling on this evidence**, which settles the question I left
+open. 16 384 stays, now for a measured reason rather than because it was the figure their
+analysis had validated.
+
+### My caveat was right about the magnitude and wrong about the ratio
+
+I reported 5.6x and wrote that "the magnitude is setup-dependent and does not transfer",
+because my synthetic fixture cost 135 ms per commit against their 5.5 ms -- a 24x difference
+caused by shard fan-out, since my fixture spread consecutive ordinals over 8 192 keys so
+every batch touched all 32 shards while their batches are document-grouped.
+
+Both halves of that are now checkable. **The writer times did not transfer**: 106-111 s
+against their 5.19-5.48 s, confirming the fan-out explanation. **The ratio did**: 5.6x
+against their 6.27x, on fixtures whose per-commit costs differ by 24x.
+
+So the thing I hedged turned out robust, and the reason is the one both measurements already
+pointed at -- **both arms were commit-bound, so the ratio is governed by the commit count and
+not by what a commit costs.** 6.25x fewer commits bought 5.6x on a fixture with expensive
+commits and 6.27x on one with cheap commits. The honest reading is that my caveat was
+correctly scoped ( I warned about the wrong quantity transferring, and named which ) but
+under-claimed: given that both setups were commit-bound, the ratio was the *more*
+transferable number of the two, not the less.
+
+A cheap way to have known this in advance: my own one-shard control already varied per-commit
+cost by 15x and moved the ratio only from 5.6x to 3.3x. That spread was evidence about
+robustness and I read it only as evidence about variability.
+
+### Two process notes from the exchange
+
+**I sent the report to the wrong session.** `ListAgents` showed exactly one haiiie-named peer
+and I treated it as the handoff's author. It reaches Claude sessions only, so the Codex pane
+that wrote the handoff could never have appeared -- and the handoff named pane %644 while my
+user named %664, neither matching that peer's row. Two signals said "not this session" and I
+inferred from a single near-match. The peer bounced it, correctly, and asked that its silence
+not be recorded as agreement. Nothing committed had named a session ( the entries say "a
+consumer" ), so only the message and my summary needed correcting.
+
+**The reply went to a file afterwards**, `.agents-workspace/tmp/apply-cap-reply-20261004.md`,
+rather than into a pane: typing into another agent's terminal interrupts whatever it is doing,
+and choosing to do that is the maintainer's call rather than mine.
