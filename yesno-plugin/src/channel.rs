@@ -60,6 +60,15 @@ pub struct Limits {
     /// draw from and stops space being reclaimed while it holds on. A peer needs
     /// one per query in flight.
     pub max_snapshots: usize,
+    /// Entries one `Apply` frame may carry.
+    ///
+    /// **Clamped to what the frame can hold, not merely to configuration.** This is the
+    /// field whose advertised value was unreachable: `MAX_WRITES` was published while
+    /// `Apply` was capped like a descriptor frame, so a peer trusting the constant got
+    /// `TooLarge` from its own encoder. `Session::with_arena` clamps this the way it already
+    /// clamps lanes, and for the reason recorded there -- an advertised limit the transport
+    /// cannot honour is worse than a low one, because the peer cannot negotiate past it.
+    pub max_writes: usize,
 }
 
 impl Default for Limits {
@@ -69,6 +78,7 @@ impl Default for Limits {
             max_lanes: MAX_LANES,
             max_blocks: 1,
             max_snapshots: 64,
+            max_writes: crate::ipc::MAX_WRITES,
         }
     }
 }
@@ -293,6 +303,13 @@ impl Session {
             let per_batch = Self::INLINE_MAX_LANES / limits.max_lanes.max(1);
             limits.max_blocks = limits.max_blocks.clamp(1, per_batch.max(1));
         }
+        // **The same clamp, for writes, and the paragraph above is why it is here.** An
+        // `Apply` payload is in the frame in both transports -- the arena carries lane
+        // payloads, never writes -- so unlike lanes this bound does not depend on which
+        // transport is in use. It is clamped regardless, because the failure it prevents is
+        // not about the arena: it is advertising an entry limit the frame cannot carry,
+        // which is what shipped on 2026-10-03 and what a consumer found by exceeding it.
+        limits.max_writes = limits.max_writes.clamp(1, crate::ipc::MAX_WRITES);
         Session {
             host,
             arena,
@@ -327,6 +344,7 @@ impl Session {
             max_lanes: self.limits.max_lanes as u32,
             max_handles: self.limits.max_handles as u32,
             max_blocks: self.limits.max_blocks.max(1) as u32,
+            max_writes: self.limits.max_writes as u32,
         }
     }
 
@@ -486,10 +504,18 @@ impl Session {
                 "a follower does not accept writes; send them to the leader",
             );
         }
-        if writes.len() > crate::ipc::MAX_WRITES {
+        // **Against what the greeting advertised**, which is the server's configured limit
+        // after clamping, not the protocol ceiling. Checking the ceiling here would accept
+        // a batch a lower-configured server had told the peer not to send, so the advertised
+        // number would again be something other than the enforced one.
+        if writes.len() > self.limits.max_writes {
             return Self::fault(
                 Status::InvalidArgument,
-                "write batch exceeds the advertised maximum",
+                &format!(
+                    "write batch of {} exceeds the advertised maximum of {}",
+                    writes.len(),
+                    self.limits.max_writes
+                ),
             );
         }
         let Some(db) = self.host.db() else {

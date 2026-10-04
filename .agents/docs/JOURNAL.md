@@ -496,3 +496,106 @@ copied.** It has a `--write` mode now, which inserts in one frame, prints the ve
 then scans the key it wrote over the same connection; `a_separate_process_writes_and_the_host_sees_it`
 runs it as a real process and asserts against the *host's* database, so a peer that printed a
 plausible version without committing would fail.
+
+## 2026-10-04 -- user-documentation drift audit
+
+The root README and `docs/` had drifted across several independent changes. The on-disk
+reference still placed standalone extent trailers inside slots, listed the old 8256-byte
+bitmap class and old superblock root offsets, and omitted `ChunkPatch` WAL records. The
+query-language guide said a Flight ticket had no lease after the server gained bounded
+snapshot leases. The troubleshooting guide required a restart for certificate rotation
+after `SIGHUP` reload shipped. The plugin-channel guide described socket access as read
+authority after `Apply` made it write authority. The DataFusion guide still warned
+that a failed snapshot read could masquerade as an absent key after the source
+became fallible. The snapshot-provider summary put EBS inside the daemon although
+local EBS uses the privileged agent. The format reference also claimed online
+reads checked only identity, though first reads now verify stored CRCs and cache
+the result. These claims were
+rewritten in place against the current implementations, and the integration guide now
+describes the container and bitvector result wires and container-payload ingest.
+
+The reusable failure mode is a standing reference that is not attached to the source
+change it describes. The self-containment and TeX checks stayed green throughout because
+the stale statements were syntactically valid; checking those gates is necessary but does
+not replace comparing format tables and operational claims with their encoders and live
+service paths.
+
+## 2026-10-04 -- the advertised write cap was 6.25x the real one
+
+A consumer integrating the channel write path reported that `MAX_WRITES = 16 * 1024` was
+unreachable. `Frame::Apply` went through the generic `MAX_PAYLOAD = 65 536` bound in both
+encode and decode, and its payload is `4 + 25 * writes`, so **2 621 entries fit and 2 622
+failed in `Frame::encode` before a byte was sent**. Their 15 000-write pilot failed at
+encode; their real-socket regression pinned the boundary at exactly those two numbers.
+
+**I wrote the constant and the comment justifying it one day earlier, and the comment
+reasoned against the wrong cap** -- "comfortably inside `MAX_INLINE_PAYLOAD`", which is true
+of that constant and irrelevant, because nothing gave `Apply` that cap. The number was never
+tested at its own limit: the codec table carries a five-entry `Apply`, which proves the
+encoding and says nothing about the bound.
+
+**The same file already recorded this exact failure.** `Session::with_arena` says: "Inline
+capacity is a property of the transport, so the advertised limits have to come from it.
+Configuration alone produced a greeting that promised more than the frame could hold." I
+published an advertised limit the frame could not hold, one module away from the note saying
+not to, and in the same change that quoted a neighbouring comment approvingly.
+
+### The fix is a derivation, not a correction
+
+`APPLY_MAX_PAYLOAD = apply_payload_bytes( MAX_WRITES )`, and `Kind::payload_cap()` returns it.
+The cap is now **computed from** the entry limit, so the two cannot disagree without failing
+to compile, and the per-kind cap is one function instead of a `matches!` in encode and
+another in decode -- two expressions that had to stay identical and were only checkable by
+reading both.
+
+Three classes rather than two, which preserves what the original comment asked for in every
+direction: descriptors get `MAX_PAYLOAD`, `BlocksInline` keeps its own, `Apply` gets its
+derived one, and raising any one cannot widen the others.
+
+`max_writes` is now in `ServerHello` beside `max_lanes` and `max_blocks`, clamped in
+`with_arena` next to the lane clamp, configurable as `channel_max_writes`, and enforced in
+`apply` against **the advertised figure rather than the protocol ceiling** -- otherwise a
+lower-configured server would again accept what it had told the peer not to send.
+
+### What the tests were missing, and now are not
+
+`the_widest_legal_apply_round_trips_and_one_more_is_refused` builds a frame at exactly
+`MAX_WRITES` and one past it, against the derived cap. Verified against the shipped version,
+which fails it with the consumer's own symptom: `a frame at the advertised limit must encode:
+TooLarge`. Three more cover the socket at the limit, a *configured* cap below the ceiling
+being both advertised and enforced, and a separate process sending the widest legal frame --
+that last one because the consumer's failure was in the peer's encoder, so the half of the
+path that broke is on the client side and only a separate process exercises it as deployed.
+
+### Measured, and the magnitude does not transfer
+
+2 094 049 point inserts over 8 192 keys, 32 shards, fresh database per arm, real socket and
+real serving loop, old effective cap against new:
+
+| cap | commits | writer, three runs | checkpoint |
+|---|---:|---:|---:|
+| 2 621 | 799 | 106.4-111.0 s | 0.50-0.53 s |
+| 16 384 | 128 | 18.8-19.6 s | 0.51-0.67 s |
+
+**5.6x on writer time, with checkpoint unchanged**, which is what one expects if the cost is
+per-commit: 6.25x fewer commits buys 5.6x.
+
+**But the absolute numbers are not theirs and the ratio is setup-dependent.** Their 913
+commits cost 5.5 ms each; mine cost 135 ms. The difference is shard fan-out per commit -- a
+commit fsyncs every shard's WAL, my fixture spreads consecutive ordinals across 8 192 keys so
+every batch touches all 32 shards, and their corpus groups by document so a batch touches
+few. A one-shard control makes the mechanism visible: 7.04 s against 2.11 s, **3.3x**, and
+the new arm's *per-commit* cost is higher there ( 16.5 ms against 8.8 ms ) because each
+commit does more work. The gain is amortisation of a fixed per-commit cost, so how much it is
+worth depends on what that cost is in a given deployment.
+
+My corpus is synthetic -- the consumer's COCO-512 residual codes live in their repository and
+this session was asked not to touch it -- so only the shape is comparable. And my host gate
+is a **proxy**: CPU idle from `/proc/stat` read 91.1% against their >= 85% threshold, but my
+I/O figure comes from `pgpgin + pgpgout` and is not the `vmstat bi + bo` their gate uses, so
+I am not claiming their gate passed. One one-shard run read 40 674 on my proxy, which would
+be over their threshold if the metrics were the same.
+
+**No claim is made that the cap alone is a speedup**, which is what they asked. The claim is
+narrower: at a fixed operation count, 6.25x fewer commits cost 5.6x less writer time on this
+fixture, and the mechanism is per-commit amortisation rather than anything about frame size.

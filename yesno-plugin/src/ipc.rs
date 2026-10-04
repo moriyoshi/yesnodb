@@ -292,13 +292,50 @@ pub struct Write {
     pub op: WriteOp,
 }
 
+/// Bytes one [`Write`] occupies in an [`Frame::Apply`] payload: three `u64` and the op.
+pub const WRITE_BYTES: usize = 25;
+
+/// Exact payload bytes an [`Frame::Apply`] of `writes` entries occupies.
+///
+/// A `u32` count followed by `writes` fixed-size entries. `const` so the cap below is
+/// *derived* from the entry limit rather than asserted to match it.
+pub const fn apply_payload_bytes(writes: usize) -> usize {
+    4 + WRITE_BYTES * writes
+}
+
 /// Entries one [`Frame::Apply`] may carry.
 ///
-/// A write is 25 bytes, so this is about 400 KiB of frame -- comfortably inside
-/// [`MAX_INLINE_PAYLOAD`] with room for the header, and large enough that a peer writing
-/// ordinal by ordinal is not paying a round trip per thousand. The bound exists because the
-/// server builds the whole batch in memory before committing it.
+/// # This number used to be a lie, and the shape of the lie is the lesson
+///
+/// It was `16 * 1024` while `Apply` was bound by [`MAX_PAYLOAD`] like every other request,
+/// so the effective limit was `( 65 536 - 4 ) / 25` = **2 621** and a frame of 2 622 failed
+/// in `Frame::encode` before it was sent. The doc comment claimed 400 KiB was "comfortably
+/// inside [`MAX_INLINE_PAYLOAD`]" -- true of that constant and irrelevant, because nothing
+/// gave `Apply` that cap. A consumer found it by exceeding it: a 15 000-write pilot failed
+/// at encode, and their real-socket regression pinned the boundary at exactly 2 621 and
+/// 2 622 ( reported 2026-10-04 ).
+///
+/// **The same file already recorded this exact failure** for lanes, in
+/// `Session::with_arena`: "Inline capacity is a property of the transport, so the advertised
+/// limits have to come from it. Configuration alone produced a greeting that promised more
+/// than the frame could hold". I wrote an advertised limit that the frame could not hold,
+/// one module away from the note saying not to.
+///
+/// So the cap is no longer written down twice. [`APPLY_MAX_PAYLOAD`] is computed from this
+/// number by [`apply_payload_bytes`], and the two cannot disagree without failing to
+/// compile. A peer should still read `max_writes` from the greeting rather than this
+/// constant, because a server may be configured lower.
 pub const MAX_WRITES: usize = 16 * 1024;
+
+/// Payload cap for [`Kind::Apply`], derived from [`MAX_WRITES`].
+///
+/// 409 604 bytes. `Apply` is **bulk**, not a descriptor, so it does not belong under
+/// [`MAX_PAYLOAD`] -- and it does not simply borrow [`Kind::BlocksInline`]'s cap either,
+/// because the stated reason for having two caps is that "raising the inline limit never
+/// widens what a control frame may demand". A third class keeps that property in both
+/// directions: raising either of the other two cannot widen `Apply`, and raising `Apply`
+/// cannot widen them.
+pub const APPLY_MAX_PAYLOAD: usize = apply_payload_bytes(MAX_WRITES);
 
 impl LaneKind {
     fn from_raw(v: u8) -> Result<LaneKind, IpcError> {
@@ -356,6 +393,16 @@ pub const MAX_INLINE_PAYLOAD: usize = 1024 * 1024;
 /// Bulk needs more room than descriptors, checked at compile time because it is a
 /// relationship between two constants rather than a property of any run.
 const _: () = assert!(MAX_INLINE_PAYLOAD > MAX_PAYLOAD);
+
+// `Apply` is bulk and must be able to carry more than a descriptor frame, or the entry
+// limit is unreachable again -- which is precisely the defect this derivation exists to
+// make impossible.
+const _: () = assert!(APPLY_MAX_PAYLOAD > MAX_PAYLOAD);
+// And it stays inside the largest frame the reader will ever buffer, so one cap bounds
+// what a connection can hold.
+const _: () = assert!(APPLY_MAX_PAYLOAD <= MAX_INLINE_PAYLOAD);
+// The count is transmitted as a `u32`.
+const _: () = assert!(MAX_WRITES <= u32::MAX as usize);
 
 /// Most `u64` values one page of [`Frame::Ordinals`] or [`Frame::Keys`] may carry.
 ///
@@ -474,6 +521,26 @@ impl Kind {
             131 => Kind::RoleChanged,
             other => return Err(IpcError::UnknownKind(other)),
         })
+    }
+
+    /// Largest payload a frame of this kind may carry.
+    ///
+    /// **Three classes, and the split is deliberate in both directions.** Descriptors and
+    /// requests get [`MAX_PAYLOAD`]; `BlocksInline` carries lane payloads and gets its own
+    /// larger bound; `Apply` carries a write batch and gets a bound derived from
+    /// [`MAX_WRITES`]. Raising any one of the three cannot widen the others, which is the
+    /// property the original two-cap comment asked for.
+    ///
+    /// **One function rather than a `matches!` in encode and another in decode.** Those two
+    /// expressions were the same by inspection and had to stay that way; an asymmetric pair
+    /// would let a peer send what the server would not accept, or the reverse, and neither
+    /// is visible from either site alone.
+    pub fn payload_cap(self) -> usize {
+        match self {
+            Kind::BlocksInline => MAX_INLINE_PAYLOAD + MAX_PAYLOAD,
+            Kind::Apply => APPLY_MAX_PAYLOAD,
+            _ => MAX_PAYLOAD,
+        }
     }
 
     /// Which way this kind travels.
@@ -650,6 +717,15 @@ pub enum Frame {
         /// a batched one, so a peer that guessed low would be slow for a reason it
         /// could not see.
         max_blocks: u32,
+        /// Entries one [`Frame::Apply`] may carry, for this server.
+        ///
+        /// **Advertised for the reason `max_blocks` is, and then some**: a peer that
+        /// guesses high does not merely run slowly, it gets `TooLarge` from its own
+        /// encoder before anything is sent. A consumer hit exactly that against a
+        /// published constant the frame could not honour, so the number a peer should
+        /// trust is this one -- it is the server's configured limit, already clamped to
+        /// what the protocol and the frame allow.
+        max_writes: u32,
     },
     SnapshotOpened {
         snapshot: u64,
@@ -857,6 +933,7 @@ impl Frame {
                 max_lanes,
                 max_handles,
                 max_blocks,
+                max_writes,
             } => {
                 p.extend_from_slice(&protocol.to_le_bytes());
                 p.extend_from_slice(&generation.to_le_bytes());
@@ -866,6 +943,7 @@ impl Frame {
                 p.extend_from_slice(&max_lanes.to_le_bytes());
                 p.extend_from_slice(&max_handles.to_le_bytes());
                 p.extend_from_slice(&max_blocks.to_le_bytes());
+                p.extend_from_slice(&max_writes.to_le_bytes());
             }
             Frame::SnapshotOpened { snapshot, version } => {
                 p.extend_from_slice(&snapshot.to_le_bytes());
@@ -1005,12 +1083,7 @@ impl Frame {
                 p.push(*to as u8);
             }
         }
-        let cap = if matches!(self.kind(), Kind::BlocksInline) {
-            MAX_INLINE_PAYLOAD + MAX_PAYLOAD
-        } else {
-            MAX_PAYLOAD
-        };
-        if p.len() > cap {
+        if p.len() > self.kind().payload_cap() {
             return Err(IpcError::TooLarge);
         }
         out.extend_from_slice(MAGIC);
@@ -1054,15 +1127,11 @@ impl Frame {
         }
         let kind = Kind::from_raw(bytes[6])?;
         let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-        // One kind carries bulk and has its own, larger bound; everything else is
-        // descriptors and requests. Two caps rather than one big one, so raising the
-        // inline limit never widens what a control frame may demand.
-        let cap = if matches!(kind, Kind::BlocksInline) {
-            MAX_INLINE_PAYLOAD + MAX_PAYLOAD
-        } else {
-            MAX_PAYLOAD
-        };
-        if len > cap {
+        // Bulk kinds have their own, larger bounds; everything else is descriptors and
+        // requests. Separate caps rather than one big one, so raising a bulk limit never
+        // widens what a control frame may demand -- and checked here, before `len` is used
+        // to size anything, so an over-cap declaration is refused rather than buffered.
+        if len > kind.payload_cap() {
             return Err(IpcError::TooLarge);
         }
         let end = HEADER_LEN + len;
@@ -1127,6 +1196,7 @@ impl Frame {
                 max_lanes: r.u32()?,
                 max_handles: r.u32()?,
                 max_blocks: r.u32()?,
+                max_writes: r.u32()?,
             },
             Kind::SnapshotOpened => Frame::SnapshotOpened {
                 snapshot: r.u64()?,
@@ -1539,6 +1609,7 @@ mod tests {
                 max_lanes: 256,
                 max_handles: 8,
                 max_blocks: 16,
+                max_writes: MAX_WRITES as u32,
             },
             Frame::SnapshotOpened {
                 snapshot: 7,
@@ -1986,6 +2057,122 @@ mod page_tests {
     use super::*;
 
     /// A page beyond the cap is refused where the value was supplied, and on decode.
+    /// The widest legal `Apply` encodes and decodes, and one more does not.
+    ///
+    /// # This is the test that was missing
+    ///
+    /// `MAX_WRITES` shipped as 16 384 while `Apply` was capped at `MAX_PAYLOAD`, so the
+    /// real boundary was 2 621 and a frame at the advertised limit failed in `encode`.
+    /// Nothing caught it because no test ever built a frame at the limit -- the codec table
+    /// carries a five-entry `Apply`, which proves the encoding and says nothing about the
+    /// cap. A consumer found it by trying to use the number.
+    ///
+    /// So the assertion is specifically at `MAX_WRITES` and `MAX_WRITES + 1`, against the
+    /// *derived* cap, which is what makes the two impossible to disagree: if a later change
+    /// moves either, this fails rather than the advertised number quietly becoming a lie
+    /// again.
+    #[test]
+    fn the_widest_legal_apply_round_trips_and_one_more_is_refused() {
+        let one = Write {
+            key: 1,
+            lo: 2,
+            hi: 2,
+            op: WriteOp::Insert,
+        };
+
+        let widest = Frame::Apply {
+            writes: vec![one; MAX_WRITES],
+        };
+        let bytes = widest
+            .encode()
+            .expect("a frame at the advertised limit must encode");
+        assert_eq!(
+            bytes.len(),
+            HEADER_LEN + apply_payload_bytes(MAX_WRITES),
+            "the payload is the derived size"
+        );
+        let (back, used) = Frame::decode(&bytes).expect("and must decode");
+        assert_eq!(used, bytes.len());
+        assert_eq!(
+            back, widest,
+            "the widest frame does not survive a round trip"
+        );
+
+        // One over fails on both sides, and on the count rather than incidentally on bytes.
+        let over = Frame::Apply {
+            writes: vec![one; MAX_WRITES + 1],
+        };
+        assert_eq!(over.encode(), Err(IpcError::TooLarge));
+
+        // Decode-side: a header declaring one entry too many, which an encoder would never
+        // produce but a hostile or mismatched peer can send.
+        let mut forged = bytes.clone();
+        let n = (MAX_WRITES + 1) as u32;
+        let payload = apply_payload_bytes(MAX_WRITES + 1) as u32;
+        forged[8..12].copy_from_slice(&payload.to_le_bytes());
+        forged[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&n.to_le_bytes());
+        forged.resize(HEADER_LEN + payload as usize, 0);
+        assert_eq!(
+            Frame::decode(&forged),
+            Err(IpcError::TooLarge),
+            "an over-cap declaration must be refused, not buffered"
+        );
+    }
+
+    /// `Apply` has its own cap, and the three classes do not leak into each other.
+    ///
+    /// The two-cap comment asked that raising the inline limit "never widen what a control
+    /// frame may demand". With `Apply` added that has to hold in every direction, which is
+    /// only checkable by comparing the caps a kind reports rather than by reading the
+    /// `match`.
+    #[test]
+    fn each_kind_gets_the_cap_its_class_implies() {
+        assert_eq!(Kind::Apply.payload_cap(), APPLY_MAX_PAYLOAD);
+        assert_eq!(
+            Kind::BlocksInline.payload_cap(),
+            MAX_INLINE_PAYLOAD + MAX_PAYLOAD
+        );
+        for k in [
+            Kind::ClientHello,
+            Kind::SnapshotOpen,
+            Kind::SnapshotLoad,
+            Kind::ServerHello,
+            Kind::Blocks,
+            Kind::Keys,
+            Kind::Committed,
+            Kind::RoleChanged,
+        ] {
+            assert_eq!(
+                k.payload_cap(),
+                MAX_PAYLOAD,
+                "{k:?} is a descriptor frame and must stay under the small cap"
+            );
+        }
+        // And the one that was wrong: a bulk kind must be able to exceed the small cap, or
+        // its advertised entry limit is unreachable.
+        assert!(
+            Kind::Apply.payload_cap() > MAX_PAYLOAD,
+            "Apply is bulk; capping it like a descriptor is the defect this test exists for"
+        );
+    }
+
+    /// The response to a write is fixed-size, whatever the request carried.
+    ///
+    /// The handoff asked for request and response limits to be symmetric. They are not
+    /// equal and should not be: `Committed` is sixteen bytes, so a peer sending the widest
+    /// legal `Apply` cannot provoke a large reply. Asserted because "symmetric" could
+    /// otherwise be read as "the reply needs the same cap", which would be the wrong fix.
+    #[test]
+    fn a_write_reply_is_fixed_size_however_wide_the_request() {
+        let reply = Frame::Committed {
+            version: u64::MAX,
+            changed: u64::MAX,
+        };
+        let bytes = reply.encode().unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN + 16);
+        assert!(bytes.len() < MAX_PAYLOAD);
+    }
+
     #[test]
     fn a_page_beyond_the_cap_is_refused_in_both_directions() {
         let values: Vec<u64> = (0..MAX_PAGE as u64 + 1).collect();

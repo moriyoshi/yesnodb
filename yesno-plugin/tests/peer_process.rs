@@ -80,6 +80,7 @@ fn serve(tag: &str, keys: &[u64]) -> (Clean, std::path::PathBuf, Arc<Db>) {
         max_lanes: keys.len().max(1),
         max_blocks: 4,
         max_snapshots: 8,
+        max_writes: yesno_plugin::ipc::MAX_WRITES,
     };
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -226,6 +227,7 @@ fn a_peer_waits_for_a_database_that_is_not_open_yet() {
         max_lanes: 2,
         max_blocks: 4,
         max_snapshots: 8,
+        max_writes: yesno_plugin::ipc::MAX_WRITES,
     };
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -392,4 +394,41 @@ fn a_separate_process_writes_and_the_host_sees_it() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(db.live_readers(), 0, "and it released its snapshot on exit");
+}
+
+/// The widest legal `Apply` crosses a **real process boundary** in one commit.
+///
+/// The server-side test proves the socket carries it; this proves a separate program can
+/// build and send it, which is what the consumer was actually doing when it hit the old
+/// cap. Their failure was in the peer's own encoder before a byte was sent, so the half of
+/// the path that broke lives on this side of the socket and only a separate process
+/// exercises it as deployed.
+#[test]
+fn a_separate_process_sends_the_widest_legal_apply() {
+    let (_c, sock, db) = serve("widest", &[10]);
+    let n = yesno_plugin::ipc::MAX_WRITES;
+
+    let out = std::process::Command::new(peer_binary())
+        .arg("--write-n")
+        .arg(&sock)
+        .arg("900")
+        .arg(n.to_string())
+        .output()
+        .expect("the peer binary must run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "peer failed: {}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("changed {n}")),
+        "every entry must be committed, got {stdout:?}"
+    );
+    assert_eq!(
+        db.snapshot().unwrap().cardinality(900).unwrap() as usize,
+        n,
+        "the host must hold all {n} ordinals a separate process sent in one frame"
+    );
 }

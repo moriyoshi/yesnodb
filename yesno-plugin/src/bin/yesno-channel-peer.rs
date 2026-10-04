@@ -25,7 +25,13 @@
 //! yesno-channel-peer <socket> <key>...                  # scan, print the cardinality
 //! yesno-channel-peer --hold <socket> <key>...           # scan, then hold and wait
 //! yesno-channel-peer --write <socket> <key> <ord>...    # insert, then scan that key
+//! yesno-channel-peer --write-n <socket> <key> <count>   # insert count ordinals in one frame
 //! ```
+//!
+//! `--write-n` exists so the **widest legal frame** can be exercised across a real process
+//! boundary: the advertised cap is 16 384 entries and passing that many on a command line
+//! is not practical. It inserts ordinals `0 .. count` under `key` in one `Apply`, which is
+//! also the shape a bulk loader uses.
 //!
 //! `--write` exists because the worked example should show the whole surface: the channel
 //! served reads only until 2026-10-04, and a consumer reading this file would otherwise
@@ -170,6 +176,8 @@ enum Mode {
     Once,
     /// Insert the given ordinals under the key in one frame, then scan it.
     Write,
+    /// Insert `count` consecutive ordinals under the key in one frame, then scan it.
+    WriteN,
     /// Scan once and keep the snapshot open until the socket closes.
     Hold,
     /// Re-open a snapshot on an interval, announcing each answer.
@@ -193,6 +201,7 @@ fn main() -> std::process::ExitCode {
     let (mode, rest) = match args.split_first() {
         Some((first, rest)) if first == "--hold" => (Mode::Hold, rest),
         Some((first, rest)) if first == "--write" => (Mode::Write, rest),
+        Some((first, rest)) if first == "--write-n" => (Mode::WriteN, rest),
         Some((first, rest)) if first == "--watch" => (Mode::Watch, rest),
         _ => (Mode::Once, &args[..]),
     };
@@ -212,6 +221,10 @@ fn main() -> std::process::ExitCode {
     };
     if mode == Mode::Write && keys.len() < 2 {
         eprintln!("--write needs a key and at least one ordinal");
+        return std::process::ExitCode::from(2);
+    }
+    if mode == Mode::WriteN && keys.len() != 2 {
+        eprintln!("--write-n needs exactly a key and a count");
         return std::process::ExitCode::from(2);
     }
 
@@ -244,17 +257,27 @@ fn run(path: &str, keys: &[u64], mode: Mode) -> std::io::Result<u64> {
 
     // The write comes first and the scan that follows is the demonstration: a snapshot
     // opened after the commit must see it.
-    let keys = if mode == Mode::Write {
+    let keys = if mode == Mode::Write || mode == Mode::WriteN {
         let (key, ordinals) = keys.split_first().expect("checked in main");
-        let writes = ordinals
-            .iter()
-            .map(|&o| yesno_plugin::ipc::Write {
-                key: *key,
-                lo: o,
-                hi: o,
-                op: yesno_plugin::ipc::WriteOp::Insert,
-            })
-            .collect();
+        let writes: Vec<_> = match mode {
+            Mode::WriteN => (0..ordinals[0])
+                .map(|o| yesno_plugin::ipc::Write {
+                    key: *key,
+                    lo: o,
+                    hi: o,
+                    op: yesno_plugin::ipc::WriteOp::Insert,
+                })
+                .collect(),
+            _ => ordinals
+                .iter()
+                .map(|&o| yesno_plugin::ipc::Write {
+                    key: *key,
+                    lo: o,
+                    hi: o,
+                    op: yesno_plugin::ipc::WriteOp::Insert,
+                })
+                .collect(),
+        };
         match peer.ask(Frame::Apply { writes })? {
             Frame::Committed { version, changed } => {
                 println!("committed version {version}, changed {changed}");
@@ -324,9 +347,9 @@ fn scan_once(peer: &mut Peer, keys: &[u64], mode: Mode) -> std::io::Result<u64> 
     }
 
     match mode {
-        // `Write` has already printed its commit; the scan it then runs behaves like
-        // `Once`, which is the whole point -- the read path is unchanged by the write.
-        Mode::Once | Mode::Write => {}
+        // The write modes have already printed their commit; the scan they then run behaves
+        // like `Once`, which is the whole point -- the read path is unchanged by the write.
+        Mode::Once | Mode::Write | Mode::WriteN => {}
         Mode::Hold => {
             // Snapshot deliberately still open. Announce it, then block: whoever
             // started this wants to kill it and watch the server clean up.

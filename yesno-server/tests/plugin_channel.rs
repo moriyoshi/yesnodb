@@ -888,3 +888,161 @@ fn a_peer_writes_and_reads_over_one_socket() {
 
     channel.stop();
 }
+
+/// The widest legal `Apply` crosses a real socket, and one over is refused before mutating.
+///
+/// # Why a socket test as well as a codec test
+///
+/// The codec test proves the frame encodes and decodes at `MAX_WRITES`. This proves the
+/// whole path carries it: a peer's encoder, the socket, `read_frame`'s incremental buffer --
+/// which grows to the frame's real size rather than a declared one -- the server's
+/// admission against the advertised cap, and one commit at the far end. The defect a
+/// consumer reported was visible only at the limit, and only end to end.
+///
+/// The over-limit half asserts the database is untouched, because "refused" has to mean
+/// nothing happened and not merely that an error came back.
+#[test]
+fn the_widest_legal_apply_crosses_the_socket_and_one_over_is_refused() {
+    use yesno_plugin::ipc::{Write, WriteOp, MAX_WRITES};
+
+    let (_c, cfg, host, sock, _slot) = setup("widest");
+    let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+
+    let mut peer = Peer::connect(&sock);
+    let advertised = match peer.read_frame() {
+        Frame::ServerHello { max_writes, .. } => {
+            assert_eq!(
+                max_writes as usize, MAX_WRITES,
+                "the greeting must advertise the cap this build enforces"
+            );
+            max_writes as usize
+        }
+        other => panic!("{other:?}"),
+    };
+    peer.ask(Frame::ClientHello {
+        protocol: yesno_plugin::ipc::VERSION as u32,
+        name: "widest".into(),
+    });
+
+    // Distinct ordinals, so the committed cardinality is the entry count exactly and a
+    // batch that silently dropped or duplicated entries would be visible.
+    let writes: Vec<Write> = (0..advertised as u64)
+        .map(|i| Write {
+            key: 300,
+            lo: i * 3,
+            hi: i * 3,
+            op: WriteOp::Insert,
+        })
+        .collect();
+    match peer.ask(Frame::Apply {
+        writes: writes.clone(),
+    }) {
+        Frame::Committed { changed, .. } => assert_eq!(
+            changed as usize, advertised,
+            "every entry of the widest legal frame must have been applied"
+        ),
+        other => panic!("the widest legal Apply must be accepted, got {other:?}"),
+    }
+    assert_eq!(
+        host.db()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .cardinality(300)
+            .unwrap() as usize,
+        advertised,
+        "one commit, every ordinal"
+    );
+
+    // One over. The peer's own encoder refuses it, which is the first line of defence and
+    // the one the consumer actually hit -- so assert on that rather than only on the server.
+    let mut over = writes;
+    over.push(Write {
+        key: 300,
+        lo: u32::MAX as u64,
+        hi: u32::MAX as u64,
+        op: WriteOp::Insert,
+    });
+    assert_eq!(
+        Frame::Apply { writes: over }.encode(),
+        Err(yesno_plugin::ipc::IpcError::TooLarge),
+        "a frame past the cap must fail at encode, before the socket"
+    );
+    assert_eq!(
+        host.db()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .cardinality(300)
+            .unwrap() as usize,
+        advertised,
+        "and the database must be untouched by the attempt"
+    );
+
+    channel.stop();
+}
+
+/// A server configured below the protocol ceiling advertises and enforces *its* number.
+///
+/// The bug was an advertised limit that was not the enforced one. The fix has to hold in
+/// both directions, so this configures a small cap and checks three things agree: what the
+/// greeting says, what is accepted at that figure, and what is refused one past it. Without
+/// this, enforcing `MAX_WRITES` while advertising a lower number would pass every other
+/// test here.
+#[test]
+fn a_configured_write_cap_is_the_one_advertised_and_enforced() {
+    use yesno_plugin::ipc::{Write, WriteOp};
+
+    let (_c, mut cfg, host, sock, _slot) = setup("writecap");
+    cfg.plugin.channel_max_writes = 64;
+    let channel = Channel::start(&cfg, host.clone()).unwrap().unwrap();
+
+    let mut peer = Peer::connect(&sock);
+    match peer.read_frame() {
+        Frame::ServerHello { max_writes, .. } => assert_eq!(max_writes, 64),
+        other => panic!("{other:?}"),
+    }
+    peer.ask(Frame::ClientHello {
+        protocol: yesno_plugin::ipc::VERSION as u32,
+        name: "capped".into(),
+    });
+
+    let batch = |n: u64| Frame::Apply {
+        writes: (0..n)
+            .map(|i| Write {
+                key: 301,
+                lo: i,
+                hi: i,
+                op: WriteOp::Insert,
+            })
+            .collect(),
+    };
+    match peer.ask(batch(64)) {
+        Frame::Committed { changed, .. } => assert_eq!(changed, 64),
+        other => panic!("the advertised figure must be accepted, got {other:?}"),
+    }
+    // One past it is refused by the server -- the frame is well under the protocol cap, so
+    // nothing but the configured limit can reject it.
+    match peer.ask(batch(65)) {
+        Frame::Fault { status, message } => {
+            assert_eq!(status, yesno_plugin::abi::Status::InvalidArgument as u32);
+            assert!(
+                message.contains("65") && message.contains("64"),
+                "the refusal must name both figures, got {message:?}"
+            );
+        }
+        other => panic!("a batch past the configured cap must be refused, got {other:?}"),
+    }
+    assert_eq!(
+        host.db()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .cardinality(301)
+            .unwrap(),
+        64,
+        "the refused batch staged nothing"
+    );
+
+    channel.stop();
+}

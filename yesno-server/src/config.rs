@@ -386,6 +386,14 @@ pub struct PluginConfig {
     /// reclamation floor while it does. A peer needs a handful: one per query in
     /// flight.
     pub channel_max_snapshots: usize,
+    /// Entries one `Apply` frame may carry, clamped to `ipc::MAX_WRITES`.
+    ///
+    /// Bounds what the server holds while building one commit: at the protocol ceiling an
+    /// `Apply` payload is 409,604 bytes on the wire and the staged batch a small multiple
+    /// of that, per connection. Lower it to trade bulk throughput for memory; the value is
+    /// advertised in the greeting, so a peer always knows the real limit rather than
+    /// discovering it as an encoder error.
+    pub channel_max_writes: usize,
 
     /// Permission bits for the channel socket, as a string such as `"0600"`.
     ///
@@ -419,6 +427,7 @@ impl Default for PluginConfig {
             channel_inline: false,
             channel_max_peers: 8,
             channel_max_snapshots: 64,
+            channel_max_writes: yesno_plugin::ipc::MAX_WRITES,
             channel_socket_mode: String::new(),
             channel_allow_uids: Vec::new(),
         }

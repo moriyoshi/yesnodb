@@ -373,6 +373,10 @@ impl Channel {
                 .channel_max_blocks
                 .clamp(1, yesno_plugin::ipc::MAX_BATCH),
             max_snapshots: cfg.plugin.channel_max_snapshots.max(1),
+            max_writes: cfg
+                .plugin
+                .channel_max_writes
+                .clamp(1, yesno_plugin::ipc::MAX_WRITES),
         };
         let peers: Arc<std::sync::Mutex<Vec<Arc<PeerHandle>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
