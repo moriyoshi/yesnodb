@@ -383,11 +383,15 @@ fn count(kind: LaneKind, bytes: &[u8]) -> u64 {
         LaneKind::Absent => 0,
         LaneKind::Array => (bytes.len() / 2) as u64,
         LaneKind::Bitmap => bytes
-            .chunks_exact(8)
-            .map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones() as u64)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| u64::from_le_bytes(*w).count_ones() as u64)
             .sum(),
         LaneKind::Run => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 let start = u16::from_le_bytes([p[0], p[1]]);
                 let end = u16::from_le_bytes([p[2], p[3]]);

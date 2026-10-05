@@ -176,7 +176,9 @@ fn a_peer_scans_through_the_socket_and_the_arena() {
                         let n = l.kind.payload_bytes(l.count);
                         first_array = Some(
                             peer.view[off..off + n]
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect(),
                         );
@@ -419,7 +421,9 @@ fn a_peer_is_served_inline_when_the_host_has_no_arena() {
                     if l.kind == LaneKind::Array && first_array.is_none() && n > 0 {
                         first_array = Some(
                             payload[at..at + n]
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect(),
                         );

@@ -198,7 +198,9 @@ fn a_scan_reports_every_block_and_writes_the_payloads_into_the_arena() {
     // are 7, 8 and 9. Read them from where the peer's arithmetic says they are.
     let off = lane_offset(arena_off, 0) as usize;
     let vals: Vec<u16> = peer_view[off..off + 6]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(
@@ -663,7 +665,9 @@ fn a_session_without_an_arena_serves_payloads_in_the_frames() {
                     if l.kind == LaneKind::Array && first_array.is_none() && n > 0 {
                         first_array = Some(
                             payload[at..at + n]
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect(),
                         );
@@ -1284,7 +1288,7 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
     /// Rebuild a lane's ordinals from `[ start, end ]` pairs, the way a peer must.
     fn from_pairs(prefix: u64, pairs: &[u16]) -> Vec<u64> {
         let mut out = Vec::new();
-        for p in pairs.chunks_exact(2) {
+        for p in pairs.as_chunks::<2>().0 {
             let (start, end) = (p[0], p[1]);
             assert!(
                 start <= end,
@@ -1329,7 +1333,9 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
                     let off = lane_offset(arena_off, i) as usize;
                     let n = lane.kind.payload_bytes(lane.count);
                     let pairs: Vec<u16> = view[off..off + n]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
                     let vals = from_pairs(prefix, &pairs);
@@ -1383,7 +1389,9 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
                     let n_bytes = lane.kind.payload_bytes(lane.count);
                     if lane.kind == LaneKind::Run {
                         let pairs: Vec<u16> = payload[at..at + n_bytes]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|c| u16::from_le_bytes([c[0], c[1]]))
                             .collect();
                         let vals = from_pairs(b.prefix, &pairs);

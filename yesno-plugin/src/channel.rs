@@ -858,7 +858,7 @@ fn encode_into(dst: &mut [u8], c: &Container) -> Lane {
     match c {
         Container::Array(a) => {
             let values = a.as_slice();
-            for (slot, value) in dst.chunks_exact_mut(2).zip(values) {
+            for (slot, value) in dst.as_chunks_mut::<2>().0.iter_mut().zip(values) {
                 slot.copy_from_slice(&value.to_le_bytes());
             }
             Lane {
@@ -876,7 +876,12 @@ fn encode_into(dst: &mut [u8], c: &Container) -> Lane {
             // short, and a run whose start exceeds its length reads as a reversed
             // interval.
             let flat = r.as_flat();
-            for (slot, pair) in dst.chunks_exact_mut(4).zip(flat.chunks_exact(2)) {
+            for (slot, pair) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(flat.as_chunks::<2>().0)
+            {
                 let (start, len_minus_1) = (pair[0], pair[1]);
                 slot[..2].copy_from_slice(&start.to_le_bytes());
                 slot[2..].copy_from_slice(&(start + len_minus_1).to_le_bytes());
@@ -904,7 +909,7 @@ fn encode_into(dst: &mut [u8], c: &Container) -> Lane {
                     let mut buf = [0u64; yesno_core::BITMAP_WORDS];
                     let ok = b.copy_words_into(&mut buf);
                     debug_assert!(ok, "a bitmap payload is always BITMAP_WORDS long");
-                    for (slot, word) in words.chunks_exact_mut(8).zip(buf) {
+                    for (slot, word) in words.as_chunks_mut::<8>().0.iter_mut().zip(buf) {
                         slot.copy_from_slice(&word.to_le_bytes());
                     }
                 }
