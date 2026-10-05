@@ -318,3 +318,45 @@ resource "aws_ecs_task_definition" "materializer" {
     },
   ])
 }
+
+# A separate daemon task exercises the ECS health-check contract. The
+# materializer above is a one-shot binary and must not inherit the daemon's
+# probe; this task runs yesnod and lets ECS report its container health.
+resource "aws_ecs_task_definition" "probe" {
+  family                   = "${local.materializer_name}-probe"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = var.architecture == "arm64" ? "ARM64" : "X86_64"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name      = "yesnod"
+      image     = local.yesnod_image_uri
+      essential = true
+      command   = ["--data-dir", "/tmp/yesno-probe-db"]
+      healthCheck = {
+        command     = ["CMD", "/usr/local/bin/yesno", "--endpoint", "http://127.0.0.1:9750", "healthz"]
+        interval    = 10
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.materializer.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "probe"
+        }
+      }
+    },
+  ])
+}

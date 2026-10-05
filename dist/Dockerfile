@@ -232,11 +232,11 @@ EXPOSE 50051 50052 9750
 
 # Local Docker only. ECS reads the task definition's `healthCheck` and
 # Kubernetes reads the pod's probes; neither consults this, so a deployment on
-# either has to declare its own. `/readyz` on the metrics listener is the one
-# that distinguishes "up" from "serving" -- a standby rebuilding its copy is up
-# and is not ready.
+# either has to declare its own. Liveness uses `/healthz`; routing uses
+# `/readyz` so a standby rebuilding its copy stays alive without receiving
+# traffic.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s \
-  CMD ["/usr/local/bin/yesno", "--endpoint", "http://127.0.0.1:50051", "status"]
+  CMD ["/usr/local/bin/yesno", "--endpoint", "http://127.0.0.1:9750", "healthz"]
 
 # Exec form, and the dispatcher `exec`s in every branch, so PID 1 ends up
 # being the selected binary and SIGTERM reaches it directly. Shutdown drains

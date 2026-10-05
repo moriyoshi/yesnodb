@@ -51,10 +51,11 @@ EXPOSE 50051 50052 9750
 
 # The healthcheck talks to the metrics listener, which by default binds
 # loopback — reachable from inside the container, which is where this runs, and
-# not from outside, which is the point. `/readyz` distinguishes "up" from
-# "serving": a standby rebuilding its copy is up and is not ready.
+# not from outside, which is the point. Liveness uses `/healthz`; routing uses
+# `/readyz` so a standby rebuilding its copy stays alive without receiving
+# traffic.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s \
-  CMD ["/usr/local/bin/yesno", "--endpoint", "http://127.0.0.1:50051", "status"]
+  CMD ["/usr/local/bin/yesno", "--endpoint", "http://127.0.0.1:9750", "healthz"]
 
 # SIGTERM must reach the process for shutdown to drain readers and take its
 # final checkpoint, so this is the exec form with no shell in between.

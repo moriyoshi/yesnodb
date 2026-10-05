@@ -52,6 +52,10 @@ output "ecs_task_definition" {
   value = aws_ecs_task_definition.materializer.arn
 }
 
+output "ecs_probe_task_definition" {
+  value = aws_ecs_task_definition.probe.arn
+}
+
 output "ecs_container_name" {
   value = local.stage_container
 }

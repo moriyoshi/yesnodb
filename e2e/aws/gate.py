@@ -247,6 +247,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ECS ignores the Docker image's HEALTHCHECK. Exercise the explicit task
+# healthCheck on a yesnod task and require ECS itself to report HEALTHY.
+probe_task=$(aws ecs run-task \
+    --cluster "$cluster" \
+    --task-definition "$probe_task_definition" \
+    --launch-type FARGATE \
+    --network-configuration "awsvpcConfiguration={subnets=[$subnet],securityGroups=[$security_group],assignPublicIp=ENABLED}" \
+    --query 'tasks[0].taskArn' --output text)
+if [ -z "$probe_task" ] || [ "$probe_task" = None ]; then
+    echo "gate-aws: ECS did not start the daemon probe task" >&2
+    exit 1
+fi
+probe_deadline=$(( $(date +%s) + 300 ))
+probe_healthy=0
+while [ "$(date +%s)" -lt "$probe_deadline" ]; do
+    probe_status=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$probe_task" \
+        --query 'tasks[0].containers[0].healthStatus' --output text)
+    if [ "$probe_status" = HEALTHY ]; then
+        probe_healthy=1
+        break
+    fi
+    task_status=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$probe_task" \
+        --query 'tasks[0].lastStatus' --output text)
+    if [ "$task_status" = STOPPED ]; then
+        aws ecs describe-tasks --cluster "$cluster" --tasks "$probe_task" >&2
+        echo "gate-aws: ECS daemon probe task stopped before becoming healthy" >&2
+        exit 1
+    fi
+    sleep 5
+done
+if [ "$probe_healthy" -ne 1 ]; then
+    aws ecs describe-tasks --cluster "$cluster" --tasks "$probe_task" >&2
+    echo "gate-aws: ECS daemon probe did not become healthy within 300s" >&2
+    exit 1
+fi
+aws ecs stop-task --cluster "$cluster" --task "$probe_task" \
+    --reason "yesno ECS health probe passed" >/dev/null
+aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$probe_task"
+echo "gate-aws: ECS daemon /healthz task check passed"
+
 docker run $common \\
     --mount "type=bind,source=$source_mount,target=$source_mount" \\
     --mount "type=bind,source=$staging_mount,target=$staging_mount" \\
@@ -790,15 +830,18 @@ assert cloud_push_image(RUNNER_DOCKERFILE, image, platform, RUNNER_TARGET) is Tr
 # YesnoCluster inside the EKS cluster, so YESNO_AWS_EKS=0 leaves it nothing to
 # run against, and the host refuses that combination before anything is applied.
 run_operator = config["eks"] and only in ("", "operator")
-if run_operator:
+run_ecs_probe = only in ("", "ecs")
+if run_operator or run_ecs_probe:
     yesnod_image = cloud_output("yesnod_image")
-    operator_image = cloud_output("operator_image")
-    # One repository, three tags, and every layer but the last already pushed
-    # above -- so these two cost a manifest each.
+    # The ECS arm needs this daemon image to exercise the task health check.
     assert config["run_id"] in yesnod_image, yesnod_image
-    assert config["run_id"] in operator_image, operator_image
-    assert yesnod_image != image and operator_image != image, yesnod_image
+    assert yesnod_image != image, yesnod_image
     assert cloud_push_image(RUNNER_DOCKERFILE, yesnod_image, platform, YESNOD_TARGET) is True
+
+if run_operator:
+    operator_image = cloud_output("operator_image")
+    assert config["run_id"] in operator_image, operator_image
+    assert operator_image != image, operator_image
     assert cloud_push_image(RUNNER_DOCKERFILE, operator_image, platform, OPERATOR_TARGET) is True
 
 # The gate opens no ingress port at all; Systems Manager reaches the runner
@@ -900,7 +943,18 @@ else:
 # differs is that yesnod hands out a provisional snapshot instead of mounting
 # one, and an ECS task materializes it.
 if only in ("", "ecs"):
-    deferred_arm("ecs", ECS_SCENARIO, ECS_SECONDS, ECS_BODY, {"cluster": cluster})
+    deferred_arm(
+        "ecs",
+        ECS_SCENARIO,
+        ECS_SECONDS,
+        ECS_BODY,
+        {
+            "cluster": cluster,
+            "probe_task_definition": cloud_output("ecs_probe_task_definition"),
+            "security_group": cloud_output("ecs_security_groups"),
+            "subnet": cloud_output("ecs_subnets"),
+        },
+    )
 else:
     print("gate-aws: YESNO_AWS_ONLY=" + only + "; the deferred ECS arm was not run")
 
