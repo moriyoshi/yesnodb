@@ -120,6 +120,10 @@ enum Cmd {
     Stats,
     /// What this server is and what it will answer.
     Status,
+    /// Check the process liveness endpoint over plain HTTP.
+    Healthz,
+    /// Check whether the process is ready to receive traffic over plain HTTP.
+    Readyz,
 }
 
 /// Let a closed pipe kill this process the way it kills `grep`.
@@ -1297,6 +1301,15 @@ async fn put_pairs(c: &mut Client, keys: Vec<u64>, ords: Vec<u64>) -> Result<(),
 }
 
 async fn run(cli: Cli) -> Result<(), Fail> {
+    let probe_path = match &cli.cmd {
+        Cmd::Healthz => Some("/healthz"),
+        Cmd::Readyz => Some("/readyz"),
+        _ => None,
+    };
+    if let Some(path) = probe_path {
+        return probe_http(&cli.endpoint, path).await;
+    }
+
     let mut c = connect(&cli).await?;
     match cli.cmd {
         Cmd::Count { key } => {
@@ -1417,6 +1430,18 @@ async fn run(cli: Cli) -> Result<(), Fail> {
                 .await
             {
                 Ok(resp) => {
+                    let follower_sync = resp
+                        .metadata()
+                        .get(yesno_server::guard::FOLLOWER_INITIAL_SYNC_COMPLETE)
+                        .and_then(|v| v.to_str().ok());
+                    println!(
+                        "follower sync : {}",
+                        match follower_sync {
+                            Some("true") => "complete",
+                            Some("false") => "incomplete",
+                            _ => "not reported",
+                        }
+                    );
                     let mut s = resp.into_inner();
                     if let Some(Ok(first)) = s.next().await {
                         println!("identity : {}", String::from_utf8_lossy(&first.payload));
@@ -1440,8 +1465,50 @@ async fn run(cli: Cli) -> Result<(), Fail> {
             }
             println!("stats    : {}", format_stats(&stats(&mut c).await?));
         }
+        Cmd::Healthz | Cmd::Readyz => {
+            unreachable!("HTTP probes are handled before Flight connects")
+        }
     }
     Ok(())
+}
+
+/// Request one of the daemon's plain-HTTP process probes.
+///
+/// This is used by container runtimes, including ECS task health checks, where
+/// the image's Docker `HEALTHCHECK` is not consulted. Metrics intentionally use
+/// plain HTTP and a separate listener from Flight, so a database still seeding
+/// from an archive can report process liveness before Flight is available.
+async fn probe_http(endpoint: &str, path: &str) -> Result<(), Fail> {
+    let uri: axum::http::Uri = endpoint.parse()?;
+    if uri.scheme_str() != Some("http") {
+        return Err("health probes require an http:// metrics endpoint".into());
+    }
+    let authority = uri
+        .authority()
+        .ok_or("health probe endpoint must include a host and port")?;
+    let port = authority.port_u16().unwrap_or(80);
+    let stream = tokio::net::TcpStream::connect((authority.host(), port)).await?;
+    let mut stream = tokio::io::BufReader::new(stream);
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    stream
+        .get_mut()
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    let mut status_line = String::new();
+    stream.read_line(&mut status_line).await?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or("health probe received an invalid HTTP status line")?;
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(format!("health probe GET {path} returned HTTP {status}").into())
+    }
 }
 
 async fn action_bytes(c: &mut Client, name: &str) -> Result<Vec<u8>, Fail> {
@@ -1493,6 +1560,33 @@ mod query_parser_tests {
 
     use super::*;
     use yesno_flight::SetExpr;
+
+    #[tokio::test]
+    async fn health_probe_accepts_liveness_and_rejects_unready_status() {
+        async fn serve_status(code: u16) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                use tokio::io::AsyncWriteExt;
+                stream
+                    .write_all(
+                        format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        let live_endpoint = serve_status(200).await;
+        probe_http(&live_endpoint, "/healthz")
+            .await
+            .expect("a live process must pass the liveness probe");
+
+        let unready_endpoint = serve_status(503).await;
+        assert!(probe_http(&unready_endpoint, "/readyz").await.is_err());
+    }
 
     #[test]
     fn parses_every_documented_operator() {

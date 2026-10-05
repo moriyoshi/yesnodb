@@ -40,7 +40,9 @@
 //! daemon: `yesnoctl restore` reconstructs a directory at a commit version or a
 //! wall clock from a published object-store history. `yesnod` contributes the
 //! commit times that make a wall-clock target answerable and nothing else, so a
-//! deployment without an archive sidecar has no recovery points to target.
+//! deployment without an archive sidecar has no recovery points to target. An
+//! opt-in follower start can ask the separately shipped `yesnoctl` to seed an
+//! empty directory from that archive before live replication begins.
 
 pub mod auth;
 pub mod config;

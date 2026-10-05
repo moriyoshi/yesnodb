@@ -480,6 +480,9 @@ impl PluginConfig {
 pub struct FollowerConfig {
     /// The leader's **replication** endpoint, e.g. `https://a.internal:50052`.
     pub leader: String,
+    /// Optional object archive used to seed an empty follower before it connects
+    /// to the leader. Existing directories continue from their own WAL.
+    pub archive_store: Option<String>,
     /// How long to wait after a pass that shipped nothing.
     pub poll_interval_secs: u64,
     /// `0` asks the leader for its own default.
@@ -506,6 +509,7 @@ impl Default for FollowerConfig {
     fn default() -> Self {
         FollowerConfig {
             leader: String::new(),
+            archive_store: None,
             // A second, because the leader's own `subscribe` already sleeps 50 ms
             // between polls when caught up — this is the interval between
             // *passes*, and a shorter one would mostly re-ask questions the
@@ -965,6 +969,10 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", env = "YESNOD_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// Object archive from which an empty follower is seeded at startup.
+    #[arg(long, env = "YESNOD_FOLLOWER_ARCHIVE_STORE")]
+    pub follower_archive_store: Option<String>,
+
     #[arg(long, value_name = "ADDR", env = "YESNOD_FLIGHT_LISTEN")]
     pub flight_listen: Option<String>,
 
@@ -1118,6 +1126,9 @@ impl Config {
         };
         if let Some(d) = &cli.data_dir {
             cfg.server.data_dir = Some(d.clone());
+        }
+        if let Some(store) = &cli.follower_archive_store {
+            cfg.follower.archive_store = Some(store.clone());
         }
         if let Some(a) = &cli.flight_listen {
             cfg.server.flight.listen = a.clone();
@@ -1713,6 +1724,16 @@ impl Config {
 
         // ---- a follower does not own the leader's Flight listener
         if self.server.role == Role::Follower {
+            if self
+                .follower
+                .archive_store
+                .as_deref()
+                .is_some_and(|store| store.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "`follower.archive_store` must not be empty".into(),
+                ));
+            }
             if self.follower.leader.trim().is_empty() {
                 return Err(ConfigError::Invalid(
                     "`server.role = \"follower\"` needs `follower.leader`, the leader's \
@@ -2404,6 +2425,29 @@ interval_secs = 5
         let path = dir.join("yesnod.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn follower_archive_store_override_reaches_the_effective_config() {
+        use clap::Parser as _;
+
+        let file = config_file(
+            "archive-override",
+            "[server]\nrole = \"follower\"\ndata_dir = \"/tmp/yesnod-archive-override\"\n\
+             [follower]\nleader = \"http://127.0.0.1:50052\"\narchive_store = \"file:///old\"\n",
+        );
+        let cli = Cli::parse_from([
+            "yesnod",
+            "--config",
+            file.to_str().unwrap(),
+            "--follower-archive-store",
+            "s3://backups/current",
+        ]);
+        let config = Config::resolve(&cli).unwrap();
+        assert_eq!(
+            config.follower.archive_store.as_deref(),
+            Some("s3://backups/current")
+        );
     }
 
     /// The channel's socket and limits are settable from the command line.

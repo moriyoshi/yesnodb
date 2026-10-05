@@ -40,6 +40,8 @@ use crate::auth::{Perm, Principal};
 pub const EXPECT_TERM: &str = "yesno-expect-term";
 /// Response metadata: the term this server is serving at.
 pub const TERM: &str = "yesno-term";
+/// Response metadata: whether a follower has completed a full replication pass.
+pub const FOLLOWER_INITIAL_SYNC_COMPLETE: &str = "yesno-follower-initial-sync-complete";
 
 /// The database a listener is currently serving, if any.
 ///
@@ -66,6 +68,9 @@ pub fn slot_of(db: Arc<Db>) -> DbSlot {
 #[derive(Clone)]
 pub struct GuardedFlight {
     db: DbSlot,
+    /// Present on read-serving followers so peers can distinguish a reachable
+    /// database from one that has completed its first full replication pass.
+    follower_status: Option<Arc<crate::follower::FollowerStatus>>,
     /// One service per database, because the service owns state that must
     /// outlive a single RPC.
     ///
@@ -93,9 +98,13 @@ pub struct GuardedFlight {
 }
 
 impl GuardedFlight {
-    pub fn new(db: DbSlot) -> GuardedFlight {
+    pub fn new(
+        db: DbSlot,
+        follower_status: Option<Arc<crate::follower::FollowerStatus>>,
+    ) -> GuardedFlight {
         GuardedFlight {
             db,
+            follower_status,
             service: Arc::new(std::sync::Mutex::new(None)),
             version: env!("CARGO_PKG_VERSION"),
         }
@@ -187,6 +196,14 @@ impl GuardedFlight {
     fn stamp<T>(&self, mut r: Response<T>, term: u32) -> Response<T> {
         if let Ok(v) = term.to_string().parse() {
             r.metadata_mut().insert(TERM, v);
+        }
+        if let Some(status) = &self.follower_status {
+            let complete = status
+                .initial_sync_complete
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Ok(v) = if complete { "true" } else { "false" }.parse() {
+                r.metadata_mut().insert(FOLLOWER_INITIAL_SYNC_COMPLETE, v);
+            }
         }
         r
     }

@@ -353,7 +353,7 @@ async fn a_read_serving_standby_answers_queries_while_it_follows() {
 
     let node = yesno_server::follower::start(validated(&fcfg)).unwrap();
     let slot = node.db.clone().expect("a read-serving standby has a slot");
-    let reads = yesno_server::lifecycle::serve_reads(validated(&fcfg), slot)
+    let reads = yesno_server::lifecycle::serve_reads(validated(&fcfg), slot, node.status.clone())
         .await
         .unwrap();
 
@@ -489,7 +489,8 @@ async fn a_rebuilding_standby_says_so_instead_of_dropping_its_port() {
     cfg.server.flight.listen = "127.0.0.1:0".into();
     cfg.server.metrics.listen = "127.0.0.1:0".into();
 
-    let reads = yesno_server::lifecycle::serve_reads(&cfg, slot.clone())
+    let status = std::sync::Arc::new(yesno_server::follower::FollowerStatus::default());
+    let reads = yesno_server::lifecycle::serve_reads(&cfg, slot.clone(), status.clone())
         .await
         .unwrap();
     let ch = tonic::transport::Channel::from_shared(format!("http://{}", reads.addr))
@@ -513,12 +514,38 @@ async fn a_rebuilding_standby_says_so_instead_of_dropping_its_port() {
     db.insert_range(1, 0, 10).unwrap();
     *slot.write().unwrap() = Some(db.clone());
 
-    let info = c
+    let response = c
         .get_flight_info(FlightDescriptor::new_cmd(1u64.to_le_bytes().to_vec()))
         .await
-        .expect("the listener did not recover when the database came back")
-        .into_inner();
+        .expect("the listener did not recover when the database came back");
+    assert_eq!(
+        response
+            .metadata()
+            .get(yesno_server::guard::FOLLOWER_INITIAL_SYNC_COMPLETE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "false"
+    );
+    let info = response.into_inner();
     assert_eq!(info.total_records, 11);
+
+    status
+        .initial_sync_complete
+        .store(true, std::sync::atomic::Ordering::Release);
+    let response = c
+        .get_flight_info(FlightDescriptor::new_cmd(1u64.to_le_bytes().to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .metadata()
+            .get(yesno_server::guard::FOLLOWER_INITIAL_SYNC_COMPLETE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "true"
+    );
 
     drop(c);
     reads.stop().await;

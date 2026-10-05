@@ -30,7 +30,9 @@
 //! comes back a follower with no memory of it. Demotion has the same shape.
 //!
 //! So `Shared` holds the role-dependent half behind a lock and `serve_shared`
-//! binds once, for the life of the process. `run_node` owns it; `follow` and
+//! binds once, for the life of the process. Startup binds it before archive
+//! seeding, so liveness is available during that potentially long operation
+//! while readiness remains unavailable. `run` owns it; `follow` and
 //! `start_with_events` swap the surface rather than binding their own.
 //! Do not reintroduce a per-role listener, and do not "fix" a probe
 //! failure here by raising `failureThreshold` -- that hides the window and
@@ -562,7 +564,7 @@ pub struct FollowerMetrics {
     status: Arc<crate::follower::FollowerStatus>,
 }
 
-/// Readiness for a standby: connected and still following.
+/// Readiness for a standby: connected, initially synchronized, and still following.
 ///
 /// A **halted** standby is unready and must stay that way. It has stopped for
 /// something a retry cannot fix — it is pointed at the wrong database, or it
@@ -583,6 +585,12 @@ fn follower_readyz_of(m: &FollowerMetrics) -> (StatusCode, String) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "not connected to the leader\n".into(),
+        );
+    }
+    if !s.initial_sync_complete.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "initial replication pass incomplete\n".into(),
         );
     }
     (StatusCode::OK, "following\n".into())
@@ -612,6 +620,12 @@ fn render_follower(m: &FollowerMetrics) -> String {
         "follower_halted",
         "1 when following has stopped for something a retry cannot fix.",
         u8::from(s.halted.load(Ordering::Relaxed)).to_string(),
+    );
+    gauge(
+        &mut out,
+        "follower_initial_sync_complete",
+        "1 after a complete replication sweep since startup or the last rebuild.",
+        u8::from(s.initial_sync_complete.load(Ordering::Acquire)).to_string(),
     );
     gauge(
         &mut out,
@@ -651,4 +665,46 @@ fn render_follower(m: &FollowerMetrics) -> String {
     );
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_tracks_startup_initial_sync_and_rebuild() {
+        let shared = Shared::new();
+
+        assert_eq!(
+            shared_readyz(State(shared.clone())).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "starting\n".into())
+        );
+
+        let status = Arc::new(crate::follower::FollowerStatus::default());
+        shared.set_follower(status.clone());
+        status.connected.store(true, Ordering::Release);
+        assert_eq!(
+            shared_readyz(State(shared.clone())).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "initial replication pass incomplete\n".into()
+            )
+        );
+
+        status.initial_sync_complete.store(true, Ordering::Release);
+        assert_eq!(
+            shared_readyz(State(shared.clone())).await,
+            (StatusCode::OK, "following\n".into())
+        );
+
+        // Rebuild clears the same gate before its database image is replaced.
+        status.initial_sync_complete.store(false, Ordering::Release);
+        assert_eq!(
+            shared_readyz(State(shared)).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "initial replication pass incomplete\n".into()
+            )
+        );
+    }
 }

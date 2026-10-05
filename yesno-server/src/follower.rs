@@ -46,6 +46,8 @@ use crate::config::{Config, ConfigError};
 #[derive(Debug, Default)]
 pub struct FollowerStatus {
     pub connected: AtomicBool,
+    /// True after a complete replication sweep has succeeded since startup or rebuild.
+    pub initial_sync_complete: AtomicBool,
     /// Versions at or below this are complete here. A lower bound after a
     /// restart — see `FollowerClient::resume_from_disk`.
     pub visible: AtomicU64,
@@ -317,6 +319,7 @@ pub fn start_with_wiring(
             {
                 Ok(moved) => {
                     st.passes.fetch_add(1, Ordering::Relaxed);
+                    st.initial_sync_complete.store(true, Ordering::Release);
                     backoff = Duration::from_millis(250);
                     // Only wait when there was nothing to do; a standby that is
                     // behind should stay in the loop.
@@ -536,6 +539,9 @@ fn close_for_rebuild(
     st: &Arc<FollowerStatus>,
     listeners: crate::plugin::Listeners<'_>,
 ) {
+    // A previously-ready follower must become unready before any database image
+    // is removed. Readiness returns after the next complete sweep succeeds.
+    st.initial_sync_complete.store(false, Ordering::Release);
     // **The slot is emptied before the peers are told, and the order is the fix.**
     // Disconnecting first left a gap: the listener stays up by design, so a peer
     // connecting between the disconnect and the take was admitted, read a database
@@ -630,4 +636,19 @@ fn classify(shard: u32, e: FollowerError, st: &Arc<FollowerStatus>) -> Result<u6
         }
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebuilding_clears_initial_sync_even_without_a_read_database() {
+        let status = Arc::new(FollowerStatus::default());
+        status.initial_sync_complete.store(true, Ordering::Release);
+
+        close_for_rebuild(None, &status, crate::plugin::Listeners::default());
+
+        assert!(!status.initial_sync_complete.load(Ordering::Acquire));
+    }
 }

@@ -66,6 +66,43 @@ async fn run(cfg: Config) -> std::process::ExitCode {
     // SIGHUP is "terminate the process".
     yesno_server::tls::watch_for_reload_signal();
 
+    // Start health reporting before archive seeding. The shared surface answers
+    // `/healthz` immediately and keeps `/readyz` unavailable until a role is
+    // serving; the seed helper can take longer than Kubernetes' liveness window.
+    let shared = yesno_server::metrics::Shared::new();
+    let metrics = match cfg.metrics_addr() {
+        Ok(Some(addr)) => match yesno_server::metrics::serve_shared(addr, shared.clone()).await {
+            Ok(serving) => Some(serving),
+            Err(error) => {
+                eprintln!("yesnod: cannot serve metrics: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("yesnod: cannot serve metrics: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let metrics_addr = metrics.as_ref().map(|m| m.addr);
+
+    if cfg.server.role == Role::Follower {
+        if let Some(store) = cfg.follower.archive_store.as_deref() {
+            // Archive code lives in the separately shipped utility crate. Use
+            // its sibling executable before opening the control journal or
+            // starting the follower role, so a failed seed never serves a
+            // half-built directory. The health listener is already live and
+            // remains unready. A resumed follower is a no-op for the helper.
+            if let Err(error) = seed_follower(&cfg, store).await {
+                eprintln!("yesnod: {error}");
+                if let Some(metrics) = metrics {
+                    metrics.stop().await;
+                }
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+
     let control_enabled = cfg.control_enabled();
     let (hub, control, mut commands, shared_replication) = match control_enabled {
         false => (None, None, None, None),
@@ -94,11 +131,56 @@ async fn run(cfg: Config) -> std::process::ExitCode {
         }
     };
 
-    let code = run_node(cfg, hub.clone(), &mut commands, shared_replication).await;
+    let code = run_node(
+        cfg,
+        hub.clone(),
+        &mut commands,
+        shared_replication,
+        shared,
+        metrics_addr,
+    )
+    .await;
     if let Some(control) = control {
         control.stop().await;
     }
+    if let Some(metrics) = metrics {
+        metrics.stop().await;
+    }
     code
+}
+
+async fn seed_follower(cfg: &Config, store: &str) -> Result<(), String> {
+    let helper = std::env::current_exe()
+        .map_err(|error| format!("cannot locate yesnoctl: {error}"))?
+        .with_file_name("yesnoctl");
+    let mut seed = tokio::process::Command::new(helper);
+    seed.arg("seed-follower")
+        .arg("--store")
+        .arg(store)
+        .arg("--target")
+        .arg(cfg.data_dir())
+        .arg("--leader")
+        .arg(&cfg.follower.leader);
+    if let Some(journal_dir) = cfg.control_journal_dir() {
+        seed.arg("--journal-dir").arg(journal_dir);
+    }
+    if let Some(ca) = cfg.follower.tls.ca.as_ref() {
+        seed.arg("--ca").arg(ca);
+    }
+    if let Some(cert) = cfg.follower.tls.cert.as_ref() {
+        seed.arg("--cert").arg(cert);
+    }
+    if let Some(key) = cfg.follower.tls.key.as_ref() {
+        seed.arg("--key").arg(key);
+    }
+    if let Some(domain) = cfg.follower.tls.domain.as_ref() {
+        seed.arg("--server-name").arg(domain);
+    }
+    match seed.status().await {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("follower archive seed exited with {status}")),
+        Err(error) => Err(format!("cannot run follower archive seed: {error}")),
+    }
 }
 
 async fn run_node(
@@ -106,29 +188,10 @@ async fn run_node(
     hub: Option<Arc<EventHub>>,
     commands: &mut Option<tokio::sync::mpsc::Receiver<Command>>,
     shared_replication: Option<control::ReplicationSlot>,
+    shared: yesno_server::metrics::Shared,
+    metrics_addr: Option<std::net::SocketAddr>,
 ) -> std::process::ExitCode {
     let mut pending_role: Option<Vec<u8>> = None;
-
-    // One metrics listener for the life of the process, not one per role.
-    // A role change swaps the surface underneath it; it never closes the port.
-    // Binding per role made promotion a stop-then-rebind, and the liveness
-    // probe watches that port -- see `metrics::Surface`.
-    let shared = yesno_server::metrics::Shared::new();
-    let metrics = match cfg.metrics_addr() {
-        Ok(Some(addr)) => match yesno_server::metrics::serve_shared(addr, shared.clone()).await {
-            Ok(serving) => Some(serving),
-            Err(error) => {
-                eprintln!("yesnod: cannot serve metrics: {error}");
-                return std::process::ExitCode::FAILURE;
-            }
-        },
-        Ok(None) => None,
-        Err(error) => {
-            eprintln!("yesnod: cannot serve metrics: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let metrics_addr = metrics.as_ref().map(|m| m.addr);
 
     loop {
         match cfg.server.role {
@@ -315,24 +378,26 @@ async fn follow(
     );
     let reads = match node.db.clone() {
         None => None,
-        Some(slot) => match yesno_server::lifecycle::serve_reads(cfg, slot).await {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                publish_server(
-                    hub,
-                    pb::server_lifecycle_event::Operation::Start,
-                    pb::EventPhase::Failed,
-                    false,
-                    &error.to_string(),
-                );
-                eprintln!("yesnod: cannot serve reads: {error}");
-                if let Some(c) = channel.as_ref() {
-                    c.stop();
+        Some(slot) => {
+            match yesno_server::lifecycle::serve_reads(cfg, slot, node.status.clone()).await {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    publish_server(
+                        hub,
+                        pb::server_lifecycle_event::Operation::Start,
+                        pb::EventPhase::Failed,
+                        false,
+                        &error.to_string(),
+                    );
+                    eprintln!("yesnod: cannot serve reads: {error}");
+                    if let Some(c) = channel.as_ref() {
+                        c.stop();
+                    }
+                    node.stop().await;
+                    return Outcome::Exit(std::process::ExitCode::FAILURE);
                 }
-                node.stop().await;
-                return Outcome::Exit(std::process::ExitCode::FAILURE);
             }
-        },
+        }
     };
 
     // The listener is already bound and answering `/healthz`; following only

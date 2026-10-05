@@ -103,9 +103,10 @@ impl Teardown {
 pub async fn serve_reads(
     cfg: &Config,
     slot: crate::guard::DbSlot,
+    follower_status: Arc<crate::follower::FollowerStatus>,
 ) -> Result<ReadListener, Box<dyn std::error::Error + Send + Sync>> {
     let auth = Arc::new(crate::auth::Authenticator::new(&cfg.auth));
-    let service = crate::guard::GuardedFlight::new(slot);
+    let service = crate::guard::GuardedFlight::new(slot, Some(follower_status));
     let service =
         FlightServiceServer::with_interceptor(service, crate::auth::interceptor(auth.clone()));
 
@@ -285,7 +286,7 @@ pub async fn start_with_plugin(
     if let Ok(mut g) = slot.write() {
         *g = Some(db.clone());
     }
-    let service = crate::guard::GuardedFlight::new(slot.clone());
+    let service = crate::guard::GuardedFlight::new(slot.clone(), None);
     let service =
         FlightServiceServer::with_interceptor(service, crate::auth::interceptor(auth.clone()));
 

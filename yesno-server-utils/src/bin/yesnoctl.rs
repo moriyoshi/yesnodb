@@ -14,6 +14,7 @@ use yesno_server_utils::basebackup::{
 use yesno_server_utils::restore::{
     completion_line as restore_completion, run as run_restore, RestoreOptions,
 };
+use yesno_server_utils::seed::{seed_follower, SeedOptions};
 use yesno_server_utils::transport::{self, ClientTls};
 
 type Fail = Box<dyn std::error::Error + Send + Sync>;
@@ -37,6 +38,8 @@ enum Command {
     Basebackup(BasebackupOptions),
     /// Restore a protobuf archive to a commit version or a wall-clock instant.
     Restore(RestoreOptions),
+    /// Seed an empty follower from an object archive before it starts.
+    SeedFollower(SeedOptions),
 }
 
 #[derive(Args, Debug)]
@@ -105,6 +108,10 @@ async fn run(cli: Cli) -> Result<String, Fail> {
             Some(report) => restore_completion(&report),
             None => "inspect complete: no directory was created".to_string(),
         }),
+        Command::SeedFollower(options) => Ok(format!(
+            "follower archive seed: {:?}",
+            seed_follower(&options).await?
+        )),
     }
 }
 
@@ -143,6 +150,19 @@ mod tests {
             "file:///archive",
             "-D",
             "restored",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "yesnoctl",
+            "seed-follower",
+            "--store",
+            "file:///archive",
+            "--target",
+            "follower",
+            "--journal-dir",
+            "follower/control",
+            "--leader",
+            "http://127.0.0.1:50052",
         ])
         .is_ok());
     }

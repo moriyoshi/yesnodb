@@ -63,6 +63,7 @@ pub const OWNS: &[&str] = &[
     "srv_restore",
     "srv_restore_at",
     "srv_restore_windows",
+    "srv_seed_follower",
     "srv_archive_gc",
     "srv_archive_second_error",
     "srv_archive_start",
@@ -320,7 +321,11 @@ fn launch(
                 None => (None, None),
                 Some(slot) => {
                     let l = rt
-                        .block_on(yesno_server::lifecycle::serve_reads(&cfg, slot))
+                        .block_on(yesno_server::lifecycle::serve_reads(
+                            &cfg,
+                            slot,
+                            node.status.clone(),
+                        ))
                         .map_err(|e| db_err(verb, e))?;
                     let addr = l.addr;
                     (Some(l), Some(addr))
@@ -583,6 +588,38 @@ impl World {
                 cfg.follower.poll_interval_secs = 1;
                 cfg.follower.max_backoff_secs = 1;
                 Ok(MontyObject::None)
+            }
+
+            // Seed an empty standby using the shipped archive join path. The
+            // later srv_launch still runs the ordinary live follower loop.
+            "srv_seed_follower" => {
+                a.exact(3)?;
+                a.no_kwargs()?;
+                let leader_handle = a.handle(1)?;
+                let addr = self
+                    .server(leader_handle, verb)?
+                    .control_addr
+                    .ok_or_else(|| {
+                        value_err(format!("{verb}(): leader has no replication endpoint"))
+                    })?;
+                let config_handle = a.handle(0)?;
+                let target = self.cfg_mut(config_handle, verb)?.data_dir().to_path_buf();
+                let object_dir = self.scenario_path(a.str_at(2)?, verb)?;
+                let options = yesno_server_utils::seed::SeedOptions {
+                    store: format!("file://{}", object_dir.display()),
+                    target,
+                    journal_dir: None,
+                    leader: format!("http://{addr}"),
+                    ca: None,
+                    cert: None,
+                    key: None,
+                    server_name: None,
+                };
+                let rt = self.rt_handle(verb)?;
+                let outcome = rt
+                    .block_on(yesno_server_utils::seed::seed_follower(&options))
+                    .map_err(|error| db_err(verb, error))?;
+                Ok(MontyObject::String(format!("{outcome:?}")))
             }
 
             // Make this standby serve reads while it follows.
