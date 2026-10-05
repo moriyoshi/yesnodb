@@ -67,6 +67,16 @@ pub struct YesnoClusterSpec {
     #[schemars(range(min = 1, max = 9))]
     pub instances: i32,
 
+    /// Optional object archive used to seed each new follower before live
+    /// replication. Credentials come from cloud identity or the named Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_archive_store: Option<String>,
+
+    /// Secret containing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION
+    /// for archive reads. Only follower Pods receive these environment values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_archive_credentials_secret_name: Option<String>,
+
     /// How long a primary may remain unavailable before automatic failover.
     /// Zero is useful for deterministic tests; production clusters should
     /// leave time for an ordinary Pod restart.

@@ -14,10 +14,37 @@ writes can be lost when the leader fails even when promotion succeeds.
 ## Topology and automatic promotion
 
 `spec.instances` is between 1 and 9. Instance zero starts as leader; the other
-instances bootstrap from it, follow its WAL, and serve potentially stale reads.
+instances bootstrap, follow its WAL, and serve potentially stale reads.
 `<name>-rw` selects the current leader and `<name>-ro` selects followers. Each
 instance has its own `ReadWriteOnce` PVC and `Recreate` Deployment, so no two
 yesnod processes mount the same database directory.
+
+Set `spec.followerArchiveStore` to an `s3://` archive prefix to seed new
+followers from a published base and WAL before they connect to the leader.
+The archive writer runs separately; the operator does not start it. Grant the
+follower Pods read access through their cloud identity or a Kubernetes Secret,
+and keep `yesnoctl` in the yesnod image. Increasing `spec.instances` then
+creates independent PVCs for the new followers. If no archive base is published
+yet, they bootstrap from the leader. Existing follower directories continue
+from their own WAL.
+
+For static S3 credentials, create a Secret in the `YesnoCluster` namespace with
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION`. It may also have
+`AWS_SESSION_TOKEN` for temporary credentials and `AWS_ENDPOINT` for an
+S3-compatible service. Then name it in the cluster spec:
+
+```yaml
+spec:
+  followerArchiveStore: s3://yesno-backups/production
+  followerArchiveCredentialsSecretName: archive-reader
+```
+
+The operator uses `secretKeyRef` for these keys on follower Pods only; it does
+not copy their values into the custom resource or a ConfigMap. The Secret must
+exist before a new follower Pod starts. Credentials in Pod environment variables
+are captured at startup, so restart a Pod to pick up a rotated Secret. For
+cloud identity, leave `followerArchiveCredentialsSecretName` unset and use
+`spec.serviceAccountName` as described below.
 
 When a ready primary becomes unavailable for `spec.failoverDelaySecs`, the
 controller chooses the reachable follower with the greatest visible version.

@@ -1273,6 +1273,33 @@ fn validate(cluster: &YesnoCluster) -> Option<String> {
     if !(1..=9).contains(&cluster.spec.instances) {
         return Some("spec.instances must be between 1 and 9".into());
     }
+    if let Some(store) = cluster.spec.follower_archive_store.as_deref() {
+        if !(store.starts_with("s3://") || store.starts_with("file://")) {
+            return Some(
+                "spec.followerArchiveStore must be an s3:// or file:// object archive URL".into(),
+            );
+        }
+    }
+    if let Some(name) = cluster
+        .spec
+        .follower_archive_credentials_secret_name
+        .as_deref()
+    {
+        if name.trim().is_empty() {
+            return Some("spec.followerArchiveCredentialsSecretName must not be empty".into());
+        }
+        if !cluster
+            .spec
+            .follower_archive_store
+            .as_deref()
+            .is_some_and(|store| store.starts_with("s3://"))
+        {
+            return Some(
+                "spec.followerArchiveCredentialsSecretName requires an s3:// spec.followerArchiveStore"
+                    .into(),
+            );
+        }
+    }
     if cluster.spec.failover_delay_secs > 600 {
         return Some("spec.failoverDelaySecs must be between 0 and 600".into());
     }
@@ -1587,6 +1614,8 @@ mod tests {
                     ..Default::default()
                 },
                 instances: 2,
+                follower_archive_store: None,
+                follower_archive_credentials_secret_name: None,
                 failover_delay_secs: 30,
                 shards: 1,
                 config: ConfigSpec {
@@ -1638,6 +1667,22 @@ mod tests {
         c.spec.config.allow_insecure = false;
         c.spec.config.secret_name = Some("config".into());
         assert!(validate(&c).unwrap().contains("per-instance template"));
+    }
+
+    #[test]
+    fn archive_credentials_require_an_s3_archive() {
+        let mut c = cluster();
+        c.spec.follower_archive_credentials_secret_name = Some("archive-reader".into());
+        assert!(validate(&c).unwrap().contains("requires an s3://"));
+
+        c.spec.follower_archive_store = Some("file:///archive".into());
+        assert!(validate(&c).unwrap().contains("requires an s3://"));
+
+        c.spec.follower_archive_store = Some("s3://backups/cluster".into());
+        assert_eq!(validate(&c), None);
+
+        c.spec.follower_archive_credentials_secret_name = Some(" ".into());
+        assert!(validate(&c).unwrap().contains("must not be empty"));
     }
 
     fn snap(role: Role) -> StateSnapshot {

@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
-    EnvVar, HTTPGetAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Probe, SecretVolumeSource,
-    SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    EnvVar, EnvVarSource, HTTPGetAction, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Probe, SecretKeySelector,
+    SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
@@ -768,6 +768,47 @@ pub(crate) fn deployment(
         args.push("--insecure".into());
         args.push("--insecure-replication".into());
     }
+    let mut env = cluster
+        .spec
+        .plugin
+        .as_ref()
+        .map(plugin_channel_env)
+        .unwrap_or_default();
+    if role == InstanceRole::Follower {
+        if let Some(store) = cluster.spec.follower_archive_store.as_ref() {
+            env.push(EnvVar {
+                name: "YESNOD_FOLLOWER_ARCHIVE_STORE".into(),
+                value: Some(store.clone()),
+                ..Default::default()
+            });
+        }
+        if let Some(secret_name) = cluster
+            .spec
+            .follower_archive_credentials_secret_name
+            .as_ref()
+        {
+            for (key, optional) in [
+                ("AWS_ACCESS_KEY_ID", false),
+                ("AWS_SECRET_ACCESS_KEY", false),
+                ("AWS_REGION", false),
+                ("AWS_SESSION_TOKEN", true),
+                ("AWS_ENDPOINT", true),
+            ] {
+                env.push(EnvVar {
+                    name: key.into(),
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(SecretKeySelector {
+                            name: secret_name.clone(),
+                            key: key.into(),
+                            optional: optional.then_some(true),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     let probe = |path: &str| Probe {
         http_get: Some(HTTPGetAction {
@@ -856,12 +897,7 @@ pub(crate) fn deployment(
                         // environment rather than only the generated config,
                         // because a cluster using `config.secretName` gets no
                         // generated config at all.
-                        env: cluster
-                            .spec
-                            .plugin
-                            .as_ref()
-                            .map(plugin_channel_env)
-                            .filter(|e| !e.is_empty()),
+                        env: (!env.is_empty()).then_some(env),
                         readiness_probe: Some(probe("/readyz")),
                         liveness_probe: Some(probe("/healthz")),
                         security_context: Some(SecurityContext {
@@ -1025,6 +1061,8 @@ mod tests {
                     ..Default::default()
                 },
                 instances: 2,
+                follower_archive_store: None,
+                follower_archive_credentials_secret_name: None,
                 failover_delay_secs: 30,
                 shards: 4,
                 config: ConfigSpec {
@@ -1071,6 +1109,51 @@ mod tests {
                 ][..]
             )
         );
+    }
+
+    #[test]
+    fn archive_seed_reaches_only_follower_pods() {
+        let mut cluster = cluster();
+        cluster.spec.follower_archive_store = Some("s3://backups/cluster".into());
+        cluster.spec.follower_archive_credentials_secret_name = Some("archive-reader".into());
+        for (instance, role) in [(0, InstanceRole::Leader), (1, InstanceRole::Follower)] {
+            let source = config_source(&cluster, instance, role, None, None, None);
+            let deployment = deployment(&cluster, instance, role, &source, 1);
+            let env = deployment.spec.unwrap().template.spec.unwrap().containers[0]
+                .env
+                .clone()
+                .unwrap_or_default();
+            let archive = env
+                .iter()
+                .find(|value| value.name == "YESNOD_FOLLOWER_ARCHIVE_STORE");
+            assert_eq!(
+                archive.and_then(|value| value.value.as_deref()),
+                (role == InstanceRole::Follower).then_some("s3://backups/cluster")
+            );
+            for (key, optional) in [
+                ("AWS_ACCESS_KEY_ID", false),
+                ("AWS_SECRET_ACCESS_KEY", false),
+                ("AWS_REGION", false),
+                ("AWS_SESSION_TOKEN", true),
+                ("AWS_ENDPOINT", true),
+            ] {
+                let value = env.iter().find(|value| value.name == key);
+                if role == InstanceRole::Leader {
+                    assert!(value.is_none(), "leader received {key}");
+                    continue;
+                }
+                let value = value.unwrap();
+                assert!(value.value.is_none(), "{key} must come from the Secret");
+                let reference = value
+                    .value_from
+                    .as_ref()
+                    .and_then(|source| source.secret_key_ref.as_ref())
+                    .unwrap();
+                assert_eq!(reference.name, "archive-reader");
+                assert_eq!(reference.key, key);
+                assert_eq!(reference.optional, optional.then_some(true));
+            }
+        }
     }
 
     #[test]

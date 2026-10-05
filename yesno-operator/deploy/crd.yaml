@@ -96,6 +96,18 @@ spec:
                 maximum: 600.0
                 minimum: 0.0
                 type: integer
+              followerArchiveCredentialsSecretName:
+                description: |-
+                  Secret containing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION
+                  for archive reads. Only follower Pods receive these environment values.
+                nullable: true
+                type: string
+              followerArchiveStore:
+                description: |-
+                  Optional object archive used to seed each new follower before live
+                  replication. Credentials come from cloud identity or the named Secret.
+                nullable: true
+                type: string
               image:
                 description: Container image containing `yesnod`.
                 type: string
