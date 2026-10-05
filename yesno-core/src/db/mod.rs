@@ -2849,7 +2849,40 @@ impl Db {
             // because the durability sequence runs with it released. Without
             // this, a second checkpoint could interleave in that window.
             let _ckpt = shard.ckpt.lock().unwrap();
+
+            // **The previous tree is enumerated before the store lock is taken.**
+            //
+            // `Tree::node_ids` visits every page of the old index, so it is `O( index )` and
+            // not `O( delta )`, and it used to run with `Mutex<ShardStore>` held: measured at
+            // 13% of the exclusive region at 40 000 index entries and **27.5% at 1 600 000**,
+            // growing as a share because the region scales with the database while the delta
+            // does not. At 1 600 000 entries the whole region was 25.2 ms and a concurrent
+            // reader's worst query was 25.6 ms -- the region *is* the stall.
+            //
+            // Only the root and the segment handle need the lock; the walk itself reads
+            // published, immutable pages through `PublishedNodes`. `_ckpt` is already held,
+            // so no other checkpoint can republish the root underneath this, and a commit
+            // cannot: it writes the WAL and the memtable, never index pages.
+            let (walk_root, published) = {
+                let store = store_lock.lock().unwrap();
+                (store.tree(), store.published_nodes())
+            };
+            let prev_nodes = match &walk_root {
+                Some(t) => Some(t.node_ids(&published)?),
+                None => None,
+            };
+
             let mut store = store_lock.lock().unwrap();
+            // Belt and braces: if the root moved while the lock was down, the enumeration
+            // describes a tree this checkpoint is not rebuilding, and using it would leak
+            // the real old pages instead of freeing them. `_ckpt` should make this
+            // impossible; discarding is cheap and a wrong free list is not.
+            let prev_nodes = match (&walk_root, store.tree()) {
+                (Some(a), Some(b)) if a.root == b.root => prev_nodes,
+                (None, None) => prev_nodes,
+                // Redone under the lock by `run` when this is `None`.
+                _ => None,
+            };
 
             // Slabs sparse enough to be worth emptying. Capped per checkpoint:
             // evacuation is extra write volume, and the whole point of the
@@ -3021,6 +3054,20 @@ impl Db {
             // `append_node` to allocate from — so index nodes were written over
             // the extents this same checkpoint had just written. See the
             // `AllocSource` docs.
+            // **Defence in depth against a change that has not happened.** `append_node`
+            // writes a node to the segment *before* recording it in `pending_nodes`, so the
+            // lock-free reader is never blind to a written page and this cannot fire today
+            // -- `a_published_tree_enumerates_identically_with_and_without_the_lock` asserts
+            // that write-through directly. It is kept because `PublishedNodes` warns about
+            // pages "only in `pending_nodes`", which is precisely the state a deferred node
+            // write would create, and the hoisted walk is the one caller that could not
+            // survive it. Checked before the call rather than inside, because `run` takes
+            // `&mut *store`.
+            debug_assert!(
+                prev_nodes.is_none() || !store.has_pending_nodes(),
+                "the previous tree was enumerated outside the lock while index pages were \
+                 buffered; safe only while node writes are write-through"
+            );
             let res = checkpoint::run(
                 w,
                 all,
@@ -3036,6 +3083,7 @@ impl Db {
                 // The clock floor the next open must not stamp below, once this
                 // image makes the WAL carrying those stamps reclaimable.
                 self.inner.oracle.commit_clock(),
+                prev_nodes,
             );
             // Every error path out of a checkpoint must discard the in-flight
             // node buffer. `?` here retained an owned copy of every index node

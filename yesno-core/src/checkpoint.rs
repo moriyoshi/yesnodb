@@ -261,6 +261,10 @@ pub fn run(
     checkpoint_seq: u64,
     wal_replay_lsn: u64,
     commit_clock: crate::mvcc::Micros,
+    // The previous tree's page ids, enumerated *before* the store lock was taken. `None`
+    // means "enumerate here", which is what the tests and any caller without a previous
+    // tree want; a caller that did the walk outside the lock passes `Some`.
+    prev_nodes: Option<Vec<crate::index::tree::PageId>>,
 ) -> Result<CheckpointResult> {
     // I4: a chunk whose only version is above the watermark is not part of this
     // snapshot and must not be persisted.
@@ -387,9 +391,26 @@ pub fn run(
     // it. The index is still rebuilt whole; only the payloads are spared.
     // The old tree's pages, before the new one is built. Anything not carried
     // over becomes unreachable from the new root the moment it is published.
-    let old_nodes = match prev_tree {
-        Some(t) => t.node_ids(&*sink)?,
-        None => Vec::new(),
+    // **Enumerated outside the lock when the caller could do it.** This walk is
+    // `O( index )` -- it visits every page of the previous tree -- and it ran with
+    // `Mutex<ShardStore>` held, where it measured 13% of the exclusive region at 40 000
+    // index entries and **27.5% at 1 600 000**, growing as a share precisely because it
+    // scales with the database rather than with the delta.
+    //
+    // It is safe to hoist because the pages it reads are **published and immutable**: the
+    // previous root is untouched for the whole checkpoint, I2 makes a published extent
+    // immutable, and `_ckpt` excludes a second checkpoint. The hazard `PublishedNodes`
+    // documents -- missing pages that exist only in `pending_nodes` -- cannot apply, because
+    // this names the *previous* tree and `pending_nodes` is this checkpoint's write buffer,
+    // still empty when the caller does the walk. The assertion below is what keeps that
+    // true if the order ever changes.
+    // The ordering this depends on is asserted at the call site, where the store is in hand;
+    // `CheckpointSink` is a blanket trait and widening it for one check would reach four
+    // implementors to answer a question only the caller can usefully ask.
+    let old_nodes = match (prev_nodes, prev_tree) {
+        (Some(ids), _) => ids,
+        (None, Some(t)) => t.node_ids(&*sink)?,
+        (None, None) => Vec::new(),
     };
 
     // The previous leaves hold every carried entry already, so the merge
@@ -546,6 +567,9 @@ mod tests {
             1,
             4096,
             0,
+            // The tests exercise the under-the-lock enumeration, which is the path that
+            // still has to work when a caller cannot hoist it.
+            None,
         )
         .unwrap();
         (res, nodes, alloc, ext)
@@ -688,6 +712,7 @@ mod tests {
             3,
             0,
             0,
+            None,
         )
         .unwrap();
 
@@ -797,6 +822,7 @@ mod tests {
             1,
             0,
             0,
+            None,
         )
         .unwrap();
         assert!(

@@ -806,6 +806,16 @@ impl ShardStore {
     /// Cheap by construction: an `Arc` clone and a `u32` copy, so the caller holds
     /// the store lock only for those. See [`PublishedNodes`] for why omitting
     /// `pending_nodes` is sound.
+    /// Whether this checkpoint has already buffered index pages.
+    ///
+    /// Exists for one assertion: the previous tree may be enumerated outside the store lock
+    /// only while nothing is pending, because `PublishedNodes` reads the file and cannot see
+    /// this buffer. Checked rather than commented, so reordering the checkpoint trips a
+    /// debug assertion instead of silently losing pages from the free list.
+    pub(crate) fn has_pending_nodes(&self) -> bool {
+        !self.pending_nodes.is_empty()
+    }
+
     pub(crate) fn published_nodes(&self) -> PublishedNodes {
         PublishedNodes {
             seg: std::sync::Arc::clone(&self.seg),
@@ -1451,6 +1461,108 @@ mod tests {
         assert_eq!(c.iter().collect::<Vec<_>>(), vec![3, 9, 27]);
     }
 
+    /// A published tree enumerates identically with and without the store lock.
+    ///
+    /// # Why the checkpoint hoist needs exactly this
+    ///
+    /// `Db::checkpoint` walks the previous tree through [`PublishedNodes`] *before* taking
+    /// `Mutex<ShardStore>`, because that walk is `O( index )` and measured 27.5% of the
+    /// exclusive region at 1.6 M entries. Its output becomes the free list, so a page the
+    /// walk misses is leaked for ever and a page it invents would be freed while a reader
+    /// can still reach it. The property the hoist rests on is that the lock-free reader and
+    /// the under-the-lock reader agree, and this asserts that directly rather than inferring
+    /// it from a checkpoint that happens to come out clean.
+    ///
+    /// The other half of the contract is the hazard `PublishedNodes` documents: it reads the
+    /// file, so a page living only in `pending_nodes` is invisible to it. That is why the
+    /// checkpoint asserts `!has_pending_nodes()` before trusting a hoisted list, and why
+    /// this test adopts the superblock first -- a published tree is the state the checkpoint
+    /// guarantees at the point it does the walk.
+    #[test]
+    fn a_published_tree_enumerates_identically_with_and_without_the_lock() {
+        let p = tmp("published-nodes");
+        let _c = Cleanup(p.clone());
+        let mut s = ShardStore::open(&p, [5u8; 16], 0).unwrap();
+
+        // Enough entries for a tree taller than one page; on a single leaf the two readers
+        // would agree trivially and the test would prove nothing. Asserted below.
+        let dirty: Vec<DirtyChunk> = (0..4_000u64)
+            .map(|i| DirtyChunk {
+                key: ChunkKey::new(i % 37, i),
+                container: Container::from_sorted(&[1, 5, 9]),
+                version: 1,
+                previous: None,
+            })
+            .collect();
+
+        let prev = s.superblock().clone();
+        let node_size = prev.node_size as usize;
+        let res = checkpoint::run(
+            1,
+            dirty,
+            &Default::default(),
+            None,
+            &mut s,
+            node_size,
+            &prev,
+            1,
+            0,
+            0,
+            None,
+        )
+        .unwrap();
+        // --- Half one: the readers agree even mid-rebuild, and the reason matters.
+        //
+        // `append_node` does `seg.write_at` and *then* records in `pending_nodes`, so a node
+        // is in the file before it is in the buffer: `pending_nodes` is a read-side cache
+        // that keeps an in-progress rebuild self-consistent, not a deferred write queue. So
+        // the lock-free reader is never blind to a written page, which is a stronger
+        // guarantee than the hoist needs.
+        //
+        // This half was originally written asserting the opposite -- that the two readers
+        // must *differ* here, on the strength of `PublishedNodes`' warning about pages "only
+        // in `pending_nodes`". The assertion fired, which is how the write-through came to
+        // light. That warning describes a state `append_node` does not produce.
+        let pending_tree = Tree {
+            root: res.superblock.root.unwrap().0,
+            height: res.superblock.root.unwrap().1,
+            node_size,
+        };
+        assert!(
+            s.has_pending_nodes(),
+            "the rebuild buffered no pages; this half proves nothing"
+        );
+        assert_eq!(
+            pending_tree.node_ids(&s).unwrap(),
+            pending_tree.node_ids(&s.published_nodes()).unwrap(),
+            "a node is written to the file before it is buffered, so the lock-free reader \
+             must already see an in-progress rebuild"
+        );
+
+        // --- Half two: once published, they must agree exactly.
+        let commit = s.prepare_superblock(res.superblock).unwrap();
+        let durable = commit.run().unwrap();
+        s.adopt_superblock(durable);
+
+        let tree = s.tree().expect("the checkpoint published a tree");
+        assert!(
+            tree.height > 0,
+            "the fixture produced a single-leaf tree; the readers would agree trivially"
+        );
+        let under_lock = tree.node_ids(&s).unwrap();
+        let without_lock = tree.node_ids(&s.published_nodes()).unwrap();
+        assert!(
+            under_lock.len() > 1,
+            "only {} page(s) enumerated; too small to distinguish the readers",
+            under_lock.len()
+        );
+        assert_eq!(
+            under_lock, without_lock,
+            "the lock-free reader enumerated a different page set, which would corrupt the \
+             checkpoint's free list"
+        );
+    }
+
     #[test]
     fn a_checkpoint_writes_an_index_readable_within_the_same_checkpoint() {
         let p = tmp("checkpoint");
@@ -1507,6 +1619,7 @@ mod tests {
                 1,
                 0,
                 0,
+                None,
             )
             .unwrap();
             // The index must resolve every chunk it just wrote.
