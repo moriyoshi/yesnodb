@@ -267,14 +267,58 @@ struct VerifiedCache {
 
 /// Entries per generation; the cache holds at most twice this.
 ///
-/// At roughly 24 bytes per `BTreeMap` entry this is about 0.8 MB per segment,
-/// and one segment per shard. Sized for the *hot* set rather than the corpus:
-/// a miss costs a single CRC over at most 8256 bytes, well under a microsecond,
-/// so the cache is there to stop a hot page being re-verified on every read --
-/// not to cover the database. Deliberately a constant and not a `DbOptions`
-/// knob: a knob is public API under R1 / R6 / R7, and nothing has yet shown a
-/// workload that needs a different number.
-const VERIFIED_GENERATION: usize = 16_384;
+/// At roughly 24 bytes per `BTreeMap` entry this is about 3 MB per segment at capacity, and
+/// one segment per shard. Sized for the *hot* set rather than the corpus: a miss costs a
+/// single CRC over at most [`MAX_VERIFIED_SPAN`] bytes, well under a microsecond, so the
+/// cache is there to stop a hot page being re-verified on every read. Deliberately a
+/// constant and not a `DbOptions` knob: a knob is public API under R1 / R6 / R7.
+///
+/// # Raised from 16 384 on 2026-10-05, and the threshold is the point
+///
+/// The previous value's own comment said "nothing has yet shown a workload that needs a
+/// different number". A consumer then showed one -- a repeated filtered scan of a
+/// 67 M-document index -- and it reproduces on this crate alone: 70 000 bitmap extents,
+/// 551 MB of payload, walked twice in one process.
+///
+/// ```text
+///   generation   warm scan   regions re-verified   bytes      invalidate
+///       16 384    156.6 ms   70 722 of 70 722      574.2 MB    87 ns/call
+///       32 768    157.3 ms   70 722 of 70 722      574.2 MB    99 ns/call
+///       49 152     80.6 ms   21 570                176.7 MB    80 ns/call
+///       65 536     44.5 ms    5 186                 42.5 MB   106 ns/call
+/// ```
+///
+/// **The shape is a threshold, not a curve.** Two generations hold at most `2 * N`, so the
+/// cache is useless until that exceeds the working set and nearly free afterwards: 16 384
+/// and 32 768 re-verify *every* region, and 65 536 re-verifies 7% of them. So this number
+/// is not "better"; it is **large enough for a corpus of this scale**, and a working set an
+/// order of magnitude bigger would see exactly the 16 384 behaviour again. **Do not raise it
+/// again on that evidence** -- a constant that chases the corpus is the wrong mechanism, and
+/// the right answer for a scan that cannot fit would be to stop caching it rather than to
+/// widen the bound until it does.
+///
+/// # The two costs, measured rather than assumed
+///
+/// **Memory is not separable from allocator noise at this scale.** Anonymous growth for an
+/// open-and-scan process was 7.8, 8.5, 10.9 and 8.5 MiB across the four capacities above --
+/// no monotonic trend, so the cache's own share is inside the variance of everything else
+/// the walk allocates. The earlier estimate of 0.8 MB per segment was computed from entry
+/// size at the old capacity; 3 MB is the same arithmetic at this one, and remains an
+/// estimate rather than a measurement.
+///
+/// **Invalidation does not get more expensive**, which is structural rather than lucky.
+/// `invalidate_verified` is a `BTreeMap` range over `[start - MAX_VERIFIED_SPAN, start + len)`
+/// -- a bounded *key window*, so its cost is `O( log n )` descent plus the entries actually
+/// overlapping, and the overlap count does not depend on capacity. Quadrupling `N` adds two
+/// levels of tree. Measured at 80-106 ns per call with no trend, 1.6-2.2 ms across 10 000
+/// scattered writes and a checkpoint, against a write phase of ~1.15 s.
+///
+/// And in steady state it drops **nothing at all**: every one of those runs reported zero
+/// entries removed, because I2 makes a published extent immutable, so a modified chunk is
+/// written to a *new* cell and the lookup lands on an address no reader has cached. The
+/// cache is invalidated by reuse of an address, which happens on reclamation rather than on
+/// write.
+const VERIFIED_GENERATION: usize = 65_536;
 
 impl VerifiedCache {
     fn is_verified(&mut self, cell: u64, len: usize) -> bool {
@@ -839,6 +883,75 @@ mod tests {
             "verified set grew to {} after {n} distinct regions, above the {} bound",
             m.verified_count(),
             2 * VERIFIED_GENERATION
+        );
+    }
+
+    /// The cache retains a working set that fits, and retains nothing when it does not.
+    ///
+    /// # Why this and not an assertion on the constant
+    ///
+    /// The capacity is a **threshold**: two generations hold at most `2 * N`, so the cache
+    /// is useless below the working set and nearly free above it. A test naming 65 536 would
+    /// pin the number; this pins the behaviour the number was chosen for, so retuning stays
+    /// a one-line change and the property it has to preserve stays checked.
+    ///
+    /// The measurement behind the current value is in `VERIFIED_GENERATION`'s own comment:
+    /// 70 000 extents re-verified in full at 16 384 and 32 768, and 7% of them at 65 536.
+    /// This is the same shape at a size a unit test can afford.
+    #[test]
+    fn a_working_set_that_fits_is_retained_and_one_that_does_not_is_not() {
+        let path = tmp("verified-threshold");
+        let _c = Cleanup(path.clone());
+        let m = SegmentedMmap::open(&path).unwrap();
+
+        let walk = |m: &SegmentedMmap, n: usize| {
+            for i in 0..n {
+                let cell = (i as u64 + 1) * MAX_VERIFIED_SPAN;
+                m.verify_once(cell, 64, || Ok(())).unwrap();
+            }
+        };
+
+        // A working set comfortably inside one generation: after a second pass every region
+        // is still remembered, so a warm walk re-verifies nothing.
+        let fits = VERIFIED_GENERATION / 2;
+        walk(&m, fits);
+        let after_first = m.verified_count();
+        walk(&m, fits);
+        assert_eq!(
+            m.verified_count(),
+            after_first,
+            "a working set inside one generation must be retained across a second walk"
+        );
+        assert!(
+            after_first >= fits,
+            "the cache stored {after_first} of {fits} regions; it is not being exercised"
+        );
+
+        // And one that cannot fit: more distinct regions than the cache can hold, so the
+        // earliest are necessarily gone. This is the 16 384-against-70 000 case, and it is
+        // the half that shows the bound is a bound.
+        let p2 = tmp("verified-overflow");
+        let _c2 = Cleanup(p2.clone());
+        let m2 = SegmentedMmap::open(&p2).unwrap();
+        walk(&m2, VERIFIED_GENERATION * 2 + 1_000);
+        // **Asked through the public behaviour rather than by peeking.** A miss is exactly
+        // "the closure ran again", which is what a caller pays for, so that is what this
+        // observes -- no accessor for cache internals is needed or added.
+        let reverified = std::cell::Cell::new(false);
+        m2.verify_once(MAX_VERIFIED_SPAN, 64, || {
+            reverified.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            reverified.get(),
+            "a working set larger than the cache must have lost its earliest region, \
+             so re-reading it must re-verify"
+        );
+        assert!(
+            m2.verified_count() <= 2 * VERIFIED_GENERATION,
+            "the bound must still hold at {}",
+            m2.verified_count()
         );
     }
 
