@@ -961,3 +961,56 @@ deleting a TODO entry that turned out to be uncommitted. Those files are now com
 on the full command line, including the waiting shell's own -- so `until ! pgrep -f
 "release/ckptsplit"` waited on itself forever. Three waiters deadlocked that way and a gate
 chain never started. Wait on a PID, or grep a log file for the verdict.
+
+## 2026-10-06 -- the span API already existed, and I had written it
+
+Asked whether a `KeyStream` span API would pay. The context: a consumer's cold peer restore
+costs ~953 serialized major faults, advisory paging hints were measured ineffective
+( `LTM/cold-peer-page-warming-20261006.md` ), and only a real `pread` populated pages -- but
+their targeted arms depended on an **oracle mask** taken from a previous read, which
+production does not have. Their own implication named the gap: "a versioned, safe way for
+yesno to identify the physical spans backing a selected logical query".
+
+So I proposed exposing the physical spans a `KeyStream` is about to read, since the plan holds
+`ChunkRef`s -- hence cells -- before any payload is decoded, and the reader slot already pins
+them against reclamation. That reasoning was sound and the conclusion was wrong: **the API
+exists, and I wrote it four days earlier.**
+
+`unstable_arrow::dense_span( snap, key, lo, hi )` returns a borrowed `Buffer` over a
+contiguous run of bitmap payloads, deriving the run from the index. What I had forgotten is
+what its own doc comment says: "Each chunk is still read through `read_container_for`, so its
+trailer is verified before any of its bytes are lent." It therefore **reads and CRCs every
+byte it lends**. As a span *lookup* that is a weakness; as a background **warmer** it is
+exactly right -- a `pread` equivalent that also populates the verification cache on the way.
+
+**The two halves of this session's work converge, which neither was designed for.** A warmer
+calling `dense_span` over a key's prefix range leaves the foreground read finding *both*
+caches warm: the page cache, removing the ~953 major faults, and the verification cache,
+removing the ~70 000 re-verifications -- and that second half only pays because `b5e7b50`
+raised `VERIFIED_GENERATION` above the working set. At 16 384 the verification half would have
+been discarded before the foreground read arrived. The oracle mask their experiment needed is
+replaced by an index walk.
+
+**Whether it buys is not an API question**, and that is the part to carry forward. Bounded by
+their measurements: serial warming is 255 + 179 = 434 ms against a 535 ms cold control, about
+**19%** -- thin. Warming hidden behind concurrent work keeps the full 535 to ~170 ms, about
+**68%**. The deciding variable is therefore whether the consumer has concurrent work to overlap
+the warm with, which **nobody has measured**, and their own document says as much: "A
+foreground read can approach warm latency after a background worker has actually populated the
+relevant payload pages." Recommended that they measure the overlapped case against their cold
+baseline before anything is built here; one number decides between a curiosity and a real win.
+
+Three conditions on using `dense_span` this way, since it was built for the Flight bitvector
+path. It covers only store-backed bitmap chunks in contiguous runs, refusing a memtable
+override and stopping at a gap or a non-bitmap chunk -- fine for a dense payload, conditional
+in general. The returned `Buffer` pins the extents it covers for as long as it lives, so a
+warmer must drop it or it holds a slab. And it lives in `unstable_arrow`, which is semver-exempt
+by design, so a new caller there adds no public promise.
+
+**The method lesson is the embarrassing one and the most reusable.** I was about to design a
+primitive this crate already had, because I reasoned about what *ought* to exist instead of
+reading what did -- and the thing I failed to read was my own doc comment from four days
+earlier, in the file I had changed most in this session. Twice before in the same session the
+correction came from measuring rather than thinking; this time it came from reading. The
+sequence that worked, after two failures, was: check the repository for the finding, check the
+source for the capability, and only then propose.
