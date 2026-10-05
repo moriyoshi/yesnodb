@@ -799,3 +799,165 @@ Added `healthz` and `readyz` probe commands to `yesno`, changed both daemon imag
 The probe unit test verifies success on HTTP 200 and failure on HTTP 503. The complete repository gate passes, including all four E2E scenarios; stable workspace Clippy, Terraform formatting, Python compilation, embedded shell syntax, Rust formatting, and `git diff --check` pass. A live AWS execution was unavailable because this environment has no usable AWS credentials or STS access, so ECS-reported health has not been observed against a real task here.
 
 The earlier sentence in this entry saying the gate and Clippy were still running was written before they completed; the results above supersede that interim status.
+
+## 2026-10-05 -- the verification cache is a threshold, not a curve
+
+A consumer reported that a repeated filtered scan of a 67 M-document index re-verified its
+whole working set on every pass, and asked whether `VERIFIED_GENERATION` should rise. The old
+value's own comment invited exactly this: "nothing has yet shown a workload that needs a
+different number". One had now been shown, and it reproduces on this crate alone -- 70 000
+bitmap extents, 551 MB of payload, walked twice in one process, four capacities in fresh
+processes:
+
+| generation | warm scan | regions re-verified | bytes | invalidate |
+|---|---:|---:|---:|---:|
+| 16 384 | 156.6 ms | 70 722 of 70 722 | 574.2 MB | 87 ns/call |
+| 32 768 | 157.3 ms | 70 722 of 70 722 | 574.2 MB | 99 ns/call |
+| 49 152 | 80.6 ms | 21 570 | 176.7 MB | 80 ns/call |
+| 65 536 | 44.5 ms | 5 186 | 42.5 MB | 106 ns/call |
+
+**The shape is the finding.** Two generations hold at most `2 * N`, so the cache is useless
+below the working set and nearly free above it. 65 536 is therefore not "better", it is
+*large enough for a corpus of this scale*, and a working set an order of magnitude larger
+returns to the 16 384 behaviour. **It must not be raised again on that evidence**: a constant
+chasing the corpus is the wrong mechanism, and the right answer for a scan that cannot fit is
+to stop caching it rather than to widen the bound until it does. That reasoning is now in the
+constant's rationale, where the next person to see a slow scan will find it.
+
+**Both costs the report flagged as unknown turned out small, and one is structural.**
+`invalidate_verified` is a `BTreeMap` range over the bounded key window
+`[ start - MAX_VERIFIED_SPAN, start + len )`, so its cost is `O( log n )` descent plus actual
+overlaps and the overlap count does not depend on capacity -- quadrupling `N` adds two levels
+of tree. It also dropped **zero** entries in every run, because I2 makes a published extent
+immutable: a modified chunk is written to a *new* cell and the lookup lands where nothing is
+cached, so the cache is invalidated by address reuse at reclamation rather than by writes.
+Memory was not separable from allocator noise: 7.8, 8.5, 10.9 and 8.5 MiB of anonymous growth
+across the four capacities, no monotonic trend.
+
+**Why the cache is worth having at all**, which the capacity question presumes and I had not
+checked: CRC32C over 8 KiB is 667 ns ( 12.3 GB/s, hardware ), miss bookkeeping is 89 ns, a hit
+is 26 ns. So a hit avoids ~640 ns for 26, and a region that never repeats wastes 89 ns against
+a CRC it would have paid anyway -- **13%, not a cliff**. I had speculated the bookkeeping might
+exceed the CRC and make the cache a net loss on an oversized working set. It does not, and the
+speculation was worth three minutes of measurement rather than an argument.
+
+**The benefit is entirely in a reused mapping**, which the consumer's own table already showed
+and neither of us had named: its fresh column is flat at 68 397 regions and 540 024 832 bytes
+for all five capacities. The cold scan here is likewise 70 722 misses at both bounds. They
+confirmed from source that serving reuses the mapping in both their deployments and that their
+open-scan-close shapes are compaction, a legacy upgrade path and harnesses -- which is what the
+flat column describes.
+
+**Three wrong probes before a right one**, each instructive about the crate. `insert_range`
+over a whole chunk makes a *run* of one interval, a few bytes rather than an 8 KiB extent, so
+24 000 chunks produced 310 cache misses. `cardinality()` is the non-materializing walk that
+reads `card_m1` from the index and never touches a payload -- the property
+`tests/allocation.rs` exists to protect -- so it produced 722. `load()` reads every payload and
+keeps 574 MB of containers, which buries a 3 MB cache in the RSS delta. Only a chunk stream
+reads each payload and drops it before the next.
+
+`a_working_set_that_fits_is_retained_and_one_that_does_not_is_not` pins the behaviour rather
+than the number, and asks about eviction through `verify_once` running its closure again so no
+accessor for cache internals is added. It passes at both capacities by design, which also
+means **nothing in the suite protects the raise itself** -- the measurement is its only
+justification. Landed as `b5e7b50`.
+
+## 2026-10-06 -- the checkpoint's exclusive region, and a buffer that was not one
+
+A consumer's `RwLock` request for the shard store was sequenced behind shortening the
+checkpoint's exclusive region, citing an upstream figure of 70-82% for the index rebuild. That
+figure predated the `fsync` split, so it was re-taken. Composition on the current tree, 200
+dirty keys throughout:
+
+| index entries | exclusive region | chunk loop | `node_ids` | `build_updating` | reader worst |
+|---|---:|---:|---:|---:|---:|
+| 40 000 | 0.8 ms | 11.6% | 13.0% | 73.4% | 3.4 ms |
+| 100 000 | 2.3 ms | 9.9% | 17.7% | 68.1% | 2.4 ms |
+| 400 000 | 4.2 ms | 2.4% | 23.9% | 71.1% | 4.3 ms |
+| 1 600 000 | 25.2 ms | 0.9% | 27.5% | 66.3% | 25.6 ms |
+
+Two things beyond the confirmed share. **The region scales with the index, not the delta** --
+200 dirty keys throughout, and it grew 0.8 to 25.2 ms as the corpus grew 40x. And **the
+reader's worst query tracks it almost exactly**, which makes the region the stall rather than
+merely correlated with it. That pairing is why shortening it is worth anything.
+
+`Tree::node_ids` now runs before the store lock is taken. Only the root and the segment handle
+need the lock; the walk reads published pages through `PublishedNodes`, which exists for this.
+Three interleaved pairs at 1 600 000 entries: 16.0 to 11.3, 26.0 to 18.6, 25.2 to 11.5 ms,
+with the stall tracking within 0.4 ms in all six runs. **No single ratio is claimed**: the two
+arms' distributions overlap -- a hoisted 18.6 ms against an unhoisted 16.0 ms from another
+pair -- so only the within-pair comparison is sound, the effect spans 28% to 54%, and three
+pairs is thin for that spread. What is not statistical is that `node_ids` measures 0.0 ms
+inside the region: it is gone from the lock rather than faster. The pairing mattered -- the
+unhoisted arm alone ranges 16.0 to 26.0 ms, so any single-run comparison would have been noise.
+
+**The test was wrong before it was right, and that is how the system got understood.** It
+asserted that pages still in `pending_nodes` are invisible to the lock-free reader, on the
+strength of `PublishedNodes`' own warning about pages "only in `pending_nodes`". The assertion
+fired. `append_node` does `seg.write_at` and **then** records in the buffer, so a node is in
+the file before it is buffered: `pending_nodes` is a read-side cache keeping an in-progress
+rebuild self-consistent, **not a deferred write queue**. The hoist is therefore safer than the
+argument first given for it, and `has_pending_nodes()` cannot fire today -- it is kept and
+worded as defence against a deferred node write, which is precisely the state that warning
+describes and the hoisted walk the one caller that could not survive it. Claiming it guarded a
+live hazard would have been wrong.
+
+**This advances the prerequisite rather than meeting it.** `build_updating` is now 89-95% of
+what remains and the region still scales with the index, so a plain `std::sync::RwLock` is
+still the wrong primitive: sustained reads would starve a writer whose critical section is
+`O( index )`, and for a checkpoint that means unbounded WAL growth. Shortening the merge is
+separate and harder, because it allocates and writes nodes rather than only reading. Landed as
+`0fda7af`.
+
+## 2026-10-06 -- four assessments that produced no code, and why that was right
+
+Half of this session's handoff work ended in "do not build this". Recording the negatives,
+because each cost real measurement and the next person will otherwise redo it.
+
+**A paging hint was refuted by evidence already in the repository.** The cold restore baseline
+is ~953 serialized major faults, and yesno issues no paging hints at all -- no `madvise`, no
+`readahead`, no `posix_fadvise` anywhere in core, plugin or server. The obvious fix is
+`MADV_WILLNEED` on regions about to be read. A neighbouring session had already measured that
+family: `POSIX_FADV_WILLNEED` across the file populated 16 MiB of a 238 MiB footprint and left
+987 faults; `readahead(2)` over the observed footprint populated 22 MiB and left 1 007; whole
+file, 32 MiB and 1 027 -- against a 953-fault control. Only a real `pread` worked, and even
+then whole-file warming is a **net loss** ( 463 + 170 ms against a 535 ms cold control ), while
+the targeted 220.5 MiB span is a modest win that depends on an oracle mask from a previous
+read. `mincore` is what exposed the advisory failure: the calls return successfully without the
+pages becoming resident. **I was one step from implementing against a documented negative
+result**, and would have measured a wall-clock improvement that was not there with no residency
+guard to catch it. See `LTM/cold-peer-page-warming-20261006.md`.
+
+**"A connection per worker" was unsound, and the limit it worked around has no ceiling.** A
+consumer's threaded row search hits `channel_max_handles`, default 4. I suggested more sockets.
+That is wrong on correctness, not resources: a peer's snapshots belong to its *session*, and a
+session is a socket, so rows of one query matrix would be scored against **different
+snapshots** -- a silently wrong answer. `channel_max_handles` is also the one limit in that
+struct with no upper clamp, and the arena is sparse: reservations of 2 GiB, 8 GiB and 32 GiB
+all succeeded at **zero RSS**, exactly as the config documented. So the answer is one socket
+with the handle limit raised, and the guard I was about to build would have defended a failure
+mode I invented by reasoning "big number = expensive" after reading the sentence that said
+otherwise. Handle exhaustion is an immediate `InvalidArgument` refusal, not a queue, so size
+handles at or above the thread count.
+
+**Socket round trips are a per-query cost, not a bulk one.** Exactly five fixed round trips per
+query -- `SnapshotOpen`, `LanesAcquire`, `LanesRelease`, `SnapshotClose` and the final advance
+returning `Done` -- which block batching cannot remove. `BlockAdvanceMany` batches the advance
+but **not** the release, so a `max_blocks` batch costs two round trips and the effective
+batching factor is half what the knob suggests. For a 220 MiB restore that is ~220 round trips,
+4-7 ms of 187 ms warm -- about 3%, so no batching primitive would move the bulk case. For many
+small searches the five fixed trips dominate because each query moves little data. Holding one
+snapshot per batch removes two of the five with no protocol change at all.
+
+**Two handoff items were refused on concurrency grounds, not technical ones.** Secure sidecar
+checkpoint credentials and external replica certificate authorization both live in
+`yesno-operator/src` and `yesno-server/src`, where another session held ~1 400 uncommitted
+insertions across 44 files. Editing credential and trust paths mid-rewrite risks destroying
+work that is not mine, and I had already come close to exactly that earlier in the session by
+deleting a TODO entry that turned out to be uncommitted. Those files are now committed
+( `a87cd10` through `9e96228`, gated before I touched them ), so the items are unblocked.
+
+**One tooling lesson, which cost more time than any of the above.** `pgrep -f <pattern>` matches
+on the full command line, including the waiting shell's own -- so `until ! pgrep -f
+"release/ckptsplit"` waited on itself forever. Three waiters deadlocked that way and a gate
+chain never started. Wait on a PID, or grep a log file for the verdict.
