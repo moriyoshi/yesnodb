@@ -17,7 +17,8 @@ the project README before it holds important data.
 ## Connect another system
 
 - [Integrations](integrations.md) covers Apache Arrow, Arrow Flight, DataFusion,
-  and the experimental PostgreSQL extension.
+  Tantivy, search engines, language clients, and the experimental PostgreSQL
+  and MySQL extensions.
 
 ## Run and recover a service
 

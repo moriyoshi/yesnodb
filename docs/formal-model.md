@@ -446,8 +446,9 @@ migration between on-disk size classes.
 $\texttt{RUN\_MAX\_INTERVALS} = 2032$ keeps an emitted run container inside a
 bitmap's footprint: $2 + 4\cdot 2032 = 8130 \le 8192$. It is a **capacity choice
 with deliberate slack, not a tight bound** — the largest $r$ satisfying
-$2 + 4r \le 8192$ is $2047$, and the largest that still fits the top size class
-( 8256 bytes, payload $\le 8248$ ) is larger still. Decoding accepts $r \le 32768$ — the
+$2 + 4r \le 8192$ is $2047$, which also fits the top 8192-byte size class
+because its trailer is stored outside the payload slot. Decoding accepts
+$r \le 32768$ — the
 information-theoretic maximum, since $r(A) \le \lceil |\mathbb{L}|/2 \rceil$ —
 so that foreign files remain readable. The asymmetry between the write bound and
 the read bound is deliberate and is the standard robustness principle.

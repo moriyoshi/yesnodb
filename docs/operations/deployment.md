@@ -110,8 +110,9 @@ Mount a validated TLS and authentication configuration for any shared network.
 Use a local persistent volume, never a network-backed volume. The named volume
 also avoids host-directory ownership mismatches with the image's non-root user.
 
-The image declares a healthcheck that asks the running daemon for its status.
-It is honoured by Docker and by Compose, and by nothing else — see below.
+The image declares a healthcheck against the daemon's `/healthz` liveness
+endpoint. It is honoured by Docker and by Compose, and by nothing else — see
+below.
 
 ## Kubernetes
 
@@ -162,6 +163,33 @@ same image reference works for both `X86_64` and `ARM64` task definitions.
 
 ECS does not read the image's healthcheck either. Declare `healthCheck` in the
 container definition.
+
+Use the daemon's HTTP liveness endpoint for the ECS container check. This stays
+successful while a follower is seeding from an archive; ECS will not restart a
+healthy process just because it is not ready to receive traffic yet:
+
+```json
+{
+  "healthCheck": {
+    "command": [
+      "CMD",
+      "/usr/local/bin/yesno",
+      "--endpoint",
+      "http://127.0.0.1:9750",
+      "healthz"
+    ],
+    "interval": 10,
+    "timeout": 5,
+    "retries": 3,
+    "startPeriod": 60
+  }
+}
+```
+
+The `yesno healthz` and `yesno readyz` commands call `/healthz` and `/readyz`
+on the plain-HTTP metrics listener. Use `/readyz` for a load balancer's target
+health check when the metrics listener is reachable from that load balancer;
+keep the ECS container health check on `/healthz` as a process-liveness check.
 
 The [deferred snapshot materialization](snapshots.md) path runs this same image
 as its worker: a task whose container override supplies the materializer's whole

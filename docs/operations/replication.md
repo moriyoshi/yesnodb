@@ -28,6 +28,7 @@ role = "replica"
 cert_sha256 = "lowercase-sha256-of-standby-certificate-der"
 
 [[auth.rule]]
+channel = "hostssl"
 principal = "standby-b"
 address = "10.0.0.0/24"
 capability = "replication"
@@ -43,6 +44,7 @@ data_dir = "/var/lib/yesno"
 
 [follower]
 leader = "https://leader.internal:50052"
+archive_store = "s3://yesno-backups/production"
 poll_interval_secs = 1
 max_backoff_secs = 30
 serve_reads = true
@@ -63,10 +65,46 @@ listen = "127.0.0.1:9750"
 Read-serving followers are always potentially stale. Do not use them for
 read-after-write.
 
+When `follower.archive_store` is set, an empty standby seeds itself from the
+archive's published base and WAL tip before it connects for live replication.
+Run `yesno-archive` against the same database and publish a first base before
+relying on this path. If the archive has no published base, or belongs to an
+older leadership term, the standby bootstraps directly from the current leader.
+An archive with a different database identity or a term ahead of the configured
+leader is refused. A standby that already has a MANIFEST resumes from its own
+files; the archive does not replace it. The seed uses `yesnoctl` installed beside
+`yesnod` and needs read access to the object store through its normal credentials.
+
+The metrics listener binds before archive seeding. During seeding, `/healthz`
+returns success and `/readyz` returns 503, so Kubernetes keeps the process alive
+without sending it traffic. Readiness becomes successful only after the follower
+connects and completes one replication pass across every shard. A rebuild clears
+readiness until another full pass completes. This marks completion of initial
+replication work; it does not mean the follower has zero lag. For a particular
+commit, compare its acknowledged visible version with
+`yesnod_follower_visible_version` as described below.
+
+Read-serving followers also attach the response metadata
+`yesno-follower-initial-sync-complete: true|false` to Flight RPC responses.
+Clients can inspect that header directly; `yesno status` prints the current
+value as `follower sync`. The header is a snapshot at response time, so clients
+that need a specific write must still compare visible versions.
+
+On Kubernetes without a workload identity provider, set
+`spec.followerArchiveCredentialsSecretName` to a Secret in the same namespace
+as the cluster. It must contain `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+and `AWS_REGION`; `AWS_SESSION_TOKEN` and `AWS_ENDPOINT` are optional. Only
+follower Pods receive those values, through Kubernetes Secret references.
+Create the Secret before increasing `spec.instances`. A Pod restart is needed
+to read updated Secret values. Leave the field unset when using a cloud
+ServiceAccount identity instead.
+
 ## Recovery objectives
 
 A deployment has one leader and any number of standbys, with asynchronous
-replication and no consensus or automatic election. A commit is durable once
+replication and no consensus election. A standalone deployment promotes
+manually; the Kubernetes operator can promote after it fences the old primary.
+A commit is durable once
 the leader has synchronized its WAL, before a standby necessarily has it. RPO
 is therefore greater than zero by construction.
 
@@ -99,7 +137,7 @@ done
 Choose the standby with the highest complete `visible_version`, not the most
 bytes applied or the highest single-shard LSN. The visible version is the
 cross-shard watermark, so it names the newest transactionally complete state.
-Promote that standby with:
+Run this on the chosen standby to promote it:
 
 ```console
 systemctl kill -s SIGUSR1 yesnod

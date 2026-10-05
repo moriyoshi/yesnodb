@@ -658,3 +658,144 @@ consumer" ), so only the message and my summary needed correcting.
 **The reply went to a file afterwards**, `.agents-workspace/tmp/apply-cap-reply-20261004.md`,
 rather than into a pane: typing into another agent's terminal interrupts whatever it is doing,
 and choosing to do that is the maintainer's call rather than mine.
+
+## 2026-10-05 -- a new follower can seed from the durable archive
+
+The existing archive already publishes a base and immutable WAL frames to an
+object store, but a new follower started with only the leader's live image and
+retained WAL. A follower created after the archive had a useful root could not
+use it. The join path now runs before a follower opens its control journal:
+`yesnod` invokes the sibling `yesnoctl seed-follower` when
+`follower.archive_store` is set. The utility restores the archive's durable tip,
+checks database UUID, leadership term, shard count and per-shard end cursors
+against the current leader, publishes the files, and leaves later frames to the
+existing live follower loop. A missing archive base or an archive from an older
+term falls back to direct leader bootstrap; a foreign UUID, an archive ahead of
+the leader, or an archive cursor ahead of its shard is refused. An existing
+MANIFEST is left alone. The operator passes the archive URL only to follower
+Pods through `spec.followerArchiveStore`; increasing `spec.instances` provisions
+their separate PVCs as before. The archiver itself remains a separate writer.
+
+**A PVC mount root cannot be replaced by a rename.** The restore runs into a
+child directory on the same volume, records its top-level file names durably,
+and moves every file into the mount root with MANIFEST last. The directory is
+synced before and after that last move. A persistent lock serializes seed
+attempts, and the file list lets a restart finish a crash between moves without
+guessing whether an incomplete directory is a database. The publication unit
+test moves one image file, simulates a restart, then requires the remaining WAL
+and MANIFEST to arrive; a second test proves an existing destination is never
+overwritten. The archive-to-live scenario creates a two-shard leader, archives a
+base plus later WAL, seeds an empty follower, then writes again after the seed:
+the follower serves all three keys and reports zero rebootstrap events. Its
+standalone run passed in 37.1 seconds with 32 host verb calls.
+
+The seam still depends on a reachable leader at admission, to reject a foreign
+or superseded archive before publication. Once the follower has a MANIFEST it
+uses the established identity and term checks during every live pass. Archive
+publication is useful for late joiners and for reducing leader image transfer;
+it does not make asynchronous replication synchronous or elect a leader.
+
+A follower that attempted direct bootstrap before an archive base existed may
+have opened its control journal under the data volume while still lacking a
+MANIFEST. The seed admission check now accepts only that configured journal
+directory and still rejects unrelated entries. The publication protocol also
+syncs both the source staging directory and the destination mount root before
+moving MANIFEST, so removal of staged names is durable with their arrival.
+
+The CI stable toolchain exposed `chunks_exact_to_as_chunks` warnings in the
+existing plugin encoder, its peer, and the plugin channel tests. Replacing those
+fixed-size chunk walks with `as_chunks` preserves their remainder behavior and
+cleared the workspace-wide stable Clippy run. The peer's 8-byte decode now
+uses the array directly rather than converting a borrowed array.
+
+Final verification passed: `./scripts/gate.sh`, workspace-wide CI-toolchain
+Clippy, and `./scripts/gate-operator.sh`. The operator's live kind scenario
+checks reconciliation, follower readiness, promotion and rejoin; its archive
+field is checked by the resource unit test, while the archive-to-live data
+path is checked by the two-shard scenario in the routine gate.
+
+## 2026-10-05 -- static archive credentials can reach operator followers
+
+The operator previously had a cloud identity hook but no static credential path
+for clusters without IRSA or Pod Identity. `spec.followerArchiveCredentialsSecretName`
+now names a Secret in the cluster namespace. The operator adds explicit
+`secretKeyRef` entries for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_REGION`, plus optional `AWS_SESSION_TOKEN` and `AWS_ENDPOINT`, only to
+follower containers. Secret values are never read by the controller or copied
+into the custom resource, generated ConfigMap, or Pod annotations. Validation
+requires an `s3://` archive URL and rejects an empty Secret name; missing
+required Secret keys fail Pod startup rather than silently falling back to
+anonymous credentials. The checked-in CRD was regenerated from the API.
+
+The operator resource test checks all five key references, their required or
+optional flags, and that neither archive URL nor credentials reach the leader.
+The validation test covers absent/local archives, S3, and empty names. The
+operator suite, full `scripts/gate.sh`, and CI stable workspace Clippy pass.
+The operating guide documents the required Secret keys, optional session token
+and endpoint, namespace, and Pod restart needed to load rotated values.
+
+## 2026-10-05 -- follower readiness waits for archive seed and first full pass
+
+The metrics listener now binds before the archive seed helper runs. Its existing
+`Starting` surface reports healthy liveness and unavailable readiness for the
+duration of object-store restore, so the Kubernetes liveness probe no longer
+restarts a follower merely because seeding exceeds its failure window. The same
+listener is passed into the role loop and remains the sole process metrics
+listener.
+
+Follower readiness now requires a leader connection and one successful pass
+over every shard. A shard rebuild clears the sync-complete state immediately;
+readiness returns after a later full pass succeeds. This is intentionally a
+startup/rebuild milestone, not a zero-lag guarantee. Clients waiting for a
+particular write still compare its visible version against the follower's
+visible-version watermark.
+
+Coverage includes the startup-to-follower readiness transitions and confirms a
+rebuild clears the gate even for a follower without a read-serving database.
+`cargo test -p yesno-server` passes. Full workspace gate and stable Clippy are
+pending for this change.
+
+The same sync-complete milestone is now attached as
+`yesno-follower-initial-sync-complete: true|false` metadata to every read-serving
+follower Flight response. The `yesno status` command prints the value from its
+handshake response, and the follower integration test checks the false-to-true
+transition over one live Flight connection. Per-response state is advisory at
+that response's instant; version watermarks remain the way to wait for a named
+commit.
+
+Final validation completed: `./scripts/gate.sh` and `cargo +stable clippy
+--workspace --all-targets --all-features -- -D warnings` pass. The gate's E2E
+scenario suite completed in 479 seconds; the follower Flight test verifies the
+metadata transition directly.
+The earlier pending note in this entry was superseded by these passing results.
+
+## 2026-10-05 -- ECS checks the daemon's HTTP liveness probe
+
+The deferred ECS scenario runs the one-shot snapshot materializer, not
+`yesnod`, and ECS ignores an image's Docker `HEALTHCHECK`. The daemon image
+healthcheck now calls `yesno healthz` against the plain-HTTP metrics listener;
+`yesno readyz` is also available for a caller that needs the traffic-readiness
+signal. The ECS operator guide shows an explicit task-definition `healthCheck`
+using the liveness command.
+
+The real-AWS ECS gate now builds the `yesnod` image for the ECS-only arm and
+starts a separate Fargate smoke task whose task definition declares the same
+health check. It waits until ECS reports the container `HEALTHY`, then stops
+that task before running the materializer scenario. The existing staging task
+remains one-shot and has no daemon health check.
+
+Local validation: the probe test checks HTTP 200 succeeds and HTTP 503 fails;
+the embedded ECS shell body passes `sh -n`, Terraform formatting and Python
+syntax checks pass. Full gate and stable Clippy are running for this change.
+
+Final ECS probe validation: `./scripts/gate.sh` passes, including the E2E scenario runner (4 passed in 465 seconds), and stable Clippy passes. Shell syntax, `terraform fmt -check`, Python syntax, `cargo fmt --check`, and `git diff --check` pass. A live ECS smoke task could not be launched because this environment has no usable AWS credentials or STS access.
+
+### Findings and work summary
+
+ECS task health does not inherit Docker image health checks, and the existing deferred ECS scenario exercises only the one-shot archive materializer. It could therefore pass without ever starting the daemon or checking its HTTP probe. The health check must be declared in the ECS task definition and exercised by a daemon task. Liveness uses `/healthz`; readiness can return unavailable while a follower consumes its initial archive seed, so it must not be used as the ECS process-liveness signal.
+
+Added `healthz` and `readyz` probe commands to `yesno`, changed both daemon image health checks to call `healthz` on the metrics listener, documented the ECS task-definition health check, and added a dedicated Fargate smoke task to the ECS gate. The gate builds and pushes the daemon image for an ECS-only run, starts the task, waits for ECS container health to become `HEALTHY`, and cleans it up before continuing with the deferred materialization scenario. The one-shot materializer task remains separate.
+
+The probe unit test verifies success on HTTP 200 and failure on HTTP 503. The complete repository gate passes, including all four E2E scenarios; stable workspace Clippy, Terraform formatting, Python compilation, embedded shell syntax, Rust formatting, and `git diff --check` pass. A live AWS execution was unavailable because this environment has no usable AWS credentials or STS access, so ECS-reported health has not been observed against a real task here.
+
+The earlier sentence in this entry saying the gate and Clippy were still running was written before they completed; the results above supersede that interim status.

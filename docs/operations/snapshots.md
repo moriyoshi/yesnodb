@@ -48,8 +48,8 @@ has ended.
 ## Privilege model
 
 Snapshot ownership belongs to `yesnod`, which owns the live database lifecycle,
-lease state, and checkpoint barrier. ZFS, Btrfs, and EBS currently execute in
-the daemon; LVM delegates privileged commands to a second local agent.
+lease state, and checkpoint barrier. ZFS and Btrfs execute in the daemon;
+LVM and local EBS delegate privileged commands to a second local agent.
 
 What decides whether a backend needs that second process is whether its
 privilege can be delegated to an ordinary account. ZFS and Btrfs can delegate

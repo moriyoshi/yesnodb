@@ -42,8 +42,11 @@ Work outward from the error chain printed by `yesno`:
 5. For mutual TLS, supply both `--cert` and `--key` and confirm that the server
    trusts their issuer.
 
-Certificate files are read at process start. After replacing one, restart the
-server before retesting.
+After replacing a server certificate, key, or client CA at its configured path,
+send `SIGHUP` or run `systemctl reload yesnod`, then confirm the new certificate
+was accepted. A failed reload leaves the previous TLS material active and logs
+the reason. Changing the configured file paths still requires a restart; see
+[Rotating certificates](operations/configuration.md#rotating-certificates).
 
 ## Authentication or permission is denied
 

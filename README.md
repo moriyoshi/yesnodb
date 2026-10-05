@@ -37,8 +37,12 @@ Implemented and covered by tests:
 - copy-on-write page storage, WAL recovery, MVCC, checkpointing, and sharding;
 - Arrow and DataFusion integration;
 - Arrow Flight ingest and queries;
+- container-payload Flight ingest for dense sets and atomic mixed-operation
+  write transactions;
 - asynchronous leader-to-standby replication, manual promotion, and
   Kubernetes-managed automatic promotion;
+- a Unix-socket plugin channel for snapshot reads and atomic single-frame
+  writes, with peers running outside the daemon;
 - packed boolean-matrix and arbitrary-precision integer operations;
 - packed views with interleaved or blocked layout, constituent selection, and
   union/intersection/parity folds;
@@ -76,10 +80,12 @@ Known limitations relevant to deployment:
   an ingest reports the version it committed at, and a read can be bound to that
   version, which waits briefly rather than failing. Reads that do not ask see
   whatever the watermark has reached.
-- Mutations carry no idempotency key. Every operation is idempotent in
-  isolation, so a retry is safe only when nothing conflicting interleaves; a
-  retried insert after another client's delete restores the deleted ordinal and
-  reports success.
+- Point and mixed mutations carry no durable idempotency key. Every individual
+  set operation is idempotent in isolation, so a retry is safe only when
+  nothing conflicting interleaves; a retried insert after another client's
+  delete restores the deleted ordinal and reports success. A Flight write
+  transaction remembers recent commit outcomes only while that server process
+  remains alive.
 - There is no compare-and-set or conditional write. A read-modify-write
   performed by a client can lose a concurrent update with no error on either
   side.
@@ -231,8 +237,9 @@ views. The getting-started guide defines the syntax and descriptor ownership
 fully.
 
 `yesnod` serves Arrow Flight and performs periodic checkpoints. Its precedence
-order is configuration file, `YESNOD_*` environment variables, then command-line
-flags. Validate the resolved configuration without opening the database:
+order is built-in defaults, configuration file, `YESNOD_*` environment
+variables, then command-line flags. Validate the resolved configuration without
+opening the database:
 
 ```console
 ./target/release/yesnod \
@@ -484,10 +491,11 @@ operate on.
 | Package | Role |
 |---|---|
 | `yesno-core` | Containers, set and bit algebra, page store, WAL, MVCC, and `Db` |
+| `yesno-opencl` | Optional device backend for batched blocked-view intersection counts |
 | `yesno-arrow` | Arrow selection masks, record-batch streams, and bulk building |
 | `yesno-datafusion` | Predicate lowering and the `yesno_lookup` table function |
 | `yesno-wire` | Set-expression wire format shared by clients and servers |
-| `yesno-flight` | Arrow Flight queries and bulk ingest |
+| `yesno-flight` | Arrow Flight queries with ordinal, container, or bitvector results and atomic bulk writes |
 | `yesno-flight-c++` | Synchronous client over Apache Arrow's native C++ Flight API |
 | `yesno-tantivy` | Generation-bound Tantivy queries over embedded or remote yesno results |
 | `yesno-flight-python` | Python package (`yesnodb`): typed Flight client and expression builder |
@@ -497,7 +505,9 @@ operate on.
 | `yesno-elasticsearch-plugin` | Elasticsearch 9.5 coordinator rewrite with a portable Roaring doc-values filter |
 | Go module (`yesno-flight-go`) | Native Arrow Go Flight client with streaming reads, writes, TLS/auth, and fencing |
 | `yesno-server` | The `yesnod` daemon, `yesno` data CLI, and single-leader WAL replication |
+| `yesno-plugin` | Served Unix-socket protocol for separate peer processes to read snapshots and commit one-frame write batches |
 | `yesno-server-utils` | The `yesnoctl` admin CLI plus continuous object archive |
+| `yesno-operator` | Kubernetes controller for retained-storage clusters and fenced automatic promotion |
 | `yesno-e2e` | Python-driven end-to-end scenario runner |
 | `yesno-c` | Host-independent C ABI with opaque database and snapshot-cursor handles |
 | `yesno-mysql` | Experimental MySQL 8.4 ordinal-set engine with embedded and remote backends |
@@ -521,14 +531,16 @@ pinned MySQL 8.4.0 together. See the
 
 yesnodb supports physical bootstrap followed by asynchronous WAL shipping from
 one leader to a standby. A standby can remain cold or serve read-only queries.
-Promotion is an operator action, and leadership terms let followers and clients
-reject a superseded timeline.
+Standalone deployments require an operator to promote a standby; the Kubernetes
+operator can promote automatically after fencing. Leadership terms let
+followers and clients reject a superseded timeline.
 
 Important operational properties:
 
 - Replicas are always potentially stale; do not use them for read-after-write.
-- There is no leader election. Operators must ensure the old leader is stopped
-  before promotion.
+- There is no consensus-based leader election. A standalone operator must fence
+  the old leader before promotion; the Kubernetes operator waits for its Pods
+  to disappear before promoting a standby.
 - A superseded leader cannot discover its own replacement. Clients that need
   fencing must require a leadership term.
 - Replication is not a backup and does not provide zero-RPO failover.
@@ -540,6 +552,10 @@ Important operational properties:
   endpoint, publishing Protobuf state, term-fenced WAL objects, and portable,
   ZFS/Btrfs/LVM, or explicit-network checkpoint bases to local or S3-compatible
   object storage.
+- A new follower can seed from a published archive base and WAL tip before
+  catching up from the leader. Standalone followers enable this with
+  `follower.archive_store`; the Kubernetes operator uses
+  `spec.followerArchiveStore`. The archive writer runs separately.
 - Local LVM snapshots use a separate `yesno-snapshot-agent` process on the same
   Unix control socket, keeping `CAP_SYS_ADMIN`, device access, and mount tools
   out of `yesnod`.
@@ -655,14 +671,15 @@ filesystems such as NFS.
 
 ## Performance and testing
 
-Benchmarks compare set-operation kernels with the `roaring` crate and keep the
-packed-lens comparisons beside the implementation they measure:
+Core benchmarks cover set-operation kernels against the `roaring` crate,
+packed lenses, and bitmap-DAG cardinality:
 
 ```console
 cargo bench -p yesno-core --bench setops
 cargo bench -p yesno-core --bench bitmatrix
 cargo bench -p yesno-core --bench bignum
 cargo bench -p yesno-core --bench view
+cargo bench -p yesno-core --features jit --bench dag
 ```
 
 The test suite combines boundary-biased property tests, semantic and byte-level
@@ -692,8 +709,8 @@ cargo test --workspace
 AWS_REGION=ap-northeast-1 ./scripts/gate-aws.sh
 ```
 
-Docker is the only host dependency of every gate above except the AWS one. Five
-of them run in a single all-in-one `yesno-e2e:local` image, which carries the
+The containerized gates use Docker; the filesystem gate also needs `/dev/kvm`.
+Five of them run in a single all-in-one `yesno-e2e:local` image, which carries the
 pinned build toolchains and artifact caches for PostgreSQL, MySQL, OpenSearch,
 and Elasticsearch, the Kubernetes tools the operator gate drives, and the QEMU
 guest the filesystem gate boots. Building it for any one of those therefore

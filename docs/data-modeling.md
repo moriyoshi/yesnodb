@@ -136,6 +136,13 @@ where separate visibility is acceptable. When a larger unit has to be atomic,
 send the operations as a mixed-operation `apply` call, which commits the whole
 call at once, or stage several calls into a write transaction and commit that.
 
+For an already encoded dense set, Flight `apply` also accepts whole container
+payloads under the container schema. It unions their members into the target
+keys in one commit and avoids sending one Arrow row per ordinal. It cannot
+express removal; use the mixed-operation schema for that. See the
+[Flight integration guide](integrations.md#arrow-flight) for capability checks
+and the payload contract.
+
 The `yesno put` command inserts pairs. Removal is available through the
 embedded API and through Flight `DoPut` with the `remove` command, but there is
 currently no `yesno remove` subcommand.

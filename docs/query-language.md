@@ -474,11 +474,12 @@ The server evaluates one query against one database version. Before returning
 rows it reports the exact count and a ticket for that version, so concurrent
 writes do not make the count and rows describe different states.
 
-A ticket is not a lease. A checkpoint can reclaim the named version before the
-client fetches it. If that happens, request the query again to obtain a fresh
-count and ticket. A ticket must also be used on the same server that issued it;
-presenting a leader's ticket to a lagging replica can name a version the replica
-has never seen.
+A newly issued ticket holds a bounded lease on its snapshot version. Once that
+lease expires, checkpointing can reclaim the version before the client fetches
+it. If that happens, request the query again to obtain a fresh count and ticket.
+A ticket must also be used on the same server that issued it; presenting a
+leader's ticket to a lagging replica can name a version the replica has never
+seen.
 
 ## Practical limits
 

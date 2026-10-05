@@ -5,8 +5,9 @@ key is commonly a term, tag, feature, or other posting-list identifier. The
 largest unsigned 64-bit value is reserved; valid ordinals end at
 `u64::MAX - 1`.
 
-yesnodb is pre-release software. Build it from a source checkout and use a local
-filesystem. There are no published crates or binary releases yet.
+yesnodb is pre-release software. The commands below build from a source checkout
+and use a local filesystem. A unified container image is also built and tagged
+by the release pipeline; see the [deployment guide](operations/deployment.md).
 
 ## Choose a surface
 
@@ -17,6 +18,8 @@ filesystem. There are no published crates or binary releases yet.
 | Send or receive Arrow data | `yesno-arrow` or Arrow Flight |
 | Query posting lists from DataFusion | `yesno-datafusion` |
 | Experiment with PostgreSQL integration | `yesno-pg` |
+| Experiment with MySQL integration | `yesno-mysql` |
+| Use an application client | Rust, Python, Go, C++, or Java Flight client |
 
 The Cargo workspace, including the core crate, needs Rust 1.95 or newer. The
 separate PostgreSQL extension needs Rust 1.96.
@@ -160,4 +163,4 @@ Force and verify a durable checkpoint with:
 Use the [operations guide](operations/index.md) before binding a non-loopback address
 or keeping important data. It covers TLS, authentication, metrics, backup,
 replication, promotion, and restore. The [integrations guide](integrations.md)
-covers Arrow, Flight, DataFusion, and PostgreSQL.
+covers Arrow, Flight, DataFusion, search engines, PostgreSQL, and MySQL.

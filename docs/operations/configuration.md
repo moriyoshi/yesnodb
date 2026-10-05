@@ -33,13 +33,30 @@ Validate a configuration without opening the database or taking its lock:
 Configuration precedence is built-in defaults, configuration file,
 `YESNOD_*` environment variables, then command-line flags.
 
+For a follower, `follower.archive_store` (or
+`YESNOD_FOLLOWER_ARCHIVE_STORE` / `--follower-archive-store`) names an optional
+object archive for its first startup. The standby reads the archive before it
+opens its database and then catches up from `follower.leader`. The data
+directory must be empty for seeding; a directory with a MANIFEST resumes its
+existing replica state.
+
 ### The out-of-process plugin channel
 
 A plugin peer runs as its own process and reaches `yesnod` over a Unix socket. It
 never opens the database: the snapshots it reads belong to `yesnod` and are keyed
-by its connection, so closing the socket is what releases them. A peer therefore
-needs no access to the data directory, cannot corrupt the daemon, and cannot keep
-space pinned after it exits or is killed.
+by its connection, so closing the socket releases them. A peer needs no access
+to the data directory and cannot keep space pinned after it exits or is killed.
+The channel also accepts writes on a leader. Treat access to the socket as
+authority to read and change the whole database.
+
+One `Apply` request carries at most 16,384 point inserts, point removals,
+inclusive-range inserts, inclusive-range removals, or whole-key deletions. The
+server validates the request, commits it as one batch, and replies with its
+version and whether it changed data. These operations are individually
+idempotent, so a peer can retry a request after losing the reply when no
+conflicting write has interleaved. A follower refuses writes; a database slot
+that is temporarily empty refuses them rather than holding a serving thread.
+For an atomic write spanning several requests, use a Flight write transaction.
 
 The channel is off until a socket path is set. These are settable from the
 configuration file, the environment, or the command line, which matters where the
@@ -81,7 +98,7 @@ channel quietly absent.
 
 **The socket is an access boundary, and it has no password.** A peer names itself
 in its greeting, but that name is a label it chooses, not a credential -- so
-whoever can open the socket can read the whole database. Two gates control that,
+whoever can open the socket can read and change the whole database. Two gates control that,
 and they are not interchangeable. The file mode is the first: set
 `channel_socket_mode = "0600"` on any shared or group-writable mount, because the
 default is whatever the umask gives. The second is the user id, taken from the

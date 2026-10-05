@@ -196,11 +196,14 @@ may be reused after the snapshot and A/B-superblock retention rules permit it.
 +---------------------+---------------------+
 |             reserved slab 0 body                               |
 +----------------------------------------------------------------+ 2 MiB
-| slab 1 metadata      | slab 1 size-class slots ...             |
+| slab 1 metadata      | payload slots ... | trailer table *    |
 +----------------------------------------------------------------+ 4 MiB
-| slab 2 metadata      | slab 2 size-class slots ...             |
+| slab 2 metadata      | payload slots ... | trailer table *    |
 +----------------------------------------------------------------+
 ```
+
+`*` Only standalone-class slabs have a trailer table; packed-page slabs use
+the whole body for page slots.
 
 The image is little-endian and is intentionally refused on an opposite-endian
 host. The one exception is the endian probe itself, which is written in native
@@ -231,11 +234,9 @@ is a hard error rather than permission to reinterpret the bytes.
 | `60..64` | `u32` | base page size, currently 4096; zero denotes a file written before this field was compared |
 | `64..68` | `u32` | slab size, currently 2 MiB; zero denotes a file written before this field was compared |
 | `68..72` | `u32` | maximum packed payload length, currently 2028 |
-| `72..76` | `u32` | number of size classes, at most 11 |
-| `76..120` | up to 11 x `u32` | persisted size-class ladder |
-| `120..124` | `u32` | root index page ID; `0xffffffff` means no root |
-| `124` | `u8` | root height; zero also means no root |
-| `125..128` | | reserved |
+| `72..76` | `u32` | number of size classes; the current writer uses 11 |
+| `76..120` | 11 x `u32` | current persisted size-class ladder |
+| `120..128` | | reserved |
 | `128..136` | `u64` | commit version represented by the checkpoint |
 | `136..144` | `u64` | LSN at which WAL replay begins |
 | `144..152` | `u64` | live payload bytes reported by the checkpoint |
@@ -243,7 +244,11 @@ is a hard error rather than permission to reinterpret the bytes.
 | `156..160` | | reserved |
 | `160..168` | `u64` | checkpoint sequence |
 | `168..172` | `u32` | index-node size; zero denotes the historical 1024-byte default |
-| `172..4092` | | reserved |
+| `172..176` | | reserved |
+| `176..184` | `u64` | last assigned commit time, UNIX epoch microseconds; zero predates commit-time stamping |
+| `184..188` | `u32` | root index page ID; `0xffffffff` means no root |
+| `188` | `u8` | root height; zero also means no root |
+| `189..4092` | | reserved |
 | `4092..4096` | `u32` | slot CRC32C |
 
 Required feature bits change interpretation and must be understood by a reader.
@@ -289,27 +294,29 @@ opened, so that exchange is rejected rather than served.
 ### Current size classes
 
 The current writer creates shards with this ladder. Class 0 is reserved for
-packed pages. The remaining classes are general allocation slots; a standalone
-container extent reserves the final eight bytes of its slot for a trailer,
-while an index node occupies only its persisted node size.
+packed pages. The remaining classes are general allocation slots. A standalone
+extent's eight-byte trailer is stored in a table after the slab's payload
+slots, while an index node occupies only its persisted node size.
 
 | class | slot bytes | maximum standalone payload bytes |
 |---:|---:|---:|
 | 0 | 4096 | packed-page container |
-| 1 | 576 | 568 |
-| 2 | 704 | 696 |
-| 3 | 896 | 888 |
-| 4 | 1088 | 1080 |
-| 5 | 1600 | 1592 |
-| 6 | 2112 | 2104 |
-| 7 | 3136 | 3128 |
-| 8 | 4160 | 4152 |
-| 9 | 6208 | 6200 |
-| 10 | 8256 | 8248 |
+| 1 | 576 | 576 |
+| 2 | 704 | 704 |
+| 3 | 896 | 896 |
+| 4 | 1088 | 1088 |
+| 5 | 1600 | 1600 |
+| 6 | 2112 | 2112 |
+| 7 | 3136 | 3136 |
+| 8 | 4160 | 4160 |
+| 9 | 6208 | 6208 |
+| 10 | 8192 | 8192 |
 
-A slab contains only one class. Its capacity is
-`floor((2 MiB - 8192) / slot_bytes)`; any tail shorter than a slot is unused.
-All slot starts are 64-byte aligned.
+A slab contains only one class. A packed-page slab has capacity
+`floor((2 MiB - 8192) / slot_bytes)`. A standalone class reserves one eight-byte
+trailer per slot at the end of the slab body, so its capacity is
+`floor((2 MiB - 8192) / (slot_bytes + 8))`. All slot starts are 64-byte aligned.
+The bitmap class holds 254 adjacent 8192-byte payloads per slab.
 
 ## Slab metadata
 
@@ -463,18 +470,21 @@ a standalone extent.
 
 ### Standalone extent
 
-A standalone extent starts at the cell stored in `ChunkRef`:
+A standalone extent starts at the cell stored in `ChunkRef`. If the cell is
+slot `i` in a slab of class `c`, its trailer is in a separate table:
 
 ```text
-cell                         payload bytes
-cell + payload_length       unused slot slack
-cell + class_size - 8       u32 chunk-key tag
-cell + class_size - 4       u32 CRC32C of payload only
+cell                                         payload bytes, then unused slot slack
+table = slab_base + 8192 + capacity(c) * class_size(c)
+table + 8*i                                  u32 chunk-key tag
+table + 8*i + 4                              u32 CRC32C of payload only
 ```
 
 There is no extent header and no liveness field. The index is the sole authority
-on which extents are live. The fixed-position trailer detects a reference that
-lands in another chunk's slot and permits offline payload verification.
+on which extents are live. A cell must be aligned to a slot of its slab's
+recorded class; an unaligned reference is refused. The trailer detects a
+reference that lands in another chunk's slot and permits offline payload
+verification.
 
 The key tag is the high 32 bits of a SplitMix64-style finalizer. All operations
 below wrap modulo `2^64`:
@@ -566,7 +576,7 @@ would mean reading its body as something else.
 |---:|---|---|
 | 0 | Pad | no semantic body; ignored during replay |
 | 1 | ChunkDelta | key, chunk prefix, add/remove counts, then within-chunk values |
-| 2 | ChunkImage | key followed by complete 64-bit ordinals |
+| 2 | ChunkImage | key followed by complete 64-bit ordinals; retained for small images and older WAL |
 | 3 | ChunkDelete | key |
 | 4 | SetRange | key, inclusive low/high ordinals, remove flag |
 | 5 | CommitIntent | physical shard IDs participating in a multi-shard commit |
@@ -575,6 +585,7 @@ would mean reading its body as something else.
 | 8 | CheckpointBegin | marker body ignored during replay |
 | 9 | CheckpointEnd | marker body ignored during replay |
 | 10 | EpochFence | open epoch |
+| 11 | ChunkPatch | key, chunk prefix, then clear and set masks as container payloads |
 
 The bodies are:
 
@@ -590,6 +601,13 @@ ChunkDelta:
 ChunkImage:
    0..8    u64 key
    8..     zero or more complete u64 ordinals
+
+ChunkPatch:
+   0..8    u64 key
+   8..16   u64 chunk prefix
+  16..     clear mask, then set mask; each is:
+           u8 kind | u32 cardinality | u32 payload length | payload bytes
+           an empty mask has zero cardinality and zero payload length
 
 ChunkDelete:
    0..8    u64 key
@@ -610,6 +628,12 @@ ShardCommit and Abort, when flag 0x01 is set:
 EpochFence:
    0..8    u64 open epoch
 ```
+
+`ChunkPatch` replays `(old chunk minus clear mask) union set mask`. Its payload
+bytes use the same array, bitmap, and run encoding as stored containers. Large
+whole-chunk writes choose this compact form; a small image can still use
+`ChunkImage`. The two record types remain distinct because older WAL histories
+may contain ordinal-encoded images.
 
 For a multi-shard transaction, every participating log receives the same
 commit version, a `CommitIntent` naming all participants, its local redo
@@ -654,23 +678,21 @@ free space cannot be inferred by scanning for locally well-formed extent bytes.
 | manifest slot | magic and CRC32C | ignore torn slot; select other slot |
 | superblock slot | magic and CRC32C | ignore torn slot; select other slot |
 | slab metadata | magic, version, CRC32C, count/bitmap agreement | treat as unknown and derive from index |
-| index node | version, shape, and stored CRC32C | shape and version checked online; the integrity scan recomputes the stored CRC |
-| standalone payload | chunk-key tag and stored payload CRC32C | tag checked online when slab geometry is known; the integrity scan recomputes the stored CRC |
-| packed page | magic, version, flags, key range, and stored CRC32C | header and range checked online when class 0 is known; the integrity scan recomputes the stored CRC |
+| index node | version, shape, and stored CRC32C | online reads recompute the CRC on first access to a region; the integrity scan recomputes it independently |
+| standalone payload | chunk-key tag and stored payload CRC32C | online reads check the tag and recompute the CRC on first access when slab geometry is known; the integrity scan recomputes it independently |
+| packed page | magic, version, flags, key range, and stored CRC32C | online reads check the header and range and recompute the page CRC on first access when class 0 is known; the integrity scan recomputes it independently |
 | WAL frame | length, LSN redundancy, type, CRC32C | ignore a crash-torn tail and remove its recovery suffix; reject valid unknown type |
 
-The distinction between "stored" and "checked" in this table is deliberate. The
-online read path avoids hashing up to 8 KiB on every container read: what it
-verifies is *identity* — a chunk-key tag, a packed page's key range, a node's
-version and shape — which costs four bytes and catches a reference that has come
-to point at the wrong bytes, but says nothing about whether those bytes are
-intact. Content is verified by the integrity scan instead, which recomputes
-every stored index-node, packed-page and standalone-payload CRC32C and reports
-each mismatch. A packed page is verified once per page rather than once per
-chunk in it, so the scan's cost tracks bytes rather than chunk count. The
-once-per-faulted-page checksum cache that would let the online path verify
-content as well is still not implemented, so between scans a corrupt payload is
-detected only when it also breaks a container invariant.
+The online read path checks both identity and content. It recomputes a stored
+checksum when an index node, standalone payload, or packed page is first read,
+then caches that successful verification until a write overlaps the region.
+Thus a repeated read avoids hashing the same bytes, while a newly encountered
+corrupt region is refused. A packed page is checked as one page, shared by all
+chunks it contains. The integrity scan independently walks every reachable
+region and recomputes its stored CRC; it also surveys data that ordinary queries
+may never touch. A slab whose class metadata is opaque is an exception to
+online extent and packed-page verification: without known geometry, the reader
+cannot locate the corresponding trailer or page boundary.
 
 Where a checksum is enforced, a version incompatibility behind a valid checksum
 is deliberately different from a torn write. What a checksum failure costs

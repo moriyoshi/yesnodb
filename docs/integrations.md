@@ -1,10 +1,12 @@
 # Integrations
 
-yesnodb separates its storage engine from Arrow, DataFusion, Flight, replication,
-and PostgreSQL. This keeps the embedded core small, but it also means each
-surface has a different contract.
+yesnodb separates its storage engine from Arrow, DataFusion, Flight, and its
+database and search-engine adapters. Each surface has a different contract.
 
 ## Capability matrix
+
+This table compares the main query surfaces. The language clients and external
+database adapters are described below.
 
 | Capability | Embedded core | `yesno` | Flight v1 | DataFusion | PostgreSQL |
 |---|---:|---:|---:|---:|---:|
@@ -12,7 +14,7 @@ surface has a different contract.
 | Exact cardinality without returning ordinals | yes | yes | yes | planner statistics | `count(*)` pushdown |
 | AND / OR / AND NOT | yes | yes | yes | predicate lowering | FDW qualifier lowering |
 | XOR / complement | yes | yes | derived from v1 nodes | no SQL-specific surface | no SQL-specific surface |
-| Bulk ingest | yes | CSV-like pairs | Arrow `DoPut` | no | FDW and access-method writes |
+| Bulk ingest | yes | CSV-like pairs | Arrow `DoPut` pairs, mixed operations, or container payloads | no | FDW and access-method writes |
 | Consistent snapshot | yes | ticket version | ticket version | one `SnapshotSource` | transaction-level rules |
 | Read replica | library primitives | transparent endpoint | transparent endpoint | transparent source | remote FDW endpoint |
 
@@ -64,7 +66,7 @@ consumers that need the actual integer values.
 ## Arrow Flight
 
 The Rust convenience client handles yesno descriptors, versioned tickets,
-record-batch decoding, pair ingest acknowledgements, and administrative actions:
+record-batch decoding, ingest acknowledgements, and administrative actions:
 
 ```rust
 use yesno_flight::{SetExpr, YesnoClient};
@@ -89,6 +91,17 @@ client.remove([(42, 10)]).await?;
 let stats = client.stats().await?;
 assert!(stats.shards > 0);
 ```
+
+Set queries offer three result representations. The default streams sorted
+`UInt64` ordinals. For a consumer that understands Roaring payloads,
+`fetch_containers` returns one encoded container per chunk with the container
+schema described below. For an Arrow mask over a known bounded ordinal window,
+`fetch_bitvector` returns one `Binary` value of packed bits per chunk, including
+zero-filled gaps; its schema metadata names the base ordinal and bits per
+value. The bitvector needs no Roaring decoder, but its size follows the window
+rather than the match count. The server refuses a window above 16,384 chunks
+instead of silently truncating it. Both alternatives are explicit client
+requests, so a client expecting ordinals is never handed another schema.
 
 `prepare_key` and `prepare_query` return reusable query metadata separately
 from `fetch`. The exact count and ticket name one snapshot version, which is
@@ -126,6 +139,20 @@ an inclusive range, and a single-ordinal operation sets them equal. Operations
 apply in stream order, which is what lets a change-data feed replay a
 delete-then-reinsert of the same key without the two reordering.
 
+For dense sets, `apply` also accepts the container schema: non-null `key`,
+`prefix48`, `kind`, `cardinality`, and `payload` columns. Each row is one
+Roaring-compatible chunk payload whose members are **inserted** into the named
+key; it does not replace the existing chunk and cannot express a removal.
+The same schema is available on the read side through container-result tickets.
+Use a container batch builder to make valid payloads, and check the server's
+container-put capability before sending them. The Rust client's
+`apply_containers` helper requires its optional `containers` feature. It
+reports the number of ordinals decoded, rather than the number of Arrow rows.
+Container batches can also be staged in a write transaction. Staging is bounded
+by payload bytes as well as ordinal count, so a dense transaction cannot grow
+without limit. On a measured half-dense 64-chunk page, the container wire was
+64.8 times smaller than the pair wire.
+
 A write spanning several calls uses a write transaction: an action opens one and
 returns its identifier, `DoPut` calls with the command `txn:<id>` stage
 mixed-operation batches into it, and a commit action applies the accumulated
@@ -135,9 +162,11 @@ support in its capability flags; open transactions are bounded in number, in
 staged rows, and by a deadline, so an abandoned one is reclaimed rather than
 held.
 
-The ingest acknowledgement is little-endian `app_metadata`: the accepted row count
-first, then the version those rows were committed at. Read the count from the
-leading eight bytes and treat any other total width than eight or sixteen as a
+The ingest acknowledgement is little-endian `app_metadata`: the accepted count
+first, then the committed version. The count is the number of rows for pair or
+mixed-operation batches, and the sum of decoded cardinalities for container
+batches. Read it from the leading eight bytes and treat any other total width
+than eight or sixteen as a
 protocol error. A sixteen-byte acknowledgement whose version is zero committed
 nothing, because no commit is ever assigned version zero; an eight-byte one comes
 from a server predating the version field, so a client should lose the version
@@ -250,6 +279,20 @@ plaintext requires an insecure option, while TLS accepts a cloned Go TLS
 configuration. The client preserves gRPC status errors so callers can branch on
 authentication, authorization, fencing, and reclaimed-version failures.
 
+### C++ and Java clients
+
+The synchronous C++ client uses Apache Arrow's native Flight API. It supports
+versioned planning, exact counts, validated ordinal reads, bulk pair writes,
+and atomic point insert, remove, contains, and clear actions. One client must
+be serialized by its host or used by one thread at a time.
+
+The synchronous Java 17 client supports streamed ordinal batches, versioned
+planning, exact counts, bounded pair writes, and conversion to 32-bit
+`RoaringBitmap` with a range check. Java `long` values carry the raw bits of
+unsigned keys and ordinals; applications must use unsigned conversions when
+displaying or parsing values above `Long.MAX_VALUE`. The Java client artifact
+is built from this checkout and is not yet published.
+
 ## Tantivy
 
 The `yesno-tantivy` crate turns a yesno result into a Tantivy `Query`.
@@ -349,11 +392,33 @@ let batches = context
 Use one `SnapshotSource` per query or bounded unit of work. It pins one version,
 the database file lock, and the reclamation floor for its lifetime.
 
-Current limitation: `PostingSource` represents both an absent key and a failed
-snapshot read as `None`. An evicted snapshot can therefore appear as an empty
-posting list. Do not use this integration where silently losing rows on reader
-eviction is acceptable; keep source lifetimes short and monitor evictions until
-the source becomes fallible.
+`PostingSource` distinguishes an absent key (`Ok(None)`) from a failed snapshot
+read (`Err`). An evicted snapshot therefore makes planning fail with a DataFusion
+error instead of silently returning an empty posting list. Keep source
+lifetimes scoped to the query so they do not pin old versions unnecessarily.
+
+## Search engines
+
+An application can resolve a yesnodb expression to a portable bitmap filter
+with the Java search adapter and submit the resulting query through its own
+OpenSearch or Elasticsearch client. The target numeric field must use the same
+stable ordinal assignment as yesnodb.
+
+Version-locked plugins instead resolve a `yesno` query on the coordinating
+search node before shard fan-out. The OpenSearch 3.8.0 plugin rewrites to its
+native bitmap-valued `terms` query. The Elasticsearch 9.5.2 plugin ships a
+portable Roaring filter against numeric document values. Both bound result
+cardinality, bitmap size, and Flight time, and a pinned snapshot version is
+never silently replaced with a newer one. These plugins are tied to their
+named engine versions; validate a new engine version before upgrading.
+
+## C embedding
+
+The separate `yesno-c` workspace exposes opaque database and materialized
+snapshot-cursor handles to C and C++ hosts. Each database handle owns an
+independent durable database; a cursor retains the set it opened even while
+later writes commit. The ABI returns explicit status codes and catches panics
+at exported boundaries. The embedded MySQL backend uses this ABI.
 
 ## PostgreSQL
 
@@ -447,3 +512,17 @@ Isolation within a yesno table follows PostgreSQL transaction levels:
 statement. A transaction touching both a yesno table and an ordinary heap can
 observe different commit moments because the two storage engines do not share a
 commit protocol. Back up yesnodb data separately from PostgreSQL.
+
+## MySQL
+
+The experimental MySQL 8.4 storage engine exposes one yesnodb key as a table
+with exactly one `BIGINT UNSIGNED NOT NULL PRIMARY KEY` column. The table's
+`CONNECTION='key=<u64>'` selects that set. Tables with the same connection
+value share data; dropping or truncating either clears the underlying set.
+
+It supports inserts, deletes, exact and range reads, ordered scans, exact
+counts, rollback, and savepoints. A transaction's buffered changes become one
+yesnodb version at MySQL commit, using either the embedded C ABI or a remote
+Flight backend selected at startup. There is no two-phase prepare: a crash
+between this engine's commit and MySQL's binlog write can leave them out of
+agreement. Back up embedded yesnodb data separately from MySQL's other engines.
