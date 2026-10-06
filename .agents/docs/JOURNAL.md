@@ -1515,3 +1515,145 @@ added here was written by **predicting** the output rather than generating it, a
 `//e2e/mysql:regress` compares byte-exactly, so the prediction held -- which is the
 discipline that file's oracle exists for, and the only way adding a case to it proves
 anything.
+
+## 2026-10-06 -- the seek loop is cheap, and the ratio that says when it stops being cheap
+
+`keystream-seek-retires-skipped-steps-linearly` asked a yes-or-no question and forbade
+answering it by inspection: `KeyStream::seek` gallops to its target in O( log delta ) and
+then calls `advance()` once per skipped step purely to keep `disk_remaining` in step, and
+the entry refused cumulative counts without a measurement because an extra field or a
+suffix table costs metadata and construction work for **every** stream, seeking or not.
+
+**The construction, so the numbers can be re-derived rather than re-measured.** Isolation
+comes from `Snapshot::key_expr`: its `Expr::Source` holds an `Arc<dyn ChunkSource>` over a
+`KeySource` that caches its resolved plan in a `OnceLock`, and `ChunkSource::open` is
+documented repeatable. So the first open resolves the plan and every later one is a
+refcount bump -- which makes `open()` the baseline, `open() + seek()` the baseline plus the
+retirement loop, and the difference the subject with plan construction excluded. One
+ordinal per chunk ( `p << 16` ) gives exactly one plan step per chunk, and a checkpoint
+makes every step a `Disk` source, which is the only kind `advance()` does work for. Arms
+interleaved, medians of 200, host at 91-94% idle with `vmstat bi` at 0.
+
+| steps | build us | seek us | ns/step | seek / build |
+| --- | --- | --- | --- | --- |
+| 1 000 | 42.8 | 0.400 | 0.40 | 0.9% |
+| 10 000 | 294.0 | 4.816 | 0.48 | 1.6% |
+| 50 000 | 1 717.8 | 42.416 | 0.85 | 2.5% |
+| 100 000 | 3 385.3 | 105.904 | 1.06 | 3.1% |
+
+`open()` on a warm source is 0.03-0.05 us at every size, which is the plan cache working
+and the thing that makes the isolation valid.
+
+**The loop is superlinear, and that is cache behaviour rather than the loop.** 0.40 ns a
+step at a thousand steps against 1.06 at a hundred thousand: the work per step is a
+`matches!` and a decrement, so what grows is the memory the walk touches.
+
+**The counter-measurement is what decided it, and I nearly did not run it.** My instinct
+after the first table was that 106 us for a 100 000-step seek was small and the entry could
+be declined. That reasoning had no denominator. Building that same plan costs **3 385 us**,
+so the seek is **0.9% to 3.1% of the construction the same caller necessarily paid to have
+a plan at all** -- and the corollary cuts the other way too: an extra O( steps ) prefix sum
+at construction is noise against 3.4 ms, so the *cost* side of cumulative counts is
+smaller than I had assumed as well. Both halves of the trade were wrong until the
+denominator existed.
+
+**So the answer is a ratio, not a verdict.** Construction is paid once per `KeySource`;
+the seek is paid once per open. The crossover is therefore far seeks per cached plan:
+**107 at 1 000 steps, 61 at 10 000, 40 at 50 000, 32 at 100 000** -- falling as plans grow,
+because the seek is superlinear and construction is not. Below that the counts lose; above
+it they win. And the regime where they win is precisely the one this entry names, a
+long-lived full plan, which is why the honest outcome is a threshold and a reopening
+condition rather than a no.
+
+Two things that keep this from being reopened on vibes. A merge join amortizes the loop
+away **by construction**: the sum of its deltas across a scan is bounded by the step count
+it would have walked anyway, and each step is a nanosecond against a chunk decode in
+microseconds. And a caller who owns a narrow chunk window already has
+`key_stream_prefix_range`, so the case that actually pays is a single far seek on a plan
+held across many queries. Reopen with a count of far seeks per cached `KeySource` from a
+real query mix; the figures above say whether it is worth it.
+
+Harness was `.agents-workspace/tmp/seekbench`, deleted once these numbers were recorded,
+per the rule that the finding is the deliverable and not the instrument.
+
+## 2026-10-06 -- the read/write mix, and four harness versions that were each confidently wrong
+
+`read-concurrency-is-bounded-by-shard-count` carried one standing instruction: "measure a
+read/write mix, not only a read sweep, before believing any figure here", because every
+measurement behind it -- including the consumer's -- had no writers, and the candidate fix
+( `RwLock<ShardStore>` ) trades "readers serialize" for "a writer may not acquire".
+
+**Construction.** 20 cores. One database per shard count, 16 keys x 236 chunks x 64
+ordinals, checkpointed so every step is a `Disk` source. Readers sweep through **cached
+`KeySource`s** obtained from `Snapshot::key_expr`, so each sweep is `next_chunk` lock
+traffic and not plan construction. The writer inserts 256 ordinals into a fresh chunk and
+then checkpoints, in a loop. Arms interleaved, medians of 3, 50 sweeps a thread.
+
+| shards | 1 thread | 20 threads | scaling | 20t + writer | checkpoint ms |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 3 845.0 | 885.3 | **0.23x** | 1 005.8 | 14.3 |
+| 4 | 2 999.6 | 2 925.4 | 0.98x | 3 129.2 | 26.7 |
+| 20 | 3 892.6 | 4 572.8 | 1.17x | 4 486.9 | 56.2 |
+
+Throughput in thousands of chunk reads a second.
+
+**The mix does not change the picture.** Adding the writer moves read throughput within
+noise, so the read-only figures this entry was opened on stand. And **checkpoint is never
+starved under the current `Mutex`**: 14.3 ms at one shard, which is the baseline any
+post-conversion figure must be compared against, since the whole `RwLock` objection is
+that a starved checkpoint converts a throughput problem into a disk-space one.
+
+**The 1-shard degradation reproduces: 0.23x against the recorded 0.22x.** Twenty threads
+deliver about a quarter of one thread's aggregate throughput, which remains the headline.
+
+**The 3.51x at 20 shards did not reproduce**, across four harness variants -- 1.62, 0.99,
+0.99, 1.17. Single-thread throughput here is 3 845 Kr/s against the recorded 952, because
+these chunks hold 64 ordinals and decode as cheap arrays; that shifts the balance from
+decode-under-lock toward lock acquisition and leaves less to win by parallelism. Stated as
+the likely reason rather than a confirmed one. **Do not treat the 20-shard gain as
+reproduced on a cheap-read fixture.**
+
+**New, and it connects two open entries with a number.** Checkpoint latency scales with
+shard count: **14.3 ms at 1 shard to 56.2 ms at 20, 3.9x**, because `checkpoint_inner`
+walks shards back to back -- which is `staggered-checkpointing`'s subject. So the knob that
+fixes read scaling multiplies checkpoint latency, and this entry's existing note that "the
+knob has a cost" now has a figure attached to it.
+
+### The four harness versions, because each was confidently wrong
+
+This is the reusable part. Every version produced a clean-looking table, and every one of
+the first four would have been reported as a result:
+
+1. **Empty checkpoints.** The writer called `checkpoint()` in a loop with no intervening
+   inserts, so every checkpoint after the first had nothing dirty to flush. It reported
+   **0.09 ms** -- the cost of finding nothing to do -- against the 14-56 ms a real one
+   takes. A writer that does not write is not a writer.
+2. **A four-millisecond baseline.** The single-thread arm ran 3 sweeps, about 4 ms, so its
+   figure swung 2 397 / 3 741 / 2 601 between runs and every *ratio* built on it was
+   noise. Fifty sweeps fixed it.
+3. **Threads in lockstep.** All twenty threads swept the same sixteen keys in the same
+   order, so they collided on one shard at a time however many shards existed. Rotating
+   each thread's starting key did not change the answer -- which is itself the useful
+   finding, because it eliminated convoy behaviour as the explanation.
+4. **Planning drowning the subject.** Each sweep called `key_stream` sixteen times and
+   re-planned every time: about 10 us a key against 944 us of chunk reads, and planning
+   takes the store lock too. So the harness measured a contention point the entry is not
+   about. Cached `KeySource`s removed it, and only then did the 1-shard figure land on the
+   recorded 0.22x.
+
+**A concurrency harness is wrong until each layer is isolated, and it looks right the
+whole time.** Three of those four flaws inflated or flattened exactly the quantity under
+test, and the fourth -- the lockstep -- was a hypothesis that measurement refuted. The
+1-shard reproduction is the only reason to trust any of the final numbers: it is the
+control, and it did not come good until the fourth version.
+
+**Why the entry stays open.** The `RwLock` conversion cannot be measured without doing it,
+and the trap recorded on the entry stands -- the inner `segs` / `pinned` / `verified`
+mutexes in `store/segment.rs` are redundant only while the store lock is exclusive and
+become load-bearing the moment it is shared. What this run supplies is the missing
+baseline: a writer costs nothing today, and checkpoint takes 14.3 ms at one shard.
+
+Host at 97-99% idle for the reported runs, with `vmstat bi` 0 and 114 GB of 121 available.
+A final confirming run was **skipped** rather than taken, because the host fell to 75%
+idle when another session started work -- the same gate this entry's wall-clock cells
+failed in September.
