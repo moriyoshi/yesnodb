@@ -1658,6 +1658,216 @@ fn replaying_a_write_batch_changes_nothing_the_second_time() {
     }
 }
 
+/// A chunk write and a point write reach the same set.
+///
+/// **This is the whole correctness claim for the dense encoding**, and it is a
+/// differential rather than a round trip on purpose: a round trip through our own encoder
+/// would agree with itself however both halves were wrong. Here the payloads are built by
+/// hand from the documented wire format, which is what a peer actually has, and the point
+/// wire -- already covered by its own tests -- is the oracle.
+///
+/// All three kinds are exercised because the three are **not** symmetric with the read
+/// side. An array is `2 * card` ascending `u16`s and a bitmap is exactly `BITMAP_BYTES`,
+/// byte-identical in both directions; a run is `[ start, end ]` pairs on the wire against
+/// the codec's `( start, len_minus_1 )` with a `u16` count prefix, so the server converts.
+/// A test covering only arrays and bitmaps would pass against a server that read runs
+/// wrong, and reading them wrong is a silently wrong *set*, not an error.
+#[test]
+fn a_chunk_write_and_a_point_write_reach_the_same_set() {
+    use yesno_plugin::ipc::{ChunkWrite, LaneKind};
+
+    const CHUNK: u64 = 1 << 16;
+    let (_c, _host, mut s) = setup("chunkput");
+    greet(&mut s);
+
+    // An array in chunk 0, a run in chunk 1, a bitmap in chunk 2.
+    let array_ordinals = [7u64, 9, 11];
+    let run_lo = CHUNK + 1_000;
+    let run_hi = CHUNK + 1_004;
+    let bitmap_positions: Vec<u32> = (0..10_000u32).step_by(2).collect();
+    let bitmap_ordinals: Vec<u64> = bitmap_positions
+        .iter()
+        .map(|p| 2 * CHUNK + *p as u64)
+        .collect();
+
+    let mut words = [0u64; yesno_core::BITMAP_WORDS];
+    for p in &bitmap_positions {
+        words[(*p / 64) as usize] |= 1u64 << (*p % 64);
+    }
+    let bitmap_payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+    let dense = Frame::ChunkPut {
+        writes: vec![
+            ChunkWrite {
+                key: 700,
+                prefix: 0,
+                kind: LaneKind::Array,
+                count: 3,
+                card: 3,
+                payload: vec![7, 0, 9, 0, 11, 0],
+            },
+            ChunkWrite {
+                key: 700,
+                prefix: 1,
+                kind: LaneKind::Run,
+                count: 1,
+                card: 5,
+                // `[ start, end ]`, which is what the read side emits and therefore what
+                // a peer echoing a lane it read will send.
+                payload: vec![0xe8, 0x03, 0xec, 0x03],
+            },
+            ChunkWrite {
+                key: 700,
+                prefix: 2,
+                kind: LaneKind::Bitmap,
+                count: yesno_core::BITMAP_WORDS as u32,
+                card: bitmap_positions.len() as u32,
+                payload: bitmap_payload,
+            },
+        ],
+    };
+    match s.handle(dense) {
+        Frame::Committed { changed, .. } => {
+            assert!(changed > 0, "the chunk write changed something")
+        }
+        other => panic!("expected Committed, got {other:?}"),
+    }
+
+    // The same ordinals on the point wire, to a different key.
+    let mut points: Vec<Write> = array_ordinals
+        .iter()
+        .map(|o| w(701, *o, *o, WriteOp::Insert))
+        .collect();
+    points.push(w(701, run_lo, run_hi, WriteOp::InsertRange));
+    points.extend(
+        bitmap_ordinals
+            .iter()
+            .map(|o| w(701, *o, *o, WriteOp::Insert)),
+    );
+    match s.handle(Frame::Apply { writes: points }) {
+        Frame::Committed { .. } => {}
+        other => panic!("expected Committed, got {other:?}"),
+    }
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("expected SnapshotOpened, got {other:?}"),
+    };
+    let count =
+        |s: &mut Session, key: u64| match s.handle(Frame::SnapshotCardinality { snapshot, key }) {
+            Frame::Count { value } => value,
+            other => panic!("expected Count, got {other:?}"),
+        };
+    let has = |s: &mut Session, key: u64, ordinal: u64| match s.handle(Frame::SnapshotContains {
+        snapshot,
+        key,
+        ordinal,
+    }) {
+        Frame::Bool { value } => value == 1,
+        other => panic!("expected Bool, got {other:?}"),
+    };
+
+    let want = array_ordinals.len() as u64 + 5 + bitmap_positions.len() as u64;
+    assert_eq!(count(&mut s, 700), want, "the chunk wire's cardinality");
+    assert_eq!(
+        count(&mut s, 700),
+        count(&mut s, 701),
+        "the two encodings must reach the same set"
+    );
+    // Cardinality alone would not catch a run shifted or reversed, which is the failure
+    // the conversion exists to prevent, so the run's endpoints are named.
+    for o in [run_lo, run_hi, 7, 11, 2 * CHUNK, 2 * CHUNK + 9_998] {
+        assert!(has(&mut s, 700, o), "the chunk wire lost ordinal {o}");
+        assert!(has(&mut s, 701, o), "the point wire lost ordinal {o}");
+    }
+    for o in [run_lo - 1, run_hi + 1, 8, 2 * CHUNK + 1] {
+        assert!(!has(&mut s, 700, o), "the chunk wire invented ordinal {o}");
+        assert!(!has(&mut s, 701, o), "the point wire invented ordinal {o}");
+    }
+}
+
+/// A reversed run interval is refused rather than read as a different set.
+///
+/// `[ start, end ]` with `end < start` is the exact shape the read side's own comment
+/// records as having handed a consumer a silently wrong set. Arriving from the write
+/// direction it must be an error.
+#[test]
+fn a_reversed_run_interval_is_refused() {
+    use yesno_plugin::ipc::{ChunkWrite, LaneKind};
+
+    let (_c, _host, mut s) = setup("chunkrun");
+    greet(&mut s);
+    match s.handle(Frame::ChunkPut {
+        writes: vec![ChunkWrite {
+            key: 1,
+            prefix: 0,
+            kind: LaneKind::Run,
+            count: 1,
+            card: 5,
+            // end 100 before start 200.
+            payload: vec![0xc8, 0x00, 0x64, 0x00],
+        }],
+    }) {
+        Frame::Fault { status, .. } => {
+            assert_eq!(status, yesno_plugin::abi::Status::InvalidArgument as u32)
+        }
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
+/// A payload that is not a container is an error, never a panic.
+///
+/// The guarantee is inherited rather than re-implemented: `codec::decode` is a fuzz target
+/// by contract, so for any input it returns an error or a valid container. This pins that
+/// the chunk path actually routes through it -- a server that trusted the payload would
+/// accept a descending array and corrupt every later binary search over it.
+#[test]
+fn a_non_ascending_array_payload_is_an_error_not_a_panic() {
+    use yesno_plugin::ipc::{ChunkWrite, LaneKind};
+
+    let (_c, _host, mut s) = setup("chunkbad");
+    greet(&mut s);
+    match s.handle(Frame::ChunkPut {
+        writes: vec![ChunkWrite {
+            key: 1,
+            prefix: 0,
+            kind: LaneKind::Array,
+            count: 3,
+            card: 3,
+            // Descending, which every kernel's binary search would misread.
+            payload: vec![11, 0, 9, 0, 7, 0],
+        }],
+    }) {
+        Frame::Fault { .. } => {}
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
+/// A follower refuses a chunk write for the same reason it refuses a point write.
+#[test]
+fn a_follower_refuses_a_chunk_write() {
+    use yesno_plugin::ipc::{ChunkWrite, LaneKind};
+
+    let (_c, host, mut s) = setup("chunkrole");
+    greet(&mut s);
+    host.set_role(Role::Follower);
+    match s.handle(Frame::ChunkPut {
+        writes: vec![ChunkWrite {
+            key: 1,
+            prefix: 0,
+            kind: LaneKind::Array,
+            count: 1,
+            card: 1,
+            payload: vec![7, 0],
+        }],
+    }) {
+        Frame::Fault { status, .. } => {
+            assert_eq!(status, yesno_plugin::abi::Status::WrongRole as u32)
+        }
+        other => panic!("expected a fault, got {other:?}"),
+    }
+}
+
 /// A follower refuses writes, and says why.
 ///
 /// A replica that applied a local write would diverge from its leader with nothing able to

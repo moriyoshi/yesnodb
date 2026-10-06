@@ -337,6 +337,41 @@ pub const MAX_WRITES: usize = 16 * 1024;
 /// cannot widen them.
 pub const APPLY_MAX_PAYLOAD: usize = apply_payload_bytes(MAX_WRITES);
 
+/// Fixed bytes of one [`ChunkWrite`], before its payload: key, prefix, kind, count, card.
+pub const CHUNK_WRITE_FIXED: usize = 8 + 8 + 1 + 4 + 4;
+
+/// Largest payload one chunk can carry.
+///
+/// A bitmap is the dense ceiling and is always [`yesno_core::BITMAP_WORDS`] words, so an
+/// array of `ARRAY_MAX` `u16`s and a run of `RUN_MAX_INTERVALS` pairs both land at or
+/// under it. Taken from the core constant rather than written as 8192, because the two
+/// disagreeing is the bug this derivation exists to make impossible.
+pub const CHUNK_PAYLOAD_MAX: usize = yesno_core::BITMAP_WORDS * 8;
+
+/// Chunks one [`Frame::ChunkPut`] may carry.
+///
+/// **64 because that is the measured case**: `channel-dense-chunk-writes` records a
+/// 64-chunk half-dense page at 34 126 004 bytes on the point wire against 526 948 as
+/// container payloads, so one frame holds exactly the page the win was measured on.
+pub const MAX_CHUNK_WRITES: usize = 64;
+
+/// Bytes a [`Frame::ChunkPut`] of `writes` chunks occupies at its worst case.
+pub const fn chunk_put_payload_bytes(writes: usize) -> usize {
+    4 + writes * (CHUNK_WRITE_FIXED + CHUNK_PAYLOAD_MAX)
+}
+
+/// Payload cap for [`Kind::ChunkPut`], derived from the two constants above.
+///
+/// **Denominated in bytes, and that is the whole point.** Counting a chunk's *ordinals*
+/// against an entry bound is what refused an 8 MiB page on the Flight path -- a dense
+/// chunk is 65 536 ordinals and 8 192 bytes, so an ordinal-denominated bound rejects
+/// exactly the payloads this frame exists to carry. Nothing here ever adds up
+/// cardinalities, and [`MAX_WRITES`] is deliberately not consulted: these are different
+/// quantities on the same protocol and conflating them is the recorded trap.
+pub const CHUNK_PUT_MAX_PAYLOAD: usize = chunk_put_payload_bytes(MAX_CHUNK_WRITES);
+const _: () = assert!(CHUNK_PUT_MAX_PAYLOAD <= MAX_INLINE_PAYLOAD);
+const _: () = assert!(MAX_CHUNK_WRITES <= u32::MAX as usize);
+
 impl LaneKind {
     fn from_raw(v: u8) -> Result<LaneKind, IpcError> {
         Ok(match v {
@@ -359,6 +394,69 @@ impl LaneKind {
             LaneKind::Bitmap => n * 8,
             LaneKind::Run => n * 4,
             LaneKind::Absent => 0,
+        }
+    }
+}
+
+/// One chunk written as its container payload, rather than as one entry per set bit.
+///
+/// Reuses [`LaneKind`], which is how the **read** side already describes a chunk payload
+/// in the arena and whose discriminants match the in-process ABI's `yesno_chunk_kind`.
+/// Forking a second table for the write direction is what Flight declined to do when its
+/// container wire reused `containers_schema` from its own read side.
+///
+/// `count` is elements as [`LaneKind::payload_bytes`] defines them -- values, words or
+/// interval pairs -- so the payload's length is **derived and never transmitted**, for the
+/// reason that method gives: a length field could contradict the kind and the count, and
+/// the peer would have to trust one of the three.
+///
+/// `card` is the chunk's cardinality, which [`yesno_core::container::codec::decode`]
+/// needs and which is not derivable from a bitmap's fixed word count. It is checked
+/// against `count` where the two must agree rather than trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkWrite {
+    pub key: u64,
+    /// The chunk's 48-bit prefix.
+    pub prefix: u64,
+    pub kind: LaneKind,
+    /// Elements, as [`LaneKind::payload_bytes`] counts them.
+    pub count: u32,
+    /// Ordinals the chunk holds.
+    pub card: u32,
+    pub payload: Vec<u8>,
+}
+
+impl ChunkWrite {
+    /// Whether the three self-describing fields agree with each other.
+    ///
+    /// Checked on both encode and decode, so a malformed record cannot reach
+    /// `codec::decode` with a payload whose length its kind would misread. The
+    /// container's own invariants stay `codec::decode`'s job -- that function is a fuzz
+    /// target by contract, so a hostile payload is an error there rather than a panic,
+    /// and re-implementing its checks here would fork them.
+    fn self_consistent(&self) -> bool {
+        if self.kind == LaneKind::Absent {
+            // Absent describes a lane the read side chose to omit. There is no such
+            // thing as writing it, and accepting it would mean a no-op frame that looks
+            // like a write.
+            return false;
+        }
+        if self.payload.len() != self.kind.payload_bytes(self.count) {
+            return false;
+        }
+        if self.payload.len() > CHUNK_PAYLOAD_MAX {
+            return false;
+        }
+        match self.kind {
+            // An array stores one `u16` per ordinal, so the two counts are the same
+            // number and a disagreement is a malformed record rather than a judgement.
+            LaneKind::Array => self.count == self.card,
+            // A bitmap is always the full word count whatever it holds.
+            LaneKind::Bitmap => self.count as usize == yesno_core::BITMAP_WORDS,
+            // A run's cardinality is the sum of its intervals, which `codec::decode`
+            // derives from the payload; nothing is claimed about it here.
+            LaneKind::Run => true,
+            LaneKind::Absent => false,
         }
     }
 }
@@ -460,6 +558,7 @@ pub enum Kind {
     SnapshotLoad = 12,
     SnapshotKeyRange = 13,
     Apply = 14,
+    ChunkPut = 15,
     // responses, 64..127
     ServerHello = 64,
     SnapshotOpened = 65,
@@ -500,6 +599,7 @@ impl Kind {
             12 => Kind::SnapshotLoad,
             13 => Kind::SnapshotKeyRange,
             14 => Kind::Apply,
+            15 => Kind::ChunkPut,
             64 => Kind::ServerHello,
             65 => Kind::SnapshotOpened,
             66 => Kind::LanesAcquired,
@@ -539,6 +639,7 @@ impl Kind {
         match self {
             Kind::BlocksInline => MAX_INLINE_PAYLOAD + MAX_PAYLOAD,
             Kind::Apply => APPLY_MAX_PAYLOAD,
+            Kind::ChunkPut => CHUNK_PUT_MAX_PAYLOAD,
             _ => MAX_PAYLOAD,
         }
     }
@@ -595,6 +696,23 @@ pub enum Frame {
     /// and with `Unavailable` while the slot is empty during a rebootstrap.
     Apply {
         writes: Vec<Write>,
+    },
+    /// Write whole chunks as container payloads, in one commit.
+    ///
+    /// The dense counterpart of [`Frame::Apply`], and **interchangeable with it**: a
+    /// chunk write unions into the key exactly as `Apply`'s inserts do, so the same
+    /// final set is reachable either way and a differential test between the two
+    /// encodings is the whole correctness claim. It replaces nothing -- `patch_chunk`
+    /// is given an empty clear set, which is what `insert` already means.
+    ///
+    /// Bounded by [`CHUNK_PUT_MAX_PAYLOAD`] in **bytes**, never by ordinals; see that
+    /// constant for why the distinction is load-bearing.
+    ///
+    /// Refused on a follower with [`crate::abi::Status::WrongRole`] and while the slot
+    /// is empty with `Unavailable`, identically to [`Frame::Apply`]: the reasons are
+    /// properties of writing at all, not of the encoding.
+    ChunkPut {
+        writes: Vec<ChunkWrite>,
     },
     SnapshotClose {
         snapshot: u64,
@@ -852,6 +970,7 @@ impl Frame {
             Frame::ClientHello { .. } => Kind::ClientHello,
             Frame::SnapshotOpen => Kind::SnapshotOpen,
             Frame::Apply { .. } => Kind::Apply,
+            Frame::ChunkPut { .. } => Kind::ChunkPut,
             Frame::SnapshotClose { .. } => Kind::SnapshotClose,
             Frame::LanesAcquire { .. } => Kind::LanesAcquire,
             Frame::LanesRelease { .. } => Kind::LanesRelease,
@@ -909,6 +1028,23 @@ impl Frame {
                     p.extend_from_slice(&w.lo.to_le_bytes());
                     p.extend_from_slice(&w.hi.to_le_bytes());
                     p.push(w.op as u8);
+                }
+            }
+            Frame::ChunkPut { writes } => {
+                if writes.len() > MAX_CHUNK_WRITES {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&(writes.len() as u32).to_le_bytes());
+                for w in writes {
+                    if !w.self_consistent() {
+                        return Err(IpcError::Malformed);
+                    }
+                    p.extend_from_slice(&w.key.to_le_bytes());
+                    p.extend_from_slice(&w.prefix.to_le_bytes());
+                    p.push(w.kind as u8);
+                    p.extend_from_slice(&w.count.to_le_bytes());
+                    p.extend_from_slice(&w.card.to_le_bytes());
+                    p.extend_from_slice(&w.payload);
                 }
             }
             Frame::LanesAcquire { snapshot, keys } => {
@@ -1181,6 +1317,38 @@ impl Frame {
                 }
                 Frame::Apply { writes }
             }
+            Kind::ChunkPut => {
+                let n = r.u32()? as usize;
+                // Checked before allocating, for the reason the `Apply` arm gives: a
+                // declared length is attacker-controlled.
+                if n > MAX_CHUNK_WRITES {
+                    return Err(IpcError::TooLarge);
+                }
+                let mut writes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let key = r.u64()?;
+                    let prefix = r.u64()?;
+                    let kind = LaneKind::from_raw(r.u8()?)?;
+                    let count = r.u32()?;
+                    let card = r.u32()?;
+                    // The length comes from the kind and the count, so a short frame
+                    // fails in `take` rather than yielding a truncated payload.
+                    let payload = r.take(kind.payload_bytes(count))?.to_vec();
+                    let w = ChunkWrite {
+                        key,
+                        prefix,
+                        kind,
+                        count,
+                        card,
+                        payload,
+                    };
+                    if !w.self_consistent() {
+                        return Err(IpcError::Malformed);
+                    }
+                    writes.push(w);
+                }
+                Frame::ChunkPut { writes }
+            }
             Kind::Committed => Frame::Committed {
                 version: r.u64()?,
                 changed: r.u64()?,
@@ -1450,6 +1618,50 @@ mod tests {
             // Every op, because the decoder maps each discriminant by hand, and both
             // bounds of the batch: empty is legal and the loop must not assume otherwise.
             Frame::Apply { writes: vec![] },
+            // Both bounds here too, and all three kinds: the decoder derives each
+            // payload's length from its kind and count, so a kind it mapped wrongly
+            // would consume the wrong number of bytes and desynchronise the frame
+            // rather than fail a field.
+            Frame::ChunkPut { writes: vec![] },
+            Frame::ChunkPut {
+                writes: vec![
+                    ChunkWrite {
+                        key: 5,
+                        prefix: 9,
+                        kind: LaneKind::Array,
+                        count: 3,
+                        card: 3,
+                        payload: vec![7, 0, 9, 0, 11, 0],
+                    },
+                    ChunkWrite {
+                        key: 6,
+                        prefix: 1,
+                        kind: LaneKind::Run,
+                        count: 2,
+                        card: 11,
+                        payload: vec![1, 0, 5, 0, 20, 0, 25, 0],
+                    },
+                    ChunkWrite {
+                        key: 7,
+                        prefix: 0,
+                        kind: LaneKind::Bitmap,
+                        count: yesno_core::BITMAP_WORDS as u32,
+                        card: 64,
+                        payload: {
+                            let mut v = vec![0u8; yesno_core::BITMAP_WORDS * 8];
+                            v[0] = 0xff;
+                            v[1] = 0xff;
+                            v[2] = 0xff;
+                            v[3] = 0xff;
+                            v[4] = 0xff;
+                            v[5] = 0xff;
+                            v[6] = 0xff;
+                            v[7] = 0xff;
+                            v
+                        },
+                    },
+                ],
+            },
             Frame::Apply {
                 writes: vec![
                     Write {
@@ -1705,6 +1917,59 @@ mod tests {
     }
 
     /// The direction ranges hold, so a misrouted frame is caught by its kind.
+    /// What the dense encoding costs on the wire, against the point encoding.
+    ///
+    /// The comparison is one frame against one frame, at exactly [`MAX_WRITES`] ordinals,
+    /// because that is the largest batch the point wire can carry atomically and so the
+    /// most favourable case it has. A dense half-chunk is 16 384 ordinals, which is
+    /// `4 + 16384 * 25` bytes as points and `4 + 25 + 8192` as a bitmap payload.
+    ///
+    /// Asserted as a **bound rather than a ratio**: the exact figure moves if a header
+    /// field is ever added, and a test that fails on a harmless field is a test people
+    /// delete. The claim worth keeping is the order of magnitude. Measured at 49.8x when
+    /// written, against the 64.8x the Flight path measured for the same question on a
+    /// different transport -- the difference is the transports' per-entry overheads, not
+    /// the encodings.
+    #[test]
+    fn the_dense_encoding_is_an_order_of_magnitude_smaller_on_the_wire() {
+        let ordinals = MAX_WRITES as u64;
+        let points = Frame::Apply {
+            writes: (0..ordinals)
+                .map(|o| Write {
+                    key: 1,
+                    lo: o,
+                    hi: o,
+                    op: WriteOp::Insert,
+                })
+                .collect(),
+        };
+        let dense = Frame::ChunkPut {
+            writes: vec![ChunkWrite {
+                key: 1,
+                prefix: 0,
+                kind: LaneKind::Bitmap,
+                count: yesno_core::BITMAP_WORDS as u32,
+                card: ordinals as u32,
+                payload: vec![0u8; yesno_core::BITMAP_WORDS * 8],
+            }],
+        };
+        let point_bytes = points
+            .encode()
+            .expect("the point batch is at its limit")
+            .len();
+        let dense_bytes = dense
+            .encode()
+            .expect("one chunk is well under the cap")
+            .len();
+        assert!(
+            point_bytes >= 40 * dense_bytes,
+            "the dense encoding should be far smaller: {point_bytes} against {dense_bytes}"
+        );
+        // And the dense frame carrying the measured 64-chunk page still fits one frame,
+        // which is what makes it one commit rather than 128.
+        assert!(chunk_put_payload_bytes(MAX_CHUNK_WRITES) <= Kind::ChunkPut.payload_cap());
+    }
+
     #[test]
     fn each_kind_declares_the_direction_its_range_implies() {
         for f in every_frame() {
@@ -1723,7 +1988,8 @@ mod tests {
                 | Kind::SnapshotMax
                 | Kind::SnapshotLoad
                 | Kind::SnapshotKeyRange
-                | Kind::Apply => Direction::Request,
+                | Kind::Apply
+                | Kind::ChunkPut => Direction::Request,
                 Kind::ServerHello
                 | Kind::SnapshotOpened
                 | Kind::LanesAcquired

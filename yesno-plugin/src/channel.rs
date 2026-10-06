@@ -401,6 +401,7 @@ impl Session {
             ),
             Frame::SnapshotOpen => self.snapshot_open(),
             Frame::Apply { writes } => self.apply(&writes),
+            Frame::ChunkPut { writes } => self.chunk_put(&writes),
             Frame::SnapshotClose { snapshot } => self.snapshot_close(snapshot),
             Frame::LanesAcquire { snapshot, keys } => self.lanes_acquire(snapshot, &keys),
             Frame::LanesRelease { lanes } => self.lanes_release(lanes),
@@ -568,6 +569,116 @@ impl Session {
                 changed: c.changed,
             },
             Err(e) => Self::fault(Status::from_core(&e), "the write failed"),
+        }
+    }
+
+    /// Write whole chunks as container payloads, in one commit.
+    ///
+    /// The dense counterpart of [`Self::apply`], and the refusals are deliberately the
+    /// same two: a follower accepting a local write would diverge from its leader with
+    /// nothing to detect it, and an empty slot has nowhere to put one. Both are
+    /// properties of writing at all rather than of the encoding, so they are stated here
+    /// in the same order and with the same statuses.
+    ///
+    /// **Bounded by the protocol constant and by nothing configurable.** `apply` checks
+    /// the *advertised* `max_writes` rather than the ceiling, because an `Apply` batch is
+    /// unbounded in the ordinals it can carry and a server may want a smaller number than
+    /// the protocol allows. A `ChunkPut` is self-bounding: `MAX_CHUNK_WRITES` chunks at
+    /// `CHUNK_PAYLOAD_MAX` each is a fixed ~514 KiB, already enforced as the frame's
+    /// payload cap before this function sees it. So there is no knob, and adding one
+    /// later means a greeting field exactly as `max_writes` has -- not a check here
+    /// against a number the peer was never told.
+    ///
+    /// Every payload goes through `codec::decode`, which is a fuzz target by contract:
+    /// for any input it returns an error or a container satisfying its invariants, and
+    /// never panics. A hostile peer's payload is therefore an `InvalidArgument` naming
+    /// which chunk, inherited rather than re-implemented here.
+    fn chunk_put(&mut self, writes: &[crate::ipc::ChunkWrite]) -> Frame {
+        use crate::ipc::LaneKind;
+        use yesno_core::container::ContainerKind;
+
+        if self.host.role() != crate::abi::Role::Leader {
+            return Self::fault(
+                Status::WrongRole,
+                "a follower does not accept writes; send them to the leader",
+            );
+        }
+        if writes.len() > crate::ipc::MAX_CHUNK_WRITES {
+            return Self::fault(
+                Status::InvalidArgument,
+                &format!(
+                    "chunk batch of {} exceeds the maximum of {}",
+                    writes.len(),
+                    crate::ipc::MAX_CHUNK_WRITES
+                ),
+            );
+        }
+        let Some(db) = self.host.db() else {
+            return Self::fault(
+                Status::Unavailable,
+                "no database in the slot; the write did not happen",
+            );
+        };
+
+        // Decoded in full before anything is staged, exactly as `apply` validates first:
+        // a payload that fails to decode halfway through must not leave the earlier
+        // chunks of the same frame committed.
+        let mut decoded = Vec::with_capacity(writes.len());
+        for (i, w) in writes.iter().enumerate() {
+            let kind = match w.kind {
+                LaneKind::Array => ContainerKind::Array,
+                LaneKind::Bitmap => ContainerKind::Bitmap,
+                LaneKind::Run => ContainerKind::Run,
+                // Unreachable through a decoded frame, which refuses it, but stated
+                // rather than unwrapped: this function is also reachable in-process.
+                LaneKind::Absent => {
+                    return Self::fault(
+                        Status::InvalidArgument,
+                        &format!("chunk {i}: an absent lane is not a chunk to write"),
+                    );
+                }
+            };
+            // Runs arrive in the wire's `[ start, end ]` form and must be converted;
+            // arrays and bitmaps are byte-identical on both sides. See
+            // `run_codec_bytes`.
+            let bytes = match w.kind {
+                LaneKind::Run => match run_codec_bytes(&w.payload, w.count) {
+                    Some(b) => std::borrow::Cow::Owned(b),
+                    None => {
+                        return Self::fault(
+                            Status::InvalidArgument,
+                            &format!("chunk {i}: run intervals are not ascending pairs"),
+                        );
+                    }
+                },
+                _ => std::borrow::Cow::Borrowed(w.payload.as_slice()),
+            };
+            match yesno_core::container::codec::decode(kind, &bytes, w.card) {
+                Ok(c) => decoded.push((w.key, w.prefix, c)),
+                Err(e) => {
+                    return Self::fault(
+                        Status::from_core(&e),
+                        &format!("chunk {i}: the payload is not a {kind:?} container"),
+                    );
+                }
+            }
+        }
+
+        // An empty clear set, so a chunk write **unions** into the key rather than
+        // replacing it. That is what `Apply`'s inserts already mean, and it is what makes
+        // the two encodings interchangeable: the same final set is reachable either way,
+        // which is the property the differential test asserts.
+        let empty = yesno_core::Container::new_array();
+        let mut wb = db.batch();
+        for (key, prefix, set) in &decoded {
+            wb.patch_chunk(*key, *prefix, &empty, set);
+        }
+        match wb.commit() {
+            Ok(c) => Frame::Committed {
+                version: c.version,
+                changed: c.changed,
+            },
+            Err(e) => Self::fault(Status::from_core(&e), "the chunk write failed"),
         }
     }
 
@@ -853,6 +964,42 @@ impl Session {
 /// every container kind rather than a convention -- `ipc`'s header does that
 /// arithmetic ( 8192, 8192 and 8128 bytes ). Returns the number of bytes written
 /// implicitly, as `lane.kind.payload_bytes( lane.count )`.
+/// The codec's run bytes, rebuilt from the wire's `[ start, end ]` pairs.
+///
+/// **The one kind whose read-side form and codec form are not the same bytes.**
+/// [`encode_into`] below records why from the read direction: in memory a run is
+/// `( start, len_minus_1 )` -- the Roaring on-disk form, which is what makes the
+/// serialized bytes identical to it -- while the wire says `[ start, end ]`, because
+/// emitting the stored pairs handed a consumer a silently wrong set. A write therefore
+/// has to convert back, and the codec additionally wants the interval count as a `u16`
+/// prefix that a lane carries out of band in its `count`.
+///
+/// Array and bitmap need no conversion, and that was checked rather than assumed:
+/// `decode_array` wants `2 * card` ascending `u16`s and `decode_bitmap` exactly
+/// `BITMAP_BYTES` of words, which is byte for byte what a lane of each kind holds.
+///
+/// Returns `None` on anything it cannot convert, leaving every judgement about the
+/// container itself to `codec::decode` -- a fuzz target by contract, so a hostile
+/// payload is an error there rather than a panic here.
+fn run_codec_bytes(payload: &[u8], count: u32) -> Option<Vec<u8>> {
+    let intervals = usize::try_from(count).ok()?;
+    if intervals == 0 || intervals > u16::MAX as usize || payload.len() != intervals * 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.extend_from_slice(&(intervals as u16).to_le_bytes());
+    for pair in payload.as_chunks::<4>().0 {
+        let start = u16::from_le_bytes([pair[0], pair[1]]);
+        let end = u16::from_le_bytes([pair[2], pair[3]]);
+        // A reversed interval is precisely the failure `encode_into`'s comment
+        // describes, arriving from the other direction.
+        let len_minus_1 = end.checked_sub(start)?;
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&len_minus_1.to_le_bytes());
+    }
+    Some(out)
+}
+
 fn encode_into(dst: &mut [u8], c: &Container) -> Lane {
     debug_assert!(dst.len() >= LANE_BYTES, "a lane slot is LANE_BYTES");
     match c {
