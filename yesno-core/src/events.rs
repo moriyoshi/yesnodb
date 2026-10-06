@@ -73,7 +73,6 @@ impl EventError {
             | CodecError::BadCardinality(_)
             | CodecError::BadRunCount(_)
             | CodecError::OutOfBounds { .. }
-            | CodecError::UnknownKind(_)
             | CodecError::DatabaseIdentityMismatch
             | CodecError::ManifestUnreadable
             | CodecError::BadCookie(_)

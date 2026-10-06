@@ -26,9 +26,6 @@ pub enum CodecError {
         buf_len: usize,
     },
 
-    #[error("unknown container kind byte {0}")]
-    UnknownKind(u8),
-
     /// A standalone extent's trailer does not carry the tag of the key that
     /// reached it.
     ///

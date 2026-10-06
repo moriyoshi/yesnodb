@@ -770,7 +770,7 @@ Two subtleties are centralized rather than open-coded:
 
 ## Error Model
 
-`CodecError` ( `error.rs` ) is the single error type, with `Result<T, E = CodecError>` as the crate alias. Its variants describe how a byte range failed to become a container: `BadLength`, `BadCardinality`, `BadRunCount`, `OutOfBounds`, `Misaligned`, `UnknownKind`, `UnsupportedEncoding`, `Invariant`, `Truncated`, `BadCookie`.
+`CodecError` ( `error.rs` ) is the single error type, with `Result<T, E = CodecError>` as the crate alias. Its variants describe how a byte range failed to become a container: `BadLength`, `BadCardinality`, `BadRunCount`, `OutOfBounds`, `Misaligned`, `UnsupportedEncoding`, `Invariant`, `Truncated`, `BadCookie`.
 
 `container::codec::decode` is a fuzz target by contract: for *any* input it must return one of these errors or a container satisfying its invariants, and must never panic.
 
