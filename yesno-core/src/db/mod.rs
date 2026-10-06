@@ -5540,7 +5540,7 @@ mod tests {
     /// The registry answers "first open in this process", canonically.
     #[test]
     fn the_open_registry_is_canonical_and_answers_once() {
-        let dir = std::env::temp_dir().join(format!("yesno-reg-{}", std::process::id()));
+        let dir = tmpdir("open-registry");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
             first_open_in_this_process(&dir),
@@ -5558,7 +5558,6 @@ mod tests {
             !first_open_in_this_process(&dir.join("nope")),
             "an uncanonicalizable path must answer false"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A reopen in this process must not punch what it inherited.
@@ -5583,8 +5582,7 @@ mod tests {
     #[test]
     fn a_reopen_in_this_process_does_not_punch_inherited_slabs() {
         use std::os::unix::fs::MetadataExt;
-        let dir = std::env::temp_dir().join(format!("yesno-pf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tmpdir("punch-inherited");
         let blocks = || -> u64 {
             std::fs::read_dir(&dir)
                 .map(|rd| {
@@ -5633,7 +5631,6 @@ mod tests {
             peak,
             "a reopen in this process must return nothing"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A write through the **real** write path evicts no verified region,
@@ -5667,7 +5664,6 @@ mod tests {
     #[test]
     fn a_checkpoint_evicts_no_verified_region_however_many_keys_share_a_page() {
         let dir = tmpdir("ckpt-evicts-nothing");
-        let _c = CleanDir(dir.clone());
         const KEYS: u64 = 64;
         // Stride 7: consecutive ordinals `optimize()` into a ~6-byte run
         // container whatever the count, which would put every key in one page
@@ -5750,8 +5746,6 @@ mod tests {
     #[test]
     fn routing_follows_the_persisted_map_rather_than_a_modulo() {
         let dir = tmpdir("route_by_map");
-        let _clean = CleanDir(dir.clone());
-        let _ = std::fs::remove_dir_all(&dir);
         const N: usize = 4;
         {
             let db = Db::open_with(
@@ -6036,7 +6030,6 @@ mod tests {
     #[test]
     fn an_endpoint_agrees_with_materializing_over_every_overlay_shape() {
         let dir = tmpdir("endpoint-agrees");
-        let _clean = CleanDir(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
 
         // Chunks 0, 3, 7 and 40 on disk; the gaps matter because the merge
@@ -6121,7 +6114,6 @@ mod tests {
     #[test]
     fn a_returned_commit_can_be_invisible_while_an_earlier_one_is_pending() {
         let dir = tmpdir("visible-lag");
-        let _clean = CleanDir(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_with(
             &dir,
@@ -6446,7 +6438,6 @@ mod tests {
     #[test]
     fn store_set_replays_to_what_it_committed() {
         let dir = tmpdir("store_set_replay");
-        let _clean = CleanDir(dir.clone());
 
         // The key must be *populated first*, and with ordinals the replacement
         // does not contain: unioning into an empty key is indistinguishable
@@ -6494,7 +6485,6 @@ mod tests {
     #[test]
     fn a_dense_store_set_does_not_log_one_ordinal_per_bit() {
         let dir = tmpdir("dense_store_set_wal");
-        let _clean = CleanDir(dir.clone());
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
 
         // Four whole chunks, dense enough that every one is a bitmap container.
@@ -6535,7 +6525,6 @@ mod tests {
     #[test]
     fn an_old_chunk_image_record_still_replays() {
         let dir = tmpdir("old_chunk_image");
-        let _clean = CleanDir(dir.clone());
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(1, &[1, 2]).unwrap();
 
@@ -6620,8 +6609,6 @@ mod tests {
 
         let d1 = tmpdir("order-doc");
         let d2 = tmpdir("order-key");
-        let _c1 = CleanDir(d1.clone());
-        let _c2 = CleanDir(d2.clone());
 
         let doc = build(&d1, true);
         let key = build(&d2, false);
@@ -6641,7 +6628,6 @@ mod tests {
     #[test]
     fn merge_set_unions_where_store_set_replaces() {
         let dir = tmpdir("merge_set");
-        let _clean = CleanDir(dir.clone());
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
 
         db.insert_many(1, &[1, 2, 3]).unwrap();
@@ -6679,7 +6665,6 @@ mod tests {
     #[test]
     fn a_merged_set_survives_a_reopen() {
         let dir = tmpdir("merge_set_reopen");
-        let _clean = CleanDir(dir.clone());
         let want: Vec<u64> = vec![1, 2, 3, 4, 5, 1 << 16];
         {
             let db = Db::open_with(&dir, DbOptions::default()).unwrap();
@@ -6711,7 +6696,6 @@ mod tests {
     #[test]
     fn merge_set_composes_with_the_rest_of_its_batch() {
         let dir = tmpdir("merge_set_batch");
-        let _clean = CleanDir(dir.clone());
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(7, &[10, 20]).unwrap();
 
@@ -6738,7 +6722,6 @@ mod tests {
     #[test]
     fn merging_an_out_of_range_ordinal_is_rejected_rather_than_written() {
         let dir = tmpdir("merge_set_range");
-        let _clean = CleanDir(dir.clone());
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert(1, 5).unwrap();
 
@@ -6771,17 +6754,46 @@ mod tests {
         assert_eq!(snap.load(1).unwrap().iter().collect::<Vec<_>>(), vec![5]);
     }
 
-    fn tmpdir(name: &str) -> std::path::PathBuf {
+    fn tmpdir(name: &str) -> CleanDir {
         let mut p = std::env::temp_dir();
         p.push(format!("yesno-db-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&p);
-        p
+        CleanDir(p)
     }
 
+    /// A scratch directory that removes itself, so a test **cannot** leave one
+    /// behind.
+    ///
+    /// `tmpdir` used to hand back a bare `PathBuf` and leave the guard to a
+    /// **separate line**, which is a line a caller can simply omit -- and eleven
+    /// sites across this module, `tests/durability.rs` and `tests/concurrency.rs`
+    /// did, one of them leaking 2 x 1.1 GB per run for as long as it had existed.
+    /// That was found on 2026-10-01 among 215 GB of accumulated scratch in `/tmp`,
+    /// which filled the disk and failed a gate with `write-ahead log I/O error`.
+    ///
+    /// Returning the guard is what makes that unrepeatable: a caller cannot obtain
+    /// the path without also obtaining the thing that removes it. `Deref` and
+    /// `AsRef` are what keep it free -- `&dir` still reaches both a `&Path`
+    /// parameter and an `impl AsRef<Path>` one, so adopting the safe shape changed
+    /// no call site's text. `db/readers.rs`'s `Scratch` is the same shape.
     struct CleanDir(std::path::PathBuf);
+
     impl Drop for CleanDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for CleanDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for CleanDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
         }
     }
 
@@ -6789,7 +6801,6 @@ mod tests {
     #[test]
     fn data_survives_a_checkpoint_and_reopen() {
         let dir = tmpdir("durable");
-        let _c = CleanDir(dir.clone());
         let opts = DbOptions {
             shards: 4,
             ..Default::default()
@@ -6836,7 +6847,6 @@ mod tests {
     #[test]
     fn data_survives_a_reopen_for_chunks_too_large_to_inline() {
         let dir = tmpdir("durable-extent");
-        let _c = CleanDir(dir.clone());
         let opts = DbOptions {
             shards: 2,
             ..Default::default()
@@ -6882,7 +6892,6 @@ mod tests {
     #[test]
     fn a_checkpoint_never_allocates_a_node_and_an_extent_at_the_same_cell() {
         let dir = tmpdir("no-overlap");
-        let _c = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {
@@ -6927,7 +6936,6 @@ mod tests {
     #[test]
     fn writes_after_reopen_continue_above_the_durable_floor() {
         let dir = tmpdir("resume");
-        let _c = CleanDir(dir.clone());
         let opts = DbOptions {
             shards: 2,
             ..Default::default()
@@ -6961,7 +6969,6 @@ mod tests {
         // Tombstones must reach disk as an absence, not be forgotten and let the
         // old value reappear.
         let dir = tmpdir("delete");
-        let _c = CleanDir(dir.clone());
         let opts = DbOptions {
             shards: 2,
             ..Default::default()
@@ -7029,9 +7036,8 @@ mod tests {
         }
 
         const KEYS: u64 = 400;
-        let build = |name: &str, d: Dispatcher| -> (std::path::PathBuf, Db) {
+        let build = |name: &str, d: Dispatcher| -> (CleanDir, Db) {
             let dir = tmpdir(name);
-            let _ = std::fs::remove_dir_all(&dir);
             let db = Db::open_with(
                 &dir,
                 DbOptions {
@@ -7059,10 +7065,8 @@ mod tests {
             (dir, db)
         };
 
-        let (dir_a, a) = build("dispatch-seq", Dispatcher::sequential());
-        let (dir_b, b) = build("dispatch-par", Dispatcher::new(Scoped));
-        let _ca = CleanDir(dir_a);
-        let _cb = CleanDir(dir_b);
+        let (_dir_a, a) = build("dispatch-seq", Dispatcher::sequential());
+        let (_dir_b, b) = build("dispatch-par", Dispatcher::new(Scoped));
 
         for k in 0..KEYS {
             let (sa, sb) = (a.snapshot().unwrap(), b.snapshot().unwrap());
@@ -7105,7 +7109,6 @@ mod tests {
         }
 
         let dir = tmpdir("dispatch-lazy");
-        let _c = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {
@@ -7133,7 +7136,6 @@ mod tests {
     #[test]
     fn a_checkpoint_advances_the_store_sequence() {
         let dir = tmpdir("ckpt-advances-seq");
-        let _c = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {
@@ -7165,7 +7167,6 @@ mod tests {
         // The tree is rebuilt whole, not patched, so a key absent from the
         // memtable must still be carried into the new index.
         let dir = tmpdir("carry");
-        let _c = CleanDir(dir.clone());
         let opts = DbOptions {
             shards: 2,
             ..Default::default()
@@ -7200,7 +7201,6 @@ mod tests {
     #[test]
     fn a_snapshot_is_isolated_across_a_checkpoint() {
         let dir = tmpdir("isolate");
-        let _c = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {
@@ -7239,7 +7239,6 @@ mod tests {
     #[test]
     fn an_abandoned_version_is_aborted_rather_than_stalling_the_watermark() {
         let dir = tmpdir("abort");
-        let _c = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {
@@ -7286,7 +7285,6 @@ mod tests {
     #[test]
     fn an_abort_is_logged_so_recovery_does_not_reopen_the_hole() {
         let dir = tmpdir("abort-logged");
-        let _c = CleanDir(dir.clone());
         {
             let db = Db::open_with(
                 &dir,
@@ -7423,7 +7421,6 @@ mod tests {
     #[test]
     fn checkpoint_retains_a_wal_record_above_its_visible_watermark() {
         let dir = tmpdir("checkpoint-pending-wal");
-        let _cleanup = CleanDir(dir.clone());
         let db = Db::open_with(
             &dir,
             DbOptions {

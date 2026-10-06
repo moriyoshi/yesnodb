@@ -22,25 +22,53 @@
 //! happened is worse than no assertion.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use yesno_core::{Db, DbOptions};
 
+/// A scratch directory that removes itself, so a test **cannot** leave one behind.
+///
+/// `tmpdir` used to hand back a bare `PathBuf` and leave the guard to a **separate
+/// line**, which is a line a caller can simply omit -- and eleven sites across this
+/// file, `durability.rs` and `db/mod.rs` did, one of them leaking 2 x 1.1 GB per run
+/// for as long as it had existed. That was found on 2026-10-01 among 215 GB of
+/// accumulated scratch in `/tmp`, which filled the disk and failed a gate with
+/// `write-ahead log I/O error`.
+///
+/// Returning the guard is what makes that unrepeatable: a caller cannot obtain the
+/// path without also obtaining the thing that removes it. `Deref` and `AsRef` are
+/// what keep it free -- `&dir` still reaches both a `&Path` parameter and an
+/// `impl AsRef<Path>` one, so adopting the safe shape changed no call site's text.
+/// `db/readers.rs`'s `Scratch` and `manifest_crash.rs`'s helper are the same shape.
 struct CleanDir(PathBuf);
+
 impl Drop for CleanDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
+impl std::ops::Deref for CleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for CleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+fn tmpdir(tag: &str) -> CleanDir {
     let mut p = std::env::temp_dir();
     p.push(format!("yesno-conc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
-    p
+    CleanDir(p)
 }
 
 /// Start every thread at once, so they contend rather than queue.
@@ -63,7 +91,6 @@ fn race<T: Send + 'static>(n: usize, f: impl Fn(usize) -> T + Send + Sync + 'sta
 #[test]
 fn concurrent_writers_to_distinct_keys_all_land() {
     let dir = tmpdir("distinct");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -111,7 +138,6 @@ fn concurrent_writers_to_distinct_keys_all_land() {
 #[test]
 fn concurrent_writers_to_one_key_do_not_lose_updates() {
     let dir = tmpdir("same-key");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -155,7 +181,6 @@ fn concurrent_writers_to_one_key_do_not_lose_updates() {
 #[test]
 fn multi_shard_batches_do_not_deadlock() {
     let dir = tmpdir("multishard");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -209,7 +234,6 @@ fn multi_shard_batches_do_not_deadlock() {
 #[test]
 fn a_snapshot_never_observes_half_a_multi_shard_batch() {
     let dir = tmpdir("atomicity");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -283,7 +307,6 @@ fn a_snapshot_never_observes_half_a_multi_shard_batch() {
 #[test]
 fn checkpoints_concurrent_with_writers_lose_nothing() {
     let dir = tmpdir("ckpt-race");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -348,7 +371,6 @@ fn checkpoints_concurrent_with_writers_lose_nothing() {
 #[test]
 fn a_snapshot_is_stable_while_writers_and_checkpoints_run() {
     let dir = tmpdir("stable-snap");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -421,7 +443,6 @@ fn a_snapshot_is_stable_while_writers_and_checkpoints_run() {
 #[test]
 fn concurrent_commit_cost_is_measured_not_assumed() {
     let dir = tmpdir("commit-cost");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -529,7 +550,6 @@ fn concurrent_commit_cost_is_measured_not_assumed() {
 #[test]
 fn the_log_stays_bounded_when_checkpoints_are_rare() {
     let dir = tmpdir("rare-ckpt");
-    let _c = CleanDir(dir.clone());
     // A policy that never fires, so the only checkpoints are the ones below.
     let policy = yesno_core::checkpoint::CheckpointPolicy {
         dirty_bytes: usize::MAX,
@@ -638,7 +658,6 @@ fn snapshots_taken_during_a_checkpoint_keep_their_memtable() {
     }
 
     let dir = tmpdir("snap-vs-ckpt");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -730,7 +749,6 @@ fn snapshots_taken_during_a_checkpoint_keep_their_memtable() {
 #[test]
 fn backup_lease_blocks_checkpoints_but_not_commits() {
     let dir = tmpdir("backup-barrier");
-    let _c = CleanDir(dir.clone());
     let db = Db::open(&dir).unwrap();
     db.insert(1, 10).unwrap();
     db.checkpoint().unwrap();
@@ -800,7 +818,6 @@ fn commit_times_never_invert_under_contention() {
     const EACH: u64 = 40;
 
     let dir = tmpdir("commit-time-order");
-    let _c = CleanDir(dir.clone());
     let db = Arc::new(
         Db::open_with(
             &dir,
@@ -898,7 +915,6 @@ fn commit_times_never_invert_under_contention() {
 #[test]
 fn a_retried_insert_resurrects_an_ordinal_another_client_removed() {
     let dir = tmpdir("retry-resurrect");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, DbOptions::default()).unwrap();
 
     // ---- Arm 1: the benign duplicate, for contrast.
@@ -987,7 +1003,6 @@ fn a_retried_insert_resurrects_an_ordinal_another_client_removed() {
 #[test]
 fn a_read_modify_write_through_store_set_loses_a_concurrent_update() {
     let dir = tmpdir("lost-update");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, DbOptions::default()).unwrap();
 
     let load =
@@ -1089,7 +1104,6 @@ fn a_read_modify_write_through_store_set_loses_a_concurrent_update() {
 #[test]
 fn readers_are_correct_while_a_checkpoint_syncs() {
     let dir = tmpdir("read-during-ckpt");
-    let _clean = CleanDir(dir.clone());
     let db = Arc::new(
         Db::open_with(
             &dir,
@@ -1189,7 +1203,6 @@ fn readers_are_correct_while_a_checkpoint_syncs() {
 fn reading_wal_bounds_while_generations_rotate_never_reports_a_missing_file() {
     let dir = tmpdir("walrotate");
     std::fs::create_dir_all(&dir).unwrap();
-    let _clean = CleanDir(dir.clone());
     let active = dir.join("shard-0000.wal");
     std::fs::write(&active, b"").unwrap();
     // 20 digits, which is what `generation_base` requires of a sealed name.

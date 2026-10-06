@@ -29,23 +29,51 @@
 //!   extent, bitmap ).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use yesno_core::stream::ChunkStream;
 use yesno_core::{Db, DbOptions};
 
+/// A scratch directory that removes itself, so a test **cannot** leave one behind.
+///
+/// `tmpdir` used to hand back a bare `PathBuf` and leave the guard to a **separate
+/// line**, which is a line a caller can simply omit -- and eleven sites across this
+/// file, `concurrency.rs` and `db/mod.rs` did, one of them leaking 2 x 1.1 GB per run
+/// for as long as it had existed. That was found on 2026-10-01 among 215 GB of
+/// accumulated scratch in `/tmp`, which filled the disk and failed a gate with
+/// `write-ahead log I/O error`.
+///
+/// Returning the guard is what makes that unrepeatable: a caller cannot obtain the
+/// path without also obtaining the thing that removes it. `Deref` and `AsRef` are
+/// what keep it free -- `&dir` still reaches both a `&Path` parameter and an
+/// `impl AsRef<Path>` one, so adopting the safe shape changed no call site's text.
+/// `db/readers.rs`'s `Scratch` and `manifest_crash.rs`'s helper are the same shape.
 struct CleanDir(PathBuf);
+
 impl Drop for CleanDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-fn tmpdir(tag: &str) -> PathBuf {
+impl std::ops::Deref for CleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for CleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+fn tmpdir(tag: &str) -> CleanDir {
     let mut p = std::env::temp_dir();
     p.push(format!("yesno-dur-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
-    p
+    CleanDir(p)
 }
 
 fn opts() -> DbOptions {
@@ -142,7 +170,6 @@ fn verify(db: &Db, expect: &[(u64, Vec<u64>)]) {
 #[test]
 fn every_read_path_survives_a_reopen() {
     let dir = tmpdir("readpaths");
-    let _c = CleanDir(dir.clone());
     let data = corpus();
 
     {
@@ -166,7 +193,6 @@ fn every_read_path_survives_a_reopen() {
 #[test]
 fn data_survives_repeated_checkpoint_and_reopen_cycles() {
     let dir = tmpdir("cycles");
-    let _c = CleanDir(dir.clone());
     let data = corpus();
 
     {
@@ -195,7 +221,6 @@ fn data_survives_repeated_checkpoint_and_reopen_cycles() {
 #[test]
 fn writes_against_disk_resident_chunks_merge_correctly() {
     let dir = tmpdir("merge");
-    let _c = CleanDir(dir.clone());
     let base: Vec<u64> = (0..500u64).map(|i| i * 4).collect();
 
     {
@@ -244,7 +269,6 @@ fn writes_against_disk_resident_chunks_merge_correctly() {
 #[test]
 fn a_live_memtable_wins_over_the_store_at_every_merge_position() {
     let dir = tmpdir("overlay");
-    let _c = CleanDir(dir.clone());
 
     // Ten ordinals per chunk, so none of them is inline in the leaf and each is
     // a genuine payload read the memtable has to suppress.
@@ -321,7 +345,6 @@ fn a_live_memtable_wins_over_the_store_at_every_merge_position() {
 #[test]
 fn the_largest_legal_ordinal_stores_and_verifies_clean() {
     let dir = tmpdir("i8");
-    let _c = CleanDir(dir.clone());
 
     let vals = vec![
         0u64,
@@ -357,7 +380,6 @@ fn the_largest_legal_ordinal_stores_and_verifies_clean() {
 #[test]
 fn removals_against_disk_resident_chunks_persist() {
     let dir = tmpdir("remove");
-    let _c = CleanDir(dir.clone());
     let base: Vec<u64> = (0..800u64).map(|i| i * 3).collect();
 
     {
@@ -382,7 +404,6 @@ fn removals_against_disk_resident_chunks_persist() {
 #[test]
 fn a_deleted_key_stays_deleted_across_a_reopen() {
     let dir = tmpdir("delete");
-    let _c = CleanDir(dir.clone());
     let data = corpus();
 
     {
@@ -419,7 +440,6 @@ fn a_deleted_key_stays_deleted_across_a_reopen() {
 #[test]
 fn many_keys_across_shards_survive_a_reopen() {
     let dir = tmpdir("shards");
-    let _c = CleanDir(dir.clone());
 
     let data: Vec<(u64, Vec<u64>)> = (0..60u64)
         .map(|k| (k * 7 + 1, (0..120u64).map(|i| k * 1_000 + i * 3).collect()))
@@ -458,7 +478,6 @@ fn many_keys_across_shards_survive_a_reopen() {
 #[test]
 fn slab_occupancy_survives_a_reopen() {
     let dir = tmpdir("slabmeta");
-    let _c = CleanDir(dir.clone());
     let data = corpus();
 
     {
@@ -499,7 +518,6 @@ fn the_shard_still_opens_when_one_superblock_slot_is_destroyed() {
     use std::io::{Seek, SeekFrom, Write};
 
     let dir = tmpdir("sb-redundancy");
-    let _c = CleanDir(dir.clone());
     let data = corpus();
 
     {
@@ -526,7 +544,6 @@ fn the_shard_still_opens_when_one_superblock_slot_is_destroyed() {
     // turn on its own copy and require the shard to open either way.
     for slot in 0..2u64 {
         let work = tmpdir(&format!("sb-redundancy-{slot}"));
-        let _w = CleanDir(work.clone());
         copy_dir(&dir, &work);
 
         for entry in std::fs::read_dir(&work).unwrap().flatten() {
@@ -574,7 +591,6 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 #[test]
 fn a_checkpoint_supersedes_only_the_chunks_it_changed() {
     let dir = tmpdir("delta-cost");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -646,7 +662,6 @@ fn a_checkpoint_supersedes_only_the_chunks_it_changed() {
 #[test]
 fn an_older_snapshot_still_sees_its_own_version_after_eviction() {
     let dir = tmpdir("isolation-evict");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -735,7 +750,6 @@ fn an_older_snapshot_still_sees_its_own_version_after_eviction() {
 #[test]
 fn a_key_created_after_a_snapshot_stays_invisible_to_it() {
     let dir = tmpdir("isolation-create");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -803,7 +817,6 @@ fn a_key_created_after_a_snapshot_stays_invisible_to_it() {
 #[test]
 fn a_snapshot_between_checkpoints_keeps_writes_its_root_predates() {
     let dir = tmpdir("isolation-between");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -855,7 +868,6 @@ fn a_snapshot_between_checkpoints_keeps_writes_its_root_predates() {
 #[test]
 fn a_one_key_change_does_not_rewrite_every_index_leaf() {
     let dir = tmpdir("index-amp");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -929,7 +941,6 @@ fn a_one_key_change_does_not_rewrite_every_index_leaf() {
 #[test]
 fn reclaiming_index_nodes_spares_the_ones_still_in_use() {
     let dir = tmpdir("node-reclaim");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -996,7 +1007,6 @@ fn reclaiming_index_nodes_spares_the_ones_still_in_use() {
 #[test]
 fn a_long_lived_snapshot_reads_through_its_root_while_pages_are_reclaimed() {
     let dir = tmpdir("root-pinned");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1054,7 +1064,6 @@ fn a_long_lived_snapshot_reads_through_its_root_while_pages_are_reclaimed() {
 #[test]
 fn rewriting_the_same_keys_does_not_grow_the_file_for_ever() {
     let dir = tmpdir("slab-recycle");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1141,7 +1150,6 @@ fn rewriting_the_same_keys_does_not_grow_the_file_for_ever() {
 #[test]
 fn aged_space_amplification_stays_bounded() {
     let dir = tmpdir("aged-gate");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1228,7 +1236,6 @@ fn aged_space_amplification_stays_bounded() {
 #[test]
 fn packed_pages_do_not_accumulate_under_churn() {
     let dir = tmpdir("packed-leak");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1309,7 +1316,6 @@ fn packed_pages_do_not_accumulate_under_churn() {
 #[test]
 fn a_packed_page_survives_while_any_chunk_in_it_is_live() {
     let dir = tmpdir("packed-mixed");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1376,7 +1382,6 @@ fn a_packed_page_survives_while_any_chunk_in_it_is_live() {
 #[test]
 fn a_deleted_and_rewritten_key_does_not_stay_dirty_for_ever() {
     let dir = tmpdir("delete-rewrite");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1455,7 +1460,6 @@ fn a_deleted_and_rewritten_key_does_not_stay_dirty_for_ever() {
 #[test]
 fn ingest_without_a_manual_checkpoint_stays_bounded() {
     let dir = tmpdir("policy-stall");
-    let _c = CleanDir(dir.clone());
 
     // A small budget, so the test exercises the trigger rather than the default
     // 256 MiB. The policy is the thing under test, not its constants.
@@ -1540,7 +1544,6 @@ fn ingest_without_a_manual_checkpoint_stays_bounded() {
 #[test]
 fn a_commit_survives_a_reopen_with_no_checkpoint() {
     let dir = tmpdir("wal-nockpt");
-    let _c = CleanDir(dir.clone());
 
     // A policy that will not fire, so nothing checkpoints behind our back.
     let policy = yesno_core::checkpoint::CheckpointPolicy {
@@ -1579,7 +1582,6 @@ fn a_commit_survives_a_reopen_with_no_checkpoint() {
 #[test]
 fn removals_and_deletes_replay_from_the_log() {
     let dir = tmpdir("wal-mixed");
-    let _c = CleanDir(dir.clone());
     let policy = yesno_core::checkpoint::CheckpointPolicy {
         dirty_bytes: usize::MAX,
         max_dirty_bytes: usize::MAX,
@@ -1638,7 +1640,6 @@ fn removals_and_deletes_replay_from_the_log() {
 #[test]
 fn redundant_wal_generations_are_reclaimed_once_their_records_are_checkpointed() {
     let dir = tmpdir("wal-truncate");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1720,7 +1721,6 @@ fn redundant_wal_generations_are_reclaimed_once_their_records_are_checkpointed()
 #[test]
 fn fsck_reports_a_healthy_database_as_consistent() {
     let dir = tmpdir("fsck");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1817,7 +1817,6 @@ fn fsck_reports_a_healthy_database_as_consistent() {
 #[test]
 fn cloning_a_snapshot_keeps_its_version_pinned_until_the_last_clone() {
     let dir = tmpdir("snap-clone");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1871,7 +1870,6 @@ fn cloning_a_snapshot_keeps_its_version_pinned_until_the_last_clone() {
 #[test]
 fn a_snapshot_clone_crosses_threads() {
     let dir = tmpdir("snap-send");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1912,7 +1910,6 @@ fn a_snapshot_clone_crosses_threads() {
 #[test]
 fn a_reference_to_the_wrong_chunk_is_refused() {
     let dir = tmpdir("mispoint");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -1987,7 +1984,6 @@ fn wal_bytes(dir: &std::path::Path) -> u64 {
 #[test]
 fn a_contiguous_bulk_insert_costs_a_constant_number_of_records() {
     let dir = tmpdir("wal-contig");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
     // Measured as a delta: opening writes an `EpochFence` per shard, which is
     // fixed cost that has nothing to do with the write under test.
@@ -2007,7 +2003,6 @@ fn a_contiguous_bulk_insert_costs_a_constant_number_of_records() {
 #[test]
 fn a_scatter_within_one_chunk_costs_about_two_bytes_per_ordinal() {
     let dir = tmpdir("wal-scatter");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
     let ords: Vec<u64> = (0..10_000u64).map(|i| i * 6).collect();
     let before = wal_bytes(&dir);
@@ -2024,7 +2019,6 @@ fn a_scatter_within_one_chunk_costs_about_two_bytes_per_ordinal() {
 #[test]
 fn a_coalesced_batch_replays_to_the_same_set() {
     let dir = tmpdir("wal-replay");
-    let _c = CleanDir(dir.clone());
     let mut expect: BTreeSet<u64> = BTreeSet::new();
     {
         let db = Db::open_with(&dir, opts()).unwrap();
@@ -2063,7 +2057,6 @@ fn insert_then_remove_of_the_same_ordinal_keeps_its_order_through_replay() {
     for (remove_last, want) in [(true, false), (false, true)] {
         let tag = if remove_last { "rm-last" } else { "ins-last" };
         let dir = tmpdir(&format!("wal-order-{tag}"));
-        let _c = CleanDir(dir.clone());
         {
             let db = Db::open_with(&dir, opts()).unwrap();
             let mut b = db.batch();
@@ -2093,7 +2086,6 @@ fn insert_then_remove_of_the_same_ordinal_keeps_its_order_through_replay() {
 #[test]
 fn a_range_insert_replays_to_the_same_set() {
     let dir = tmpdir("range-replay");
-    let _c = CleanDir(dir.clone());
     let mut expect: BTreeSet<u64> = BTreeSet::new();
     {
         let db = Db::open_with(&dir, opts()).unwrap();
@@ -2116,7 +2108,6 @@ fn a_range_insert_replays_to_the_same_set() {
 #[test]
 fn a_range_reports_only_what_it_changed() {
     let dir = tmpdir("range-count");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
     assert_eq!(db.insert_range(1, 0, 999).unwrap(), 1000);
     // Half of this overlaps what is already there.
@@ -2129,7 +2120,6 @@ fn a_range_reports_only_what_it_changed() {
 #[test]
 fn a_range_write_does_not_scale_its_wal_with_its_span() {
     let dir = tmpdir("range-wal");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
     let before = wal_bytes(&dir);
     db.insert_range(1, 0, 4_999_999).unwrap();
@@ -2153,7 +2143,6 @@ fn a_range_write_does_not_scale_its_wal_with_its_span() {
 #[test]
 fn a_second_open_of_a_live_database_is_refused() {
     let dir = tmpdir("lock-excl");
-    let _c = CleanDir(dir.clone());
     let first = Db::open_with(&dir, opts()).unwrap();
     first.insert(1, 42).unwrap();
 
@@ -2168,7 +2157,6 @@ fn a_second_open_of_a_live_database_is_refused() {
 #[test]
 fn the_lock_is_released_when_the_database_is_dropped() {
     let dir = tmpdir("lock-release");
-    let _c = CleanDir(dir.clone());
     {
         let db = Db::open_with(&dir, opts()).unwrap();
         db.insert_many(1, &[10, 20, 30, 40]).unwrap();
@@ -2184,7 +2172,6 @@ fn the_lock_is_released_when_the_database_is_dropped() {
 #[test]
 fn cloned_handles_share_the_one_lock() {
     let dir = tmpdir("lock-clone");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
     let clone = db.clone();
     clone.insert(7, 7).unwrap();
@@ -2201,7 +2188,6 @@ fn cloned_handles_share_the_one_lock() {
 #[test]
 fn every_open_takes_a_higher_fencing_epoch() {
     let dir = tmpdir("lock-epoch");
-    let _c = CleanDir(dir.clone());
     let mut seen = Vec::new();
     for _ in 0..4 {
         let db = Db::open_with(&dir, opts()).unwrap();
@@ -2234,7 +2220,6 @@ fn ranges_reaching_the_top_of_the_address_space_do_not_overflow() {
     use yesno_core::{CodecError, ORDINAL_MAX};
 
     let dir = tmpdir("u64-ceiling");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
 
     // Inclusive on both ends, and the high end is the last storable ordinal.
@@ -2299,7 +2284,6 @@ fn ranges_reaching_the_top_of_the_address_space_do_not_overflow() {
 #[test]
 fn keys_at_the_top_of_the_address_space_stay_distinct() {
     let dir = tmpdir("u64-keys");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
 
     for (i, k) in [u64::MAX, u64::MAX - 1, i64::MAX as u64, 1u64 << 63]
@@ -2349,7 +2333,6 @@ fn keys_at_the_top_of_the_address_space_stay_distinct() {
 #[test]
 fn superseding_a_packed_run_returns_its_bytes_to_the_page() {
     let dir = tmpdir("packed-run-live");
-    let _c = CleanDir(dir.clone());
     let db = Db::open_with(&dir, opts()).unwrap();
 
     for k in 0..32u64 {
@@ -2452,7 +2435,6 @@ fn superseding_a_packed_run_returns_its_bytes_to_the_page() {
 #[test]
 fn extents_pending_at_shutdown_are_not_orphaned_by_a_reopen() {
     let dir = tmpdir("orphan-reopen");
-    let _c = CleanDir(dir.clone());
 
     let pending_before = {
         let db = Db::open_with(&dir, opts()).unwrap();
@@ -2527,7 +2509,6 @@ fn extents_pending_at_shutdown_are_not_orphaned_by_a_reopen() {
 #[test]
 fn reopening_with_a_different_shard_count_keeps_every_key() {
     let dir = tmpdir("shard_count_mismatch");
-    let _clean = CleanDir(dir.clone());
     let keys: Vec<u64> = (0..64u64).map(|k| k * 7 + 1).collect();
 
     let opts_at = |n: usize| DbOptions {
@@ -2567,7 +2548,6 @@ fn reopening_with_a_different_shard_count_keeps_every_key() {
 #[test]
 fn a_torn_manifest_slot_still_opens_from_its_sibling() {
     let dir = tmpdir("torn_manifest");
-    let _clean = CleanDir(dir.clone());
     {
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(1, &[10, 20, 30]).unwrap();
@@ -2603,9 +2583,7 @@ fn a_torn_manifest_slot_still_opens_from_its_sibling() {
 #[test]
 fn a_shard_file_from_another_database_is_refused() {
     let one = tmpdir("identity_one");
-    let _clean_one = CleanDir(one.clone());
     let two = tmpdir("identity_two");
-    let _clean_two = CleanDir(two.clone());
     for (d, key) in [(&one, 1u64), (&two, 2u64)] {
         let db = Db::open_with(d, DbOptions::default()).unwrap();
         db.insert_many(key, &[key * 10, key * 10 + 1]).unwrap();
@@ -2635,7 +2613,6 @@ fn a_shard_file_from_another_database_is_refused() {
 #[test]
 fn a_wholly_unreadable_manifest_is_refused_rather_than_recreated() {
     let dir = tmpdir("manifest_unreadable");
-    let _clean = CleanDir(dir.clone());
     {
         let db = Db::open_with(&dir, DbOptions::default()).unwrap();
         db.insert_many(1, &[10, 20, 30]).unwrap();
@@ -2685,7 +2662,6 @@ fn a_wholly_unreadable_manifest_is_refused_rather_than_recreated() {
 #[test]
 fn a_multi_shard_commit_missing_one_participant_is_discarded_on_both() {
     let dir = tmpdir("partial-multi-shard");
-    let _c = CleanDir(dir.clone());
 
     // A policy that will not fire: a checkpoint would make the records durable
     // through the data file instead, and there would be nothing to discard.
@@ -2803,7 +2779,6 @@ fn a_multi_shard_commit_missing_one_participant_is_discarded_on_both() {
 #[test]
 fn a_shards_lsns_never_restart_across_checkpoints_or_reopens() {
     let dir = tmpdir("global-lsn");
-    let _c = CleanDir(dir.clone());
     let opts = DbOptions {
         shards: 1,
         ..Default::default()
@@ -2894,7 +2869,6 @@ fn a_shards_lsns_never_restart_across_checkpoints_or_reopens() {
 #[test]
 fn the_wal_size_trigger_can_fire_on_a_workload_the_dirty_trigger_cannot_see() {
     let dir = tmpdir("wal-trigger");
-    let _c = CleanDir(dir.clone());
     const LIMIT: u64 = 64 << 10;
     // Only the WAL-size trigger may fire, so a checkpoint is proof it did.
     let policy = yesno_core::checkpoint::CheckpointPolicy {
@@ -2973,7 +2947,6 @@ fn the_wal_size_trigger_can_fire_on_a_workload_the_dirty_trigger_cannot_see() {
 #[test]
 fn a_range_to_the_top_of_the_universe_sees_the_top_chunk() {
     let dir = tmpdir("range-ceiling");
-    let _c = CleanDir(dir.clone());
     let opts = DbOptions {
         shards: 1,
         ..Default::default()
@@ -3085,7 +3058,6 @@ fn a_prefix_bounded_key_stream_matches_persisted_mvcc_oracle() {
     }
 
     let dir = tmpdir("prefix-stream");
-    let _c = CleanDir(dir.clone());
     let key = u64::MAX;
     let mut before = BTreeSet::new();
 
@@ -3208,7 +3180,6 @@ fn a_prefix_bounded_key_stream_matches_persisted_mvcc_oracle() {
 #[test]
 fn key_enumeration_agrees_with_an_oracle_across_a_reopen() {
     let dir = tmpdir("keys");
-    let _clean = CleanDir(dir.clone());
     let mut live: BTreeSet<u64> = BTreeSet::new();
 
     {
@@ -3310,7 +3281,6 @@ fn key_enumeration_agrees_with_an_oracle_across_a_reopen() {
 #[test]
 fn a_reader_opens_alongside_a_live_writer_and_sees_the_last_checkpoint() {
     let dir = tmpdir("reader");
-    let _clean = CleanDir(dir.clone());
 
     let writer = Db::open_with(&dir, opts()).unwrap();
     writer.insert_many(1, &[1, 2, 3]).unwrap();
@@ -3423,7 +3393,10 @@ fn find_leaf_node(file: &[u8]) -> Option<usize> {
 }
 
 /// Build a database with a real on-disk index, and return its shard path.
-fn one_shard_db(tag: &str) -> (PathBuf, PathBuf) {
+///
+/// The directory comes back as the [`CleanDir`] guard rather than as a path, so a
+/// caller cannot take the shard path and forget the cleanup.
+fn one_shard_db(tag: &str) -> (CleanDir, PathBuf) {
     let dir = tmpdir(tag);
     let db = Db::open_with(
         &dir,
@@ -3501,9 +3474,11 @@ fn find_standalone_bitmap(file: &[u8]) -> Option<(usize, usize)> {
 
 /// A one-shard database holding a **dense** chunk, so at least one container is
 /// stored as a standalone 8 KiB bitmap rather than packed inline.
-fn one_shard_dense_db(name: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("yesno-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
+///
+/// Like [`one_shard_db`], the directory comes back as the [`CleanDir`] guard, so
+/// the cleanup is not a line a caller can omit.
+fn one_shard_dense_db(name: &str) -> (CleanDir, PathBuf) {
+    let dir = tmpdir(name);
     let db = Db::open_with(
         &dir,
         DbOptions {
@@ -3535,7 +3510,6 @@ fn one_shard_dense_db(name: &str) -> (PathBuf, PathBuf) {
 #[test]
 fn a_corrupt_standalone_payload_fails_a_real_verify() {
     let (dir, shard) = one_shard_dense_db("crc-standalone-e2e");
-    let _c = CleanDir(dir.clone());
 
     let bytes = std::fs::read(&shard).unwrap();
     let (at, len) = find_standalone_bitmap(&bytes)
@@ -3579,7 +3553,7 @@ fn a_corrupt_standalone_payload_fails_a_real_verify() {
     );
 }
 
-fn reopen_one_shard(dir: &PathBuf) -> Db {
+fn reopen_one_shard(dir: &Path) -> Db {
     Db::open_with(
         dir,
         DbOptions {
@@ -3595,7 +3569,6 @@ fn reopen_one_shard(dir: &PathBuf) -> Db {
 #[test]
 fn an_intact_database_passes_the_checksum_scan() {
     let (dir, shard) = one_shard_db("crc-clean");
-    let _c = CleanDir(dir.clone());
 
     let bytes = std::fs::read(&shard).unwrap();
     assert!(
@@ -3622,7 +3595,6 @@ fn an_intact_database_passes_the_checksum_scan() {
 #[test]
 fn a_corrupt_index_node_payload_fails_the_checksum_scan() {
     let (dir, shard) = one_shard_db("crc-node-payload");
-    let _c = CleanDir(dir.clone());
 
     let mut bytes = std::fs::read(&shard).unwrap();
     let at = find_leaf_node(&bytes).expect("no B+tree leaf found");
@@ -3693,7 +3665,6 @@ fn a_corrupt_index_node_payload_fails_the_checksum_scan() {
 #[test]
 fn a_corrupt_index_node_checksum_field_fails_the_checksum_scan() {
     let (dir, shard) = one_shard_db("crc-node-field");
-    let _c = CleanDir(dir.clone());
 
     let mut bytes = std::fs::read(&shard).unwrap();
     let at = find_leaf_node(&bytes).expect("no B+tree leaf found");
@@ -3735,7 +3706,6 @@ fn a_corrupt_index_node_checksum_field_fails_the_checksum_scan() {
 #[test]
 fn widely_separated_keys_survive_a_reopen() {
     let dir = tmpdir("wide-keys");
-    let _c = CleanDir(dir.clone());
 
     // Bits 20, 36 and 52 of the user key put the first differing bit at chunk-key
     // bit 68, 84 and 100 -- suffix widths 10, 12 and 14 respectively.
@@ -3781,7 +3751,6 @@ fn widely_separated_keys_survive_a_reopen() {
 #[test]
 fn a_corrupt_standalone_payload_is_refused_by_the_read_path() {
     let (dir, shard) = one_shard_dense_db("crc-read-standalone");
-    let _c = CleanDir(dir.clone());
 
     let bytes = std::fs::read(&shard).unwrap();
     let (at, len) = find_standalone_bitmap(&bytes)
