@@ -804,14 +804,14 @@ Everything below is on-disk state for one shard. The full rationale for each dec
 
 ### The size-class ladder
 
-The current ladder has eleven classes; `MAX_CLASSES` is the superblock field capacity derived from `( OFF_ROOT - OFF_CLASSES ) / 4`, not the current ladder length. Adding a class beyond that capacity is a format change. Every entry is ≡ 0 mod 64, and slab bases are 2 MiB-aligned, so **every slot in every class is 64-byte aligned by construction**. Bitmap alignment is therefore a property of the ladder rather than a per-kind rule an allocator change could silently break. Packed classes are selected by `is_packed_class`, not by assuming they occupy a particular position; `class_for` must never return one.
+The current ladder has twelve entries, of which eleven are classes: **entry 0 is reserved and sized 0**, so `class_size( 0 )` is `None`, `slab_capacity( 0 )` is 0, `class_for` never returns it and `slabmeta::decode` refuses a block naming it. The reservation is what makes a zero byte structurally not a class -- on disk at a slab metadata block's class field, and in memory where it lets a published reader's class map be `Option<NonZeroU8>`, one byte a slab, rather than `Option<u8>`, which has no niche and is two. `PACKED_CLASS` is therefore 1, not 0. `MAX_CLASSES` is the superblock field capacity derived from `( OFF_ROOT - OFF_CLASSES ) / 4`, not the current ladder length. Adding a class beyond that capacity is a format change. Every entry is ≡ 0 mod 64, and slab bases are 2 MiB-aligned, so **every slot in every class is 64-byte aligned by construction**. Bitmap alignment is therefore a property of the ladder rather than a per-kind rule an allocator change could silently break. Packed classes are selected by `is_packed_class`, not by assuming they occupy a particular position; `class_for` must never return one.
 
 Two properties to preserve when editing `CLASS_SIZES`:
 
 - **8192 is exact-fit for a bitmap payload.** Standalone extent trailers live in a table at the slab body's tail, so bitmap slots are adjacent and OS-page aligned. The 8192-byte class holds 254 payloads per slab; the older 8256-byte inline-trailer class held 253 and left a 64-byte gap between payloads.
 - That same class also holds a full 4096-element array, so **`Array(4096) → Bitmap` promotion stays a same-class rewrite** with no slab migration. This is the hottest conversion in the system; segregating heaps by container kind would turn it into a cross-heap move, which is the main reason grouping is by *size class* and not by kind.
 
-The ladder is persisted in the superblock, not compiled in. Retuning it is therefore not a format break, and a file written by a differently-tuned binary stays readable.
+The ladder is persisted in the superblock **and compared against the compiled one at open**, which is why renumbering it on 2026-10-07 cost nothing: addressing is driven by `CLASS_SIZES`, so a file carrying any other ladder is refused outright rather than misread, and `a_ladder_this_build_cannot_honour_is_refused_rather_than_misread` pins that. This paragraph previously said the opposite -- that retuning was not a format break and a differently-tuned file stayed readable -- which had not been true since that comparison landed.
 
 ### Packed pages
 

@@ -544,20 +544,21 @@ mod tests {
     #[test]
     fn a_ladder_this_build_cannot_honour_is_refused_rather_than_misread() {
         let mut s = SuperBlock::initial([1u8; 16], 0);
-        s.class_sizes = vec![4096, 576, 1088, 2112, 8256];
+        // Entry 0 reserved, as every well-formed ladder has it.
+        s.class_sizes = vec![0, 4096, 576, 1088, 2112, 8256];
         validate_ladder(&s.class_sizes)
             .expect("the retuned ladder is well-formed; shape is not what refuses it");
 
         // The divergence the refusal exists to prevent, stated in bytes.
-        let under_stored = 3u64 * s.class_sizes[2] as u64;
-        let under_compiled = 3u64 * CLASS_SIZES[2] as u64;
+        let under_stored = 3u64 * s.class_sizes[3] as u64;
+        let under_compiled = 3u64 * CLASS_SIZES[3] as u64;
         assert_ne!(
             under_stored, under_compiled,
-            "slot 3 of class 2 must land somewhere else under the stored ladder, \
+            "slot 3 of class 3 must land somewhere else under the stored ladder, \
              or this file would be harmless and there would be nothing to refuse"
         );
         assert_eq!(
-            crate::store::alloc::slot_offset(1, 2, 3),
+            crate::store::alloc::slot_offset(1, 3, 3),
             crate::store::SLAB_SIZE + crate::store::SLAB_META + under_compiled,
             "addressing is driven by the compiled ladder, which is the whole \
              reason a differently-tuned file cannot simply be opened"
@@ -578,7 +579,7 @@ mod tests {
     fn a_single_retuned_class_is_enough_to_refuse() {
         let mut s = SuperBlock::initial([1u8; 16], 0);
         s.class_sizes = CLASS_SIZES.to_vec();
-        s.class_sizes[5] = 1664; // was 1600; still aligned and still ascending
+        s.class_sizes[6] = 1664; // was 1600; still aligned and still ascending
         validate_ladder(&s.class_sizes).expect("still well-formed");
         assert!(SuperBlock::decode(&s.encode().unwrap()).is_err());
     }

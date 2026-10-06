@@ -888,6 +888,75 @@ fn an_endpoint_is_not_answered_by_materializing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Opening a stream must cost one allocation -- the stream itself -- and no more.
+///
+/// # Why this test exists
+///
+/// It did not, and that is how a regression reached a consumer. `KeyStream::over` began
+/// capturing a published metadata view per open on 2026-10-06 -- first a copy of the
+/// allocator's class map, then a copy of the segment list -- taking the per-open cost
+/// from one allocation to three. A reader whose workload is one key and many lanes opens
+/// one stream a lane, so two of the three were `O( lanes )` for views every lane shares,
+/// and haiiie's calibrated allocation guard caught it at 248 extra allocations for 248
+/// extra lanes while every test in this crate passed.
+///
+/// # Why the budget is one and not zero
+///
+/// `ChunkSource::open` returns a [`BoxedStream`](yesno_core::stream::BoxedStream) by
+/// signature, so the box is unavoidable and was already in the consumer's passing
+/// baseline. One is therefore the floor, not a tolerance: both metadata views are now
+/// shared behind an `Arc`, and anything a *third* allocation would pay for is something
+/// a lane should be sharing.
+#[test]
+fn opening_a_stream_does_not_allocate_per_open() {
+    use yesno_core::{Db, DbOptions};
+
+    let dir = std::env::temp_dir().join(format!("yesno-alloc-opens-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let chunks = 200u64;
+    let opts = || DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+    {
+        let db = Db::open_with(&dir, opts()).unwrap();
+        let vals: Vec<u64> = (0..chunks).map(|c| c << 16).collect();
+        db.insert_many(1, &vals).unwrap();
+        db.checkpoint().unwrap();
+    }
+    let db = Db::open_with(&dir, opts()).unwrap();
+    let snap = db.snapshot().unwrap();
+
+    // One cached source, so the plan is built once and only the *open* is measured --
+    // which is the operation a lane repeats.
+    let src = match snap.key_expr(1) {
+        yesno_core::Expr::Source(s) => s,
+        other => panic!("key_expr must be a lazy source, got {other:?}"),
+    };
+    drop(src.open());
+
+    let opens = |n: usize| {
+        count_allocs(|| {
+            for _ in 0..n {
+                std::hint::black_box(src.open());
+            }
+        })
+        .1
+    };
+    // Warm anything one-off before either arm is counted.
+    let _ = opens(4);
+    let few = opens(8);
+    let many = opens(128);
+    let per_open = (many as f64 - few as f64) / 120.0;
+    assert!(
+        per_open < 1.5,
+        "each stream open allocated about {per_open:.2} times: {few} for 8 opens against \
+         {many} for 128. Only the boxed stream may be per-open; the snapshot's published \
+         metadata must be shared, or a reader with one stream a lane pays O( lanes )."
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `Snapshot::key_stream` must not decode the key it streams.
 ///
 /// This is the budget the whole operation exists for. `Snapshot::load` builds

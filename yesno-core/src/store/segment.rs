@@ -212,7 +212,13 @@ pub struct SegmentedMmap {
     /// into it point at payload offsets scattered through the page.
     pinned: Vec<Mutex<BTreeMap<u64, Weak<ExtentGuard>>>>,
     /// Append-only. Existing entries are never replaced, only added to.
-    segs: Mutex<Vec<Arc<MmapSegment>>>,
+    ///
+    /// Held as an `Arc<Vec<_>>` rather than a bare `Vec` so that
+    /// [`Self::published_segments`] is an `Arc` clone and not a copy. A reader opens one
+    /// stream a lane, so a copy there is `O( lanes )` allocations for a view that almost
+    /// never changes; growth pays the copy instead, under `Arc::make_mut`, and only while
+    /// some reader still holds the previous snapshot.
+    segs: Mutex<Arc<Vec<Arc<MmapSegment>>>>,
     /// Regions whose stored checksum has been recomputed and matched, as
     /// `file offset -> byte length`.
     ///
@@ -438,7 +444,7 @@ impl SegmentedMmap {
             .open(path)?;
         let this = SegmentedMmap {
             file,
-            segs: Mutex::new(Vec::new()),
+            segs: Mutex::new(Arc::new(Vec::new())),
             pinned: (0..CACHE_SHARDS)
                 .map(|_| Mutex::new(BTreeMap::new()))
                 .collect(),
@@ -472,7 +478,14 @@ impl SegmentedMmap {
     /// Map any segments the file has grown to cover. Never unmaps.
     fn remap_to_file_len(&self) -> std::io::Result<()> {
         let file_len = self.file_len()?;
-        let mut segs = self.segs.lock().unwrap();
+        let mut guard = self.segs.lock().unwrap();
+        if (guard.len() as u64) * SEGMENT_SIZE >= file_len {
+            return Ok(());
+        }
+        // Copy-on-write: this clones the list only when a reader is holding the
+        // previous snapshot, which is the one case where mutating in place would
+        // be wrong anyway.
+        let segs = Arc::make_mut(&mut *guard);
         while (segs.len() as u64) * SEGMENT_SIZE < file_len {
             let base = segs.len() as u64 * SEGMENT_SIZE;
             let len = SEGMENT_SIZE.min(file_len - base) as usize;
@@ -500,26 +513,94 @@ impl SegmentedMmap {
 
     fn segment_for(&self, cell: u64, len: usize) -> Result<Arc<MmapSegment>> {
         let segs = self.segs.lock().unwrap();
-        let idx = (cell / SEGMENT_SIZE) as usize;
-        let seg = segs.get(idx).ok_or(CodecError::OutOfBounds {
-            off: cell as usize,
-            len,
-            buf_len: segs.len() * SEGMENT_SIZE as usize,
-        })?;
-        if !seg.covers(cell, len) {
-            // Only possible if an extent straddles a segment boundary, which the
-            // SEGMENT_SIZE % SLAB_SIZE assertion is meant to make impossible.
-            return Err(CodecError::Invariant("extent straddles a segment boundary"));
-        }
-        Ok(seg.clone())
+        segment_for_in(&segs, cell, len)
     }
 
+    /// A snapshot of the segment list, for a reader that cannot take the lock.
+    ///
+    /// **This is what removes the last per-read lock from the chunk path.** `segment_for`
+    /// takes `segs` on every `buffer_at`, and an ablation on 2026-10-06 measured that one
+    /// mutex at **2.7x** of twenty-thread throughput ( 1 223 -> 3 321 Kr/s ) -- more than
+    /// the published reader and the striping of the other two caches put together.
+    ///
+    /// Safe to hold because the list is append-only and an `Arc<MmapSegment>` keeps its
+    /// mapping alive independently of it: growth pushes, so a held snapshot stops covering
+    /// newly added cells but never dangles and never has an entry change meaning. A plan
+    /// names only cells that existed when it was built, and the reader slot pins them, so
+    /// a snapshot taken at open covers everything that plan will ask for -- the same
+    /// argument the class map in `PublishedChunks` already rests on.
+    ///
+    /// An `Arc` clone, not a copy. It was a copy for one day, and that made one stream
+    /// open cost two `Vec` allocations: a reader with one stream a lane paid `O( lanes )`
+    /// for a view every lane shares, which a consumer's allocation guard caught on
+    /// 2026-10-07.
+    pub(crate) fn published_segments(&self) -> Arc<Vec<Arc<MmapSegment>>> {
+        Arc::clone(&self.segs.lock().unwrap())
+    }
+
+    /// [`Self::buffer_at`], against a pre-resolved segment list when one is supplied.
+    pub(crate) fn buffer_at_in(
+        &self,
+        segs: Option<&[Arc<MmapSegment>]>,
+        cell: u64,
+        len: usize,
+    ) -> Result<Buffer> {
+        match segs {
+            Some(segs) => self.buffer_from(segment_for_in(segs, cell, len)?, cell, len),
+            None => self.buffer_at(cell, len),
+        }
+    }
+
+    /// [`Self::read_at`], against a pre-resolved segment list when one is supplied.
+    pub(crate) fn read_at_in(
+        &self,
+        segs: Option<&[Arc<MmapSegment>]>,
+        cell: u64,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        let seg = match segs {
+            Some(segs) => segment_for_in(segs, cell, len)?,
+            None => self.segment_for(cell, len)?,
+        };
+        let off = (cell - seg.base()) as usize;
+        Ok(seg.as_slice()[off..off + len].to_vec())
+    }
+}
+
+/// The segment covering `[cell, cell + len)`, from a list rather than from the lock.
+///
+/// One copy of this lookup, called both under `segs` and from a published snapshot: two
+/// implementations drifting would let a reader address bytes outside the mapping it
+/// checked.
+fn segment_for_in(segs: &[Arc<MmapSegment>], cell: u64, len: usize) -> Result<Arc<MmapSegment>> {
+    let idx = (cell / SEGMENT_SIZE) as usize;
+    let seg = segs.get(idx).ok_or(CodecError::OutOfBounds {
+        off: cell as usize,
+        len,
+        buf_len: segs.len() * SEGMENT_SIZE as usize,
+    })?;
+    if !seg.covers(cell, len) {
+        // Only possible if an extent straddles a segment boundary, which the
+        // SEGMENT_SIZE % SLAB_SIZE assertion is meant to make impossible.
+        return Err(CodecError::Invariant("extent straddles a segment boundary"));
+    }
+    Ok(seg.clone())
+}
+
+impl SegmentedMmap {
     /// A zero-copy [`Buffer`] over `[cell, cell + len)`.
     ///
     /// The returned buffer keeps the underlying mapping alive independently of
     /// this `SegmentedMmap` and of any snapshot.
     pub fn buffer_at(&self, cell: u64, len: usize) -> Result<Buffer> {
-        let seg = self.segment_for(cell, len)?;
+        self.buffer_from(self.segment_for(cell, len)?, cell, len)
+    }
+
+    /// [`Self::buffer_at`] with the segment already resolved.
+    ///
+    /// Split so a published reader can supply the segment from its own snapshot and take
+    /// no lock at all; everything below the lookup is unchanged and shared by both.
+    fn buffer_from(&self, seg: Arc<MmapSegment>, cell: u64, len: usize) -> Result<Buffer> {
         let off = (cell - seg.base()) as usize;
         let ptr = seg.as_slice()[off..off + len].as_ptr();
         // One guard per cell, shared by every live Buffer over it, so that a

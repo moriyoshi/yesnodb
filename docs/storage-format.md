@@ -234,8 +234,8 @@ is a hard error rather than permission to reinterpret the bytes.
 | `60..64` | `u32` | base page size, currently 4096; zero denotes a file written before this field was compared |
 | `64..68` | `u32` | slab size, currently 2 MiB; zero denotes a file written before this field was compared |
 | `68..72` | `u32` | maximum packed payload length, currently 2028 |
-| `72..76` | `u32` | number of size classes; the current writer uses 11 |
-| `76..120` | 11 x `u32` | current persisted size-class ladder |
+| `72..76` | `u32` | number of size classes; the current writer uses 12 |
+| `76..124` | 12 x `u32` | current persisted size-class ladder, entry 0 being the reserved class and therefore zero |
 | `120..128` | | reserved |
 | `128..136` | `u64` | commit version represented by the checkpoint |
 | `136..144` | `u64` | LSN at which WAL replay begins |
@@ -293,24 +293,29 @@ opened, so that exchange is rejected rather than served.
 
 ### Current size classes
 
-The current writer creates shards with this ladder. Class 0 is reserved for
-packed pages. The remaining classes are general allocation slots. A standalone
-extent's eight-byte trailer is stored in a table after the slab's payload
-slots, while an index node occupies only its persisted node size.
+The current writer creates shards with this ladder. Class 0 is reserved and is
+not a class: its ladder entry is zero, it has no slot size and no capacity, and
+a slab metadata block naming it is rejected. The reservation exists so that a
+zero byte is never a valid class, which is what lets a reader hold one class per
+slab in a single byte. Class 1 is the packed-page class; classes 2 and above are
+general allocation slots. A standalone extent's eight-byte trailer is stored in
+a table after the slab's payload slots, while an index node occupies only its
+persisted node size.
 
 | class | slot bytes | maximum standalone payload bytes |
 |---:|---:|---:|
-| 0 | 4096 | packed-page container |
-| 1 | 576 | 576 |
-| 2 | 704 | 704 |
-| 3 | 896 | 896 |
-| 4 | 1088 | 1088 |
-| 5 | 1600 | 1600 |
-| 6 | 2112 | 2112 |
-| 7 | 3136 | 3136 |
-| 8 | 4160 | 4160 |
-| 9 | 6208 | 6208 |
-| 10 | 8192 | 8192 |
+| 0 | - | reserved; not a class |
+| 1 | 4096 | packed-page container |
+| 2 | 576 | 576 |
+| 3 | 704 | 704 |
+| 4 | 896 | 896 |
+| 5 | 1088 | 1088 |
+| 6 | 1600 | 1600 |
+| 7 | 2112 | 2112 |
+| 8 | 3136 | 3136 |
+| 9 | 4160 | 4160 |
+| 10 | 6208 | 6208 |
+| 11 | 8192 | 8192 |
 
 A slab contains only one class. A packed-page slab has capacity
 `floor((2 MiB - 8192) / slot_bytes)`. A standalone class reserves one eight-byte
@@ -333,7 +338,7 @@ checks are unavailable.
 | `0..2` | `u16` | magic `0x5953` |
 | `2` | `u8` | version, currently 1 |
 | `3` | `u8` | state: 0 free, 1 in use |
-| `4` | `u8` | size class |
+| `4` | `u8` | size class; never zero, which is the reserved class |
 | `5..8` | | reserved |
 | `8..12` | `u32` | allocation generation |
 | `12..16` | `u32` | number of occupied slots |
@@ -680,7 +685,7 @@ free space cannot be inferred by scanning for locally well-formed extent bytes.
 | slab metadata | magic, version, CRC32C, count/bitmap agreement | treat as unknown and derive from index |
 | index node | version, shape, and stored CRC32C | online reads recompute the CRC on first access to a region; the integrity scan recomputes it independently |
 | standalone payload | chunk-key tag and stored payload CRC32C | online reads check the tag and recompute the CRC on first access when slab geometry is known; the integrity scan recomputes it independently |
-| packed page | magic, version, flags, key range, and stored CRC32C | online reads check the header and range and recompute the page CRC on first access when class 0 is known; the integrity scan recomputes it independently |
+| packed page | magic, version, flags, key range, and stored CRC32C | online reads check the header and range and recompute the page CRC on first access when the packed class is known; the integrity scan recomputes it independently |
 | WAL frame | length, LSN redundancy, type, CRC32C | ignore a crash-torn tail and remove its recovery suffix; reject valid unknown type |
 
 The online read path checks both identity and content. It recomputes a stored

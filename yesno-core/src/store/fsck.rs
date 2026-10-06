@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn slot_base_and_index_are_consistent() {
-        let class = 1u8;
+        let class = 2u8;
         let sz = class_size(class).unwrap() as u64;
         let body = SLAB_META;
         for slot in [0u64, 1, 5, 100] {

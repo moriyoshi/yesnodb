@@ -378,7 +378,7 @@ impl ShardStore {
     /// `stored-page-crcs-are-not-verified` and
     /// `miri-cannot-reach-the-mmap-unsafe-sites`.
     pub fn read_container_for(&self, key: ChunkKey, cref: ChunkRef) -> Result<Option<Container>> {
-        read_container_for_in(&self.seg, &self.alloc, key, cref)
+        read_container_for_in(&self.seg, None, &self.alloc, key, cref)
     }
 
     /// Let punching reach slabs inherited at open. See
@@ -677,29 +677,50 @@ impl ChunkGeometry for crate::store::alloc::Allocator {
 /// -- while reclamation is deferred for versions a reader still pins, so a slab holding an
 /// extent reachable from a pinned plan cannot be freed or reclassified underneath it.
 ///
-/// The class map is a copy taken under the store lock, one byte a slab. That is the whole
-/// price of not holding the lock per chunk: `KeyStream::next_chunk` serialized concurrent
-/// readers of one key on `Mutex<ShardStore>` once per 8 KiB chunk, which a consumer
-/// measured at about 1 us a chunk and a floor of 71 ms however many workers ran -- with
-/// eight slower than one, because readers of a single key are readers of a single shard
-/// and no shard count can spread them.
+/// Three `Arc` clones and no copy at all. That is the whole price of not holding the lock
+/// per chunk: `KeyStream::next_chunk` serialized concurrent readers of one key on
+/// `Mutex<ShardStore>` once per 8 KiB chunk, which a consumer measured at about 1 us a
+/// chunk and a floor of 71 ms however many workers ran -- with eight slower than one,
+/// because readers of a single key are readers of a single shard and no shard count can
+/// spread them.
+///
+/// **Both views are shared, not copied.** For one day they were copies -- the class map
+/// one byte a slab, the segment list one pointer a 1 GiB segment -- and a reader that
+/// opens one stream a lane therefore paid two allocations a lane for views every lane
+/// shares. A consumer's allocation guard caught it on 2026-10-07. `Alloc::class_map`
+/// memoizes behind an `Arc` and `SegmentedMmap::published_segments` holds its list behind
+/// one, so the per-open cost is now a refcount.
 pub(crate) struct PublishedChunks {
     seg: std::sync::Arc<crate::store::segment::SegmentedMmap>,
+    /// The segment list as of this reader's creation.
+    ///
+    /// **The last per-read lock, and the largest one.** `segment_for` took `segs` on every
+    /// `buffer_at`; an ablation on 2026-10-06 measured that single mutex at **2.7x** of
+    /// twenty-thread throughput, more than the published reader and the striped caches put
+    /// together. Holding the list is sound because it is append-only and each
+    /// `Arc<MmapSegment>` keeps its own mapping alive: a growth pushes, so this snapshot
+    /// covers fewer cells rather than dangling, and a plan names only cells that already
+    /// existed.
+    segs: std::sync::Arc<Vec<std::sync::Arc<crate::store::segment::MmapSegment>>>,
     /// Slab class by slab id, as of the moment this reader was made.
-    classes: Vec<Option<u8>>,
+    ///
+    /// One byte a slab, so a 2 MiB-slab store holding a terabyte needs 512 KiB. That is
+    /// true only because class 0 is reserved and the entry is therefore
+    /// `Option<NonZeroU8>`; `Option<u8>` has no niche and would double it.
+    classes: std::sync::Arc<Vec<Option<std::num::NonZeroU8>>>,
 }
 
 impl ChunkGeometry for PublishedChunks {
     fn packed_page(&self, cell: u64) -> Option<(u64, usize)> {
-        let class = (*self
-            .classes
-            .get(crate::store::alloc::slab_of(cell) as usize)?)?;
-        crate::store::alloc::packed_page_of(class, cell)
+        crate::store::alloc::packed_page_of(self.owning_class(cell)?, cell)
     }
     fn owning_class(&self, cell: u64) -> Option<u8> {
-        *self
-            .classes
-            .get(crate::store::alloc::slab_of(cell) as usize)?
+        Some(
+            (*self
+                .classes
+                .get(crate::store::alloc::slab_of(cell) as usize)?)?
+            .get(),
+        )
     }
 }
 
@@ -710,19 +731,20 @@ impl PublishedChunks {
         key: ChunkKey,
         cref: ChunkRef,
     ) -> Result<Option<Container>> {
-        read_container_for_in(&self.seg, self, key, cref)
+        read_container_for_in(&self.seg, Some(&self.segs), self, key, cref)
     }
 }
 
 /// `ShardStore::payload_len_of`, over a mapping rather than a store.
 fn payload_len_in(
     seg: &crate::store::segment::SegmentedMmap,
+    segs: Option<&[std::sync::Arc<crate::store::segment::MmapSegment>]>,
     cref: ChunkRef,
     cell: u64,
 ) -> Result<usize> {
     Ok(match cref.kind() {
         ContainerKind::Run => {
-            let hdr = seg.read_at(cell, 2)?;
+            let hdr = seg.read_at_in(segs, cell, 2)?;
             crate::run_bytes(u16::from_le_bytes([hdr[0], hdr[1]]) as u32)
         }
         _ => cref.payload_len(None)?,
@@ -732,6 +754,7 @@ fn payload_len_in(
 /// `ShardStore::read_container`, over a mapping rather than a store.
 fn read_container_in(
     seg: &crate::store::segment::SegmentedMmap,
+    segs: Option<&[std::sync::Arc<crate::store::segment::MmapSegment>]>,
     cref: ChunkRef,
 ) -> Result<Option<Container>> {
     if let Some(vals) = cref.inline_values() {
@@ -740,10 +763,10 @@ fn read_container_in(
     let Some(cell) = cref.cell() else {
         return Ok(None);
     };
-    let len = payload_len_in(seg, cref, cell)?;
+    let len = payload_len_in(seg, segs, cref, cell)?;
     // Zero-copy: the container aliases the mapping, and its Buffer keeps
     // that mapping alive independently of this store.
-    let buf = seg.buffer_at(cell, len)?;
+    let buf = seg.buffer_at_in(segs, cell, len)?;
     Ok(Some(codec::decode_buffer(
         cref.kind(),
         &buf,
@@ -760,6 +783,7 @@ fn read_container_in(
 /// how a reader comes to verify a different region than the writer wrote.
 fn read_container_for_in(
     seg: &crate::store::segment::SegmentedMmap,
+    segs: Option<&[std::sync::Arc<crate::store::segment::MmapSegment>]>,
     geom: &impl ChunkGeometry,
     key: ChunkKey,
     cref: ChunkRef,
@@ -773,11 +797,11 @@ fn read_container_for_in(
     let Some(cell) = cref.cell() else {
         // Inline: the payload is in the index entry, so there is no
         // reference to be wrong about.
-        return read_container_in(seg, cref);
+        return read_container_in(seg, segs, cref);
     };
 
     if let Some((base, page)) = geom.packed_page(cell) {
-        let hdr = seg.read_at(base, crate::store::packed::HEADER)?;
+        let hdr = seg.read_at_in(segs, base, crate::store::packed::HEADER)?;
         let h = crate::store::packed::PackedHeader::parse(&hdr)?;
         if !h.may_contain(key) {
             return Err(CodecError::Invariant(
@@ -810,7 +834,7 @@ fn read_container_for_in(
         // Sized from the slab's class rather than from a global constant, so a
         // large page is checksummed whole rather than in its first 4 KiB.
         seg.verify_once(base, page, || {
-            let bytes = seg.read_at(base, page)?;
+            let bytes = seg.read_at_in(segs, base, page)?;
             crate::store::packed::PackedHeader::verify(&bytes).map(|_| ())
         })?;
     } else if let Some(class) = geom.owning_class(cell) {
@@ -822,7 +846,7 @@ fn read_container_for_in(
             .ok_or(CodecError::Invariant("extent cell is not slot-aligned"))?;
         let off =
             crate::store::alloc::trailer_offset(crate::store::alloc::slab_of(cell), class, slot);
-        let raw = seg.read_at(off, crate::store::extent::EXT_TRAILER_BYTES)?;
+        let raw = seg.read_at_in(segs, off, crate::store::extent::EXT_TRAILER_BYTES)?;
         let t = crate::store::extent::ExtTrailer::from_le_bytes(
             raw.try_into()
                 .map_err(|_| CodecError::Invariant("short extent trailer"))?,
@@ -847,7 +871,7 @@ fn read_container_for_in(
         // bytes are the ones that were written. A wrong-but-in-range offset
         // with a matching tag, or an intact reference over a corrupted
         // payload, both pass the tag and fail here.
-        let payload_len = payload_len_in(seg, cref, cell)?;
+        let payload_len = payload_len_in(seg, segs, cref, cell)?;
         seg.verify_once(cell, payload_len, || {
             // Zero-copy: the CRC reads the mapping directly. Copying the
             // payload out with `read_at` first -- which is what this did
@@ -855,7 +879,7 @@ fn read_container_for_in(
             // against **1.25 us** this way, so the copy was a third of the
             // one-off cost. Both figures are a first touch; steady state is
             // zero either way.
-            let buf = seg.buffer_at(cell, payload_len)?;
+            let buf = seg.buffer_at_in(segs, cell, payload_len)?;
             if crate::store::checksum::crc32c(buf.as_slice()) != t.crc32c {
                 return Err(CodecError::Invariant(
                     "extent payload fails its stored checksum",
@@ -867,7 +891,7 @@ fn read_container_for_in(
     // An Opaque slab has no known geometry, so there is nothing to check
     // against; the read proceeds unverified rather than failing.
 
-    read_container_in(seg, cref)
+    read_container_in(seg, segs, cref)
 }
 
 impl NodeReader for PublishedNodes {
@@ -910,11 +934,12 @@ impl ShardStore {
 
     /// A lock-free reader for this shard's **published** chunk payloads.
     ///
-    /// An `Arc` clone and one byte a slab, so the caller holds the store lock only for
+    /// Three `Arc` clones and no allocation, so the caller holds the store lock only for
     /// that. See [`PublishedChunks`] for why reading a published extent without the lock
     /// is sound, and what it is for.
-    pub(crate) fn published_chunks(&self) -> PublishedChunks {
+    pub(crate) fn published_chunks(&mut self) -> PublishedChunks {
         PublishedChunks {
+            segs: self.seg.published_segments(),
             seg: std::sync::Arc::clone(&self.seg),
             classes: self.alloc.class_map(),
         }
@@ -1537,7 +1562,7 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, c.kind(), c.len()).unwrap();
-        let back = read_container_in(&s.seg, cref).unwrap().unwrap();
+        let back = read_container_in(&s.seg, None, cref).unwrap().unwrap();
         assert_eq!(back.iter().collect::<Vec<_>>(), vals);
     }
 
@@ -1559,7 +1584,7 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, ContainerKind::Run, c.len()).unwrap();
-        let back = read_container_in(&s.seg, cref).unwrap().unwrap();
+        let back = read_container_in(&s.seg, None, cref).unwrap().unwrap();
         assert_eq!(back.len(), 3000);
         assert_eq!(
             back.iter().collect::<Vec<_>>(),
@@ -1585,8 +1610,8 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, ContainerKind::Bitmap, c.len()).unwrap();
-        let a = read_container_in(&s.seg, cref).unwrap().unwrap();
-        let b = read_container_in(&s.seg, cref).unwrap().unwrap();
+        let a = read_container_in(&s.seg, None, cref).unwrap().unwrap();
+        let b = read_container_in(&s.seg, None, cref).unwrap().unwrap();
 
         // Two independent reads of the same extent must share bytes. If the read
         // path copied, these would be distinct allocations.
@@ -1616,7 +1641,7 @@ mod tests {
             let cell = s.allocator().alloc(class).unwrap();
             s.write_extent(cell, &payload).unwrap();
             let cref = ChunkRef::extent(cell, ContainerKind::Bitmap, c.len()).unwrap();
-            read_container_in(&s.seg, cref).unwrap().unwrap()
+            read_container_in(&s.seg, None, cref).unwrap().unwrap()
         }; // store dropped, mapping must survive via the guard
 
         assert_eq!(held.iter().collect::<Vec<_>>(), scattered);
@@ -1628,7 +1653,7 @@ mod tests {
         let _c = Cleanup(p.clone());
         let s = ShardStore::open(&p, [6u8; 16], 0).unwrap();
         let cref = ChunkRef::inline(&[3, 9, 27]).unwrap();
-        let c = read_container_in(&s.seg, cref).unwrap().unwrap();
+        let c = read_container_in(&s.seg, None, cref).unwrap().unwrap();
         assert_eq!(c.iter().collect::<Vec<_>>(), vec![3, 9, 27]);
     }
 
@@ -1822,7 +1847,7 @@ mod tests {
 
         s.allocator().begin_generation();
         for _ in 0..100 {
-            let cell = s.allocator().alloc(10).unwrap();
+            let cell = s.allocator().alloc(11).unwrap();
             s.write_extent(cell, &[0u8; 8192]).unwrap();
         }
         let grown = s.seg.file_len().unwrap();

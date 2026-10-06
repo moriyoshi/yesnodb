@@ -399,7 +399,9 @@ impl ExtTrailer {
 
 /// Slot size for the packed-page class. Packed pages hold many small
 /// array/run payloads; see `store::packed`.
-pub const PACKED_CLASS: u8 = 0;
+///
+/// **1, not 0, because class 0 is reserved as "no class".** See [`CLASS_SIZES`].
+pub const PACKED_CLASS: u8 = 1;
 
 /// Largest payload packed rather than given its own extent.
 ///
@@ -410,7 +412,32 @@ pub const PACKED_CLASS: u8 = 0;
 /// payloads near 1310 B where a 512 cap makes nothing packable and costs 17%.
 pub const PACK_MAX: usize = 2028;
 
-/// Slot sizes, indexed by class. Entry 0 is the packed-page class.
+/// Slot sizes, indexed by class. **Entry 0 is reserved and is not a class**; entry 1 is
+/// the packed-page class.
+///
+/// # Why zero is not a class
+///
+/// So that a zero byte never reads as a valid class, at either end of the format.
+///
+/// In memory it is what lets a reader's class map be `Option<NonZeroU8>` -- one byte a
+/// slab, where `Option<u8>` has no niche and is two, so the map was twice its documented
+/// size for as long as it was spelled that way. That was the prompting reason.
+///
+/// On disk a slab's class is a raw `u8` in its metadata block ( `slabmeta`'s `OFF_CLASS` ).
+/// A wholly absent or torn block was already refused there by the magic and the CRC, so
+/// this does not close a live corruption path; what it removes is the block whose CRC
+/// *holds* and whose class this build does not implement. `slab_capacity` answers 0 for
+/// such a class and the stored capacity would be 0 too, so the cross-check passed and the
+/// slab came back `InUse` with no geometry -- occupied for ever, reported to no reader.
+/// `slabmeta::decode` now rejects it on the class, which is structural rather than
+/// derived.
+///
+/// Renumbering a persisted class is a format change, and it was free here for one reason:
+/// the ladder is itself persisted in the superblock and `DbStore::open` rejects a file
+/// whose ladder is not this array ( exact equality, not a subset ), so an older file
+/// fails loudly at open rather than reading class 1 as the ladder's second entry.
+///
+/// # Alignment
 ///
 /// Every entry is a multiple of 64. Because slab bases are 2 MiB aligned, that
 /// makes **every slot in every class 64-byte aligned** — so bitmap alignment is
@@ -437,24 +464,25 @@ pub const fn is_packed_class(class: u8) -> bool {
     class == PACKED_CLASS
 }
 
-pub const CLASS_SIZES: [u32; 11] = [
-    4096, // 0  PACKED
-    576,  // 1  payload <=  568
-    704,  // 2           <=  696
-    896,  // 3           <=  888
-    1088, // 4           <= 1080
-    1600, // 5           <= 1592
-    2112, // 6           <= 2104   exact for 2048
-    3136, // 7           <= 3128
-    4160, // 8           <= 4152   exact for 4096
-    6208, // 9           <= 6200
+pub const CLASS_SIZES: [u32; 12] = [
+    0,    // 0  RESERVED -- not a class; `class_size` returns None for it
+    4096, // 1  PACKED
+    576,  // 2  payload <=  568
+    704,  // 3           <=  696
+    896,  // 4           <=  888
+    1088, // 5           <= 1080
+    1600, // 6           <= 1592
+    2112, // 7           <= 2104   exact for 2048
+    3136, // 8           <= 3128
+    4160, // 9           <= 4152   exact for 4096
+    6208, // 10          <= 6200
     // 10. **Exactly a bitmap payload.** It was 8256 -- `round_up_64( 8192 + 8 )` -- while
     // every slot carried its own 8-byte trailer, and that 64 bytes of slack was the sole
     // reason consecutive dense payloads could not be adjacent: `8256 % 4096 == 64` also
     // put each one across three OS pages instead of two. The trailer now lives in a table
     // at the tail of the slab body, so the slot is the payload and consecutive slots are
     // contiguous.
-    8192,
+    8192, // 11
 ];
 
 /// Smallest class whose slot holds `payload_len` plus a trailer, or `None` if
@@ -472,6 +500,9 @@ pub fn class_for(payload_len: usize) -> Option<u8> {
         // only packed one; with two, skipping a prefix would admit the large page here
         // and hand a 9 KiB payload a 64 KiB slot.
         .filter(|(i, _)| !is_packed_class(*i as u8))
+        // And never the reserved entry, whose size is 0 and would therefore satisfy
+        // every `need` of 0.
+        .filter(|(_, &sz)| sz > 0)
         .find(|(_, &sz)| sz as usize >= need)
         .map(|(i, _)| i as u8)
 }
@@ -495,9 +526,18 @@ pub const fn ladder_max() -> u32 {
     m
 }
 
+/// The slot size of `class`, or `None` if `class` is not a class.
+///
+/// **The zero filter is what makes class 0 structurally invalid**, rather than a rule
+/// stated in a comment. Everything that derives geometry -- `slab_capacity`,
+/// `slot_offset`, `packed_page_of`, the reader's class map -- consults this one function,
+/// so reserving the entry here reserves it everywhere.
 #[inline]
 pub fn class_size(class: u8) -> Option<u32> {
-    CLASS_SIZES.get(class as usize).copied()
+    CLASS_SIZES
+        .get(class as usize)
+        .copied()
+        .filter(|sz| *sz > 0)
 }
 
 /// Round up to the next multiple of 64.
@@ -520,14 +560,23 @@ pub fn validate_ladder(sizes: &[u32]) -> Result<()> {
             ));
         }
     }
-    // The **standalone** classes must ascend; packed pages sit outside that ordering.
-    // Filtered rather than sliced: this was `sizes[ 1.. ]`, which was the same thing
-    // while class 0 was the only packed class, and would now demand that a 64 KiB page
-    // ascend from an 8256-byte slot.
+    // Entry 0 is reserved as "no class" and must be 0, so that a zero class byte is not
+    // a class. Checked rather than assumed: the ladder is persisted, and a foreign file
+    // carrying a real size here would make every reader's "absent" marker name a slot
+    // geometry.
+    if sizes[0] != 0 {
+        return Err(CodecError::Invariant(
+            "class 0 is reserved and its ladder entry must be 0",
+        ));
+    }
+    // The **standalone** classes must ascend; packed pages sit outside that ordering, and
+    // so does the reserved entry. Filtered rather than sliced: this was `sizes[ 1.. ]`,
+    // which was the same thing while class 0 was the only packed class, and would now
+    // demand that a 64 KiB page ascend from an 8256-byte slot.
     let standalone: Vec<u32> = sizes
         .iter()
         .enumerate()
-        .filter(|(i, _)| !is_packed_class(*i as u8))
+        .filter(|(i, _)| !is_packed_class(*i as u8) && *i != 0)
         .map(|(_, &s)| s)
         .collect();
     if standalone.windows(2).any(|w| w[0] >= w[1]) {
@@ -772,11 +821,12 @@ mod tests {
         // payload size ( see `is_packed_class` ), so no payload can round up into one
         // and it has no fragmentation to bound. Written as `CLASS_SIZES[ 1.. ]` while
         // class 0 was the only packed class, which made "skip the packed classes" and
-        // "skip the first" the same sentence.
+        // "skip the first" the same sentence. Class 0 is now reserved and sized 0, which
+        // is neither packed nor standalone -- left in and the ratio would be infinite.
         let standalone: Vec<u32> = CLASS_SIZES
             .iter()
             .enumerate()
-            .filter(|(i, _)| !is_packed_class(*i as u8))
+            .filter(|(i, _)| !is_packed_class(*i as u8) && *i != 0)
             .map(|(_, &s)| s)
             .collect();
         for w in standalone.windows(2) {

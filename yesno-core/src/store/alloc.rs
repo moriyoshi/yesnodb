@@ -43,6 +43,8 @@
 //! adopts the result. See [`Allocator::adopt_live_at_open`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroU8;
+use std::sync::Arc;
 
 use super::extent::{class_size, is_packed_class, CLASS_SIZES, EXT_TRAILER_BYTES, PACKED_CLASS};
 use crate::error::{CodecError, Result};
@@ -536,6 +538,20 @@ pub struct Allocator {
     /// needs no durability, by the same I3+I4 argument that makes the deferred
     /// free list non-durable, and an index scan recomputes it exactly.
     packed_live: std::collections::HashMap<u64, u32>,
+    /// Memoized [`Self::class_map`], dropped whenever a slab's class or liveness
+    /// changes.
+    ///
+    ///
+    /// **A memo and not a parallel structure**: the map is still derived from
+    /// `slabs`, so a missed invalidation yields a stale `Arc` rather than two
+    /// disagreeing tables, and `the_class_map_memo_tracks_every_slab_transition`
+    /// drives every transition that can change it.
+    ///
+    /// It exists because a reader opens one stream a lane and each open takes this
+    /// map. Rebuilding it per open made stream opening `O( slabs )` work and one
+    /// allocation, which a consumer's allocation guard caught on 2026-10-07; an
+    /// `Arc` clone costs neither.
+    classes: Option<Arc<Vec<Option<NonZeroU8>>>>,
 }
 
 impl Default for Allocator {
@@ -543,6 +559,14 @@ impl Default for Allocator {
         Self::new()
     }
 }
+
+/// One entry of a reader's class map is **one byte**, which is only true because class 0
+/// is reserved and the entry is therefore `Option<NonZeroU8>`.
+///
+/// Checked rather than commented: the niche is the whole reason for the reservation, and
+/// widening the entry to `Option<u8>` -- which has no niche -- would silently double a map
+/// the docs size at one byte a slab.
+const _: () = assert!(std::mem::size_of::<Option<NonZeroU8>>() == 1);
 
 /// The packed page holding `cell` inside a slab of `class`, as `( base, page_size )`.
 ///
@@ -574,6 +598,7 @@ impl Allocator {
             freed_total: 0,
             punch_floor: 0,
             punchable: Vec::new(),
+            classes: None,
         }
     }
 
@@ -614,6 +639,7 @@ impl Allocator {
             .into_iter()
             .map(|s| s.unwrap_or_else(Slab::opaque))
             .collect();
+        a.classes = None;
         a
     }
 
@@ -730,6 +756,7 @@ impl Allocator {
             // its previous class, and `Slab::free()` from restored metadata has
             // no geometry at all.
             self.slabs[id] = Slab::new(class, self.generation);
+            self.classes = None;
             self.active[class as usize] = Some(id as u32);
             return id as u32;
         }
@@ -755,6 +782,7 @@ impl Allocator {
         }
         let id = self.slabs.len() as u32;
         self.slabs.push(Slab::new(class, self.generation));
+        self.classes = None;
         self.active[class as usize] = Some(id);
         id
     }
@@ -839,14 +867,35 @@ impl Allocator {
 
     /// Every slab's class, indexed by slab id, for a reader that cannot take this lock.
     ///
-    /// A copy rather than a borrow, and small: one byte a slab, so a 2 MiB-slab store
+    /// Owned rather than borrowed, and small: one byte a slab, so a 2 MiB-slab store
     /// holding a terabyte needs 512 KiB. Taken under the store lock and then owned, which
     /// is what lets the read path run with no lock at all.
-    pub(crate) fn class_map(&self) -> Vec<Option<u8>> {
+    ///
+    /// Shared behind an `Arc` and rebuilt only when a slab's class or liveness changed,
+    /// so repeated readers of one unchanging store pay a refcount and not a copy. See
+    /// [`Self::classes`].
+    pub(crate) fn class_map(&mut self) -> Arc<Vec<Option<NonZeroU8>>> {
+        if self.classes.is_none() {
+            self.classes = Some(Arc::new(self.class_map_derived()));
+        }
+        Arc::clone(self.classes.as_ref().expect("filled just above"))
+    }
+
+    /// [`Self::class_map`] computed from `slabs`, ignoring the memo.
+    ///
+    /// `NonZeroU8` rather than `u8` so that the vacant case is the niche and an entry is
+    /// **one byte**: `Option<u8>` has none and is two, which made the map twice the size
+    /// its own comment claimed. Class 0 is reserved precisely so that the class can be
+    /// the `NonZeroU8` itself with no offset -- see [`CLASS_SIZES`].
+    ///
+    /// `NonZeroU8::new` returning `None` for a zero class is the right degradation and
+    /// not a lost case: every reader of this map already handles "class unknown", and a
+    /// slab recorded as class 0 has no geometry to report.
+    fn class_map_derived(&self) -> Vec<Option<NonZeroU8>> {
         self.slabs
             .iter()
             .map(|s| match s.state {
-                SlabState::InUse { class, .. } => Some(class),
+                SlabState::InUse { class, .. } => NonZeroU8::new(class),
                 _ => None,
             })
             .collect()
@@ -926,6 +975,7 @@ impl Allocator {
             }
             if slab.used_count == 0 {
                 slab.state = SlabState::Free;
+                self.classes = None;
                 self.retire_from_active(id);
                 // **Offer it, which `free_now` does and this did not.** A slab
                 // freed here is one the committed root does not reach, and at open
@@ -1154,6 +1204,7 @@ impl Allocator {
         self.packed_live.remove(&cell);
         if emptied {
             self.slabs[id as usize].state = SlabState::Free;
+            self.classes = None;
             self.retire_from_active(id);
             // Do not shrink the file: space is returned by **punching a hole**,
             // never by truncating, because truncating under a live mapping is
@@ -1351,14 +1402,14 @@ mod tests {
     #[test]
     fn an_inherited_slab_is_not_reused_while_the_punch_floor_stands() {
         let mut a = Allocator::new();
-        let cells: Vec<u64> = (0..4).map(|_| a.alloc(9).unwrap()).collect();
+        let cells: Vec<u64> = (0..4).map(|_| a.alloc(10).unwrap()).collect();
         let inherited = slab_of(cells[0]);
 
         a.adopt_live_at_open(&BTreeMap::new());
         assert!(matches!(a.slabs[inherited as usize].state, SlabState::Free));
 
         assert_ne!(
-            slab_of(a.alloc(10).unwrap()),
+            slab_of(a.alloc(11).unwrap()),
             inherited,
             "an inherited slab may still be aliased by a container from the \
              previous instance, so it must not be allocated into"
@@ -1367,12 +1418,12 @@ mod tests {
         // And the space is not lost for ever: the floor is what withholds it,
         // and a first open in a process lifts it.
         let mut b = Allocator::new();
-        let cells: Vec<u64> = (0..4).map(|_| b.alloc(9).unwrap()).collect();
+        let cells: Vec<u64> = (0..4).map(|_| b.alloc(10).unwrap()).collect();
         let inherited = slab_of(cells[0]);
         b.adopt_live_at_open(&BTreeMap::new());
         b.allow_punching_inherited_slabs();
         assert_eq!(
-            slab_of(b.alloc(10).unwrap()),
+            slab_of(b.alloc(11).unwrap()),
             inherited,
             "with no floor there is nothing to protect, so the slab is reused"
         );
@@ -1603,7 +1654,7 @@ mod tests {
     #[test]
     fn allocation_is_dense_and_offsets_are_unique() {
         let mut a = Allocator::new();
-        let class = 1u8;
+        let class = 2u8;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             let cell = a.alloc(class).unwrap();
@@ -1620,7 +1671,7 @@ mod tests {
     #[test]
     fn allocation_rolls_over_to_a_new_slab_when_full() {
         let mut a = Allocator::new();
-        let class = 10u8; // bitmaps: fewest slots per slab
+        let class = 11u8; // bitmaps: fewest slots per slab
         let cap = slab_capacity(class);
         for _ in 0..cap {
             a.alloc(class).unwrap();
@@ -1638,7 +1689,9 @@ mod tests {
         // One allocation in each of several classes, as a checkpoint writing
         // mixed-density chunks would do.
         let mut slabs = Vec::new();
-        for class in 1..=5u8 {
+        // 2..=6, not 1..=5: class 1 is the packed page and class 0 is reserved, so the
+        // first five *standalone* classes start at 2.
+        for class in 2..=6u8 {
             let cell = a.alloc(class).unwrap();
             slabs.push(slab_of(cell));
         }
@@ -1661,7 +1714,7 @@ mod tests {
         // and compaction could not recover it because relocated chunks land in
         // the slab that gets abandoned next. See `begin_generation`.
         a.begin_generation();
-        let cell = a.alloc(1).unwrap();
+        let cell = a.alloc(2).unwrap();
         assert_eq!(
             slab_of(cell),
             1,
@@ -1682,15 +1735,15 @@ mod tests {
         a.begin_generation();
 
         // Three live slots in a known slab, and one that nothing references.
-        let live: Vec<u64> = (0..3).map(|_| a.alloc(1).unwrap()).collect();
-        let orphan = a.alloc(1).unwrap();
+        let live: Vec<u64> = (0..3).map(|_| a.alloc(2).unwrap()).collect();
+        let orphan = a.alloc(2).unwrap();
         let slab = slab_of(live[0]);
         assert_eq!(slab_of(orphan), slab, "the fixture wants them in one slab");
 
         let mut map: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         let entry = map.entry(slab).or_default();
         for c in &live {
-            entry.insert(slot_index(*c, 1).unwrap());
+            entry.insert(slot_index(*c, 2).unwrap());
         }
 
         assert_eq!(
@@ -1700,11 +1753,11 @@ mod tests {
         );
         for c in &live {
             assert!(
-                a.slab(slab).unwrap().is_set(slot_index(*c, 1).unwrap()),
+                a.slab(slab).unwrap().is_set(slot_index(*c, 2).unwrap()),
                 "adoption freed a referenced slot"
             );
         }
-        assert!(!a.slab(slab).unwrap().is_set(slot_index(orphan, 1).unwrap()));
+        assert!(!a.slab(slab).unwrap().is_set(slot_index(orphan, 2).unwrap()));
 
         // A slab whose contents this process never learned must come through
         // untouched. Today that is enforced twice over: `Slab::opaque` carries
@@ -1735,7 +1788,7 @@ mod tests {
     #[test]
     fn reclaim_requires_all_three_conditions() {
         let mut a = Allocator::new();
-        let cell = a.alloc(1).unwrap();
+        let cell = a.alloc(2).unwrap();
         a.defer_free(cell, 100);
         assert_eq!(a.deferred_count(), 1);
 
@@ -1891,7 +1944,7 @@ mod tests {
     #[test]
     fn a_misaligned_cell_is_refused() {
         let mut a = Allocator::new();
-        let cell = a.alloc(1).unwrap();
+        let cell = a.alloc(2).unwrap();
         assert!(a.owning_class(cell).is_some(), "the slot base resolves");
         assert!(
             a.owning_class(cell + 1).is_none(),
@@ -1911,7 +1964,7 @@ mod tests {
     #[test]
     fn reclaimed_slot_is_reused_only_after_a_fresh_generation() {
         let mut a = Allocator::new();
-        let cell = a.alloc(1).unwrap();
+        let cell = a.alloc(2).unwrap();
         a.defer_free(cell, 0);
         assert_eq!(a.reclaim(u64::MAX, RECLAIM_CKPT_DELAY, |_, _| false), 1);
         assert_eq!(a.slab(0).unwrap().used_count(), 0);
@@ -1952,7 +2005,7 @@ mod tests {
     #[test]
     fn evacuation_candidates_are_emptiest_first() {
         let mut a = Allocator::new();
-        let class = 10u8;
+        let class = 11u8;
         let cap = slab_capacity(class);
 
         // Fill three slabs, then free most of slab 0 and some of slab 1.
@@ -1986,7 +2039,7 @@ mod tests {
     #[test]
     fn slot_liveness_is_queryable_for_rebuild() {
         let mut a = Allocator::new();
-        let class = 1u8;
+        let class = 2u8;
         let c0 = a.alloc(class).unwrap();
         let c1 = a.alloc(class).unwrap();
         let slab = a.slab(slab_of(c0)).unwrap();
@@ -2019,6 +2072,121 @@ mod tests {
         assert!(a.alloc(99).is_err());
     }
 
+    /// Class 0 is reserved, and reserved means *not a class* at every level.
+    ///
+    /// The point of the reservation is that a zero byte is never a class -- in a slab's
+    /// persisted metadata, where an absent or torn block is all zeros, and in a reader's
+    /// class map, where it is what lets an entry be one byte instead of two. Both rest on
+    /// nothing being able to hand class 0 a geometry, so that is what is asserted here
+    /// rather than the size of the ladder.
+    #[test]
+    fn class_zero_is_not_a_class() {
+        assert_eq!(CLASS_SIZES[0], 0, "the reserved entry must stay sized 0");
+        assert!(class_size(0).is_none(), "class 0 must have no slot size");
+        assert_eq!(slab_capacity(0), 0, "class 0 must admit no slot");
+        assert!(
+            !is_packed_class(0),
+            "class 0 must not be the packed class, or a zeroed metadata block              would decode as a packed slab"
+        );
+
+        let mut a = Allocator::new();
+        assert!(
+            matches!(a.alloc(0), Err(CodecError::Invariant("unknown size class"))),
+            "allocating into the reserved class must be refused"
+        );
+
+        // No payload may round up into it, which is the other half: `class_for` picks by
+        // size, and a zero-sized entry satisfies every `need` of 0.
+        for len in [0usize, 1, 64, 568, 4096, crate::BITMAP_BYTES] {
+            assert_ne!(class_for(len), Some(0), "class_for({len}) reached class 0");
+        }
+
+        // And a foreign file cannot re-enable it. The ladder is persisted, so a stored
+        // ladder with a real size at entry 0 would make every reader's "absent" marker
+        // name a slot geometry.
+        let mut retuned = CLASS_SIZES.to_vec();
+        retuned[0] = 576;
+        assert!(
+            matches!(
+                crate::store::extent::validate_ladder(&retuned),
+                Err(CodecError::Invariant(
+                    "class 0 is reserved and its ladder entry must be 0"
+                ))
+            ),
+            "a ladder that sizes class 0 must be refused"
+        );
+    }
+
+    /// The memoized class map must equal the derived one after every transition that can
+    /// change it.
+    ///
+    /// # Why this test exists
+    ///
+    /// [`Allocator::class_map`] is memoized because a reader takes it once per stream
+    /// open, and a missed invalidation is **invisible**. The map is read only by a
+    /// published chunk reader, which would then resolve a cell believing its slab still
+    /// holds the old class -- landing at a plausible offset inside the right slab and
+    /// decoding whatever is there. Nothing errors and no checksum is wrong, because the
+    /// bytes it reads are real bytes. So the invalidation is checked against the
+    /// derivation at each transition here rather than left for the read path to expose.
+    #[test]
+    fn the_class_map_memo_tracks_every_slab_transition() {
+        fn check(a: &mut Allocator, what: &str) {
+            let memo = a.class_map();
+            assert_eq!(
+                *memo,
+                a.class_map_derived(),
+                "the memoized class map went stale after {what}"
+            );
+        }
+
+        let mut a = Allocator::new();
+        check(&mut a, "open");
+
+        // Opening the first slab of a class: the push path in `new_slab_for`.
+        a.begin_generation();
+        let first = a.alloc(2).unwrap();
+        check(&mut a, "the first allocation");
+
+        // A second class, so the map has more than one entry to go stale.
+        a.alloc(6).unwrap();
+        check(&mut a, "a second class");
+
+        // Rolling into another slab of the same class.
+        let cap = slab_capacity(11);
+        for _ in 0..=cap {
+            a.alloc(11).unwrap();
+        }
+        check(&mut a, "rolling over into a new slab");
+
+        // Emptying a slab: the `Free` transition in `free_now`.
+        a.defer_free(first, 0);
+        assert_eq!(a.reclaim(u64::MAX, RECLAIM_CKPT_DELAY, |_, _| false), 1);
+        check(&mut a, "freeing a slab's last slot");
+
+        // Re-initializing that free slab for a different class, which is the transition
+        // that actually changes a *class* rather than only its liveness -- and so the one
+        // a stale map resolves to the wrong slot size.
+        a.begin_generation();
+        let reused = a.alloc(7).unwrap();
+        assert_eq!(
+            slab_of(reused),
+            slab_of(first),
+            "the fixture wants the freed slab reused, or it checks nothing"
+        );
+        check(&mut a, "reusing a free slab for another class");
+
+        // Adoption at open, which frees every slab the index does not reach.
+        let mut b = Allocator::new();
+        b.alloc(3).unwrap();
+        b.adopt_live_at_open(&BTreeMap::new());
+        check(&mut b, "adoption at open");
+
+        // And a restore, whose slab table arrives wholesale.
+        let mut c = Allocator::restore(vec![None, Some(Slab::new_for_test(4, 1))]);
+        check(&mut c, "restore");
+    }
+
     /// Reclamation must gate on **reachability**, not on a version proxy.
     ///
     /// An extent superseded by checkpoint `k` is reachable from the roots of
@@ -2035,7 +2203,7 @@ mod tests {
     fn reclamation_gates_on_the_superseding_checkpoint_not_the_version() {
         let mut a = Allocator::new();
         a.begin_generation();
-        let cell = a.alloc(1).unwrap();
+        let cell = a.alloc(2).unwrap();
         // Superseded by checkpoint 7.
         assert!(a.defer_free(cell, 7));
 

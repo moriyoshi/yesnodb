@@ -36,7 +36,7 @@
 //!  0  u16  magic
 //!  2  u8   version
 //!  3  u8   state      0 = Free, 1 = InUse
-//!  4  u8   class
+//!  4  u8   class      never 0: class 0 is reserved, so a zero byte is not a class
 //!  5  [3]  reserved
 //!  8  u32  generation
 //! 12  u32  used_count
@@ -53,6 +53,7 @@
 use crate::error::{CodecError, Result};
 use crate::store::alloc::{slab_capacity, Slab, SlabState};
 use crate::store::checksum::crc32c;
+use crate::store::extent::class_size;
 use crate::store::SLAB_META;
 
 pub const MAGIC: u16 = 0x5953; // "SY"
@@ -143,6 +144,16 @@ pub fn decode(b: &[u8]) -> Option<Slab> {
         STATE_FREE => Some(Slab::free()),
         STATE_IN_USE => {
             let class = b[OFF_CLASS];
+            // A class this build does not implement -- including the reserved class 0,
+            // which is what a zero byte here is.
+            //
+            // **The capacity cross-check below does not catch it.** `slab_capacity`
+            // answers 0 for a class it does not know and `fits( 0 )` holds, so a block
+            // claiming an unknown class with capacity 0 is internally consistent and used
+            // to decode as an `InUse` slab with no geometry: a slab the allocator believes
+            // is occupied, never reuses, and reports no class for. Leaked space rather
+            // than lost data, which is why it went unnoticed.
+            class_size(class)?;
             let gen = u32::from_le_bytes(b[OFF_GEN..OFF_GEN + 4].try_into().ok()?);
             let used_count = u32::from_le_bytes(b[OFF_USED..OFF_USED + 4].try_into().ok()?);
             let capacity = u32::from_le_bytes(b[OFF_CAP..OFF_CAP + 4].try_into().ok()?);
@@ -269,6 +280,48 @@ mod tests {
     fn a_block_of_zeros_is_not_mistaken_for_a_valid_slab() {
         // An unwritten region reads as zeros, and must not look like "free".
         assert!(decode(&vec![0u8; SLAB_META as usize]).is_none());
+    }
+
+    /// A block that names a class this build has no geometry for is refused, CRC or not.
+    ///
+    /// Class 0 is the reserved one and is the case that matters, since a zero is what a
+    /// stray or mis-offset byte most often is. The capacity cross-check cannot do this:
+    /// `slab_capacity` answers 0 for an unknown class and `fits( 0 )` holds, so such a
+    /// block is self-consistent and used to decode as an `InUse` slab with no geometry --
+    /// a slab held occupied for ever and reported to no reader.
+    #[test]
+    fn a_block_naming_a_class_this_build_lacks_is_rejected() {
+        let class = class_for(crate::BITMAP_BYTES).unwrap();
+        let reseal = |mut b: Vec<u8>, class: u8, capacity: u32| {
+            b[OFF_CLASS] = class;
+            b[OFF_CAP..OFF_CAP + 4].copy_from_slice(&capacity.to_le_bytes());
+            b[OFF_USED..OFF_USED + 4].fill(0);
+            b[OFF_BITMAP..].fill(0);
+            let mut p = b.clone();
+            p[OFF_CRC..OFF_CRC + 4].fill(0);
+            let crc = crc32c(&p);
+            b[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+            b
+        };
+        let good = encode(&in_use(class, &[3, 9])).unwrap();
+        for bad in [0u8, CLASS_SIZES.len() as u8, u8::MAX] {
+            // Capacity 0 is what makes this self-consistent, and therefore the shape the
+            // old check let through.
+            let b = reseal(good.clone(), bad, 0);
+            assert_eq!(
+                crc32c(&{
+                    let mut p = b.clone();
+                    p[OFF_CRC..OFF_CRC + 4].fill(0);
+                    p
+                }),
+                u32::from_le_bytes(b[OFF_CRC..OFF_CRC + 4].try_into().unwrap()),
+                "the fixture must have a valid CRC, or it proves nothing"
+            );
+            assert!(
+                decode(&b).is_none(),
+                "a block naming class {bad} was accepted"
+            );
+        }
     }
 
     #[test]

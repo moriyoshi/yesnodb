@@ -1848,3 +1848,123 @@ If the second dominates, no further lock work will help and the per-read shared-
 traffic has to be designed out. Measure which before building either -- this thread has
 now produced one regression and one 9.5% gain by guessing at the mechanism, and the
 guesses that worked were the ones the entry had already reasoned through.
+
+## 2026-10-07 — A shared published view, and class 0 reserved so the map fits in a byte
+
+### What happened
+
+haiiie's calibrated allocation guard `yesno_tiled_width_does_not_allocate_a_mask_per_lane`
+failed on the read-concurrency work: 2245 allocations at `52ab729`, 2493 at the committed
+`30aa4fc`, 2741 at the uncommitted published-segment-list change. Their instruction was
+exact and correct: **share these published metadata views per snapshot/shard before
+committing; do not raise the calibrated guard.**
+
+The arithmetic names the mechanism with no measurement needed. Their fixture runs 248
+lanes, the two deltas are +248 and +248, so each was **one allocation a lane**:
+`KeyStream::over` captured a `PublishedChunks` per open, and `published_chunks()` copied
+`Alloc::class_map()` ( a `Vec`, one entry a slab ) and `SegmentedMmap::published_segments()`
+( a `Vec`, one `Arc` a segment ). Both are views every lane shares, and a reader whose
+workload is one key and many lanes opens one stream a lane, so the cost was `O( lanes )`
+for data that is identical across them.
+
+Worse than the caveat I wrote. `PublishedChunks`'s own doc comment said "the class map is
+a copy taken under the store lock, one byte a slab", framed as the price of dropping the
+per-chunk lock. That framing is per *reader*; the workload is per *lane*, and I had
+already recorded that readers of one key are readers of one shard. The cost I described as
+bounded was the cost multiplied by the thing the whole change exists to parallelize.
+
+### The fix: share, do not copy
+
+Neither view needs to be copied, because neither is mutated in place.
+
+* `SegmentedMmap.segs` is now `Mutex<Arc<Vec<Arc<MmapSegment>>>>`, so
+  `published_segments()` is an `Arc` clone. The list is append-only, so growth under
+  `Arc::make_mut` copies **only while a reader holds the previous snapshot** -- which is
+  exactly the case where mutating in place would be wrong. `remap_to_file_len` now returns
+  early when the file has not grown, so the common path takes the lock and no copy.
+* `Allocator::class_map()` is memoized behind an `Arc`, dropped at the five transitions
+  that can change it ( the push and reuse paths of `new_slab_for`, the `Free` transitions
+  in `adopt_live_at_open` and `free_now`, and `restore` ).
+
+`published_chunks()` is now three `Arc` clones and no allocation. The per-open cost is one
+allocation -- the `BoxedStream` that `ChunkSource::open` returns by signature -- which is
+what the consumer's passing 2245 baseline already contained.
+
+**A memo and not a parallel structure**, deliberately. The map is still derived from
+`slabs`, so a missed invalidation yields a stale `Arc` rather than two tables that
+disagree, and `the_class_map_memo_tracks_every_slab_transition` drives each transition and
+compares against `class_map_derived`. A debug-build recompute-and-compare was considered
+and rejected: it allocates once per call, which is precisely what the allocation guards
+measure.
+
+### Class 0 is now reserved, which is what makes the map one byte
+
+The entry was `Option<u8>`, and the user pointed out that this is **two** bytes: `u8` has
+no niche. The comment next to it claimed one byte a slab, 512 KiB for a terabyte of 2 MiB
+slabs, and had been claiming it since the field existed. `Option<NonZeroU8>` is one byte,
+but `PACKED_CLASS` was 0 and in constant use, so a `NonZeroU8` could not hold it.
+
+I first wrote a `ClassTag` newtype storing `class + 1` and argued the renumber was the
+wrong trade: persisted class byte, persisted ladder, `fsck`, fixtures. **The user pushed
+back and was right.** Reading rather than assuming:
+
+* `slab_capacity` already did `class_size( class ).filter( |s| *s > 0 )`, so a zero ladder
+  entry was *already* "not a class". The design anticipated this.
+* The ladder is persisted in the superblock **and compared for exact equality at open**, so
+  a file with any other ladder is refused outright rather than misread. The format change
+  is detected loudly and the project is unpublished, so it costs nothing.
+* No test hardcoded a class *name*; what they hardcoded were class *numbers*, and those
+  shift mechanically by one.
+
+So `CLASS_SIZES` gained a reserved entry 0 sized 0, `PACKED_CLASS` is 1, and `class_size`
+filters the zero -- which reserves the class **everywhere**, because every geometry
+derivation consults that one function. `ClassTag` was deleted; the map is
+`Option<NonZeroU8>` holding the class itself, with `const _: () = assert!( size_of::<
+Option< NonZeroU8 > >() == 1 )` so the niche cannot be lost again.
+
+It also closed a real hole on the disk side, which was not the hole I first claimed. An
+all-zero metadata block was already refused by the magic and the CRC, so the torn-block
+story I wrote first was wrong and is corrected in the comment. What *was* reachable: a
+block whose CRC holds naming a class this build does not implement. `slab_capacity`
+answers 0 for it and `fits( 0 )` holds, so the stored-capacity cross-check passed and the
+slab came back `InUse` with no geometry -- occupied for ever, reported to no reader. Leaked
+space, not lost data, which is why nothing caught it. `slabmeta::decode` now rejects on
+`class_size( class ).is_none()`, which is structural rather than derived, and
+`a_block_naming_a_class_this_build_lacks_is_rejected` pins it for class 0, for one past the
+ladder, and for `u8::MAX`.
+
+### Eight lib tests broke, all of them tests
+
+Production behaviour was unchanged by the renumber; every failure was a test holding a
+class number as a literal. Worth recording because it is the measure of the blast radius
+the renumber actually had: five in `alloc` ( literals 1, 9, 10 meaning the first standalone
+class, the second-widest, and the bitmap class ), two in `superblock` ( retuned-ladder
+fixtures that now need a reserved entry 0 ), one in `extent` ( the adjacent-ratio loop,
+which divided by the reserved 0 and got `inf` ). `for class in 1..=5u8` had meant "the
+first five standalone classes" and silently became "the packed class and four standalone
+ones", which is the only failure that needed reading rather than shifting.
+
+### A stale paragraph corrected
+
+`ARCHITECTURE.md`'s size-class section said "The ladder is persisted in the superblock, not
+compiled in. Retuning it is therefore not a format break, and a file written by a
+differently-tuned binary stays readable." That has been false since the exact-equality
+comparison landed, and `a_ladder_this_build_cannot_honour_is_refused_rather_than_misread`
+has been pinning the opposite. I relied on the *true* version of that fact to justify the
+renumber, which is the only reason I read the code rather than the paragraph.
+
+### What a later session should take from this
+
+* **A per-reader cost is not a per-reader cost if the workload opens a reader a lane.**
+  Both copies were introduced by me, under a comment I wrote stating the price, in a change
+  whose entire purpose was to let many readers run at once.
+* **The consumer's guard found it and this crate's did not.** `tests/allocation.rs` had
+  seven mentions of `key_stream` and no coverage of growth *per open*; it measured
+  allocations per *chunk walked*. `opening_a_stream_does_not_allocate_per_open` now
+  compares 8 opens against 128 over a cached `Expr::Source`, so the plan is built once and
+  only the open is counted. Its budget is **one, the box, and it says why** -- a budget
+  stated without its floor is a number the next person rounds up.
+* **"It would touch too much" deserves a grep before it is said.** The renumber's real cost
+  was eleven test literals, two superblock fixtures and one ratio loop, in a design that had
+  already made room for a zero entry. I argued against it from a list of places the class
+  byte *appears*, which is not the same as the places that would *break*.
