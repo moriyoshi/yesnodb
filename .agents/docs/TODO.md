@@ -1378,7 +1378,7 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
 
   **So the blocker is the mechanism, not the structure.** Per-commit thread spawning is too coarse at these timescales; this needs a persistent pool, and `yesno-core` deliberately has no background threads -- the stall comment in `enforce_policy` states the position directly, that the writer *is* the checkpointer. Revisit if a pool arrives for another reason, or if a workload shows commits large enough that 120 us of spawn is noise. Do **not** revisit on the strength of the sum alone: it is real, and it is smaller than the spawn.
 
-- [ ] **staggered-checkpointing** ( *2026-09-16, proposed by the consumer from their tail-shape data; verified here as a genuine gap* ): `Db::checkpoint` takes every shard **back to back in one call** -- `checkpoint_inner` loops `self.inner.shards` -- and `enforce_policy` calls that same entry point. Spreading the per-shard checkpoints in **time** would turn an existing accident into a knob.
+- [x] **staggered-checkpointing** ( **DONE 2026-10-06**: `Db::checkpoint_staggered( gap )` pauses between shards and `checkpoint()` delegates to it with `ZERO`, so **nothing changes by default** and `enforce_policy` keeps calling the unstaggered path -- which matters because a commit can trigger a checkpoint on the writer's own thread, and a knob that slowed that would be a throughput regression sold as a latency fix. That is the asymmetry this entry argued for: a percentile objective takes it, a throughput objective never sees it. The pause sits between shards holding **nothing**: every lock the loop takes is acquired and released inside one iteration, so the gap is the one window in a checkpoint where a reader gets in. **The staleness it introduces is conservative by construction and is documented at the site**: the safe version and reader floor are sampled once before any shard lock -- resampling per shard would free an extent a reader registered in between still needs -- so a gap makes those samples older and later shards reclaim *less*, which is the right direction to err and is the knob's real cost. The backup barrier lease spans the call, so a staggered checkpoint also delays a concurrent base backup by about the total gap. Two tests: a staggered checkpoint persists exactly what an unstaggered one does, asserted after a reopen so it is about what reached disk and carrying no timing; and the gap is taken between shards, as a **lower** bound because `sleep` overshoots but never returns early. **The second test was fragile and the regression said so**: at a 25 ms gap the threshold was 75 ms while this fixture's unstaggered checkpoint measured 67 ms on a host running another project's fsync benchmark, so a slower machine would have let an implementation that never slept pass. Widened to 60 ms ( 3.2x margin ) and given a relative bound as well, since an absolute bound on the default path is really a bound on fsync. Measured motivation from the same day: checkpoint latency already scales 14.3 -> 56.2 ms from 1 to 20 shards because the loop runs them back to back ) ( *2026-09-16, proposed by the consumer from their tail-shape data; verified here as a genuine gap* ): `Db::checkpoint` takes every shard **back to back in one call** -- `checkpoint_inner` loops `self.inner.shards` -- and `enforce_policy` calls that same entry point. Spreading the per-shard checkpoints in **time** would turn an existing accident into a knob.
 
   **The quoted consumer totals now overstate the stall** ( noted 2026-10-06 ): the exclusive region was measured at 0.8-25.2 ms with reader stalls tracking it to within 0.4 ms after the enumeration hoist, so the millisecond figures below are an upper bound from before that change. The invariant-total, varying-distribution argument this entry rests on is unaffected, which is why the entry stands.
 
@@ -1501,6 +1501,36 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
   * **Checkpoint holds the store lock across its entire body** ( `mod.rs` 2730-2907: tree rebuild, superblock flip, deferred reclamation ). One long exclusive hold. **No longer true as of 2026-10-06, and the correction weakens this bullet rather than removing it**: checkpoint takes the lock, drops it for the durability sequence and retakes it, with a `Shard::ckpt` guard closing the window that opened, and node enumeration is a separate short hold. Reclamation still runs under the lock, so the writer-starvation objection to `RwLock` survives in smaller form. The `keystream.rs` line numbers in this entry have also drifted.
 
   `std::sync::RwLock` is not writer-preferring, and sustained full-occupancy reading is precisely the shape that starves a writer. **A starved checkpoint is not a latency problem**: checkpointing is what bounds WAL growth and what runs `reclaim_deferred`, so delaying it converts a throughput issue into a disk-space one -- a worse failure than the one being fixed. Measure a read/write mix, not only a read sweep, before believing any figure here.
+
+  **Consumer evidence on a real workload, 2026-10-06, and it removes this entry's only existing
+  mitigation.** haiiie reports a persisted index of 1 002 235 rows, 71 588 forward chunks a query, zero
+  scorer so traversal only, medians over 10-12 queries: **1 worker 71.4 ms** ( 71.1 ms CPU, 0 voluntary
+  switches ), **2 workers 61.8 ms**, **4 workers 79.1 ms**, **8 workers 96.6 ms** ( 51-58 ms CPU each,
+  4.9-5.2k voluntary switches, no page faults ). A smaller index shows the same shape, 34.6 ms to 54.7 ms.
+  Exploratory and not quiet-gated, but the effect is far above noise.
+
+  **Why it matters more than the sweep above**: their rows for one index are **one key, hence one shard**,
+  and each worker opens its own `KeyStream` over that same key. So every worker queues on one mutex once
+  per 8 KiB chunk, and *more shards cannot help* -- the knob this entry offers as the existing mitigation
+  is unavailable to that shape. Two workers beat one and four are worse than one, which is a lock convoy
+  rather than saturation.
+
+  **It also reconciles a discrepancy in this entry's own numbers.** The critical section is recorded here
+  as 278 ns; theirs is about **1 us a chunk**, because an 8 KiB bitmap costs more to verify and decode
+  under the lock than a sparse chunk does. The local sweep of 2026-10-06 saw the same thing from the other
+  side -- 64-ordinal chunks gave 3 845 Kr/s against the 952 recorded -- so **the section's length is a
+  property of chunk density, not a constant**, and the denser the data the more serialization costs. That
+  weakens this entry's "hold time is not the bottleneck" framing for dense workloads without overturning
+  it for sparse ones.
+
+  **Their question, and the answer from the source**: can an already published, immutable chunk be read
+  without the exclusive mutex, via a shared or published reader like the one `build_plan` uses?
+  `ShardStore::read_container_for` is **`&self`**, so the read genuinely needs only a shared borrow and the
+  exclusivity is an artifact of the lock *type* rather than of the operation -- which is what the 10-of-13
+  classification above already established. The blockers are unchanged and are both below: writer
+  starvation under a non-writer-preferring `RwLock`, and the inner segment mutexes becoming load-bearing.
+  Full write-up in their tree at `.agents-workspace/tmp/scaled-threads/FINDING.md`; nothing in this tree
+  was touched by them.
 
   **A trap for anyone doing both halves: the inner `segs` / `pinned` / `verified` mutexes in `store/segment.rs` are redundant *only while the store lock is exclusive*.** `SegmentedMmap` is owned by value inside `ShardStore` and every production access is under `Mutex<ShardStore>`, so those three acquisitions per read currently guard against a race that cannot happen. Convert the store lock to `RwLock` and they immediately **become load-bearing**, because concurrent readers would then mutate `pinned` and `verified` at once. Removing them first and converting second gives data races on two `BTreeMap`s, and each step looks locally justified. See JOURNAL 2026-09-14.
 

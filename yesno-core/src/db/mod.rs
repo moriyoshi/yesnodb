@@ -2703,6 +2703,40 @@ impl Db {
     /// Returns the watermark that is now durable. A no-op for an in-memory
     /// database.
     pub fn checkpoint(&self) -> Result<Version> {
+        self.checkpoint_staggered(std::time::Duration::ZERO)
+    }
+
+    /// [`Self::checkpoint`], pausing `gap` between shards.
+    ///
+    /// **A knob, never a default, and the asymmetry is the reason.** A caller
+    /// serving a percentile objective wants the exclusive regions spread; one
+    /// serving throughput would only see a slower call. So `checkpoint` passes
+    /// `ZERO` and `enforce_policy` keeps calling that, which means the write
+    /// path -- where a commit can trigger a checkpoint on the writer's own
+    /// thread -- cannot be slowed by this.
+    ///
+    /// **What spreading buys is distribution, not total.** A query reading keys
+    /// on every shard blocks once per shard and waits the whole exclusive hold
+    /// however it is divided, so the sum is invariant: the consumer measured
+    /// 5 341 / 5 993 / 4 892 ms at 1 / 8 / 32 shards and the shape reproduced
+    /// here four orders of magnitude smaller. What changes is the profile --
+    /// one shard gives few severe stalls, thirty-two gives many mild ones.
+    /// Before this existed, `checkpoint` was the only entry point and it took
+    /// every shard back to back, so a caller could choose *when* to checkpoint
+    /// but not how to spread one.
+    ///
+    /// **The staleness this introduces is conservative by construction.** The
+    /// safe version and the reader checkpoint floor are sampled once before any
+    /// shard lock, deliberately -- resampling per shard would let them advance
+    /// mid-loop and free an extent a reader registered in between still needs.
+    /// A gap makes those samples older relative to wall clock, so later shards
+    /// reclaim *less* than they could. That is the right direction to err, and
+    /// it is the cost of the knob: a long gap trades reclamation for latency.
+    ///
+    /// The backup barrier lease is held for the whole call, so a staggered
+    /// checkpoint also delays a concurrent base backup by roughly the total
+    /// gap.
+    pub fn checkpoint_staggered(&self, gap: std::time::Duration) -> Result<Version> {
         let _checkpoint_lease = self.inner.backup_barrier.begin_checkpoint();
         let operation_id = events::next_operation_id();
         let watermark = self.inner.oracle.visible();
@@ -2727,7 +2761,7 @@ impl Db {
                 wal_bytes,
             },
         );
-        match self.checkpoint_inner(operation_id) {
+        match self.checkpoint_inner(operation_id, gap) {
             Ok(watermark) => {
                 events::emit(
                     &self.inner.events,
@@ -2766,7 +2800,11 @@ impl Db {
         }
     }
 
-    fn checkpoint_inner(&self, operation_id: events::OperationId) -> Result<Version> {
+    fn checkpoint_inner(
+        &self,
+        operation_id: events::OperationId,
+        gap: std::time::Duration,
+    ) -> Result<Version> {
         self.last_checkpoint.store(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2797,10 +2835,20 @@ impl Db {
             hook();
         }
 
+        // Counted rather than derived from `shard_id`, because a shard with no
+        // store is skipped above and must not consume a gap it never used.
+        let mut checkpointed_one = false;
         for (shard_id, shard) in self.inner.shards.iter().enumerate() {
             let Some(store_lock) = shard.store.as_ref() else {
                 continue;
             };
+            // Between shards, holding nothing: every lock this loop takes is
+            // acquired below and released at the end of the iteration, so the
+            // pause is the one place in a checkpoint where a reader can get in.
+            if checkpointed_one && !gap.is_zero() {
+                std::thread::sleep(gap);
+            }
+            checkpointed_one = true;
 
             // Snapshot the memtable at W. Holding the write lock keeps the set
             // of dirty chunks stable for the duration.
@@ -6752,6 +6800,115 @@ mod tests {
         b.commit().unwrap();
         let snap = db.snapshot().unwrap();
         assert_eq!(snap.load(1).unwrap().iter().collect::<Vec<_>>(), vec![5]);
+    }
+
+    /// A staggered checkpoint persists exactly what an unstaggered one does.
+    ///
+    /// The knob is about *when* each shard's exclusive region runs, never about what it
+    /// writes, so this is the assertion that matters and it carries no timing. The gap
+    /// also makes the once-sampled safe version and reader floor older, which reclaims
+    /// less rather than more -- so a difference here would mean the stagger had changed
+    /// visibility, which is the failure worth catching.
+    #[test]
+    fn a_staggered_checkpoint_persists_what_an_unstaggered_one_does() {
+        let plain = tmpdir("ckpt-plain");
+        let spread = tmpdir("ckpt-spread");
+        let ordinals: Vec<u64> = (0..4_000u64).map(|i| i * 37).collect();
+
+        let mut seen = Vec::new();
+        for (dir, gap) in [
+            (&plain, std::time::Duration::ZERO),
+            (&spread, std::time::Duration::from_millis(3)),
+        ] {
+            let db = Db::open_with(
+                dir,
+                DbOptions {
+                    shards: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for key in 0..8u64 {
+                db.insert_many(key, &ordinals).unwrap();
+            }
+            let version = db.checkpoint_staggered(gap).unwrap();
+            drop(db);
+
+            // Reopened, so the assertion is about what reached disk rather than what the
+            // memtable still remembers.
+            let db = Db::open_with(
+                dir,
+                DbOptions {
+                    shards: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let snap = db.snapshot().unwrap();
+            let mut cards = Vec::new();
+            for key in 0..8u64 {
+                cards.push(snap.load(key).unwrap().len());
+            }
+            seen.push((version, cards));
+        }
+        assert_eq!(
+            seen[0].1, seen[1].1,
+            "a gap between shards must not change what is persisted"
+        );
+        assert_eq!(
+            seen[0].1[0],
+            ordinals.len() as u64,
+            "the fixture itself must have persisted"
+        );
+    }
+
+    /// The gap is actually taken, and taken between shards rather than once.
+    ///
+    /// A **lower** bound, because `sleep` may overshoot but never returns early, so this
+    /// cannot fail on a slow or loaded host -- which matters for an assertion about time
+    /// in a suite that runs beside other work. Four shards means three gaps, and the
+    /// unstaggered control shares the fixture so a machine slow enough to confuse them
+    /// would fail the comparison rather than pass it vacuously.
+    #[test]
+    fn a_gap_is_taken_between_shards_and_not_by_the_default_path() {
+        let dir = tmpdir("ckpt-gap");
+        let db = Db::open_with(
+            &dir,
+            DbOptions {
+                shards: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.insert_many(1, &[1, 2, 3]).unwrap();
+
+        // 60 ms, so three gaps are 180 ms against the ~67 ms this fixture's
+        // unstaggered checkpoint measured on a host running another project's fsync
+        // benchmark. That margin is the point: at 25 ms the threshold was 75 ms and the
+        // real work 67 ms, so a slower host would have let an implementation that never
+        // slept pass this test. Verified by regressing the sleep away, which fails here.
+        let gap = std::time::Duration::from_millis(60);
+        let t = std::time::Instant::now();
+        db.checkpoint_staggered(gap).unwrap();
+        let staggered = t.elapsed();
+
+        db.insert_many(1, &[4]).unwrap();
+        let t = std::time::Instant::now();
+        db.checkpoint().unwrap();
+        let plain = t.elapsed();
+
+        // Three gaps for four shards: the first shard pays none.
+        assert!(
+            staggered >= gap * 3,
+            "four shards must take three gaps, got {staggered:?}"
+        );
+        // Relative as well as absolute, because an absolute bound on the default path is
+        // a bound on fsync and this suite runs beside other work. The default must be at
+        // least two gaps faster than the staggered call on the same database.
+        assert!(
+            plain + gap * 2 < staggered,
+            "the default path must take no gaps: {plain:?} against {staggered:?}"
+        );
     }
 
     fn tmpdir(name: &str) -> CleanDir {
