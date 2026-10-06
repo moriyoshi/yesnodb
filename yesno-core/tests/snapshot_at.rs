@@ -270,7 +270,10 @@ fn snapshot_is_snapshot_at_visible() {
 /// to give it back. A leak here is invisible in every functional test and shows
 /// up much later as "snapshot registry is full", or as a floor that never rises
 /// because a phantom reader pins it — the reclamation bug this crate has already
-/// recorded once under `reader-registry-pid-reuse`.
+/// recorded once, where a slot stayed claimed after its reader was gone and the
+/// floor never rose again. ( That entry is closed and its text is gone, so the
+/// reasoning is stated here rather than pointed at: a dangling pointer is worse
+/// than prose, because prose cannot dangle. )
 #[test]
 fn a_refused_snapshot_releases_its_slot() {
     let dir = CleanDir::new("noleak");

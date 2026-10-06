@@ -1096,3 +1096,166 @@ exactly the case the skip-reporting exists for. Rust: `cargo +1.99 clippy --work
 interoperability test, so the next wire change will break it silently again and Go and Python will
 be the ones to say so. The shared hex vector narrows that to changes a vector cannot express; it
 does not close it.
+
+## 2026-10-06 -- a TODO sweep, and what a backlog of 65 actually contained
+
+Ran the `tackle-todos` sweep over `.agents/docs/TODO.md` ( 65 open, 40 closed ). The
+dispatched work is small; the sweep itself produced more than the work did, which is
+the reusable part.
+
+**Step 1 came back empty, and that is a result rather than an absence.** 21 matches
+for `TODO` / `FIXME` across every crate, and not one is a dispatchable marker: all 21
+are doc comments *citing* a `TODO.md` slug by name. The backlog lives entirely in one
+file, and `scripts/check-todo-refs.py` is the only thing keeping those citations
+honest. A sweep that greps for markers would have reported this tree as having no
+outstanding work at all.
+
+**22 entries were verified against the tree before any was worked, which closed two
+and demoted none.** `hole-punching-is-documented-but-not-implemented` and
+`arbitrary-precision-integers-in-the-expression-language` are done, with evidence, and
+are now ticked carrying their residuals rather than a bare tick -- punching's
+monotonic space pattern belongs to evacuation ( `EVACUATE_PER_CHECKPOINT` is still 0 ),
+which is the entry's own prediction about its option ( b ), and the big-integer work
+left `AnyExpr::decode` unfuzzed. Three are partial: `flight-dense-set-results`,
+`no-session-guarantees-on-the-flight-surface`, and
+`checkpoint-super-floor-work-still-holds-store-lock`, where `build_updating` is still
+89-95% of the exclusive region -- the same figure measured from the other side earlier
+the same day.
+
+**One entry must stay open and must not be ticked.**
+`miri-cannot-reach-the-mmap-unsafe-sites` has no deliverable left, but
+`scripts/check-unsafe-count.py` carries its slug and `scripts/gate.sh` cites it by
+name, so closing or deleting it reddens a gate step. It is a standing record whose
+only maintenance is already mechanized. Worth stating because every sweep will re-raise
+it.
+
+### The citation triage, and why the obvious fix is vacuous
+
+`slug-citations-inside-agent-docs-are-unchecked` asks for `check-todo-refs.py` to cover
+the agent docs. **It cannot, and the reason is structural rather than a matter of
+taste.** The script resolves a slug by substring search over
+`.agents/docs/**/*.md`; extending the *scan* to those same files makes the scan root
+and the resolution corpus identical, so every slug cited in `TODO.md` resolves by
+appearing in `TODO.md`. The check would pass unconditionally. The entry argues against
+a checker change on judgement; this is the argument that settles it.
+
+So the residual is a one-time manual triage, and it shrank honestly under reading. Of
+45 raw kebab-case citations, 26 are crate names, runner labels, external crates or
+skill names; two resolve elsewhere ( `disjoint-or-is-overcharged` in
+`LTM/expression-planning-statistics-and-segmentation.md`, `fallible-posting-source` in
+this file ); and most of the remainder are provenance whose own sentence already
+carries the result -- "closed the same day", "retracted", "was `no-ci`" -- which is
+exactly what the `docs/` rule asks for. **Five sites across four slugs** were phrased
+as live pointers to something a reader cannot find, and each now states the fact.
+
+**The best of the five was not a dead link at all.** Around the `fmt-baseline`
+citation stood the instruction "Do not add `cargo fmt --check` over the whole tree --
+89 pre-existing hunks would make it red on arrival", which `scripts/gate.sh` has been
+doing since the baseline was formatted away on 2026-08-27. Stale advice contradicting
+the live gate, sitting inside a provenance note nobody re-read. A dangling pointer is
+cheap to spot; the sentence it is attached to being false is not.
+
+**Then the checker failed on my own repair, from the direction I had not considered.**
+Removing the last `.agents/docs` mention of `reader-registry-pid-reuse` made a
+*source* citation dangle -- `yesno-core/tests/snapshot_at.rs` cited it, and the
+`TODO.md` line was the only thing resolving it. `check-todo-refs.py` reported it with
+its own preference order, and the first option is the right one: restate the reasoning
+at the site and drop the pointer, because prose cannot dangle. **Repairing a citation
+in one file can break a citation in another, and only the checker sees it.**
+
+### Two facts that were in no entry
+
+**`TODO.md` line 1856 was falsified by a commit of mine the same morning.**
+`flight-dense-set-results` stated in bold "a non-Rust client cannot ask for any of it";
+`5096c6e` gave Go, Python and Java the 48-byte header and a typed representation
+field, so such a client can decode a ticket, set the representation and re-encode. The
+capability arrived and the ergonomics did not, which is a different and smaller claim.
+Corrected in place. A backlog entry is falsified by ordinary work far more often than
+anyone goes back to read it.
+
+**`AnyExpr::decode` had no fuzz target, and that is a contract gap.** CLAUDE.md makes
+the far smaller `container::codec::decode` a fuzz target *by contract*; the expression
+decoder is reached from a Flight ticket and from a `QueryRequest` descriptor command
+and enforces `MAX_DEPTH`, `MAX_NODES`, `MAX_VALUE_BITS`, `MAX_WORK` and
+`MAX_RESULT_BITS` all at decode time, with nothing fuzzing it. `decode_expr` now
+covers all three wire-reachable entry points. It needed a `yesno-wire` path dependency
+in `yesno-core/fuzz`, which costs nothing against the dependency budget because that
+crate is outside the workspace -- `check-lean-core.sh` still reads direct 5/5,
+total 36/36.
+
+Beyond not panicking it asserts a value-level round trip, that `SetExpr::decode` and
+`AnyExpr::decode` agree ( the agreement the server's `looks_like_expr` dispatch rests
+on, which a unit test only spot-checked ), that an accepted expression's re-encoding
+still passes `looks_like_expr` -- what separates an expression from a bare 8-byte key
+on a descriptor -- and that `keys` is bounded by `MAX_NODES`. **The near-miss is worth
+recording**: a `Vec[Big]` element is deliberately *not* capped at `MAX_VALUE_BITS`,
+because a zip of two 2^20-bit vectors legitimately denotes 2^21-bit elements and what
+bounds that node is the arity-times-width product. Asserting an element cap there
+would have made the target fail on valid input. ~19M executions over two runs, no
+crash, 1648 edges.
+
+**And the line advertising the fuzz targets was undercounting them.** `gate.sh`'s
+"not run even by --deep" banner named `decode_container` alone -- since the day
+`roaring_import` was added, and by today omitting a third. It now derives the list from
+`fuzz_targets/*.rs`, for the reason `check-todo-refs.py` already gives about its own
+`SCRIPT_STEMS`: a hand-written list is the thing that goes stale.
+
+### The unwired sweep, re-run as part of verifying it
+
+Caller search over the whole tree with **no file-type restriction**, which the entry
+records as its own past false-positive source. Scripts half: three uninvoked, all three
+already explained ( `fmt-scoped.py` deliberately retained, `miri.sh` withdrawn,
+`gate-mount-propagation.sh` opt-in by its own header ), and the recorded false positive
+reproduces and is still false -- `build-database-artifacts.sh` is called from
+`e2e/Dockerfile` and `yesno-e2e/src/operator.rs`. **No action.** The `pub fn` half:
+281 files, 824 declared, 24 with no caller, 99 test-only, against 242 / 697 / 16 / 86
+on 2026-09-17. Growth, not a regression -- and a triage lead rather than a verdict,
+because the positive control was not run and two names on the list are the entry's own
+recorded negative results. Removing public API is a semver decision and belongs in its
+own diff.
+
+### The CI finding, which the morning's repair caused
+
+The `gate` job timed out at its 30-minute ceiling on the push that fixed the four
+failures. It failed no check. For ten days that job died at `clippy` in four to five
+minutes, so **the steps after linting never ran and the 30-minute budget was never
+tested against a job that gets past it**. A pipeline that fails fast stops measuring
+itself, and the first green-ish run is where you discover what it actually costs.
+
+Note for whoever raises the ceiling: **the log is unrecoverable.** GitHub returns
+`BlobNotFound` for a job its runner killed on timeout, so there are no step timings
+from that run. Picking a number needs either a raised ceiling and a fresh run, or
+step-level timing added first. Do not infer it from the local gate -- this host ran the
+same step list in about twenty minutes while sharing the machine with another session's
+`cargo test`, which is evidence about this host and not about a two-core runner.
+
+### The guard refactor, and the one line that made it mechanical
+
+`scratch-guards-are-a-separate-forgettable-line` is done: `tmpdir` returns the guard in
+all three files, 106 redundant guard lines are gone, and **not one call site's body
+text changed**. That last property is the whole reason a 104-site conversion was
+mechanical rather than a week, and it rested on a detail worth keeping: the
+`db/readers.rs` `Scratch` shape uses `Deref<Target = Path>`, which is enough there
+because its callees take a concrete `&Path` -- but **deref coercion does not apply to a
+generic parameter**, and almost every site here passes `&dir` to
+`Db::open_with( impl AsRef<Path>, .. )`. Adding `impl AsRef<Path>` beside the `Deref`
+makes `&dir` reach both shapes. Without it the refactor would have touched every call.
+
+Two sites in `db/mod.rs` never used `tmpdir` at all and were the same gap in disguise:
+each removed its directory on the test's **last line**, so a failing assertion leaked
+it, and one is deliberately over 4 MiB of slab by its own assertion. The sweep was
+looking for a forgettable second line and found two cases of no line at all.
+
+One drop order flipped, and it is strictly safer rather than merely different: the
+guards used to drop before the `Db` handles, removing directories under open
+databases; now each `Db` closes first. Verified the way the entry asked -- `/tmp/yesno-*`
+counted across a full `cargo test -p yesno-core`, 3 before and 3 after, all three
+pre-existing `yesno-e2e` roots belonging to
+`e2e-scenario-roots-are-retained-with-no-reaper`. The 21-binary suite now leaves no
+new scratch directories, including on a panic.
+
+**Sweep total: three entries closed** ( punching, big integers, scratch guards ), one
+backlog sentence corrected that a commit of the same morning had falsified, five dead
+citations restated, one source citation repaired that a repair had broken, one fuzz
+target added for a contract that had none, and one `gate.sh` banner that had been
+undercounting its own inventory since the second target was added.
