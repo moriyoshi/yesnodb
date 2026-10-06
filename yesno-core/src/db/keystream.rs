@@ -119,7 +119,6 @@ struct Step {
 /// lazy and what is not.
 pub struct KeyStream {
     db: Arc<DbInner>,
-    shard: usize,
     version: Version,
     /// Holds the reclamation floor for as long as the stream can still read.
     ///
@@ -129,6 +128,25 @@ pub struct KeyStream {
     /// outlived its `Snapshot` without holding one would follow a reference
     /// into a reused extent.
     slot: Arc<ReaderSlot>,
+    /// A lock-free reader for this shard's published chunks, captured at open.
+    ///
+    /// **This is why `next_chunk` takes no lock.** It used to take
+    /// `Mutex<ShardStore>` once per chunk and hold it across the whole of
+    /// `read_container_for` -- trailer read, checksum, `buffer_at`, decode -- so
+    /// concurrent readers serialized per shard. A consumer measured about 1 us a
+    /// chunk under that lock and a floor of 71 ms however many workers ran, with
+    /// eight workers slower than one, because the rows of one index are one key
+    /// and therefore one shard: no shard count can spread them.
+    ///
+    /// Sound for the reason [`Self::slot`] above already states. The slot pins
+    /// the reclamation floor for as long as this stream can read, so the extents
+    /// the plan names cannot be reclaimed or their slabs reclassified while it
+    /// lives -- which is exactly what a published view of the class map needs.
+    /// A published extent is immutable besides, by invariant I2.
+    ///
+    /// `None` for a shard with no store, which is the in-memory case and reads
+    /// nothing from disk anyway.
+    chunks: Option<crate::db::store::PublishedChunks>,
     plan: Arc<Plan>,
     idx: usize,
     /// Steps at or after `idx` that still need a disk read. Kept incrementally
@@ -163,11 +181,17 @@ impl KeyStream {
 
     /// A cursor over an already-resolved plan. No scan, no locks.
     fn over(snap: &Snapshot, shard: usize, plan: Arc<Plan>) -> KeyStream {
+        // One acquisition here, in exchange for none per chunk. The haiiie
+        // workload reads 71 588 chunks a query, so this is the whole trade.
+        let chunks = snap.db.shards[shard]
+            .store
+            .as_ref()
+            .map(|s| s.lock().unwrap().published_chunks());
         KeyStream {
             db: snap.db.clone(),
-            shard,
             version: snap.version,
             slot: snap._slot.clone(),
+            chunks,
             disk_remaining: plan.disk,
             plan,
             idx: 0,
@@ -368,13 +392,11 @@ impl ChunkStream for KeyStream {
                 Source::Disk(ck, cref) => (s.prefix, (*ck, *cref)),
             }
         };
-        let shard = &self.db.shards[self.shard];
-        let Some(store) = shard.store.as_ref() else {
+        let Some(chunks) = self.chunks.as_ref() else {
             return Ok(None);
         };
-        let store = store.lock().unwrap();
-        // Checked: a stale or corrupt reference must not decode as this key.
-        match store.read_container_for(want.0, want.1)? {
+        // No lock. Checked: a stale or corrupt reference must not decode as this key.
+        match chunks.read_container_for(want.0, want.1)? {
             Some(c) => Ok(Some((prefix, c))),
             // The index named a chunk the store no longer holds. `load` drops
             // this silently; see the module docs for why this does not.

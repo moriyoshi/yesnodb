@@ -337,36 +337,6 @@ impl ShardStore {
     /// about the span -- a CRC compared over a different length than the writer
     /// used fails on intact data, which is the failure mode that would have this
     /// check switched off rather than debugged.
-    fn payload_len_of(&self, cref: ChunkRef, cell: u64) -> Result<usize> {
-        Ok(match cref.kind() {
-            ContainerKind::Run => {
-                let hdr = self.seg.read_at(cell, 2)?;
-                crate::run_bytes(u16::from_le_bytes([hdr[0], hdr[1]]) as u32)
-            }
-            _ => cref.payload_len(None)?,
-        })
-    }
-
-    pub fn read_container(&self, cref: ChunkRef) -> Result<Option<Container>> {
-        if let Some(vals) = cref.inline_values() {
-            return Ok(Some(Container::from_sorted(&vals)));
-        }
-        let Some(cell) = cref.cell() else {
-            return Ok(None);
-        };
-        let len = self.payload_len_of(cref, cell)?;
-        // Zero-copy: the container aliases the mapping, and its Buffer keeps
-        // that mapping alive independently of this store.
-        let buf = self.seg.buffer_at(cell, len)?;
-        Ok(Some(codec::decode_buffer(
-            cref.kind(),
-            &buf,
-            0,
-            len,
-            cref.cardinality(),
-        )?))
-    }
-
     /// Reserve space for `n` more bytes of allocation.
     fn ensure_capacity(&self) -> Result<()> {
         let want = RESERVED + (self.alloc.slab_count() as u64 + 1) * SLAB_SIZE;
@@ -408,115 +378,7 @@ impl ShardStore {
     /// `stored-page-crcs-are-not-verified` and
     /// `miri-cannot-reach-the-mmap-unsafe-sites`.
     pub fn read_container_for(&self, key: ChunkKey, cref: ChunkRef) -> Result<Option<Container>> {
-        // A version gate, not a corruption check: refuse format bits this build
-        // does not understand *before* interpreting the payload they describe.
-        // See `ChunkRef::validate` for why silently decoding kind 3 as `Array`
-        // is the wrong default.
-        cref.validate()?;
-
-        let Some(cell) = cref.cell() else {
-            // Inline: the payload is in the index entry, so there is no
-            // reference to be wrong about.
-            return self.read_container(cref);
-        };
-
-        if let Some((base, page)) = self.alloc.packed_page(cell) {
-            let hdr = self.seg.read_at(base, crate::store::packed::HEADER)?;
-            let h = crate::store::packed::PackedHeader::parse(&hdr)?;
-            if !h.may_contain(key) {
-                return Err(CodecError::Invariant(
-                    "packed reference points at a page that does not hold this key",
-                ));
-            }
-            // The payload region starts immediately after the header, so a cell
-            // below that is decoding the header as a payload. `may_contain` is
-            // a *range* check over the page's `[first, last]` — it says the page
-            // could hold this key, not that the offset is where the key lives —
-            // so it cannot catch this. Free: the page base is already computed
-            // and no extra read is needed.
-            if cell < base + crate::store::packed::HEADER as u64 {
-                return Err(CodecError::Invariant(
-                    "packed reference points into the page header",
-                ));
-            }
-            // Whole-page CRC, once per page rather than once per chunk read --
-            // which matters more here than for the other two families, because a
-            // packed page holds many chunks and they share one checksum.
-            //
-            // **The sharing cuts both ways and the cost side is unmeasured.**
-            // One cache entry covers all 4096 bytes, so a write intersecting
-            // this page invalidates verification for **every key with a chunk in
-            // it**, and each of their readers then re-CRCs the whole page rather
-            // than its own chunk. The amplification is keys-per-page, and a
-            // single-key benchmark cannot see it by construction. Tracked as
-            // `packed-page-sharing-may-contend-across-keys`; do not treat the
-            // once-per-page framing as a pure win until that is measured.
-            // Sized from the slab's class rather than from a global constant, so a
-            // large page is checksummed whole rather than in its first 4 KiB.
-            self.seg.verify_once(base, page, || {
-                let bytes = self.seg.read_at(base, page)?;
-                crate::store::packed::PackedHeader::verify(&bytes).map(|_| ())
-            })?;
-        } else if let Some(class) = self.alloc.owning_class(cell) {
-            // The trailer is in the table at the tail of the slab body, addressed by slot
-            // index. It used to sit at a fixed distance from the slot's *end*, which is
-            // what forced every slot to be wider than its payload and kept consecutive
-            // dense payloads from being adjacent.
-            let slot = crate::store::alloc::slot_of_cell(cell, class)
-                .ok_or(CodecError::Invariant("extent cell is not slot-aligned"))?;
-            let off = crate::store::alloc::trailer_offset(
-                crate::store::alloc::slab_of(cell),
-                class,
-                slot,
-            );
-            let raw = self
-                .seg
-                .read_at(off, crate::store::extent::EXT_TRAILER_BYTES)?;
-            let t = crate::store::extent::ExtTrailer::from_le_bytes(
-                raw.try_into()
-                    .map_err(|_| CodecError::Invariant("short extent trailer"))?,
-            );
-            let expected = crate::store::extent::ckey_tag(key);
-            if t.ckey_tag != expected {
-                return Err(CodecError::MisPointedExtent {
-                    key: key.0,
-                    cell,
-                    class,
-                    trailer_off: off,
-                    found: t.ckey_tag,
-                    expected,
-                });
-            }
-            // The trailer is already in hand, so the stored CRC costs no extra
-            // read -- only the pass over the payload, and only the first time
-            // this region is touched.
-            //
-            // **This is the check `ckey_tag` cannot make.** The tag proves the
-            // reference names the right chunk; it says nothing about whether the
-            // bytes are the ones that were written. A wrong-but-in-range offset
-            // with a matching tag, or an intact reference over a corrupted
-            // payload, both pass the tag and fail here.
-            let payload_len = self.payload_len_of(cref, cell)?;
-            self.seg.verify_once(cell, payload_len, || {
-                // Zero-copy: the CRC reads the mapping directly. Copying the
-                // payload out with `read_at` first -- which is what this did
-                // when it landed -- measured **1.99 us per 8 KiB region**
-                // against **1.25 us** this way, so the copy was a third of the
-                // one-off cost. Both figures are a first touch; steady state is
-                // zero either way.
-                let buf = self.seg.buffer_at(cell, payload_len)?;
-                if crate::store::checksum::crc32c(buf.as_slice()) != t.crc32c {
-                    return Err(CodecError::Invariant(
-                        "extent payload fails its stored checksum",
-                    ));
-                }
-                Ok(())
-            })?;
-        }
-        // An Opaque slab has no known geometry, so there is nothing to check
-        // against; the read proceeds unverified rather than failing.
-
-        self.read_container(cref)
+        read_container_for_in(&self.seg, &self.alloc, key, cref)
     }
 
     /// Let punching reach slabs inherited at open. See
@@ -785,6 +647,229 @@ pub(crate) struct PublishedNodes {
     node_size: usize,
 }
 
+/// What a chunk read needs to know about slab geometry, and nothing more.
+///
+/// Two lookups. Everything else [`read_container_for_in`] does is arithmetic over
+/// `SLAB_SIZE`, `SLAB_META` and `class_size`, or a read through the mapping -- which is
+/// why a reader that cannot take the store lock needs only a snapshot of these, not a
+/// shared borrow of the allocator.
+pub(crate) trait ChunkGeometry {
+    fn packed_page(&self, cell: u64) -> Option<(u64, usize)>;
+    fn owning_class(&self, cell: u64) -> Option<u8>;
+}
+
+impl ChunkGeometry for crate::store::alloc::Allocator {
+    fn packed_page(&self, cell: u64) -> Option<(u64, usize)> {
+        crate::store::alloc::Allocator::packed_page(self, cell)
+    }
+    fn owning_class(&self, cell: u64) -> Option<u8> {
+        crate::store::alloc::Allocator::owning_class(self, cell)
+    }
+}
+
+/// A lock-free reader for this shard's **published** chunk payloads.
+///
+/// The counterpart of [`PublishedNodes`] for chunks rather than index pages, and sound
+/// for the same two reasons. The mapping is already shared: `ShardStore.seg` is an
+/// `Arc<SegmentedMmap>` whose interior mutexes are load-bearing precisely because
+/// `Db::checkpoint` already clones it and reads outside the store lock. And a published
+/// extent is immutable by **invariant I2** -- a modified chunk is written to a *new* cell
+/// -- while reclamation is deferred for versions a reader still pins, so a slab holding an
+/// extent reachable from a pinned plan cannot be freed or reclassified underneath it.
+///
+/// The class map is a copy taken under the store lock, one byte a slab. That is the whole
+/// price of not holding the lock per chunk: `KeyStream::next_chunk` serialized concurrent
+/// readers of one key on `Mutex<ShardStore>` once per 8 KiB chunk, which a consumer
+/// measured at about 1 us a chunk and a floor of 71 ms however many workers ran -- with
+/// eight slower than one, because readers of a single key are readers of a single shard
+/// and no shard count can spread them.
+pub(crate) struct PublishedChunks {
+    seg: std::sync::Arc<crate::store::segment::SegmentedMmap>,
+    /// Slab class by slab id, as of the moment this reader was made.
+    classes: Vec<Option<u8>>,
+}
+
+impl ChunkGeometry for PublishedChunks {
+    fn packed_page(&self, cell: u64) -> Option<(u64, usize)> {
+        let class = (*self
+            .classes
+            .get(crate::store::alloc::slab_of(cell) as usize)?)?;
+        crate::store::alloc::packed_page_of(class, cell)
+    }
+    fn owning_class(&self, cell: u64) -> Option<u8> {
+        *self
+            .classes
+            .get(crate::store::alloc::slab_of(cell) as usize)?
+    }
+}
+
+impl PublishedChunks {
+    /// Read one published chunk, taking no lock.
+    pub(crate) fn read_container_for(
+        &self,
+        key: ChunkKey,
+        cref: ChunkRef,
+    ) -> Result<Option<Container>> {
+        read_container_for_in(&self.seg, self, key, cref)
+    }
+}
+
+/// `ShardStore::payload_len_of`, over a mapping rather than a store.
+fn payload_len_in(
+    seg: &crate::store::segment::SegmentedMmap,
+    cref: ChunkRef,
+    cell: u64,
+) -> Result<usize> {
+    Ok(match cref.kind() {
+        ContainerKind::Run => {
+            let hdr = seg.read_at(cell, 2)?;
+            crate::run_bytes(u16::from_le_bytes([hdr[0], hdr[1]]) as u32)
+        }
+        _ => cref.payload_len(None)?,
+    })
+}
+
+/// `ShardStore::read_container`, over a mapping rather than a store.
+fn read_container_in(
+    seg: &crate::store::segment::SegmentedMmap,
+    cref: ChunkRef,
+) -> Result<Option<Container>> {
+    if let Some(vals) = cref.inline_values() {
+        return Ok(Some(Container::from_sorted(&vals)));
+    }
+    let Some(cell) = cref.cell() else {
+        return Ok(None);
+    };
+    let len = payload_len_in(seg, cref, cell)?;
+    // Zero-copy: the container aliases the mapping, and its Buffer keeps
+    // that mapping alive independently of this store.
+    let buf = seg.buffer_at(cell, len)?;
+    Ok(Some(codec::decode_buffer(
+        cref.kind(),
+        &buf,
+        0,
+        len,
+        cref.cardinality(),
+    )?))
+}
+
+/// The whole chunk read path, over a mapping and a geometry rather than a store.
+///
+/// **One copy, two callers.** `ShardStore` passes its live allocator and
+/// [`PublishedChunks`] passes a snapshot; having each implement the read separately is
+/// how a reader comes to verify a different region than the writer wrote.
+fn read_container_for_in(
+    seg: &crate::store::segment::SegmentedMmap,
+    geom: &impl ChunkGeometry,
+    key: ChunkKey,
+    cref: ChunkRef,
+) -> Result<Option<Container>> {
+    // A version gate, not a corruption check: refuse format bits this build
+    // does not understand *before* interpreting the payload they describe.
+    // See `ChunkRef::validate` for why silently decoding kind 3 as `Array`
+    // is the wrong default.
+    cref.validate()?;
+
+    let Some(cell) = cref.cell() else {
+        // Inline: the payload is in the index entry, so there is no
+        // reference to be wrong about.
+        return read_container_in(seg, cref);
+    };
+
+    if let Some((base, page)) = geom.packed_page(cell) {
+        let hdr = seg.read_at(base, crate::store::packed::HEADER)?;
+        let h = crate::store::packed::PackedHeader::parse(&hdr)?;
+        if !h.may_contain(key) {
+            return Err(CodecError::Invariant(
+                "packed reference points at a page that does not hold this key",
+            ));
+        }
+        // The payload region starts immediately after the header, so a cell
+        // below that is decoding the header as a payload. `may_contain` is
+        // a *range* check over the page's `[first, last]` — it says the page
+        // could hold this key, not that the offset is where the key lives —
+        // so it cannot catch this. Free: the page base is already computed
+        // and no extra read is needed.
+        if cell < base + crate::store::packed::HEADER as u64 {
+            return Err(CodecError::Invariant(
+                "packed reference points into the page header",
+            ));
+        }
+        // Whole-page CRC, once per page rather than once per chunk read --
+        // which matters more here than for the other two families, because a
+        // packed page holds many chunks and they share one checksum.
+        //
+        // **The sharing cuts both ways and the cost side is unmeasured.**
+        // One cache entry covers all 4096 bytes, so a write intersecting
+        // this page invalidates verification for **every key with a chunk in
+        // it**, and each of their readers then re-CRCs the whole page rather
+        // than its own chunk. The amplification is keys-per-page, and a
+        // single-key benchmark cannot see it by construction. Tracked as
+        // `packed-page-sharing-may-contend-across-keys`; do not treat the
+        // once-per-page framing as a pure win until that is measured.
+        // Sized from the slab's class rather than from a global constant, so a
+        // large page is checksummed whole rather than in its first 4 KiB.
+        seg.verify_once(base, page, || {
+            let bytes = seg.read_at(base, page)?;
+            crate::store::packed::PackedHeader::verify(&bytes).map(|_| ())
+        })?;
+    } else if let Some(class) = geom.owning_class(cell) {
+        // The trailer is in the table at the tail of the slab body, addressed by slot
+        // index. It used to sit at a fixed distance from the slot's *end*, which is
+        // what forced every slot to be wider than its payload and kept consecutive
+        // dense payloads from being adjacent.
+        let slot = crate::store::alloc::slot_of_cell(cell, class)
+            .ok_or(CodecError::Invariant("extent cell is not slot-aligned"))?;
+        let off =
+            crate::store::alloc::trailer_offset(crate::store::alloc::slab_of(cell), class, slot);
+        let raw = seg.read_at(off, crate::store::extent::EXT_TRAILER_BYTES)?;
+        let t = crate::store::extent::ExtTrailer::from_le_bytes(
+            raw.try_into()
+                .map_err(|_| CodecError::Invariant("short extent trailer"))?,
+        );
+        let expected = crate::store::extent::ckey_tag(key);
+        if t.ckey_tag != expected {
+            return Err(CodecError::MisPointedExtent {
+                key: key.0,
+                cell,
+                class,
+                trailer_off: off,
+                found: t.ckey_tag,
+                expected,
+            });
+        }
+        // The trailer is already in hand, so the stored CRC costs no extra
+        // read -- only the pass over the payload, and only the first time
+        // this region is touched.
+        //
+        // **This is the check `ckey_tag` cannot make.** The tag proves the
+        // reference names the right chunk; it says nothing about whether the
+        // bytes are the ones that were written. A wrong-but-in-range offset
+        // with a matching tag, or an intact reference over a corrupted
+        // payload, both pass the tag and fail here.
+        let payload_len = payload_len_in(seg, cref, cell)?;
+        seg.verify_once(cell, payload_len, || {
+            // Zero-copy: the CRC reads the mapping directly. Copying the
+            // payload out with `read_at` first -- which is what this did
+            // when it landed -- measured **1.99 us per 8 KiB region**
+            // against **1.25 us** this way, so the copy was a third of the
+            // one-off cost. Both figures are a first touch; steady state is
+            // zero either way.
+            let buf = seg.buffer_at(cell, payload_len)?;
+            if crate::store::checksum::crc32c(buf.as_slice()) != t.crc32c {
+                return Err(CodecError::Invariant(
+                    "extent payload fails its stored checksum",
+                ));
+            }
+            Ok(())
+        })?;
+    }
+    // An Opaque slab has no known geometry, so there is nothing to check
+    // against; the read proceeds unverified rather than failing.
+
+    read_container_in(seg, cref)
+}
+
 impl NodeReader for PublishedNodes {
     fn node(&self, id: PageId) -> Result<Page> {
         let cell = page_id_to_cell(id);
@@ -820,6 +905,18 @@ impl ShardStore {
         PublishedNodes {
             seg: std::sync::Arc::clone(&self.seg),
             node_size: self.sb.node_size as usize,
+        }
+    }
+
+    /// A lock-free reader for this shard's **published** chunk payloads.
+    ///
+    /// An `Arc` clone and one byte a slab, so the caller holds the store lock only for
+    /// that. See [`PublishedChunks`] for why reading a published extent without the lock
+    /// is sound, and what it is for.
+    pub(crate) fn published_chunks(&self) -> PublishedChunks {
+        PublishedChunks {
+            seg: std::sync::Arc::clone(&self.seg),
+            classes: self.alloc.class_map(),
         }
     }
 }
@@ -967,6 +1064,80 @@ mod tests {
         s.alloc.add_packed(cell, total);
         crate::checkpoint::ExtentWriter::write_extent(s, cell, &page).unwrap();
         (cell, refs)
+    }
+
+    /// A published reader returns exactly what the locked store returns.
+    ///
+    /// **This is the whole correctness claim for reading without the store lock.** The
+    /// two paths share one body -- `read_container_for_in` -- so what is actually under
+    /// test is the geometry: the live allocator against a snapshot of its class map, and
+    /// the shared `packed_page_of` arithmetic against itself. A reader that computed a
+    /// different base or class would verify a different region than the writer wrote,
+    /// which is a wrong answer rather than an error.
+    ///
+    /// Both families that consult geometry are covered. A packed page needs the class to
+    /// find its base and size, and an extent needs it to address the trailer table; an
+    /// inline reference is deliberately absent, because it returns before any geometry
+    /// lookup and so says nothing about the part that differs.
+    #[test]
+    fn a_published_reader_agrees_with_the_locked_store() {
+        let p = tmp("published-chunks");
+        let _c = Cleanup(p.clone());
+        let mut s = ShardStore::open(&p, [7u8; 16], 0).unwrap();
+
+        // Packed: several keys in one page.
+        let (_page, packed) = packed_page_of(&mut s, &[11, 22, 33]);
+
+        // Extent: large enough to own a slot, so the trailer path runs.
+        let key = ChunkKey::new(4242, 0);
+        let vals: Vec<u16> = (0..1400u16).map(|i| i * 3).collect();
+        let payload = codec::encode(&Container::from_sorted(&vals));
+        s.alloc.begin_generation();
+        let class = class_for(payload.len()).unwrap();
+        let cell = s.alloc.alloc(class).unwrap();
+        crate::checkpoint::ExtentWriter::write_extent(&mut s, cell, &payload).unwrap();
+        // The trailer, written exactly as `checkpoint::run` writes it. Without it the
+        // read fails -- identically in both readers, which is agreement but proves only
+        // that they refuse together. A legitimate extent makes the trailer path return an
+        // answer, which is what the geometry has to get right.
+        let idx = crate::store::alloc::slot_of_cell(cell, class).unwrap();
+        let trailer_at =
+            crate::store::alloc::trailer_offset(crate::store::alloc::slab_of(cell), class, idx);
+        let trailer = crate::store::extent::ExtTrailer {
+            ckey_tag: crate::store::extent::ckey_tag(key),
+            crc32c: crate::store::checksum::crc32c(&payload),
+        };
+        crate::checkpoint::ExtentWriter::write_extent(&mut s, trailer_at, &trailer.to_le_bytes())
+            .unwrap();
+        let extent = ChunkRef::extent(cell, ContainerKind::Array, vals.len() as u32).unwrap();
+
+        let mut refs = packed;
+        refs.push((key, extent));
+
+        let published = s.published_chunks();
+        for (k, cref) in &refs {
+            let locked = s.read_container_for(*k, *cref);
+            let free = published.read_container_for(*k, *cref);
+            match (locked, free) {
+                (Ok(a), Ok(b)) => assert_eq!(
+                    a.as_ref().map(|c| c.iter().collect::<Vec<_>>()),
+                    b.as_ref().map(|c| c.iter().collect::<Vec<_>>()),
+                    "the two readers disagreed on {k:?}"
+                ),
+                // Refusing together is agreement too, and the errors must match: a
+                // geometry that differed would compute a different trailer offset and so
+                // a different error, which this comparison catches.
+                (Err(a), Err(b)) => {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "errors differ on {k:?}")
+                }
+                (a, b) => panic!("one reader failed and the other did not: {a:?} / {b:?}"),
+            }
+            assert!(
+                published.read_container_for(*k, *cref).unwrap().is_some(),
+                "every reference in this fixture must read back: {k:?}"
+            );
+        }
+        assert_eq!(refs.len(), 4, "the fixture must cover packed and extent");
     }
 
     /// A `ChunkRef` naming an extent that belongs to a **different** key is
@@ -1366,7 +1537,7 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, c.kind(), c.len()).unwrap();
-        let back = s.read_container(cref).unwrap().unwrap();
+        let back = read_container_in(&s.seg, cref).unwrap().unwrap();
         assert_eq!(back.iter().collect::<Vec<_>>(), vals);
     }
 
@@ -1388,7 +1559,7 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, ContainerKind::Run, c.len()).unwrap();
-        let back = s.read_container(cref).unwrap().unwrap();
+        let back = read_container_in(&s.seg, cref).unwrap().unwrap();
         assert_eq!(back.len(), 3000);
         assert_eq!(
             back.iter().collect::<Vec<_>>(),
@@ -1414,8 +1585,8 @@ mod tests {
         s.write_extent(cell, &payload).unwrap();
 
         let cref = ChunkRef::extent(cell, ContainerKind::Bitmap, c.len()).unwrap();
-        let a = s.read_container(cref).unwrap().unwrap();
-        let b = s.read_container(cref).unwrap().unwrap();
+        let a = read_container_in(&s.seg, cref).unwrap().unwrap();
+        let b = read_container_in(&s.seg, cref).unwrap().unwrap();
 
         // Two independent reads of the same extent must share bytes. If the read
         // path copied, these would be distinct allocations.
@@ -1445,7 +1616,7 @@ mod tests {
             let cell = s.allocator().alloc(class).unwrap();
             s.write_extent(cell, &payload).unwrap();
             let cref = ChunkRef::extent(cell, ContainerKind::Bitmap, c.len()).unwrap();
-            s.read_container(cref).unwrap().unwrap()
+            read_container_in(&s.seg, cref).unwrap().unwrap()
         }; // store dropped, mapping must survive via the guard
 
         assert_eq!(held.iter().collect::<Vec<_>>(), scattered);
@@ -1457,7 +1628,7 @@ mod tests {
         let _c = Cleanup(p.clone());
         let s = ShardStore::open(&p, [6u8; 16], 0).unwrap();
         let cref = ChunkRef::inline(&[3, 9, 27]).unwrap();
-        let c = s.read_container(cref).unwrap().unwrap();
+        let c = read_container_in(&s.seg, cref).unwrap().unwrap();
         assert_eq!(c.iter().collect::<Vec<_>>(), vec![3, 9, 27]);
     }
 

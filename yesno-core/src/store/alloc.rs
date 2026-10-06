@@ -544,6 +544,25 @@ impl Default for Allocator {
     }
 }
 
+/// The packed page holding `cell` inside a slab of `class`, as `( base, page_size )`.
+///
+/// **Split out so there is one copy of this arithmetic.** The allocator answers it from
+/// its live slab table and a published chunk reader answers it from a snapshot of the
+/// class map; the two computing it separately is exactly the divergence that would make a
+/// reader address a page the writer never wrote.
+pub(crate) fn packed_page_of(class: u8, cell: u64) -> Option<(u64, usize)> {
+    if !is_packed_class(class) {
+        return None;
+    }
+    let page = class_size(class)? as u64;
+    let body = slab_of(cell) as u64 * SLAB_SIZE + SLAB_META;
+    if cell < body {
+        return None;
+    }
+    let base = body + ((cell - body) / page) * page;
+    Some((base, page as usize))
+}
+
 impl Allocator {
     pub fn new() -> Self {
         Allocator {
@@ -801,20 +820,36 @@ impl Allocator {
     /// not divide the 8 KiB slab header, so the modulus would name an address inside the
     /// previous page and the header parse would read payload bytes as a header.
     pub fn packed_page(&self, cell: u64) -> Option<(u64, usize)> {
-        let id = slab_of(cell);
-        let SlabState::InUse { class, .. } = self.slabs.get(id as usize)?.state else {
+        packed_page_of(self.class_of_cell(cell)?, cell)
+    }
+
+    /// The class of the slab holding `cell`, if that slab is in use.
+    ///
+    /// The whole of what a *reader* needs from this allocator. Everything else
+    /// [`ShardStore::read_container_for`](crate::db::store::ShardStore::read_container_for)
+    /// consults is arithmetic over `SLAB_SIZE`, `SLAB_META` and `class_size`, which is why
+    /// a published chunk reader can be a snapshot of this one lookup rather than a shared
+    /// borrow of the allocator.
+    pub(crate) fn class_of_cell(&self, cell: u64) -> Option<u8> {
+        let SlabState::InUse { class, .. } = self.slabs.get(slab_of(cell) as usize)?.state else {
             return None;
         };
-        if !is_packed_class(class) {
-            return None;
-        }
-        let page = class_size(class)? as u64;
-        let body = id as u64 * SLAB_SIZE + SLAB_META;
-        if cell < body {
-            return None;
-        }
-        let base = body + ((cell - body) / page) * page;
-        Some((base, page as usize))
+        Some(class)
+    }
+
+    /// Every slab's class, indexed by slab id, for a reader that cannot take this lock.
+    ///
+    /// A copy rather than a borrow, and small: one byte a slab, so a 2 MiB-slab store
+    /// holding a terabyte needs 512 KiB. Taken under the store lock and then owned, which
+    /// is what lets the read path run with no lock at all.
+    pub(crate) fn class_map(&self) -> Vec<Option<u8>> {
+        self.slabs
+            .iter()
+            .map(|s| match s.state {
+                SlabState::InUse { class, .. } => Some(class),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Note that a packed chunk is superseded, and queue its **page** once every
