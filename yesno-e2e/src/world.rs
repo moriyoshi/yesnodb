@@ -341,6 +341,123 @@ enum Mutation {
 
 include!("scenario_prefix.rs");
 
+/// How long a retained scenario root survives before the next run reclaims it.
+///
+/// **Chosen from the recorded rate, not from taste.** `scenario_prefix` measured
+/// 49 retained directories totalling 4.2 GB over five weeks, so roughly 1.4
+/// roots and 120 MB a day. A seven-day floor therefore holds about ten roots and
+/// under a gigabyte -- long enough that the retention this naming exists for is
+/// still useful to a person investigating yesterday's failure, and bounded enough
+/// that the 2026-10-01 disk-full incident cannot repeat by accumulation.
+const RETAINED_ROOT_FLOOR_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The epoch-seconds stamp in a scenario root's name, if it has one.
+///
+/// `scenario_prefix` emits `yesno-e2e-<label>-<secs>-` and `tempfile` appends
+/// alphanumeric characters, so the stamp is the second-to-last hyphen-separated
+/// field. The label may itself contain hyphens, which is why this counts from the
+/// right.
+fn root_stamp_secs(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix("yesno-e2e-")?;
+    let mut fields = rest.rsplit('-');
+    let _random = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+/// Whether a root's *name* says it is old enough to reclaim.
+///
+/// Separated from the filesystem so it can be tested without creating or
+/// deleting anything: the predicate is the part that can be wrong in a way that
+/// destroys evidence.
+fn root_is_reapable(name: &str, now_secs: u64, floor_secs: u64) -> bool {
+    match root_stamp_secs(name) {
+        // Unparseable stamps are left alone. A name this function does not
+        // understand is not a name it should delete.
+        None => false,
+        Some(stamp) => now_secs.saturating_sub(stamp) >= floor_secs,
+    }
+}
+
+/// Reclaim scenario roots older than [`RETAINED_ROOT_FLOOR_SECS`].
+///
+/// **On start, never on exit.** A reaper that ran at teardown would race the
+/// other scenarios of a concurrent session -- this repository routinely has
+/// several -- and the thing it would race is directory removal, where losing
+/// means deleting a live run's state. Running once at start, against a floor of
+/// days, means every candidate is far older than any run that could still be
+/// alive.
+///
+/// Two gates, and the second is weaker than it looks. The name's stamp is the
+/// run's start time and carries the real safety. The newest mtime among the
+/// root's immediate children is a cheap second opinion that catches a root
+/// being written right now -- but **a directory's mtime only moves when its own
+/// entries change**, so a deep write leaves both the root and its children
+/// untouched. That is why the floor is days rather than hours: the mtime check
+/// cannot distinguish a seven-day-old live run, and nothing here pretends to.
+///
+/// Failures are ignored by design. Another session may remove the same root
+/// between the scan and the removal, and a reaper that aborted a test run over
+/// losing that race would be worse than the leak it fixes.
+fn reap_stale_roots() {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    reap_in(
+        &std::env::temp_dir(),
+        now.as_secs(),
+        RETAINED_ROOT_FLOOR_SECS,
+    );
+}
+
+/// [`reap_stale_roots`] with the directory, the clock and the floor supplied.
+///
+/// Split out so a test can exercise the **removal** and not merely the
+/// predicate: at a floor of zero every name the parser recognises is stale, so
+/// the whole path -- scan, filter, delete -- runs against a directory the test
+/// owns. Without this the only testable part was the arithmetic, and the part
+/// that deletes things would have had no test at all.
+fn reap_in(dir: &std::path::Path, now_secs: u64, floor_secs: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !root_is_reapable(name, now_secs, floor_secs) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() || touched_within(&path, now_secs, floor_secs) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// Whether the root or any immediate child was modified inside the floor.
+///
+/// Depth one on purpose: a scenario root can hold gigabytes, and walking it to
+/// answer a question the name's stamp has already answered would make every run
+/// pay for the reaper.
+fn touched_within(path: &std::path::Path, now_secs: u64, floor_secs: u64) -> bool {
+    let recent = |meta: &std::fs::Metadata| {
+        meta.modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| now_secs.saturating_sub(d.as_secs()) < floor_secs)
+    };
+    if path.metadata().as_ref().is_ok_and(recent) {
+        return true;
+    }
+    let Ok(children) = std::fs::read_dir(path) else {
+        // Unreadable means not provably stale, so leave it.
+        return true;
+    };
+    children
+        .flatten()
+        .any(|c| c.metadata().as_ref().is_ok_and(recent))
+}
+
 impl World {
     /// A world rooted at a fresh temporary directory, removed on drop.
     pub fn temporary() -> std::io::Result<Self> {
@@ -357,6 +474,12 @@ impl World {
     /// See `scenario_prefix` for why the name matters: a failing scenario's
     /// root is deliberately retained, and an anonymous one cannot be found again.
     pub fn temporary_labelled(label: &str, args: Vec<(String, u64)>) -> std::io::Result<Self> {
+        // Once per process, before the first root is created. Every entry point
+        // -- the binary, `tests/scenarios.rs`, the measurement fixtures -- comes
+        // through here, so one call site covers all of them without any of them
+        // having to remember.
+        static REAPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        REAPED.get_or_init(reap_stale_roots);
         let tmp = tempfile::Builder::new()
             .prefix(&scenario_prefix(label))
             .tempdir()?;
@@ -1708,6 +1831,145 @@ mod tests {
         w.call("flight_stop", std::slice::from_ref(&f), &[])
             .unwrap();
         w.call("db_close", std::slice::from_ref(&h), &[]).unwrap();
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// The reaper's parser is tied to the producer, so a format change fails
+    /// here rather than making the reaper silently match nothing.
+    ///
+    /// That is the failure mode worth a test: a reaper that quietly stops
+    /// recognising names does not error, it just stops reclaiming, and the leak
+    /// it was written for comes back invisibly.
+    #[test]
+    fn the_reaper_parses_the_name_the_prefix_actually_produces() {
+        let name = format!(
+            "{}a1b2c3",
+            super::scenario_prefix("e2e/scenarios/pitr_retention.py")
+        );
+        let stamp = super::root_stamp_secs(&name).expect("the live prefix must parse");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now - stamp < 5,
+            "the stamp must be this run's start, got {stamp}"
+        );
+        assert!(
+            !super::root_is_reapable(&name, now, 7 * DAY),
+            "a fresh root must survive"
+        );
+        assert!(
+            super::root_is_reapable(&name, now + 8 * DAY, 7 * DAY),
+            "a root past the floor must be reclaimable"
+        );
+    }
+
+    /// A hyphenated scenario label must not shift the stamp field.
+    ///
+    /// `scenario_prefix` maps every non-alphanumeric character to `-`, so the
+    /// label routinely contains hyphens and the stamp can only be found by
+    /// counting from the right.
+    #[test]
+    fn a_hyphenated_label_does_not_move_the_stamp() {
+        let name = format!("{}zz", super::scenario_prefix("../weird name/a.b.py"));
+        assert!(
+            name.contains('-'),
+            "the label must actually contain hyphens: {name}"
+        );
+        assert!(
+            super::root_stamp_secs(&name).is_some(),
+            "the stamp must still parse: {name}"
+        );
+    }
+
+    /// A name the parser does not understand is never deleted.
+    #[test]
+    fn an_unrecognised_name_is_left_alone() {
+        for name in [
+            "yesno-e2e-nostamp",
+            "yesno-e2e-badstamp-notanumber-aa",
+            "models",
+            "qwen35-kv-probe",
+            "yesno-c-target",
+        ] {
+            assert!(
+                !super::root_is_reapable(name, u64::MAX, 7 * DAY),
+                "{name} must not be reapable even at an absurd clock"
+            );
+        }
+    }
+
+    /// The reaper removes what it recognises and leaves everything else.
+    ///
+    /// Exercises the removal rather than the predicate, in a directory the test
+    /// owns, with the floor at zero so every recognised name is stale. The
+    /// survivors matter more than the casualty: these are the real neighbours of
+    /// a scenario root in the scratch directory, and a reaper that took any of
+    /// them would destroy another session's work.
+    #[test]
+    fn the_reaper_removes_only_scenario_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let doomed = home
+            .path()
+            .join(format!("yesno-e2e-aged-{}-qq", now - 9 * DAY));
+        std::fs::create_dir(&doomed).unwrap();
+        std::fs::write(doomed.join("payload"), b"x").unwrap();
+        // `unrelated-probe-1000000000-aa` is the load-bearing survivor and the
+        // reason this list is not decorative: it *parses* as a stamp -- the
+        // second-to-last field is all digits -- so only the `yesno-e2e-` prefix
+        // check saves it, and a 2001 stamp makes it maximally stale. Verified by
+        // regressing the parser to accept any prefix: that reaps it and fails
+        // this test, and without an entry of this shape the same regression
+        // passed. The others fail the stamp parse on their own, so they test
+        // nothing about the prefix. Deliberately a synthetic name: a real
+        // neighbour's directory does not belong in a fixture.
+        let survivors = [
+            "unrelated-probe-1000000000-aa",
+            "models",
+            "yesno-c-target",
+            "yesno-e2e-nostamp",
+            "mysql-8.4.0.tar.gz",
+        ];
+        for name in survivors {
+            std::fs::create_dir(home.path().join(name)).unwrap();
+        }
+
+        super::reap_in(home.path(), now, 0);
+
+        assert!(!doomed.exists(), "an aged scenario root must be reclaimed");
+        for name in survivors {
+            assert!(
+                home.path().join(name).exists(),
+                "{name} is not a scenario root and must survive"
+            );
+        }
+    }
+
+    /// A directory being written now is held back by the second gate.
+    ///
+    /// Guards against the check being inverted, which would reclaim exactly the
+    /// roots it exists to protect.
+    #[test]
+    fn a_directory_touched_now_is_not_considered_stale() {
+        let dir = tempfile::Builder::new()
+            .prefix("yesno-e2e-reaptest-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("payload"), b"x").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            super::touched_within(dir.path(), now, 7 * DAY),
+            "a directory written this instant must read as touched"
+        );
     }
 
     /// The retained-directory name must carry the scenario and sort by age.
