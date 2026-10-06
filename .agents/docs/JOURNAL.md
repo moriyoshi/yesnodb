@@ -1787,3 +1787,64 @@ regression established rather than suspected.
 Keep the single-thread column in any rerun. The scaling ratio alone would have read as
 "0.38 to 0.30, mildly worse"; the absolute numbers say the lock itself is slower, which is
 a different and more useful conclusion.
+
+## 2026-10-06 -- striping the segment caches, and a denominator that made three results meaningless
+
+`RwLock` on `SegmentedMmap`'s interior caches was a 31% regression, and the backlog entry
+explained why in a sentence written about the store lock: "what pays is fewer contenders
+per lock, not a smaller lock." Striping is what reduces contenders, so that was the next
+thing to try.
+
+**`verified` and `pinned` are now 64 independent mutexes**, keyed by a multiplicative hash
+of the cell. Low bits would have put a whole size class -- and therefore a whole scan --
+in one shard, which is the contention being spread. Per-shard generation capacity is
+`VERIFIED_GENERATION / 64`, so the aggregate is unchanged: that constant was raised to
+65 536 against a measured working set on 2026-10-05 and its own comment says not to raise
+it again on that evidence, so striping had to **divide** it rather than multiply it by 64.
+`invalidate_verified` and `any_pinned_in` now scan every shard, since a hash spreads a cell
+range across all of them; both are write-path only, which is the trade.
+
+| | 20 threads, median of 5 | min-max |
+| --- | --- | --- |
+| unstriped `Mutex` | 1 129.9 Kr/s | 1 119.8 - 1 139.6 |
+| striped, 64 shards | **1 237.4 Kr/s** | 1 235.8 - 1 239.8 |
+
+**+9.5%, with non-overlapping ranges.** Small, real, and the right sign -- against the
+`RwLock` attempt's -31% on the same bottleneck. Two interventions, opposite outcomes,
+exactly as the entry's analysis predicts.
+
+### The denominator, which is the actual lesson
+
+**Three results in this thread were built on a number that varies by 50% run to run.** The
+1-thread arm at 3 sweeps measured **3 021 Kr/s and then 4 513 Kr/s on back-to-back runs of
+the same binary**, so the same code reported 0.38x and then 0.25x scaling. Every ratio I
+had quoted -- 0.38 for the published reader, 0.30 for `RwLock`, 0.39 for striping -- shared
+that denominator.
+
+The 20-thread arm was stable all along, within 1% across the same runs. So the fix was to
+stop reporting a ratio and report the contended throughput, with 10 sweeps and 5
+repetitions. Only then did the striping A/B separate: 1 129.9 against 1 237.4 with ranges
+that do not touch.
+
+**What survives of the earlier numbers is their sign, not their value.** `RwLock` was worse
+and striping is better, and both were worse or better by enough to show through the noise.
+The 0.23x figure this entry was opened on came from a different harness again and should
+not be compared with any of them. A ratio is a measurement divided by a measurement, and
+the cheap one to get wrong is the divisor -- which is also why the single-thread column was
+what exposed `RwLock` as a slower lock rather than merely a less parallel one.
+
+### What this does not fix
+
+Twenty threads deliver 1 237 Kr/s where one delivers 3 000 or more. Two candidates remain,
+and they are hypotheses rather than findings:
+
+* `segs` is still a **single** unstriped `Mutex`, taken on every `buffer_at`. Striping
+  cannot help: it guards one append-only `Vec`. The fix is a published snapshot of the
+  segment list -- the same trick `PublishedChunks` already uses for the class map.
+* Every read clones a shared `Arc<MmapSegment>` and touches an `ExtentGuard` refcount, so
+  **even with no locks at all** the atomics on those shared cache lines would serialize.
+
+If the second dominates, no further lock work will help and the per-read shared-`Arc`
+traffic has to be designed out. Measure which before building either -- this thread has
+now produced one regression and one 9.5% gain by guessing at the mechanism, and the
+guesses that worked were the ones the entry had already reasoned through.

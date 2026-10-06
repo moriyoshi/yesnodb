@@ -1584,6 +1584,39 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
   the single-thread column is as informative as the scaling ratio -- it is what showed this
   attempt was slower in absolute terms rather than merely less parallel.
 
+  **Striping those caches is a real +9.5% and still does not fix this, 2026-10-06.**
+  `verified` and `pinned` are now 64 independent mutexes keyed by a multiplicative hash of
+  the cell -- low bits would put a whole size class, and so a whole scan, in one shard.
+  Per-shard generation capacity is `VERIFIED_GENERATION / 64`, so the aggregate is
+  unchanged: the 65 536 figure was raised against a measured working set on 2026-10-05 and
+  its comment says not to raise it again, so striping had to divide it rather than multiply
+  it. Invalidation and `any_pinned_in` now scan every shard, because a hash spreads a cell
+  range across all of them -- paid on the write path only.
+
+  | | 20 threads, median of 5 | min-max |
+  | --- | --- | --- |
+  | unstriped `Mutex` | 1 129.9 Kr/s | 1 119.8 - 1 139.6 |
+  | striped, 64 | **1 237.4 Kr/s** | 1 235.8 - 1 239.8 |
+
+  Non-overlapping ranges, so the gain is real rather than noise -- and the contrast with
+  the `RwLock` attempt's **-31%** is the whole lesson: same bottleneck, two interventions,
+  opposite signs, exactly as "fewer contenders per lock, not a smaller lock" predicts.
+
+  **Report the 20-thread absolute, not the scaling ratio.** Every ratio in this thread was
+  built on a 1-thread arm that swung **3 021 to 4 513 Kr/s between back-to-back runs** at 3
+  sweeps -- the same code reading 0.38x then 0.25x. With 10 sweeps and 5 repetitions the
+  20-thread figure repeats within 1%. The noisy denominator is why the earlier 0.38 / 0.30 /
+  0.39 comparisons should not be trusted beyond their sign.
+
+  **Two candidates remain, stated as hypotheses rather than findings.** `segs` is still a
+  *single* unstriped `Mutex` taken on every `buffer_at`, and striping cannot help because it
+  guards one append-only `Vec` -- the fix there is a published snapshot of the segment list,
+  the same trick `PublishedChunks` uses for the class map. And every read clones a shared
+  `Arc<MmapSegment>` and touches an `ExtentGuard` refcount, so even with no locks at all the
+  atomics on those shared cache lines would serialize. If the second dominates, no further
+  lock work will help and the per-read shared-`Arc` traffic has to be designed out. Measure
+  which before building either.
+
   **A trap for anyone doing both halves: the inner `segs` / `pinned` / `verified` mutexes in `store/segment.rs` are redundant *only while the store lock is exclusive*.** `SegmentedMmap` is owned by value inside `ShardStore` and every production access is under `Mutex<ShardStore>`, so those three acquisitions per read currently guard against a race that cannot happen. Convert the store lock to `RwLock` and they immediately **become load-bearing**, because concurrent readers would then mutate `pinned` and `verified` at once. Removing them first and converting second gives data races on two `BTreeMap`s, and each step looks locally justified. See JOURNAL 2026-09-14.
 
   So the direction is reducing **acquisitions per read** or removing the shared mutex from the read path -- a read path that took `Mutex<ShardStore>` once per chunk plus three more inside `segment.rs` is acquiring four locks to move bytes that are already immutable under I2. Releasing the store lock before the decode remains sound ( the `Buffer` keeps its mapping alive independently, which is the whole purpose of `ExtentGuard` ) but is not by itself the fix.

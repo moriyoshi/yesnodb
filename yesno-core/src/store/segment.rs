@@ -210,7 +210,7 @@ pub struct SegmentedMmap {
     /// A `BTreeMap` rather than a `HashMap` because the question asked is a
     /// *range* one: a packed page is freed at its base cell while the `Buffer`s
     /// into it point at payload offsets scattered through the page.
-    pinned: Mutex<BTreeMap<u64, Weak<ExtentGuard>>>,
+    pinned: Vec<Mutex<BTreeMap<u64, Weak<ExtentGuard>>>>,
     /// Append-only. Existing entries are never replaced, only added to.
     segs: Mutex<Vec<Arc<MmapSegment>>>,
     /// Regions whose stored checksum has been recomputed and matched, as
@@ -227,7 +227,7 @@ pub struct SegmentedMmap {
     /// ( `set_len` only ever grows it, under I6 ). That invalidation is *exact*
     /// rather than conservative because I2 forbids rewriting a published extent:
     /// a write can only land on space no snapshot can reach.
-    verified: Mutex<VerifiedCache>,
+    verified: Vec<Mutex<VerifiedCache>>,
 }
 
 /// Bounded two-generation set of verified regions.
@@ -320,6 +320,39 @@ struct VerifiedCache {
 /// write.
 const VERIFIED_GENERATION: usize = 65_536;
 
+/// Independent locks over the verification and pin caches, striped by cell.
+///
+/// **Sharded, not converted, and the distinction is measured.** Read-locking these caches
+/// was tried on 2026-10-06 and was *slower* -- 0.38x to 0.30x at twenty threads and 15%
+/// worse single-threaded -- because an `RwLock` does not reduce contenders: twenty threads
+/// still bounce one lock's state between caches and its read side costs more to acquire.
+/// The backlog entry had already said so about the store lock: "what pays is fewer
+/// contenders per lock, not a smaller lock." Striping is what reduces contenders.
+const CACHE_SHARDS: usize = 64;
+
+/// Entries per generation **per shard**, so the aggregate capacity is unchanged.
+///
+/// [`VERIFIED_GENERATION`] was raised to 65 536 on 2026-10-05 against a measured working
+/// set and its comment says not to raise it again on that evidence. Striping must
+/// therefore divide it rather than multiply it: 64 shards of 1 024 hold the same 65 536 a
+/// generation, and the cache still holds at most twice that.
+const VERIFIED_GENERATION_PER_SHARD: usize = VERIFIED_GENERATION / CACHE_SHARDS;
+
+/// Which shard owns `cell`.
+///
+/// A multiplicative hash rather than low bits, because cells are slab-aligned and spaced
+/// by their size class: masking low bits would put a whole class -- and therefore a whole
+/// scan -- in one shard, which is the contention this exists to spread.
+fn cache_shard_of(cell: u64) -> usize {
+    (cell.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+}
+
+const _: () = assert!(
+    CACHE_SHARDS == 64,
+    "cache_shard_of shifts by 58 for 64 shards"
+);
+const _: () = assert!(VERIFIED_GENERATION_PER_SHARD > 0);
+
 impl VerifiedCache {
     fn is_verified(&mut self, cell: u64, len: usize) -> bool {
         if self.young.get(&cell).is_some_and(|&l| l as usize == len) {
@@ -337,7 +370,7 @@ impl VerifiedCache {
 
     fn insert(&mut self, cell: u64, len: u32) {
         self.young.insert(cell, len);
-        if self.young.len() >= VERIFIED_GENERATION {
+        if self.young.len() >= VERIFIED_GENERATION_PER_SHARD {
             self.old = std::mem::take(&mut self.young);
         }
     }
@@ -406,8 +439,12 @@ impl SegmentedMmap {
         let this = SegmentedMmap {
             file,
             segs: Mutex::new(Vec::new()),
-            pinned: Mutex::new(BTreeMap::new()),
-            verified: Mutex::new(VerifiedCache::default()),
+            pinned: (0..CACHE_SHARDS)
+                .map(|_| Mutex::new(BTreeMap::new()))
+                .collect(),
+            verified: (0..CACHE_SHARDS)
+                .map(|_| Mutex::new(VerifiedCache::default()))
+                .collect(),
         };
         this.remap_to_file_len()?;
         Ok(this)
@@ -488,7 +525,10 @@ impl SegmentedMmap {
         // One guard per cell, shared by every live Buffer over it, so that a
         // `Weak` to it answers "is this cell still being read?".
         let guard = {
-            let mut pinned = self.pinned.lock().unwrap();
+            // One shard, chosen by cell, for the same reason as the verification cache:
+            // `buffer_at` runs once per chunk read, so an unstriped lock here serializes
+            // concurrent readers of one key however cheap its critical section is.
+            let mut pinned = self.pinned[cache_shard_of(cell)].lock().unwrap();
             match pinned.get(&cell).and_then(Weak::upgrade) {
                 Some(g) => g,
                 None => {
@@ -525,22 +565,30 @@ impl SegmentedMmap {
     /// `Buffer`s into it point at payload offsets scattered through the page, so
     /// an exact-match lookup would report a busy page as free.
     pub fn any_pinned_in(&self, start: u64, len: u64) -> bool {
-        let mut pinned = self.pinned.lock().unwrap();
-        // Dropping a Buffer cannot remove its own entry, so dead weaks
-        // accumulate. Sweeping here keeps the map proportional to live readers
-        // rather than to reads ever performed.
-        pinned.retain(|_, w| w.strong_count() > 0);
-        pinned
-            .range(start..start.saturating_add(len))
-            .next()
-            .is_some()
+        // **Every shard.** `cache_shard_of` hashes, so a cell range is spread across all
+        // of them and none can be ruled out -- the same consequence striping has for
+        // `invalidate_verified`, and paid on the same path: reclamation, not reads.
+        let hi = start.saturating_add(len);
+        self.pinned.iter().any(|shard| {
+            let mut pinned = shard.lock().unwrap();
+            // Dropping a Buffer cannot remove its own entry, so dead weaks
+            // accumulate. Sweeping here keeps the map proportional to live readers
+            // rather than to reads ever performed.
+            pinned.retain(|_, w| w.strong_count() > 0);
+            pinned.range(start..hi).next().is_some()
+        })
     }
 
     /// How many cells are currently pinned. Diagnostics and tests.
     pub fn pinned_count(&self) -> usize {
-        let mut pinned = self.pinned.lock().unwrap();
-        pinned.retain(|_, w| w.strong_count() > 0);
-        pinned.len()
+        self.pinned
+            .iter()
+            .map(|shard| {
+                let mut pinned = shard.lock().unwrap();
+                pinned.retain(|_, w| w.strong_count() > 0);
+                pinned.len()
+            })
+            .sum()
     }
 
     /// Read a range by copying, for callers that cannot accept the aliasing
@@ -581,7 +629,12 @@ impl SegmentedMmap {
         len: usize,
         verify: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        if self.verified.lock().unwrap().is_verified(cell, len) {
+        // One shard, chosen by cell. `KeyStream::next_chunk` calls this once per chunk,
+        // and with the outer `Mutex<ShardStore>` gone this is the bottleneck that held
+        // 20-thread scaling at 0.38x. Striping spreads it over `CACHE_SHARDS` locks
+        // rather than making one lock cheaper, which measurement showed does not work.
+        let shard = &self.verified[cache_shard_of(cell)];
+        if shard.lock().unwrap().is_verified(cell, len) {
             return Ok(());
         }
         verify()?;
@@ -590,7 +643,7 @@ impl SegmentedMmap {
         // `MAX_VERIFIED_SPAN` pins that against the ladder -- and a silent
         // stale entry is exactly what this cache exists to prevent.
         if len as u64 <= MAX_VERIFIED_SPAN {
-            self.verified.lock().unwrap().insert(cell, len as u32);
+            shard.lock().unwrap().insert(cell, len as u32);
         }
         Ok(())
     }
@@ -598,12 +651,22 @@ impl SegmentedMmap {
     /// How many regions are currently remembered as verified. Tests.
     #[cfg(test)]
     pub fn verified_count(&self) -> usize {
-        self.verified.lock().unwrap().len()
+        self.verified.iter().map(|s| s.lock().unwrap().len()).sum()
     }
 
     /// Forget every verified region intersecting `[start, start + len)`.
     fn invalidate_verified(&self, start: u64, len: u64) {
-        let mut v = self.verified.lock().unwrap();
+        // **Every shard.** `cache_shard_of` hashes, so a contiguous key range is spread
+        // across all of them and no subset can be ruled out. Invalidation therefore costs
+        // `CACHE_SHARDS` bounded scans instead of one -- paid on the write path only,
+        // which is the trade striping is for.
+        for v in &self.verified {
+            Self::invalidate_verified_shard(v, start, len);
+        }
+    }
+
+    fn invalidate_verified_shard(shard: &Mutex<VerifiedCache>, start: u64, len: u64) {
+        let mut v = shard.lock().unwrap();
         if v.len() == 0 {
             return;
         }
