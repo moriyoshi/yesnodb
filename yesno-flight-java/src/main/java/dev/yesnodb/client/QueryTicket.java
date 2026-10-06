@@ -8,14 +8,25 @@ import java.util.Optional;
 
 /** The decoded yesnodb metadata inside an opaque Arrow Flight ticket. */
 public final class QueryTicket {
-  /** The fixed v1 ticket header length. */
-  public static final int HEADER_LENGTH = 40;
+  /**
+   * The fixed ticket header length: six little-endian {@code uint64}s, in the order this class
+   * declares them. A ticket may append an encoded expression after this header.
+   *
+   * <p>This was 40 bytes until the set representation was added to the header on 2026-09-30, and
+   * this constant was not widened with it. Nothing here caught that: the only server these tests
+   * talk to is a fake in {@code YesnoClientTest} that mints its ticket from this very constant, so
+   * the test and the code were self-consistently wrong together. The fixed vector in {@code
+   * QueryTicketTest} is a literal rather than a constant for that reason -- it is the one thing in
+   * this module that a widening on the Rust side can make fail.
+   */
+  public static final int HEADER_LENGTH = 48;
 
   private final long version;
   private final long key;
   private final long prefixLo;
   private final long prefixHi;
   private final long expressionHash;
+  private final SetWire wire;
   private final SetExpression expression;
   private final byte[] encoded;
 
@@ -25,6 +36,7 @@ public final class QueryTicket {
       long prefixLo,
       long prefixHi,
       long expressionHash,
+      SetWire wire,
       SetExpression expression,
       byte[] encoded) {
     this.version = version;
@@ -32,11 +44,19 @@ public final class QueryTicket {
     this.prefixLo = prefixLo;
     this.prefixHi = prefixHi;
     this.expressionHash = expressionHash;
+    this.wire = wire;
     this.expression = expression;
     this.encoded = encoded;
   }
 
-  /** Decode and validate a complete v1 ticket. */
+  /**
+   * Decode and validate a complete ticket.
+   *
+   * @param encoded the opaque ticket bytes a yesnodb server issued
+   * @return the decoded ticket
+   * @throws IllegalArgumentException if the ticket is short, inverted, asks for an unknown
+   *     representation, or carries an expression that will not parse
+   */
   public static QueryTicket decode(byte[] encoded) {
     Objects.requireNonNull(encoded, "encoded");
     if (encoded.length < HEADER_LENGTH) {
@@ -49,6 +69,7 @@ public final class QueryTicket {
     long prefixLo = input.getLong();
     long prefixHi = input.getLong();
     long expressionHash = input.getLong();
+    SetWire wire = SetWire.fromCode(input.getLong());
     if (Long.compareUnsigned(prefixLo, prefixHi) > 0) {
       throw new IllegalArgumentException("yesnodb ticket has an inverted prefix range");
     }
@@ -57,7 +78,7 @@ public final class QueryTicket {
             ? SetExpression.decode(Arrays.copyOfRange(encoded, HEADER_LENGTH, encoded.length))
             : null;
     return new QueryTicket(
-        version, key, prefixLo, prefixHi, expressionHash, expression, encoded.clone());
+        version, key, prefixLo, prefixHi, expressionHash, wire, expression, encoded.clone());
   }
 
   /** The database snapshot version shared by the count and row stream. */
@@ -83,6 +104,15 @@ public final class QueryTicket {
   /** The reserved expression identity field. */
   public long expressionHash() {
     return expressionHash;
+  }
+
+  /**
+   * The representation the row stream for this ticket will use.
+   *
+   * @return the set representation named in the header
+   */
+  public SetWire wire() {
+    return wire;
   }
 
   /** The pushed-down expression, if this is an expression query. */

@@ -207,8 +207,11 @@ mod tests {
         };
         assert_eq!(Ticket::decode(&t.encode()), Some(t.clone()));
 
-        // The compatibility property: a bare header is still exactly the old
-        // 40 bytes and decodes to a ticket with no expression.
+        // A bare header is exactly `TICKET_HEADER_LEN` bytes and decodes to a
+        // ticket with no expression. It was 40 bytes until the representation
+        // field widened it to 48 on 2026-09-30; the sentence that said so is
+        // replaced rather than corrected beside it, because a comment naming
+        // the old width reads as a promise the format no longer makes.
         assert_eq!(t.encode().len(), TICKET_HEADER_LEN);
     }
 
@@ -242,6 +245,48 @@ mod tests {
             "the representation lives in the header, so it costs no extra bytes"
         );
         assert_eq!(Ticket::decode(&bytes), Some(dense));
+    }
+
+    /// A fixed byte vector for the **header**, mirrored verbatim in the Python,
+    /// Go and Java clients' own tests, in the same discipline as
+    /// `the_cross_implementation_wire_vector_is_stable` in `yesno-wire`.
+    ///
+    /// This test exists because the header widened from 40 to 48 bytes on
+    /// 2026-09-30 and the three satellite clients were not widened with it. Each
+    /// kept round-tripping against its own 40-byte constant -- so every client
+    /// test stayed green -- while every real ticket from the server now had eight
+    /// bytes they fed to an expression decoder. The Go and Python integration
+    /// suites caught it against a live daemon; Java has no live daemon in its
+    /// gate and could not. A shared constant is what catches it in all four
+    /// without one.
+    ///
+    /// Both representations are pinned, so the field's **position** is checked and
+    /// not merely its presence: a vector for `Ordinals` alone would pass if the
+    /// field moved, because its bytes are zero.
+    #[test]
+    fn the_cross_implementation_ticket_header_is_stable() {
+        let t = Ticket {
+            version: 9,
+            key: 42,
+            prefix_lo: 1,
+            prefix_hi: 1 << 20,
+            expr_hash: 7,
+            expr: None,
+            wire: SetWire::Ordinals,
+        };
+        let hex =
+            |t: &Ticket| -> String { t.encode().iter().map(|b| format!("{b:02x}")).collect() };
+        // version(8) key(8) prefix_lo(8) prefix_hi(8) expr_hash(8) wire(8)
+        assert_eq!(
+            hex(&t),
+            "09000000000000002a000000000000000100000000000000000010000000000007000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex(&t.clone().with_wire(SetWire::Containers)),
+            "09000000000000002a000000000000000100000000000000000010000000000007000000000000000100000000000000"
+        );
+        assert_eq!(t.encode().len(), TICKET_HEADER_LEN);
+        assert_eq!(Ticket::decode(&t.encode()), Some(t));
     }
 
     /// The representation and a pushed-down filter coexist.

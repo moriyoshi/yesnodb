@@ -290,6 +290,10 @@ class YesnoClientTest {
           records);
     }
 
+    // Every word is written explicitly, including the representation. Leaving
+    // the tail of the buffer to its zeroes would make this fake agree with
+    // `QueryTicket.HEADER_LENGTH` whatever that constant said, which is how a
+    // 40-byte header survived here for a week after the server moved to 48.
     private static byte[] ticket(long version, long key) {
       return ByteBuffer.allocate(QueryTicket.HEADER_LENGTH)
           .order(ByteOrder.LITTLE_ENDIAN)
@@ -298,6 +302,7 @@ class YesnoClientTest {
           .putLong(0)
           .putLong(1L << 48)
           .putLong(0)
+          .putLong(SetWire.ORDINALS.code())
           .array();
     }
   }
