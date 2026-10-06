@@ -286,7 +286,12 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "yesno-core",
+ "yesno-wire",
 ]
+
+[[package]]
+name = "yesno-wire"
+version = "0.1.0"
 
 [[package]]
 name = "zerocopy"

@@ -18,6 +18,13 @@ libfuzzer-sys = "0.4"
 [dependencies.yesno-core]
 path = ".."
 
+# The expression decoders live here, not in `yesno-core`: `yesno-core` does not
+# depend on `yesno-wire` at all. A second path dependency is what reaching them
+# costs, and it is cheap -- `yesno-wire` has no dependencies of its own, by
+# policy, so this adds one entry to the lockfile and nothing else.
+[dependencies.yesno-wire]
+path = "../../yesno-wire"
+
 [[bin]]
 name = "decode_container"
 path = "fuzz_targets/decode_container.rs"
@@ -28,6 +35,13 @@ bench = false
 [[bin]]
 name = "roaring_import"
 path = "fuzz_targets/roaring_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_expr"
+path = "fuzz_targets/decode_expr.rs"
 test = false
 doc = false
 bench = false

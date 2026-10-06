@@ -582,7 +582,17 @@ step "two-node failover drill (real processes, real ports, mutual TLS)"
 check ./yesno-server/dist/two-node.sh
 
 printf '\n\033[1m== not run even by --deep\033[0m\n'
-printf '   fuzz targets: cd yesno-core && cargo +nightly fuzz run decode_container\n'
+# Derived from the directory, not listed. This line named `decode_container`
+# alone from the day `roaring_import` was added, and by 2026-10-06 it omitted
+# `decode_expr` too -- a line that reads as the inventory of fuzz targets while
+# undercounting it by two. The same reasoning as `SCRIPT_STEMS` in
+# `scripts/check-todo-refs.py`: a hand-written list is the thing that goes
+# stale, so derive it and the drift cannot recur.
+for target in yesno-core/fuzz/fuzz_targets/*.rs; do
+    [[ -e "$target" ]] || continue
+    name=${target##*/}
+    printf '   fuzz target: cd yesno-core && cargo +nightly fuzz run %s\n' "${name%.rs}"
+done
 printf '   they need a time budget, so they take an argument rather than a default\n'
 
 verdict "$EXPECT_STEPS_DEEP"
