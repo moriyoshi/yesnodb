@@ -21,7 +21,16 @@ identity; renaming the SQL table does not move data.
 
 - `INSERT`, `DELETE`, exact primary-key reads, ordered scans, and primary-key
   ranges are supported. `COUNT(*)` uses the exact yesnodb cardinality.
-- `UPDATE` is rejected; use `DELETE` followed by `INSERT`.
+- `UPDATE` moves an ordinal, which is a row's whole identity here, so it is a
+  removal and an insertion applied in one commit. Landing on an occupied
+  ordinal is a duplicate-key error, exactly as `INSERT` is, and an unchanged
+  value is a no-op. A statement whose rows collide **transiently** -- `SET
+  ordinal = ordinal + 1` over a dense range, where each row lands on its
+  not-yet-moved neighbour -- raises a duplicate-key error on the first
+  collision, and whether it collides at all depends on the order the server
+  feeds rows in. That is a property of a unique index rather than of this
+  engine; InnoDB refuses the same statement the same way. Rewrite such an
+  update to move rows to free values, or do it as `DELETE` then `INSERT`.
 - Cursors read a stable snapshot. A scan does not see rows inserted after that
   scan starts.
 - Writes are **transactional**. They are buffered per connection and applied

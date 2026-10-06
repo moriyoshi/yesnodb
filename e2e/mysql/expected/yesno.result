@@ -28,6 +28,48 @@ ordinal
 65540
 7
 1
+UPDATE postings SET ordinal = 11 WHERE ordinal = 1;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+7
+11
+65540
+UPDATE postings SET ordinal = 7 WHERE ordinal = 7;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+7
+11
+65540
+UPDATE postings SET ordinal = 11 WHERE ordinal = 7;
+ERROR 23000: Duplicate entry '11' for key 'postings.PRIMARY'
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+7
+11
+65540
+UPDATE postings SET ordinal = ordinal + 1000 WHERE ordinal < 100000;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+1007
+1011
+66540
+UPDATE postings SET ordinal = 5 WHERE ordinal = 123456;
+SELECT COUNT(*) FROM postings;
+COUNT(*)
+3
+START TRANSACTION;
+UPDATE postings SET ordinal = 2000 WHERE ordinal = 1007;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+1011
+2000
+66540
+ROLLBACK;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ordinal
+1007
+1011
+66540
 RENAME TABLE postings TO renamed_postings;
 SELECT COUNT(*) FROM renamed_postings;
 COUNT(*)

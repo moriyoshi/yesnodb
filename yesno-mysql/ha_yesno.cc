@@ -777,11 +777,58 @@ int ha_yesno::write_row(uchar *buf) {
   return 0;
 }
 
-int ha_yesno::update_row(const uchar *, uchar *) {
+/// Move one ordinal, which for this engine is the row's whole identity.
+///
+/// **This was refused until 2026-10-06, and the refusal was right when written.**
+/// `write_row` then committed one ordinal per commit, so
+/// `UPDATE ... SET ordinal = ordinal + 1` scanning forward would commit 5 -> 6,
+/// step onto the 6 it had just written, update that, and cascade to the end of
+/// the domain. The Halloween problem, and unavoidable without buffering.
+///
+/// Two properties make it safe, and both already existed before this function
+/// did. Writes are buffered per transaction and applied once at commit, and
+/// `OverlayCursor` takes its view **by value at construction** -- see
+/// `open_cursor`, whose comment states the intent -- so a scan cannot observe
+/// the writes its own statement makes while it runs. The cascade is
+/// structurally impossible rather than merely unlikely.
+///
+/// `TxnBuffer` settles the pair without help, including `old == new`: both land
+/// in one level's `ops` map keyed by ordinal, so the insert supersedes the
+/// remove and the ordinal stays present, which is what a no-op update must do.
+/// The explicit early return below is for MySQL's benefit rather than the
+/// buffer's -- it keeps an unchanged row out of the write plan entirely.
+///
+/// **What is deliberately not supported** is a statement whose rows collide
+/// transiently, such as `SET ordinal = ordinal + 1` over a dense range: the
+/// first collision raises `ER_DUP_ENTRY`. That is a property of a unique index,
+/// not of this engine -- InnoDB refuses the same statement the same way -- so it
+/// is pinned by a fixture rather than worked around here.
+int ha_yesno::update_row(const uchar *old_data, uchar *new_data) {
   DBUG_TRACE;
-  return command_error(
-      "UPDATE is not supported; the ordinal is the row identity, so use "
-      "DELETE followed by INSERT");
+  if (table->field[0]->is_null())
+    return command_error("the ordinal column must not be NULL");
+  const ulonglong old_ordinal = read_ordinal(old_data);
+  const ulonglong new_ordinal = read_ordinal(new_data);
+  if (old_ordinal == new_ordinal) return 0;
+
+  bool present = false;
+  if (const int result = view_contains(old_ordinal, &present); result != 0)
+    return result;
+  if (!present) return HA_ERR_KEY_NOT_FOUND;
+  if (const int result = view_contains(new_ordinal, &present); result != 0)
+    return result;
+  if (present) {
+    errkey = 0;
+    return HA_ERR_FOUND_DUPP_KEY;
+  }
+
+  // Order matters only for readability: the buffer is a map keyed by ordinal
+  // and these are two different keys once `old != new`, which the early return
+  // above guarantees.
+  TxnBuffer &buffer = txn_state(ha_thd())->buffer;
+  buffer.record(key_, old_ordinal, true);
+  buffer.record(key_, new_ordinal, false);
+  return 0;
 }
 
 int ha_yesno::delete_row(const uchar *buf) {

@@ -1413,3 +1413,105 @@ exactly that today, on the very run that then ran out of disk. Narrowed to
 runner's disk ceiling is cleared, and this file's own CI header says the same about the
 workflow: treat the first execution as the test, and do not read a green local gate as
 evidence that the pipeline works.
+
+## 2026-10-06 -- CI green for the first time in ten days, and a refusal that outlived its cause
+
+Two threads closed today. The pipeline, which had been red on every push since
+2026-09-27, and `UPDATE` in the MySQL engine, which turned out to be blocked by a
+condition that a change earlier the same day had already removed.
+
+### The pipeline is green, and the split is what did it
+
+`main` now runs clean for the first time since **2026-09-19**. The measured split, on
+its second run with warm per-job caches:
+
+| job | cold | warm |
+| --- | --- | --- |
+| `gate` ( rustfmt, clippy ) | 4m29s | **44s** |
+| `docs` ( links resolve ) | 3m39s | **36s** |
+| `feature-tests` | -- | 2m49s |
+| `tests` ( workspace ) | -- | 18m0s |
+| `policy` | 8s | 8s |
+
+**`tests` at 18 minutes is the vindication.** One step needs more than half the old
+job's entire 30-minute ceiling, so no raised ceiling would have fixed the disk, and no
+single job could have held it beside three other builds. It finished inside a 45-minute
+budget on its own runner with its own disk, and nothing ran out of space.
+
+**Per-job cache keys earned their cost immediately.** `gate` fell from 4m29s to 44s
+because it restores a cache holding exactly its own check-mode artifacts. One shared key
+would have had four jobs overwriting each other's `target/` and each paying a partial
+rebuild for ever.
+
+And the earlier diagnosis was half right twice over, which is worth stating plainly. I
+first blamed my own clippy fix for letting the job run further, then corrected that to
+disk exhaustion dating from 2026-09-27. The complete answer is **both limits at once**:
+18 minutes of tests plus 4 of clippy plus the feature-variant rebuilds plus `cargo doc`
+exceeded 30 minutes *and* exceeded ~14 GB. Either ceiling alone was fatal, and a fix
+aimed at one would have left the other.
+
+### A refusal that expired with its cause
+
+`ha_yesno::update_row` refused with "the ordinal is the row identity, so use DELETE
+followed by INSERT". **The identity argument was never the obstacle.** The obstacle was
+that `write_row` committed one ordinal per commit, so `UPDATE ... SET ordinal = ordinal
++ 1` scanning forward would commit 5 -> 6, step onto the 6 it had just written, update
+that, and cascade to the end of the domain. The Halloween problem, and unavoidable
+without buffering.
+
+Two properties now prevent it, and **both existed before this work started**. Writes are
+buffered per transaction and applied once at commit -- the change that closed
+`mysql-write-row-cannot-batch` in this morning's sweep -- and `OverlayCursor` takes its
+view **by value at construction**, which `open_cursor`'s own comment explains as keeping
+a scan from changing shape halfway through. A scan therefore cannot observe the writes
+its own statement makes. The cascade is structurally impossible, not improbable.
+
+`TxnBuffer` needed nothing either: last-write-wins per ordinal per level means
+`remove( old )` then `insert( new )` settles to the right pair, and `old == new` settles
+correctly as well, the insert superseding the remove so the ordinal stays present. So the
+function is the existing checks in a new order, and the interesting work was all in
+deciding what to test.
+
+**The lesson is about the gap between a refusal and its reason.** The comment stated a
+true fact -- the ordinal *is* the row identity -- which was not the blocking one. A
+reader auditing for expired constraints would have read that sentence and moved on. What
+actually expired was a performance property of the write path, recorded nowhere near the
+refusal it justified.
+
+### Two of three files is not a survey
+
+Assessing coverage I grepped `e2e/mysql/sql/yesno.test` and `expected/yesno.result`,
+found no mention of `UPDATE`, and reported that even the refusal was untested. **It was
+tested** -- by `e2e/mysql/mysql.py`, the third file, which asserted the failure and
+matched its message text. The first gate run failed with "embedded update refusal
+unexpectedly succeeded": an engine accepting `UPDATE` against a harness asserting it
+refuses, a contradiction I had introduced and the gate was the only thing holding.
+
+The assertion became positive coverage rather than being deleted, on the ordinals the
+harness already establishes ( 7 present, 8 asserted absent ): the old ordinal vacated
+and the new one arrived checked as **two separate counts**, because one combined count
+cannot say which survived; cardinality unchanged at 6, the real invariant of a
+remove-plus-insert; a duplicate on an occupied ordinal; and a no-op on an unchanged
+value.
+
+### What was deliberately not pinned, for the second time today
+
+`SET ordinal = ordinal + 1` over a dense range collides or not **depending on the order
+the server feeds rows in** -- descending succeeds where ascending fails. Pinning that in
+a byte-exact oracle would encode a server implementation detail as an expectation, which
+is precisely the defect fixed in `dense_span`'s tests a few hours earlier, where a
+60-second checkpoint interval made an assertion depend on wall clock. So the limit is
+documented in `yesno-mysql/README.md` as a property of a unique index -- InnoDB refuses
+the same statement the same way -- and no fixture asserts it.
+
+**Twice in one day a test wanted to pin something environmental.** The first cost a deep
+gate run and three skipped measurement steps; the second was caught before it was
+written. The distinction worth carrying: pin what the code promises, document what the
+environment happens to do.
+
+**Verified**: `gate-mysql passed`, 1 of 1 test, against MySQL 8.4 built from pinned
+source with `ha_yesno.so` linked into a throwaway server. The `expected/yesno.result`
+added here was written by **predicting** the output rather than generating it, and
+`//e2e/mysql:regress` compares byte-exactly, so the prediction held -- which is the
+discipline that file's oracle exists for, and the only way adding a case to it proves
+anything.

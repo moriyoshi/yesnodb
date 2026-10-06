@@ -112,14 +112,55 @@ def exercise_contract(mysql, client_base, env, key, label):
     )
     assert cardinality["stdout"] == "6\n"
 
+    # UPDATE moves an ordinal, which is a row's whole identity here, so it is a
+    # removal and an insertion applied in one commit -- the cardinality must not
+    # move. This assertion read "update refusal" until 2026-10-06; the engine
+    # refused UPDATE because `write_row` once committed per row, which made a
+    # scan able to re-visit its own writes. Buffered writes and a cursor view
+    # snapshotted at open removed that, so the refusal expired with its cause.
+    checked(
+        mysql_run(
+            mysql, client_base, env, "UPDATE " + table + " SET ordinal=8 WHERE ordinal=7", False
+        ),
+        label + " update to a free ordinal",
+    )
+    vacated = checked(
+        mysql_run(mysql, client_base, env, "SELECT COUNT(*) FROM " + table + " WHERE ordinal=7", True),
+        label + " update vacated the old ordinal",
+    )
+    arrived = checked(
+        mysql_run(mysql, client_base, env, "SELECT COUNT(*) FROM " + table + " WHERE ordinal=8", True),
+        label + " update reached the new ordinal",
+    )
+    assert vacated["stdout"] == "0\n", f"{label} update left the old ordinal behind"
+    assert arrived["stdout"] == "1\n", f"{label} update did not store the new ordinal"
+    cardinality = checked(
+        mysql_run(mysql, client_base, env, "SELECT COUNT(*) FROM " + table, True),
+        label + " cardinality after update",
+    )
+    assert cardinality["stdout"] == "6\n", f"{label} update changed the cardinality"
+
+    # Landing on an occupied ordinal is a duplicate, exactly as INSERT is.
     failed_mysql(
         mysql,
         client_base,
         env,
-        "UPDATE " + table + " SET ordinal=8 WHERE ordinal=7",
-        "UPDATE is not supported",
-        label + " update refusal",
+        "UPDATE " + table + " SET ordinal=9 WHERE ordinal=8",
+        "Duplicate entry",
+        label + " update onto an occupied ordinal",
     )
+    # An unchanged value is a no-op rather than a remove followed by an insert.
+    checked(
+        mysql_run(
+            mysql, client_base, env, "UPDATE " + table + " SET ordinal=8 WHERE ordinal=8", False
+        ),
+        label + " update to the same ordinal",
+    )
+    cardinality = checked(
+        mysql_run(mysql, client_base, env, "SELECT COUNT(*) FROM " + table, True),
+        label + " cardinality after refused and no-op updates",
+    )
+    assert cardinality["stdout"] == "6\n"
     checked(
         mysql_run(mysql, client_base, env, "DELETE FROM " + table + " WHERE ordinal=9", False),
         label + " delete present",

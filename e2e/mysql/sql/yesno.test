@@ -17,6 +17,26 @@ INSERT INTO postings VALUES (7);
 DELETE FROM postings WHERE ordinal = 9;
 SELECT ordinal FROM postings ORDER BY ordinal DESC;
 
+UPDATE postings SET ordinal = 11 WHERE ordinal = 1;
+SELECT ordinal FROM postings ORDER BY ordinal;
+UPDATE postings SET ordinal = 7 WHERE ordinal = 7;
+SELECT ordinal FROM postings ORDER BY ordinal;
+
+--error ER_DUP_ENTRY
+UPDATE postings SET ordinal = 11 WHERE ordinal = 7;
+SELECT ordinal FROM postings ORDER BY ordinal;
+
+UPDATE postings SET ordinal = ordinal + 1000 WHERE ordinal < 100000;
+SELECT ordinal FROM postings ORDER BY ordinal;
+UPDATE postings SET ordinal = 5 WHERE ordinal = 123456;
+SELECT COUNT(*) FROM postings;
+
+START TRANSACTION;
+UPDATE postings SET ordinal = 2000 WHERE ordinal = 1007;
+SELECT ordinal FROM postings ORDER BY ordinal;
+ROLLBACK;
+SELECT ordinal FROM postings ORDER BY ordinal;
+
 RENAME TABLE postings TO renamed_postings;
 SELECT COUNT(*) FROM renamed_postings;
 

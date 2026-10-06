@@ -520,8 +520,10 @@ with exactly one `BIGINT UNSIGNED NOT NULL PRIMARY KEY` column. The table's
 `CONNECTION='key=<u64>'` selects that set. Tables with the same connection
 value share data; dropping or truncating either clears the underlying set.
 
-It supports inserts, deletes, exact and range reads, ordered scans, exact
-counts, rollback, and savepoints. A transaction's buffered changes become one
+It supports inserts, updates, deletes, exact and range reads, ordered scans,
+exact counts, rollback, and savepoints. An update moves an ordinal, which is a
+row's whole identity here, so it is a removal and an insertion in one commit;
+landing on an occupied ordinal is a duplicate-key error, as an insert would be. A transaction's buffered changes become one
 yesnodb version at MySQL commit, using either the embedded C ABI or a remote
 Flight backend selected at startup. There is no two-phase prepare: a crash
 between this engine's commit and MySQL's binlog write can leave them out of
