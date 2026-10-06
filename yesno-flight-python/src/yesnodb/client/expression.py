@@ -1368,9 +1368,7 @@ class BigScale(VecBigExpr):
         return self.op.width_bound(self.vector.element_bound(), self.scalar.width_bound())
 
     def work_bound(self) -> int:
-        per = self.op.element_work(
-            self.vector.element_bound(), self.scalar.width_bound()
-        )
+        per = self.op.element_work(self.vector.element_bound(), self.scalar.width_bound())
         return self.vector.work_bound() + self.scalar.work_bound() + self.arity * per
 
     def _encode_node(self, out: bytearray) -> None:
