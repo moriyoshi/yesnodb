@@ -926,7 +926,7 @@ the targeted 220.5 MiB span is a modest win that depends on an oracle mask from 
 read. `mincore` is what exposed the advisory failure: the calls return successfully without the
 pages becoming resident. **I was one step from implementing against a documented negative
 result**, and would have measured a wall-clock improvement that was not there with no residency
-guard to catch it. See `LTM/cold-peer-page-warming-20261006.md`.
+guard to catch it. See `../../../shifou/.agents/docs/cold-peer-page-warming-20261006.md`.
 
 **"A connection per worker" was unsound, and the limit it worked around has no ceiling.** A
 consumer's threaded row search hits `channel_max_handles`, default 4. I suggested more sockets.
@@ -966,7 +966,7 @@ chain never started. Wait on a PID, or grep a log file for the verdict.
 
 Asked whether a `KeyStream` span API would pay. The context: a consumer's cold peer restore
 costs ~953 serialized major faults, advisory paging hints were measured ineffective
-( `LTM/cold-peer-page-warming-20261006.md` ), and only a real `pread` populated pages -- but
+( `../../../shifou/.agents/docs/cold-peer-page-warming-20261006.md` ), and only a real `pread` populated pages -- but
 their targeted arms depended on an **oracle mask** taken from a previous read, which
 production does not have. Their own implication named the gap: "a versioned, safe way for
 yesno to identify the physical spans backing a selected logical query".
@@ -1014,3 +1014,85 @@ earlier, in the file I had changed most in this session. Twice before in the sam
 correction came from measuring rather than thinking; this time it came from reading. The
 sequence that worked, after two failures, was: check the repository for the finding, check the
 source for the capability, and only then propose.
+
+## 2026-10-06 -- CI had been red for ten days, in four unrelated ways
+
+Asked to find out why CI was failing. It was not one cause. The `release` workflow had been red
+on every push since 2026-09-27 and the scheduled `ci` run since at least 2026-10-04, and the four
+causes are independent of each other -- which is itself the finding, because a pipeline that is
+already red reports nothing about the next thing to break.
+
+**1. The Flight ticket header widened and three clients were not told.** `d882756` took
+`TICKET_HEADER_LEN` from 40 to 48 bytes on 2026-09-30, adding `SetWire` as a sixth `u64`. The Go,
+Python and Java clients each kept their own `40`. Each reads five fields, finds eight bytes left
+over, and hands them to its expression decoder, which rejects them -- so every Go integration test
+failed with "ticket carries a malformed expression" and every Python one with "not a yesnodb
+expression". Reproduced locally against `target/debug/yesnod` before changing anything. Only the
+server-to-client direction was affected: the descriptor command is `QueryRequest` with its own
+`YSNQ` magic, and all three clients re-send the ticket bytes verbatim for `DoGet`.
+
+**Java was green and equally broken, which is the part worth keeping.** Its only server is a fake
+inside `YesnoClientTest` that minted its ticket with `ByteBuffer.allocate( QueryTicket.HEADER_LENGTH )`
+-- so the test and the code were wrong together, and no assertion in the module could tell. **A test
+that derives its fixture from the constant it is checking cannot fail.** The fix is a literal: a
+48-byte hex vector mirrored in all four implementations, authored in `yesno-flight/src/ticket.rs` as
+`the_cross_implementation_ticket_header_is_stable`, following the discipline
+`the_cross_implementation_wire_vector_is_stable` in `yesno-wire` already set for expressions. Both
+`Ordinals` and `Containers` are pinned, because a vector for the default alone would still pass if
+the field moved -- its bytes are zero. All three clients now also decode and validate the
+representation, rejecting an unknown one rather than defaulting to ordinals, which matches the Rust
+decoder's reasoning: answering in a representation the caller did not ask for is indistinguishable
+to it from a server that understood.
+
+**2. Clippy on an unpinned `stable`, two toolchain generations deep.** `ci.yml` installs `stable`;
+this host's default is 1.97.1. The 2026-09-29 run died on `chunks_exact_to_as_chunks`, new in
+clippy **1.98**, at one site in `yesno-plugin`; by 2026-10-04 the same lint had widened to four
+sites there ( fixed that morning in `a87cd10` ); and 1.99 immediately landed two more in
+`yesno-server` -- `clippy::single_element_loop` in `config.rs` and the `fetch_update` ->
+`try_update` deprecation in a `#[cfg( test )]` fault injector, which only `--all-targets` reaches.
+`cargo +stable clippy` locally was 1.98 and reported the file clean, so reproducing this needed
+`rustup toolchain install 1.99`; with it, `--keep-going` enumerated the complete set in one run
+rather than one crate per push. `try_update` compiles at the 1.95 floor, so the rename costs no
+MSRV, and that was checked rather than assumed.
+
+**3. ruff in the Python client, and a third failure hiding behind it.** Three autofixable errors
+( `I001` twice, `RUF022` on `__all__` ), not version drift -- ruff 0.16.5 is pinned in `uv.lock` and
+that lock has never changed, so symbols went into those import blocks without anyone running
+`yesno-flight-python/gate.sh`. Because the script lints before it tests, ruff had been **masking
+cause 1 for the whole week**: CI never reached the integration suite. Fixing `ruff check` then
+exposed a `ruff format` failure in `expression.py` that no CI log had ever printed, for the same
+reason one step further along. **An ordered gate reports its first failure, not its worst.**
+
+**4. The local gate was structurally incapable of seeing any of it.** `scripts/gate.sh` invoked none
+of the four client gates, and `scripts/check-gate-parity.py` -- the mechanism that exists precisely
+because "a check only CI runs is a check the local workflow is free to break, and it will" -- could
+not report that, because its `SCRIPT` pattern matched `scripts/*.py` and `scripts/*.sh` and every
+client gate lives in its own crate directory. This is instance **5** on that script's own list, and
+the first one its automation was blind to.
+
+Fixed in both directions. The checker now compares `*/gate.sh` too; the Java client grew a
+`gate.sh` so that it could be compared at all, and `ci.yml` calls it instead of spelling out
+`gradlew`; and `gate.sh` gained a "client gates" step naming all four. The checker was **regressed
+to prove it has teeth**: deleting the Java line makes it report "runs in CI and in no gate.sh step"
+and exit 1.
+
+A gate that is absent and a gate that cannot run are different problems, and the step treats them
+differently. Each client gate runs only if its toolchain is on `PATH`; a missing one is reported by
+name in the step and again in the verdict ( "N client gate( s ) not run on this host" ), never
+skipped silently. That is not fastidiousness -- it is the same failure as cause 4 in miniature, and
+the alternative is worse in a specific way `gate.sh`'s own header already warns about: a gate that
+fails because the host has no JDK is a gate people stop running, which is how these checks ended up
+in CI alone.
+
+**Verification.** Go: 4 failing integration tests to a clean `go test -race -tags=integration`.
+Python: `ruff`, `ruff format`, `mypy` and 94 tests clean, including the 8 integration tests that
+the lint failure had been hiding. Java: `gradlew build` green, which needed a JDK fetched into the
+scratch directory -- **this host has `java` and no `javac`**, so the Java gate skips here, which is
+exactly the case the skip-reporting exists for. Rust: `cargo +1.99 clippy --workspace --all-targets
+--all-features --keep-going -- -D warnings` clean, `cargo +1.95 check --workspace --all-targets
+--all-features` clean, and the full `scripts/gate.sh`.
+
+**The residual gap, stated rather than papered over**: the Java client still has no live-daemon
+interoperability test, so the next wire change will break it silently again and Go and Python will
+be the ones to say so. The shared hex vector narrows that to changes a vector cannot express; it
+does not close it.
