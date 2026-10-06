@@ -45,13 +45,42 @@ fn dense(chunks: u64) -> Vec<u64> {
         .collect()
 }
 
+/// Options with the **interval checkpoint trigger disabled**.
+///
+/// `CheckpointPolicy::interval_secs` defaults to 60 and the write path evaluates
+/// `should_checkpoint` on **every insert**, so an insert made more than a minute after the
+/// last checkpoint checkpoints as a side effect. Nothing here is about scheduling, and
+/// `a_memtable_override_is_refused` depends on an uncommitted ordinal *staying*
+/// uncommitted: a checkpoint between its insert and its assertion flushes the override
+/// into the store, `dense_span` is then right to lend the bytes, and the test fails having
+/// proved nothing about the refusal it exists to pin.
+///
+/// **Not hypothetical.** That test passed here and in CI for days and failed in the
+/// scheduled Valgrind job on 2026-10-04, where this file takes 268 s and the minute
+/// elapses mid-test. Valgrind reported zero errors from zero contexts: it found a
+/// time bomb, not a memory fault. Reproduced in 0.30 s by setting `interval_secs` to 0,
+/// which fails at the identical line with the identical message.
+///
+/// Applied to every test in the file rather than only that one. The others insert before
+/// their checkpoint and so are unharmed by an extra one, but the next test added here
+/// would have to rediscover this.
+fn options() -> DbOptions {
+    DbOptions {
+        policy: yesno_core::checkpoint::CheckpointPolicy {
+            interval_secs: u64::MAX,
+            ..Default::default()
+        },
+        ..DbOptions::default()
+    }
+}
+
 #[test]
 fn a_contiguous_window_is_lent_and_not_copied() {
     let d = dir("lent");
     let _c = CleanDir(d.clone());
     let chunks = 8u64;
 
-    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    let db = Db::open_with(&d, options()).unwrap();
     db.insert_many(1, &dense(chunks)).unwrap();
     // Checkpointed, because only a store-backed payload can be lent at all -- a
     // memtable-resident one has no mapping behind it.
@@ -99,7 +128,7 @@ fn a_gap_stops_the_run_rather_than_refusing_it() {
     let d = dir("gap");
     let _c = CleanDir(d.clone());
 
-    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    let db = Db::open_with(&d, options()).unwrap();
     // Chunks 0 and 2 dense, chunk 1 empty: a hole has no stride, so bit arithmetic over the
     // window would silently shift every position after it.
     let mut vals: Vec<u64> = (0..CHUNK_CARD as u64).filter(|o| o % 2 == 0).collect();
@@ -127,7 +156,7 @@ fn a_memtable_override_is_refused() {
     let _c = CleanDir(d.clone());
     let chunks = 4u64;
 
-    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    let db = Db::open_with(&d, options()).unwrap();
     db.insert_many(1, &dense(chunks)).unwrap();
     db.checkpoint().unwrap();
     assert!(
@@ -153,7 +182,7 @@ fn a_sparse_chunk_stops_the_run() {
     let d = dir("sparse");
     let _c = CleanDir(d.clone());
 
-    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    let db = Db::open_with(&d, options()).unwrap();
     // Chunk 0 dense, chunk 1 holding three ordinals: an array, whose payload is neither
     // 8192 bytes nor at the stride the window's arithmetic assumes.
     let mut vals: Vec<u64> = (0..CHUNK_CARD as u64).filter(|o| o % 2 == 0).collect();
@@ -188,7 +217,7 @@ fn a_key_spanning_a_slab_boundary_is_lent_in_full() {
     // Comfortably past one slab body's 254 chunks.
     let chunks = 300u64;
 
-    let db = Db::open_with(&d, DbOptions::default()).unwrap();
+    let db = Db::open_with(&d, options()).unwrap();
     db.insert_many(1, &dense(chunks)).unwrap();
     db.checkpoint().unwrap();
     let snap = db.snapshot().unwrap();
