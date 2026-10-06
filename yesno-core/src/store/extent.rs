@@ -476,7 +476,7 @@ pub const CLASS_SIZES: [u32; 12] = [
     3136, // 8           <= 3128
     4160, // 9           <= 4152   exact for 4096
     6208, // 10          <= 6200
-    // 10. **Exactly a bitmap payload.** It was 8256 -- `round_up_64( 8192 + 8 )` -- while
+    // 11. **Exactly a bitmap payload.** It was 8256 -- `round_up_64( 8192 + 8 )` -- while
     // every slot carried its own 8-byte trailer, and that 64 bytes of slack was the sole
     // reason consecutive dense payloads could not be adjacent: `8256 % 4096 == 64` also
     // put each one across three OS pages instead of two. The trailer now lives in a table

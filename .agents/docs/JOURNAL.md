@@ -1968,3 +1968,49 @@ renumber, which is the only reason I read the code rather than the paragraph.
   was eleven test literals, two superblock fixtures and one ratio loop, in a design that had
   already made room for a zero entry. I argued against it from a list of places the class
   byte *appears*, which is not the same as the places that would *break*.
+
+### Addendum, same day: the renumbering residue, and where it was not
+
+The commit above ( `9ed609f` ) shifted eleven class literals in tests and both inline
+markers in the `CLASS_SIZES` array. Eight lib tests failed and were repaired; the
+compiler and the suite between them caught every *row*. One thing survived, and it was
+found not by a check but by being asked to restate the ladder in conversation: the
+rationale block for the bitmap class still opened `// 10. **Exactly a bitmap payload.**`
+on what is now class 11.
+
+**The residue lands on the worst half.** Rows are checked -- by rustc, by a failing
+assertion, by `validate_ladder`. A number written into a *sentence* is checked by nobody,
+and the sentences in `yesno-core/src/store/` are the ones carrying the why, which is the
+half this tree treats as load-bearing documentation and the half a later reader trusts
+without re-deriving. My own edit script matched on array rows, so it reached the table and
+not the paragraph above it. It is the same maintenance failure as a stale figure in a
+comment, on a different axis, and partly sweepable in the same way -- grep the old and the
+new number as prose near the identifier and read each hit as a sentence.
+
+### And again, in the document that owns the ladder
+
+The paragraph above was written, and the user then asked whether there was already a
+storage format document. There is, and it had the same drift: `docs/storage-format.md`
+said *"A packed page occupies one 4096-byte class-0 slot"* -- in a file I had edited in
+`9ed609f`, where I had updated the ladder table, the superblock field widths, the slab
+metadata row and one other prose mention of class 0, and walked past this one. Fixed by
+naming the class by **role** rather than by number ( "packed-class slot" ), which is the
+repair that cannot drift again.
+
+**Two instances in one change makes it a class, and the second one landed after the rule
+was written.** The sweep I had just prescribed was scoped to `yesno-core/src/store/`,
+because the instance in hand was a source comment; the ladder's canonical human-facing
+description lives under `docs/`, and nothing in the prescription said to look there. A
+rule derived from one instance inherits that instance's scope -- which is the second-order
+version of the same failure. So the sweep, if run at all, has to cover `yesno-*/src/`,
+`docs/` and `.agents/docs/` together; and where the number is not load-bearing, name the
+thing by **role** instead ( "the packed class", not "class 1" ), which is the only repair
+that cannot drift again.
+
+**The machinery to prevent this already exists one document over.**
+`scripts/check-model-constants.py` recomputes `docs/formal-model.md`'s derived figures
+from the source constants, binding each to a named site that must match exactly once,
+precisely so that correcting one occurrence cannot leave four stale. The ladder table in
+`docs/storage-format.md` is pure arithmetic over `CLASS_SIZES` -- twelve rows, the class
+count, and the superblock byte range -- so it is in the mechanizable half by §8's own
+test, and it is currently unaudited. Recorded in `TODO.md` rather than built here.

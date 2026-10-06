@@ -503,7 +503,7 @@ tag = (z XOR (z >> 31)) >> 32
 
 ### Packed page
 
-A packed page occupies one 4096-byte class-0 slot and contains several small
+A packed page occupies one 4096-byte packed-class slot and contains several small
 array or run payloads. It has no per-payload directory. Each `ChunkRef` points
 directly to its payload, and the index supplies its kind, cardinality, and
 length. Payloads are appended in ascending chunk-key order and are naturally
