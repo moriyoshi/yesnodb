@@ -93,13 +93,52 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Why this is five jobs and not one
+  # ---------------------------------------------------------------------------
+  #
+  # It was one job named `gate`, and on 2026-10-06 it failed two different ways
+  # in one afternoon: once on the 30-minute timeout, once on `No space left on
+  # device` while linking test binaries. Both are the same cause. That job built
+  # this workspace several times over into a single `target/` on a single
+  # runner -- `clippy --all-targets --all-features`, then `cargo test
+  # --workspace` at `debuginfo = 2`, then three feature-variant rebuilds, then
+  # `cargo doc` -- on top of a restored cache, against a standard runner's
+  # ~14 GB disk and its 30-minute budget.
+  #
+  # **Separate jobs get separate runners, so they get separate disks.** That is
+  # the point of the split; the wall-clock win from running them in parallel is
+  # a side effect. Successful runs of the single job were 17m48s to 20m57s
+  # ( measured 2026-09-14 to 2026-09-19, the last four greens ), and the
+  # measured split on 2026-10-06 was setup-and-cache 2m54s, clippy 4m03s,
+  # `cargo test --workspace` 9m11s.
+  #
+  # Disk was already failing on **2026-09-27** -- that run could not even write
+  # the runner's own diagnostic log -- and nobody saw it, because every run from
+  # that date died at `clippy` in four minutes and never reached the part that
+  # fills the disk. A job that fails fast stops measuring itself.
+  #
+  # `policy` carries the eleven checks that need no cargo at all. They used to
+  # queue behind twenty minutes of compiling, so a `TODO.md` typo was reported
+  # after twenty minutes; it now reports in seconds.
+  #
+  # Do not merge these back into one job. `scripts/check-gate-parity.py`
+  # compares which scripts and which whole-workspace commands appear in this
+  # file, not which job they sit in, so the split is invisible to it -- and
+  # `release.yml`'s `needs: gate` names its own calling job, not these.
+
   gate:
-    name: gate (clippy, tests, layout)
+    name: gate (rustfmt, clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Line tables, not full DWARF. `debuginfo = 2` on ~70 test
+      # binaries is what put this over a runner's disk; line tables keep
+      # backtrace file and line numbers, which is the part `RUST_BACKTRACE`
+      # is set for.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-
       - name: Install toolchain
         # All workspace members now promise at least Rust 1.95, matching
         # Cranelift and Monty. Core's floor is checked by the `msrv` job.
@@ -107,7 +146,6 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
           rustc --version
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -115,22 +153,103 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
+          # `Cargo.lock`, not `**/Cargo.lock`. The glob matched four lockfiles
+          # and three of them have nothing to do with the `target/` being cached
+          # here: `yesno-c` is a separate workspace whose gate redirects
+          # `CARGO_TARGET_DIR` to scratch, `yesno-core/fuzz` is outside
+          # `[workspace] members`, and `yesno-pg` is built by Bazel and never by
+          # this job. So editing any of the three evicted the whole workspace
+          # cache and cold-built it -- which is what adding a fuzz target did on
+          # 2026-10-06, on the very run that first exceeded this job's timeout.
+          # Narrowed the same day.
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
       - name: rustfmt
         run: |
           cargo fmt --all -- --check
           (cd yesno-core/fuzz && cargo fmt --all -- --check)
-
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  tests:
+    name: tests (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Line tables, not full DWARF. `debuginfo = 2` on ~70 test
+      # binaries is what put this over a runner's disk; line tables keep
+      # backtrace file and line numbers, which is the part `RUST_BACKTRACE`
+      # is set for.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # All workspace members now promise at least Rust 1.95, matching
+        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # `Cargo.lock`, not `**/Cargo.lock`. The glob matched four lockfiles
+          # and three of them have nothing to do with the `target/` being cached
+          # here: `yesno-c` is a separate workspace whose gate redirects
+          # `CARGO_TARGET_DIR` to scratch, `yesno-core/fuzz` is outside
+          # `[workspace] members`, and `yesno-pg` is built by Bazel and never by
+          # this job. So editing any of the three evicted the whole workspace
+          # cache and cold-built it -- which is what adding a fuzz target did on
+          # 2026-10-06, on the very run that first exceeded this job's timeout.
+          # Narrowed the same day.
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tests-
       - name: tests
         # Includes `yesno-e2e`'s scenario suite, which runs every `.py` under
         # `e2e/scenarios/` against a real database.
         run: cargo test --workspace
 
+  feature-tests:
+    name: tests behind off-by-default features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Line tables, not full DWARF. `debuginfo = 2` on ~70 test
+      # binaries is what put this over a runner's disk; line tables keep
+      # backtrace file and line numbers, which is the part `RUST_BACKTRACE`
+      # is set for.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # All workspace members now promise at least Rust 1.95, matching
+        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # `Cargo.lock`, not `**/Cargo.lock`. The glob matched four lockfiles
+          # and three of them have nothing to do with the `target/` being cached
+          # here: `yesno-c` is a separate workspace whose gate redirects
+          # `CARGO_TARGET_DIR` to scratch, `yesno-core/fuzz` is outside
+          # `[workspace] members`, and `yesno-pg` is built by Bazel and never by
+          # this job. So editing any of the three evicted the whole workspace
+          # cache and cold-built it -- which is what adding a fuzz target did on
+          # 2026-10-06, on the very run that first exceeded this job's timeout.
+          # Narrowed the same day.
+          key: ${{ runner.os }}-cargo-features-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-features-
       - name: tests behind off-by-default features
         # The step above is **default features**, so
         # `yesno-tantivy/tests/flight.rs` -- `#![cfg( feature = "flight" )]`,
@@ -163,27 +282,77 @@ jobs:
           # distinction the two cases above were written about.
           cargo test -p yesno-opencl --features opencl
 
+  docs:
+    name: docs (links resolve)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Line tables, not full DWARF. `debuginfo = 2` on ~70 test
+      # binaries is what put this over a runner's disk; line tables keep
+      # backtrace file and line numbers, which is the part `RUST_BACKTRACE`
+      # is set for.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # All workspace members now promise at least Rust 1.95, matching
+        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # `Cargo.lock`, not `**/Cargo.lock`. The glob matched four lockfiles
+          # and three of them have nothing to do with the `target/` being cached
+          # here: `yesno-c` is a separate workspace whose gate redirects
+          # `CARGO_TARGET_DIR` to scratch, `yesno-core/fuzz` is outside
+          # `[workspace] members`, and `yesno-pg` is built by Bazel and never by
+          # this job. So editing any of the three evicted the whole workspace
+          # cache and cold-built it -- which is what adding a fuzz target did on
+          # 2026-10-06, on the very run that first exceeded this job's timeout.
+          # Narrowed the same day.
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-docs-
+      - name: doc links resolve
+        # `-D warnings`, not just `broken_intra_doc_links`: the
+        # `private_intra_doc_links` baseline was cleared on 2026-09-17, so this
+        # is a line at zero rather than a baseline. `cargo doc` fails fast per
+        # crate, so a partial count here means earlier crates aborted the run.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  policy:
+    name: policy (layout, docs, invariants)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # No Rust toolchain, and that is the point: every check below is
+      # `python3` or `sh -n`. Verified rather than assumed -- `check-r1.py`
+      # names cargo only in prose, and `check-runner-scripts.py`'s subprocess
+      # runs `sh -n`. So this job needs no toolchain, no cache and no build,
+      # which is why it answers in seconds instead of after a compile.
       - name: ARCHITECTURE.md layout matches the tree
         run: python3 scripts/check-layout.py
-
       - name: the unified image's binary set matches the workspace
         # The binary list lives in the crates' `[[bin]]` targets, in
         # `dist/Dockerfile`'s copy loop and in `dist/entrypoint.sh`'s dispatch
         # arm. Only this connects the three. Building the image to find out
         # costs an hour of cross-compilation; this costs a second.
         run: python3 scripts/check-image-binaries.py
-
       - name: the image entrypoint parses as POSIX sh
         run: sh -n dist/entrypoint.sh
-
       - name: policy R1 (no Arrow types in yesno-core's public API)
         # Baselined: fails on new violations and on baseline entries that have
         # been fixed but not removed, so the list can only shrink.
         run: python3 scripts/check-r1.py
-
       - name: docs/ is self-contained
         run: python3 scripts/check-docs-selfcontained.py
-
       - name: docs/ converts to TeX
         # The one failure here with no author-side signal: a bare math symbol in
         # prose renders fine in every Markdown viewer and fails only under
@@ -204,7 +373,6 @@ jobs:
         # so a missing `fi` inside a string literal survives compilation,
         # `terraform apply`, and fifteen minutes of cluster creation.
         run: python3 scripts/check-runner-scripts.py
-
       - name: Theorem 7's termination measure
         run: python3 scripts/check-plan-measure.py
 
@@ -217,17 +385,8 @@ jobs:
       # and make the drift invisible to a name-based sweep.
       - name: cited backlog slugs are recorded
         run: python3 scripts/check-todo-refs.py
-
       - name: unsafe block count matches the recorded inventory
         run: python3 scripts/check-unsafe-count.py
-
-      - name: doc links resolve
-        # `-D warnings`, not just `broken_intra_doc_links`: the
-        # `private_intra_doc_links` baseline was cleared on 2026-09-17, so this
-        # is a line at zero rather than a baseline. `cargo doc` fails fast per
-        # crate, so a partial count here means earlier crates aborted the run.
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-
       - name: the article's derived figures still follow from the constants
         # `--self-test` first, exactly as the local gate does: it verifies the
         # checker can still fail, because a constants audit that has silently
