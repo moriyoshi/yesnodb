@@ -1259,3 +1259,157 @@ backlog sentence corrected that a commit of the same morning had falsified, five
 citations restated, one source citation repaired that a repair had broken, one fuzz
 target added for a contract that had none, and one `gate.sh` banner that had been
 undercounting its own inventory since the second target was added.
+
+## 2026-10-06 -- the sweep continued, and the backlog's prose drifts faster than its code
+
+Carried the `tackle-todos` sweep past the dispatchable work into verifying the
+entries that had only been read by their headers. **37 of the 65 open entries are now
+verified against the tree, and eleven are closed** ( 65 open / 40 closed -> 54 / 51 ).
+The method finding is the one worth keeping.
+
+**Roughly a quarter of the entries verified today carried a claim about the code that
+was no longer true.** Not vague or aged -- specifically false, in a file agents are
+told to read as current:
+
+* `planner-overlap-estimation`: "overlap is only ever detected, never estimated" --
+  but `shared_prefixes` estimates at prefix level under the `STATS_MAX_CHUNKS` budget
+  and `prefix_disjoint` detects chunk-level disjointness exactly. What is actually
+  missing is narrower: an estimate feeding the **rewrite-licensing** guards, where
+  `disjoint` is still interval-only.
+* `read-concurrency-is-bounded-by-shard-count`: "checkpoint holds the store lock across
+  its entire body" -- it now takes, drops for the durability sequence, and retakes,
+  with a `Shard::ckpt` guard closing the window that opened. The writer-starvation
+  objection to `RwLock` survives in smaller form, because reclamation still runs under
+  the lock. Its `keystream.rs` line citations had drifted too.
+* `mysql-write-row-cannot-batch`: "writes one ordinal per commit" -- `write_row`
+  buffers, answers duplicates from the transaction's own pending ops, and flushes once
+  through `Backend::Apply`. Closed.
+* `staggered-checkpointing`: its quoted consumer stall totals predate the enumeration
+  hoist and now overstate the stall. The invariant-total argument it rests on is
+  untouched, so the entry stands with the number marked.
+
+**And two entries' headers disagreed with their own bodies.**
+`typed-set-expression-language` said "steps 3 and 4 open" while the body carried
+"Step 3 DONE" and "Step 4 DONE", with a leftover "Step 4 open" line between them;
+`planner-cost-is-o-chunks` had one of its two axes closed and said so nowhere. A
+reader who stops at the header gets the wrong answer, which is what a header is for.
+
+**The reusable rule: verify before dispatching, because the entry is evidence about
+the past and the tree is evidence about now.** Had any of these four been worked from
+its own text, the work would have been wrong at the first step -- and two of them
+( `mysql-write-row-cannot-batch`, `simd-arms-without-a-crate-level-case` ) would have
+been work on something already done or already retracted.
+
+### Three findings that were not in any entry
+
+**A specialized kernel has a reachable slow path nobody had noticed.** The array x
+bitmap arm in `and_cardinality` and `is_disjoint` sits behind a smaller-side probe
+selection, so when the **bitmap** is the smaller operand the pair falls through to the
+generic merge. That window is reachable because `BITMAP_DEMOTE` ( 3584 ) is below
+`ARRAY_MAX` ( 4096 ), so a bitmap can legitimately be shorter than an array. Same
+answer, slow path. Recorded on the entry rather than fixed: it is a narrow case and
+nothing has measured it, and `kernel-specialization-simd`'s own standard is that an
+arm earns its place by measurement.
+
+**A re-measurement that inverted a headline never reached LTM.**
+`memoize-loads-not-statistics` was opened on 4.5x / 6.2x / 16.1x with the gap widening
+by size; re-measured it is 1.16x / 1.01x / 0.79x -- it inverts. The entry's own
+appended note says so and the bench doc carries it, but
+`LTM/expression-planning-statistics-and-segmentation.md` has no load-versus-statistics
+ratio at all. **A finding recorded only in the backlog is a finding that dies with the
+entry**, which is the opposite of what CLAUDE.md asks for. Left for the next
+consolidation rather than written here, because another session is editing LTM now.
+
+**`miri-cannot-reach-the-mmap-unsafe-sites` must not be closed**, and that is now
+stated in it. It has no deliverable, but `check-unsafe-count.py` carries its slug and
+`gate.sh` cites it by name, so ticking or deleting it reddens a gate step. Every sweep
+will re-raise it; this is the note that stops the next one.
+
+### What the remaining 54 are
+
+Not a queue. **~17 are design** -- the seven product-direction entries plus `tam-mvcc`,
+`btrfs-provider-seam`, the two two-phase-commit items, the view-extension trio,
+`release-image-filesystem-userland`. **~13 are performance** under QG section 4, which
+means measure first, and several carry retractions of their own numbers.
+**~9 are blocked on hardware or an account this host does not have** -- x86 for the
+AVX2 and view arms, an AVX512-VPOPCNTDQ host for `jit-vpopcntb-tier-unexercised`, a
+live AWS account for the four EBS and archive entries. The genuinely dispatchable
+remainder is small, and after this sweep it is also honest.
+
+## 2026-10-06 -- the CI gate was out of disk, not out of time, and had been for nine days
+
+Earlier today I recorded that the `gate` job timed out because my repair let it past
+`clippy` for the first time in ten days. **That attribution was incomplete, and the
+correction is the finding.**
+
+The job failed twice in one afternoon, in two different ways. Once on the 30-minute
+ceiling. Once -- on the very next push -- with `rustc-LLVM ERROR: IO failure on output
+stream: No space left on device` while linking test binaries, at 16m08s, nowhere near
+the ceiling. Two symptoms, one cause: **that job built this workspace four times over
+into a single `target/` on a single runner** -- `clippy --all-targets --all-features`,
+then `cargo test --workspace` at `debuginfo = 2`, then three feature-variant rebuilds,
+then `cargo doc` -- against a standard runner's ~14 GB disk and 30-minute budget, on
+top of a restored cache.
+
+**And disk had been failing since 2026-09-27.** That run could not write the runner's
+own diagnostic log: `System.IO.IOException: No space left on device`. I read that line
+earlier in this session, in the first failing run I opened, and attributed the failures
+to clippy because clippy was the step that reported. The disk error sat in a different
+part of the output and I did not connect it. Nine days of runs died at `clippy` in four
+minutes and never reached the part that fills the disk, so **a job that fails fast
+stops measuring itself** -- the same lesson as the timeout, arriving through a resource
+nobody was watching.
+
+### What the measurement cost, and why it had to be reconstructed
+
+GitHub discards a job's log when its runner is killed on timeout -- `BlobNotFound` --
+so the timing evidence from the 30-minute failure is **unrecoverable**. The breakdown
+below was reconstructed by polling the *next* run's job state every 15 seconds and
+recording step transitions, which is the only instrument left once the log is gone:
+
+| phase | duration |
+| --- | --- |
+| setup, checkout, toolchain, cache restore | 2m54s |
+| `clippy --workspace --all-targets --all-features` | 4m03s |
+| `cargo test --workspace` | 9m11s |
+
+Against the last four green single-job runs at **17m48s, 19m20s, 19m22s and 20m57s**
+( 2026-09-14 to 2026-09-19 ), which is 60-70% of the budget. The job crossed 100%
+through cumulative growth -- a twelfth workspace member, JIT and vectorized sparse view
+evaluation, two more feature-gated test runs -- while being unable to report it.
+
+### The repair, and the part that is not about time
+
+One job became five: `gate` ( rustfmt, clippy ), `tests`, `feature-tests`, `docs`, and
+`policy`. **The reason is disk, not wall-clock**: separate jobs get separate runners
+and therefore separate disks, so each build lands on its own machine instead of
+accumulating. The parallel speed-up is a side effect, and sizing a new ceiling would
+not have fixed the disk at all.
+
+Three decisions inside it:
+
+* **Per-job cache keys.** Four jobs sharing one key would overwrite each other's
+  `target/` state, and each would then restore a partial tree it has to rebuild.
+* **`CARGO_PROFILE_DEV_DEBUG: line-tables-only`** on the cargo jobs. Full DWARF across
+  about seventy test binaries is what filled the disk; line tables keep the file and
+  line numbers that `RUST_BACKTRACE` is set for, and change nothing under test.
+* **`policy` gets no toolchain, no cache and no build**, verified rather than assumed:
+  `check-r1.py` names cargo only in prose and `check-runner-scripts.py`'s subprocess
+  runs `sh -n`. Those eleven checks used to queue behind twenty minutes of compiling,
+  so a `TODO.md` typo was reported after twenty minutes. They now answer in seconds,
+  and all twelve commands pass locally in that configuration.
+
+### One defect found on the way
+
+The cache key was `hashFiles('**/Cargo.lock')`, and that glob matched **four**
+lockfiles of which three have nothing to do with the cached `target/`: `yesno-c` is a
+separate workspace whose gate redirects `CARGO_TARGET_DIR` to scratch,
+`yesno-core/fuzz` is outside `[workspace] members`, and `yesno-pg` is built by Bazel.
+So editing any of the three cold-built the entire workspace. Adding a fuzz target did
+exactly that today, on the very run that then ran out of disk. Narrowed to
+`hashFiles('Cargo.lock')`.
+
+**The first run of the split is the test of it.** Nothing on this host can prove a
+runner's disk ceiling is cleared, and this file's own CI header says the same about the
+workflow: treat the first execution as the test, and do not read a green local gate as
+evidence that the pipeline works.
