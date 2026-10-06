@@ -311,7 +311,7 @@ jobs:
             yesno-flight-java/gradle/wrapper/gradle-wrapper.properties
 
       - name: Java package gate
-        run: yesno-flight-java/gradlew -p yesno-flight-java --no-daemon build
+        run: ./yesno-flight-java/gate.sh
 
   go-client:
     name: go client (vet, race, Flight interoperability)
@@ -338,9 +338,16 @@ jobs:
   # host-supplied dispatch callback end to end, and nothing else in this file
   # compiles a C translation unit against the published header at all.
   #
-  # `yesno-c` is a separate workspace, so `scripts/gate.sh --workspace` does not
-  # reach it either. Added 2026-09-17; needs only a Rust toolchain and the cc
-  # the runner already has.
+  # `yesno-c` is a separate workspace, so `cargo` flags in `scripts/gate.sh` do
+  # not reach it. Added 2026-09-17; needs only a Rust toolchain and the cc the
+  # runner already has.
+  #
+  # The sentence here said the local gate "does not reach it either", and that
+  # stopped being true on 2026-10-06: `scripts/gate.sh` gained a "client gates"
+  # step that calls this script and the other three, after the four of them
+  # living in this file alone let a wire change break three clients for a week.
+  # `scripts/check-gate-parity.py` now compares `*/gate.sh`, so a client gate
+  # named in one file and not the other is reported.
   c-abi:
     name: c abi (clippy, fmt, linked C11 fixture)
     runs-on: ubuntu-latest

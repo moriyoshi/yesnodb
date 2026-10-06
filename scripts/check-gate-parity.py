@@ -15,14 +15,25 @@ first instance of it. There have now been four, and a warning is not a mechanism
      only in `ci.yml`. `libc` entered `yesno-core` on 2026-09-27, CI went red, and
      **25 commits landed** while every local gate run stayed green -- because the
      local gate is the one people act on and it could not see the check.
+  5. 2026-10-06, and this check could not see it either: the four **client**
+     gates ( Python, Go, Java, C ABI ) ran only in `ci.yml`, and the comparison
+     below matched `scripts/*.py` and `scripts/*.sh` only, so every one of them
+     lived outside it. The Flight ticket header widened from 40 to 48 bytes on
+     2026-09-30, three clients were not widened with it, and the local gate stayed
+     green for a week. Fixed in both directions: `*/gate.sh` is compared too, and
+     Java grew a `gate.sh` so that it could be.
 
 # What this compares, and what it deliberately does not
 
 Two granularities, chosen because they are the ones the four instances actually
 took, and because they are the ones that can be compared without guessing:
 
-* **Scripts.** Every `scripts/*.py` and `scripts/*.sh` either side invokes. This
-  is instances 2, 3 and 4, and it is exact: a script is present or it is not.
+* **Scripts.** Every `scripts/*.py` and `scripts/*.sh` either side invokes, plus
+  every per-crate `*/gate.sh` -- the client gates. This is instances 2, 3, 4 and
+  5, and it is exact: a script is present or it is not. The `*/gate.sh` half is
+  why a client gate must be *named* in `scripts/gate.sh` even on a host that
+  cannot run it; the local gate reports such a skip rather than omitting the
+  call.
 * **Canonical commands.** A short list of whole-workspace commands -- clippy,
   fmt, doc, the workspace test -- compared by their *flags*. This is instance 1,
   which no script-level check could have caught: the command was in both files,
@@ -122,7 +133,10 @@ def ci_commands() -> list[str]:
     return [normalise(c) for c in commands(CI.read_text())]
 
 
-SCRIPT = re.compile(r"\bscripts/[A-Za-z0-9_-]+\.(?:py|sh)\b")
+# `scripts/<name>.{py,sh}`, and any crate-local `<dir>/gate.sh`. The second
+# alternative is instance 5: the client gates are not under `scripts/`, and
+# matching only the first made four checks invisible to this comparison.
+SCRIPT = re.compile(r"(?:\bscripts/[A-Za-z0-9_-]+\.(?:py|sh)|[A-Za-z0-9_.+-]+/gate\.sh)\b")
 
 
 def scripts_in(cmds: list[str]) -> set[str]:

@@ -56,6 +56,9 @@ deep=0
 
 fail=0
 steps_run=0
+# Client gates this host could not run, named in the verdict. A skip that is not
+# reported is the failure mode the client gates had in the first place.
+client_skips=()
 # How many `step` calls each mode must reach. **Update these when adding or
 # removing a step** — a mismatch is reported, not silently tolerated.
 # **Raised 12 -> 14 and 18 -> 20 on 2026-09-14**, for two steps added the same
@@ -70,7 +73,13 @@ steps_run=0
 # every local gate run. Diagnosed before raising, as the paragraph above demands:
 # the step is a new unconditional addition next to the other policy checks, so it
 # counts in both modes.
-EXPECT_STEPS=18
+# **Raised 18 -> 19 and 24 -> 25 on 2026-10-06** for "client gates", which runs
+# the four per-client gate scripts that existed only in `ci.yml`. Diagnosed
+# before raising, as the paragraph above demands: the step is one unconditional
+# addition next to the other test steps, and a run with it printed the rustfmt
+# steps and the `skipped ( use --deep )` banner, so it reached the end and the
+# mismatch was the addition rather than an early exit.
+EXPECT_STEPS=19
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -117,7 +126,7 @@ EXPECT_STEPS=18
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=24
+EXPECT_STEPS_DEEP=25
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -142,6 +151,13 @@ verdict() {
         printf '\n\033[31m   INCOMPLETE: ran %d of %d steps\033[0m\n' "$steps_run" "$want"
         printf '   The run stopped early. Its verdict below covers only what ran.\n'
         fail=1
+    fi
+    # Named, not counted away. A gate that silently covers three clients
+    # instead of four is the state that let the ticket header break all three.
+    if (( ${#client_skips[@]} > 0 )); then
+        printf '\n\033[33m   %d client gate(s) not run on this host: %s\033[0m\n' \
+            "${#client_skips[@]}" "${client_skips[*]}"
+        printf '   This run says nothing about them. CI does.\n'
     fi
     [[ $fail -eq 0 ]] && printf '\n\033[32mgate passed\033[0m\n' || printf '\n\033[31mgate failed\033[0m\n'
     exit $fail
@@ -248,6 +264,41 @@ check cargo test -p yesno-core --features jit
 # rather than linking it, so this builds anywhere, and each test prints why it
 # skipped rather than passing silently.
 check cargo test -p yesno-opencl --features opencl
+
+step "client gates (python, go, java, C ABI)"
+# The four client gates ran **only in CI**, and nothing local could see them.
+#
+# That is the fifth instance of the asymmetry `scripts/check-gate-parity.py`
+# exists to stop, and the most expensive so far. The Flight ticket header widened
+# from 40 to 48 bytes on 2026-09-30; the Go, Python and Java clients were not
+# widened with it; every local gate run stayed green for a week while the Go and
+# Python CI jobs failed every integration test with "a malformed expression", and
+# Java stayed green *and* broken because its only server is a fake that mints
+# tickets from the client's own constant.
+#
+# The parity checker could not report it either: it compared `scripts/*.py` and
+# `scripts/*.sh` only, and every client gate lives in its own crate directory. It
+# now compares `*/gate.sh` as well, which is why these lines must stay here --
+# removing one makes that check fail rather than making the gate quieter.
+#
+# Each gate runs only if its toolchain is present. A missing toolchain is
+# **reported by name** here and again in the verdict rather than passing
+# silently: a gate that fails because this host has no JDK is a gate people stop
+# running, and that is how the checks got into CI alone to begin with.
+client_gate() {
+    local tool=$1 gate=$2 job=$3
+    if command -v "$tool" >/dev/null 2>&1; then
+        check "./$gate"
+    else
+        client_skips+=("$gate")
+        printf '   SKIPPED: %s needs `%s`, absent on this host.\n' "$gate" "$tool"
+        printf '            CI job "%s" runs it; this run cannot vouch for it.\n' "$job"
+    fi
+}
+client_gate uv yesno-flight-python/gate.sh "python client"
+client_gate go yesno-flight-go/gate.sh "go client"
+client_gate javac yesno-flight-java/gate.sh "java client"
+client_gate cc yesno-c/gate.sh "c abi"
 
 step "ARCHITECTURE.md layout matches the tree"
 # Cheap, and it catches a class review cannot: a diagram that is 90% right reads
