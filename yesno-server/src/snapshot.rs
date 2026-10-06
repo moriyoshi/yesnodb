@@ -193,9 +193,13 @@ impl SnapshotProvider for TestProvider {
 
     async fn cleanup(&self, _cleanup: &Cleanup) -> Result<(), SnapshotError> {
         self.cleanups.fetch_add(1, Ordering::Relaxed);
+        // `try_update` rather than `fetch_update`: the latter was renamed for
+        // consistency and is deprecated from 1.99, and `-D warnings` makes a
+        // deprecation an error. `try_update` is stable at this workspace's 1.95
+        // floor, so this does not move the floor.
         if self
             .failures
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

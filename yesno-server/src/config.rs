@@ -1440,17 +1440,20 @@ impl Config {
                         )));
                     }
                 }
-                for (field, value, prefix) in [("volume_id", ebs.volume_id.as_str(), "vol-")] {
-                    if value.len() == prefix.len()
-                        || !value.starts_with(prefix)
-                        || !value[prefix.len()..]
-                            .bytes()
-                            .all(|byte| byte.is_ascii_hexdigit())
-                    {
-                        return Err(ConfigError::Invalid(format!(
-                            "`server.snapshot.ebs.{field}` is not a valid {prefix} identifier"
-                        )));
-                    }
+                // Bound rather than iterated: the list above it has two entries
+                // and this one has one, so the parallel shape read as a loop
+                // while being a `clippy::single_element_loop`. The names stay
+                // because the error message interpolates them.
+                let (field, value, prefix) = ("volume_id", ebs.volume_id.as_str(), "vol-");
+                if value.len() == prefix.len()
+                    || !value.starts_with(prefix)
+                    || !value[prefix.len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "`server.snapshot.ebs.{field}` is not a valid {prefix} identifier"
+                    )));
                 }
                 if ebs.source_mount.as_os_str().is_empty() {
                     return Err(ConfigError::Invalid(
