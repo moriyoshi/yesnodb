@@ -1532,6 +1532,32 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
   Full write-up in their tree at `.agents-workspace/tmp/scaled-threads/FINDING.md`; nothing in this tree
   was touched by them.
 
+  **PARTLY FIXED 2026-10-06, and the trap below is now the bottleneck -- it was right.**
+  `KeyStream::next_chunk` no longer takes the store lock: `PublishedChunks`, the chunk
+  counterpart of `PublishedNodes`, is captured once in `KeyStream::over` and the read runs
+  against an `Arc<SegmentedMmap>` plus a snapshot of the slab class map. One acquisition a
+  stream rather than one a chunk.
+
+  **Measured on the consumer's shape** -- one key, 20 000 chunks, one stream a worker, host
+  gated at 90% idle and 99% after: **0.23x -> 0.38x** at one shard, a 1.65x relative gain.
+  **Still degradation**: twenty threads deliver 38% of one thread, not twenty times it. So
+  the per-chunk store lock was never the only serialization point.
+
+  **Where the rest is, exactly as the note below predicted**: `verify_once` takes
+  `SegmentedMmap`'s `verified` mutex on **every** chunk read, and `buffer_at` touches
+  `segs` and `pinned`. Those three were redundant only while the store lock was exclusive;
+  removing the outer lock made them load-bearing, so contention moved from one coarse mutex
+  to three fine ones rather than disappearing. The next step is making the verification
+  cache concurrent -- sharded, or a read-mostly structure -- and it should be measured the
+  same way before being believed.
+
+  **A cost this introduced, stated rather than buried**: `published_chunks()` copies the
+  class map per stream open, so a short stream now pays a lock *and* an allocation it used
+  to amortise over few chunks. A first harness opening 16 streams a sweep over 236 chunks
+  each measured **no change at all** ( 0.22x ) for exactly that reason -- the win is the
+  ratio of chunks to opens, which is 236 there and 71 588 in the workload this targets.
+  Streams that are opened often and read little are the shape to watch.
+
   **A trap for anyone doing both halves: the inner `segs` / `pinned` / `verified` mutexes in `store/segment.rs` are redundant *only while the store lock is exclusive*.** `SegmentedMmap` is owned by value inside `ShardStore` and every production access is under `Mutex<ShardStore>`, so those three acquisitions per read currently guard against a race that cannot happen. Convert the store lock to `RwLock` and they immediately **become load-bearing**, because concurrent readers would then mutate `pinned` and `verified` at once. Removing them first and converting second gives data races on two `BTreeMap`s, and each step looks locally justified. See JOURNAL 2026-09-14.
 
   So the direction is reducing **acquisitions per read** or removing the shared mutex from the read path -- a read path that took `Mutex<ShardStore>` once per chunk plus three more inside `segment.rs` is acquiring four locks to move bytes that are already immutable under I2. Releasing the store lock before the decode remains sound ( the `Buffer` keeps its mapping alive independently, which is the whole purpose of `ExtentGuard` ) but is not by itself the fix.

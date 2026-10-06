@@ -1657,3 +1657,83 @@ Host at 97-99% idle for the reported runs, with `vmstat bi` 0 and 114 GB of 121 
 A final confirming run was **skipped** rather than taken, because the host fell to 75%
 idle when another session started work -- the same gate this entry's wall-clock cells
 failed in September.
+
+## 2026-10-06 -- the published chunk reader, and contention that moved rather than left
+
+haiiie reported that `KeyStream::next_chunk` serializes parallel readers of one key on
+`Mutex<ShardStore>`, once per 8 KiB chunk: 1 worker 71.4 ms, 8 workers 96.6 ms, about 1 us
+a chunk under the lock and a ~70 ms floor however many workers ran. Their rows for one
+index are one key and therefore one shard, so the existing mitigation -- more shards --
+is unavailable by construction. The maintainer chose the published-reader route over
+`RwLock<ShardStore>`, because it sidesteps writer starvation rather than trading against
+it.
+
+### It was much smaller than the backlog thought, and the source said why
+
+Two comments already carried the argument, and neither was written for this:
+
+* `KeyStream.slot` -- the reader slot "holds the reclamation floor for as long as the
+  stream can still read", so the extents a plan names cannot be reclaimed or their slabs
+  reclassified while it lives. That is exactly what a published view of the class map
+  needs to be sound.
+* `ShardStore.seg` -- sharing the mapping "is what makes `segment.rs`'s interior mutexes
+  load-bearing", because `Db::checkpoint` already clones that `Arc` and reads outside the
+  store lock. The backlog entry treated that as an **unpaid cost** of converting; the
+  checkpoint hoist of the same morning had already paid it.
+
+And the dependency was one lookup. Tracing the read path: it needs the mapping plus
+`packed_page( cell )` and `owning_class( cell )`, and both read only whether a slab is
+`InUse` and its class byte. `payload_len_of` and `read_container` need only the mapping.
+So the published reader is an `Arc` clone plus **one byte a slab**.
+
+`packed_page_of` moved to module scope so the live allocator and the published view compute
+the base and size from one copy of that arithmetic, and the read body moved into
+`read_container_for_in` behind a two-method `ChunkGeometry` seam. Two implementations
+drifting is how a reader comes to verify a region the writer never wrote, which is a wrong
+answer rather than an error -- so the differential test is the correctness claim, and
+regressing the published class by one proves it has teeth.
+
+### The result: 0.23x to 0.38x, which is a real gain and not the fix
+
+Measured on the consumer's shape -- one key, 20 000 chunks, one stream a worker, 20 cores,
+host gated at 90% idle and 99% after:
+
+| | 1 thread | 20 threads | scaling |
+| --- | --- | --- | --- |
+| before | -- | -- | **0.23x** |
+| after | 2 988.1 Kr/s | 1 148.3 Kr/s | **0.38x** |
+
+A 1.65x relative improvement, and **still degradation**: twenty threads deliver 38% of
+one. The per-chunk store lock was never the only serialization point.
+
+**The remainder is where the entry said it would be, in a note written weeks earlier as a
+warning to whoever did this work.** `verify_once` takes `SegmentedMmap`'s `verified` mutex
+on every chunk read and `buffer_at` touches `segs` and `pinned`; those three were
+redundant only while the store lock was exclusive. Removing the outer lock made them
+load-bearing, so **contention moved from one coarse mutex to three fine ones** instead of
+disappearing. The next step is a concurrent verification cache, and it should be measured
+this way before anyone believes it.
+
+### Two mistakes of mine worth recording
+
+**A harness of the wrong shape measured no change, and I nearly reported that.** The first
+version opened 16 streams a sweep over 236 chunks each. The per-chunk lock is gone but
+`KeyStream::over` still takes it once to capture the reader, so the whole benefit is the
+ratio of chunks to opens: 236 there against 71 588 in the workload this targets. It
+measured **0.22x against a 0.23x baseline** -- no change -- and the honest reading was not
+"the change does nothing" but "this harness cannot see it". It also ran at **7% host
+idle**, which should have stopped me reporting it at all.
+
+That reshaping exposed a cost worth stating: `published_chunks()` copies the class map per
+open, so a stream opened often and read little now pays a lock *and* an allocation it used
+to amortise. Long streams get that for free; short ones do not.
+
+**And the plumbing bit me three times in one sitting.** Twice I declared a gate finished
+having waited on a PID that exited while its child kept building -- `pgrep` handing back a
+transient process while `run-database-gate.sh` continued. The fix was to stop waiting on
+processes and poll the gate's own verdict line, which cannot be confused with a sibling.
+Separately, a stray `cat > .agences` swallowed the stdin two heredocs needed, so a harness
+I believed I had written did not exist, and the `cargo build` I ran in its empty directory
+walked up and built the main workspace instead -- reporting "Finished" with no binary.
+**A command that reports success is not evidence that it did what was intended**, which is
+the same lesson as the four wrong harnesses earlier today, arriving through the shell.
