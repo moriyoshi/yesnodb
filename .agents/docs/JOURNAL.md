@@ -1737,3 +1737,53 @@ I believed I had written did not exist, and the `cargo build` I ran in its empty
 walked up and built the main workspace instead -- reporting "Finished" with no binary.
 **A command that reports success is not evidence that it did what was intended**, which is
 the same lesson as the four wrong harnesses earlier today, arriving through the shell.
+
+## 2026-10-06 -- RwLock on the segment caches is slower, and the entry had already said so
+
+The published chunk reader took 20-thread scaling at one shard from 0.23x to 0.38x and
+left the contention in `SegmentedMmap`'s three interior mutexes -- `verify_once` takes
+`verified` on every chunk read, and `buffer_at` touches `segs` and `pinned`. The obvious
+next move was to read-lock them, and all three have a clean fast path: `segment_for` is
+purely read-only, a `pinned` hit only looks up a guard that already exists, and a
+`verified` hit in the young generation mutates nothing ( an `old` hit promotes, so that
+re-checks under the write lock ).
+
+**It is a regression.** A/B on one harness, one quiet host, medians of 3, haiiie's shape
+of one key and 20 000 chunks with one stream a worker:
+
+| | 1 thread | 20 threads | scaling |
+| --- | --- | --- | --- |
+| `Mutex` ( kept ) | 3 066.8 Kr/s | 1 157.8 Kr/s | **0.38x** |
+| `RwLock` ( reverted ) | 2 614.7 Kr/s | 794.1 Kr/s | **0.30x** |
+
+31% worse at twenty threads and **15% worse single-threaded**. That second column is what
+makes it unambiguous: this is not a contention trade that happens to lose, it is a more
+expensive lock. Reverted before committing.
+
+**The reason was already written down, in the same backlog entry, two paragraphs above the
+trap note I was acting on.** It says of the store lock: "hold time is not the bottleneck;
+the overhead of contending for a short, hot lock is, and shortening a section already too
+short only raises the acquisition rate", and "what pays is fewer contenders per lock, not
+a smaller lock." A reader-writer lock does not reduce contenders. Twenty threads still
+bounce one lock's state between caches, and `std::sync::RwLock`'s read acquisition costs
+more than a mutex lock. The argument was made about the outer lock and transfers wholesale
+to the inner three.
+
+**I read that paragraph this morning and quoted it in my own assessment**, then spent an
+hour implementing the thing it rules out. The failure was not missing information; it was
+treating "the inner mutexes become load-bearing" as a separate problem needing a separate
+answer, when the entry's analysis of *why* lock conversion does not help applies to any
+short hot lock in this path. The next step is **sharding** -- stripe each cache by cell so
+readers mostly touch different locks -- which is the thing that reduces contenders.
+
+Two method notes. The first harness for this question was the **wrong shape** and measured
+no change at all ( 0.22x against a 0.23x baseline ) because it opened 16 streams a sweep
+over 236 chunks each: the benefit is the ratio of chunks to stream opens, 236 there
+against 71 588 in the workload. And the A/B had to be run on **one** harness -- my 0.38x
+and 0.30x initially came from two slightly different ones, which is not a comparison. Only
+after rebuilding the committed version and measuring it with the same binary was the
+regression established rather than suspected.
+
+Keep the single-thread column in any rerun. The scaling ratio alone would have read as
+"0.38 to 0.30, mildly worse"; the absolute numbers say the lock itself is slower, which is
+a different and more useful conclusion.

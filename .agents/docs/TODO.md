@@ -1558,6 +1558,32 @@ The trap there is silent: `--at-version` must encode a **`QueryRequest`**, not a
   ratio of chunks to opens, which is 236 there and 71 588 in the workload this targets.
   Streams that are opened often and read little are the shape to watch.
 
+  **Converting those three to `RwLock` was tried on 2026-10-06 and is a REGRESSION. Do not
+  repeat it.** Read-locked fast paths were added for all three -- `segment_for` is purely
+  read-only, a `pinned` hit only looks up an existing guard, and a `verified` hit in the
+  young generation mutates nothing ( an `old` hit promotes, so it re-checked under write ).
+  Measured A/B on one harness, one quiet host, medians of 3, haiiie's shape of one key and
+  20 000 chunks with one stream a worker:
+
+  | | 1 thread | 20 threads | scaling |
+  | --- | --- | --- | --- |
+  | `Mutex` ( kept ) | 3 066.8 Kr/s | 1 157.8 Kr/s | **0.38x** |
+  | `RwLock` ( reverted ) | 2 614.7 Kr/s | 794.1 Kr/s | **0.30x** |
+
+  **31% worse at twenty threads and 15% worse single-threaded**, so it is not a contention
+  trade that happens to lose -- `RwLock` is simply the more expensive lock here. **And this
+  entry already said why, two paragraphs up**: "hold time is not the bottleneck; the
+  overhead of contending for a short, hot lock is", and "what pays is fewer contenders per
+  lock, not a smaller lock". A reader-writer lock does not reduce contenders; twenty
+  threads still bounce one lock's state between caches, and the read side costs more to
+  acquire than a mutex. The argument was written about the *store* lock and transfers
+  wholesale to these three.
+
+  **So the next step is sharding, not a different lock type**: stripe each cache by cell so
+  concurrent readers mostly touch different locks. Measure it the same way, and note that
+  the single-thread column is as informative as the scaling ratio -- it is what showed this
+  attempt was slower in absolute terms rather than merely less parallel.
+
   **A trap for anyone doing both halves: the inner `segs` / `pinned` / `verified` mutexes in `store/segment.rs` are redundant *only while the store lock is exclusive*.** `SegmentedMmap` is owned by value inside `ShardStore` and every production access is under `Mutex<ShardStore>`, so those three acquisitions per read currently guard against a race that cannot happen. Convert the store lock to `RwLock` and they immediately **become load-bearing**, because concurrent readers would then mutate `pinned` and `verified` at once. Removing them first and converting second gives data races on two `BTreeMap`s, and each step looks locally justified. See JOURNAL 2026-09-14.
 
   So the direction is reducing **acquisitions per read** or removing the shared mutex from the read path -- a read path that took `Mutex<ShardStore>` once per chunk plus three more inside `segment.rs` is acquiring four locks to move bytes that are already immutable under I2. Releasing the store lock before the decode remains sound ( the `Buffer` keeps its mapping alive independently, which is the whole purpose of `ExtentGuard` ) but is not by itself the fix.
