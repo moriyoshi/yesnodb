@@ -2641,3 +2641,125 @@ it. Contaminating a peer's measurement does not only cost cells; it can cost a d
   wrong ranking.
 * **A control that can only fail in one direction is half a control.** The clamp that makes
   the self-load fix safe is the same clamp that can make it always pass.
+
+## 2026-10-07 — The Scaled8 arm, and four optimizations of which one worked
+
+Second half of the top-k offload work, after a consumer asked for a tiled Scaled8 arm.
+Nothing lands in `yesno-*/src`; the prototype is under `.agents-workspace/tmp/topk/`. What
+follows separates measurement from arithmetic from projection, because several figures in
+the first half did not and had to be withdrawn.
+
+### What shipped in the prototype
+
+`score8_tile` mirroring the consumer's own structure; `CodeWidth` as the declarative width
+seam, returning a function item so the inner loop carries no branch on width; both scan
+paths generic over the weight element; and `check_candidates`, which refuses candidate ids
+that are not **strictly ascending**.
+
+That last one came from review rather than measurement, and it is the only correctness bug
+found in the arm: a duplicate id was scored twice and offered to the heap twice, so the same
+document appeared twice in the answer, displacing a legitimate hit. Silently. The consumer
+adopted strict ascent with a typed fault as contract, which closes duplicates and
+out-of-order together, because strict ascent implies uniqueness.
+
+### Exactness, which is what licenses the rest
+
+| check | result |
+|---|---|
+| 262 144 rows, 64 complete ordered top-100 arrays vs the consumer's `Scaled8::search_batch_on_snapshot` | 0 mismatches |
+| 1 002 235 rows, 32 arrays, same oracle | 0 mismatches |
+| gather path, 5 000 candidates, both scales | exact |
+| across a real process boundary, 16 lanes | 0 mismatched |
+| semantics suite | 21 cases, including four duplicate/out-of-order refusals with both controls |
+
+A bug the oracle caught that self-consistency could not: the weight derivation divides by
+the code maximum, **2047 at twelve bits and 127 at eight**, and the first version used the
+twelve-bit constant for the eight-bit model. Every score 16x wrong -- which often preserves
+the *ranking* and never the scores, so a recall check passes and an exact one fails. The
+width is now a required parameter rather than a constant.
+
+### The frames the consumer asked to keep distinct
+
+**Scan**, 8 workers, k=100, per-core foreign-idle gated at both edges:
+
+| corpus | 16 separate single-lane scans | one tile16 scan | ratio | block reads |
+|---|---|---|---|---|
+| 262 144 | 7.824 ms/q | 3.003 ms/q | **2.61x** | 199 968 -> 12 498 |
+| 1 002 235 | 22.095 ms/q | 8.639 ms/q | **2.56x** | 764 224 -> 47 764 |
+
+The separate arm uses a real single-lane scorer, 384 multiply-accumulates a row rather than
+a padded 6 144. Measuring it through the tiled scorer would have measured tile padding,
+which this work got wrong once already. Block reads are exactly 16x, so the read amortizes
+perfectly and the arithmetic does not.
+
+**Served**, a real two-process Unix socket: round trip 136.134 ms at 1M, server scan
+136.064, so the **boundary is 0.070 ms, 0.1%**, with parity exact across it. Every earlier
+timing in this work was in-process and could not speak to this.
+
+**Traffic**, containers counted: 74 832 B and one round trip against 102 263 750 B, so
+**1 368x** at 262k. One chunk is an *array* rather than a bitmap -- the partial tail -- so
+measured containers differ from the full-block count here, where for Scaled12 all chunks
+were bitmaps and the two coincided.
+
+**Build**, both widths from the same vectors with borrowed models: Scaled8 144.366 s,
+6 942 rows/s, 629 MB; Scaled12 246.730 s, 4 062 rows/s, 821 MB. **1.71x faster to build**,
+better than its 0.667x row bytes. No recall number is taken, because the models are
+borrowed.
+
+### Four optimizations, and the one number that explained all of them
+
+| change | result |
+|---|---|
+| i32 weights ( halves weight bytes and load count a dimension ) | **null**, -1.5% to +0.3% |
+| hand-unrolling the sixteen-lane inner loop | **null and slightly worse**, +2.4% to +4.3% |
+| code width 12 -> 8 ( 0.667x row bytes *and* block reads ) | **null**, ratio 0.95x to 1.09x |
+| **NEON `smlal` on i32 weights** | **2.3x to 2.5x, exact, stable to 0.6%** |
+
+The explanation is one figure: the scalar loop runs at **1.58 multiply-accumulates per cycle
+per thread, 79% of dual-issue scalar `madd`**. Nothing that reduces bytes or loop overhead
+can move a loop already near its issue ceiling, and past 2 MAC/cycle needs more MACs per
+instruction. `smlal` does two: predicted ceiling 2.54x, measured 2.3-2.5x at 3.65
+MAC/cycle, which is 92% of the prediction and 183% of scalar peak.
+
+**So `i32` weights matter as a precondition and not for bandwidth.** NEON has no 64x64
+integer multiply, so an `i64` weight cannot be vectorized at all. Narrowing alone is worth
+nothing measurable; narrowing so that `smlal` can exist is worth the whole 2.3x. The
+consumer said exactly this at the outset and I mis-sized it twice before measuring it.
+
+The NEON arm keeps the sixteen `i64` accumulators in eight vector registers across the whole
+384-coordinate loop, loaded once a row rather than per coordinate, with the code broadcast
+and the weights streamed. It has **not** been through this project's gates for new `unsafe`
+and would need all of them to go anywhere real.
+
+### Three wrong instruments, and what each one was actually measuring
+
+Worth more than the results, because each looked conclusive.
+
+1. **An ablation that shrank footprint, not traffic.** Collapsing the weight array from
+   48 KiB to 2 KiB measured 3% and was reported as the cost of weight streaming. But 48 KiB
+   fits a 64 KiB L1d and is the *same array for every row*, so it was L1-resident either
+   way, and the ablation kept the same eight `ldp` a dimension merely from a smaller region.
+   It measured footprint, which was never the constraint. The direct test -- actually
+   narrowing to `i32` -- is the one that answers the question, and it says null.
+2. **A two-term fit that divided by 0.333.** Solving `W + R = t12` and `W + 0.667R = t8` for
+   the width-invariant share amplifies any noise in either arm threefold. One run returned
+   a share of **128%**, which is impossible and is the clearest possible signal that the
+   estimator rather than the data is wrong. Withdrawn outright, not caveated.
+3. **A per-rep spread of 30% to 50%** on this harness, which means nothing finer than about
+   5% is resolvable from it. The tile ratios and the NEON ratio survive that; the width
+   comparison never did, and reporting 0.990x as a measurement was reading precision the
+   instrument does not have.
+
+### Carry away
+
+* **Compute the ceiling before optimizing toward it.** 1.58 of 2 MAC/cycle would have
+  predicted three of the four nulls in advance, and it is one division.
+* **Ablate the thing the change would change.** Footprint and load count are different
+  quantities and the optimization touched the second.
+* **A derived bound and a measured maximum are not interchangeable in an argument.** The
+  NEON safety comment first quoted `2.5e7`, which is 2048 times the *measured* worst weight,
+  where the analytic product bound is `1.0e9`. The conclusion survived; the reasoning did
+  not. This is the same error as treating `i16` as safe because one corpus fits it with 2x
+  margin while the bound is 15x away -- which I had warned the consumer about an hour
+  earlier, then committed one level down, in the comment whose whole purpose is to be
+  checkable rather than believed.
