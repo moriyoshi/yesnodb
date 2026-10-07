@@ -2865,3 +2865,83 @@ prologue. That restructures the scan loop and is not done here.
    1.98 -- both need only 1.95, and the floor is now the intrinsics'. Changing the *number*
    in a comment and leaving its *reason* is the same failure as the renumbering that reached
    the table and missed the paragraph, earlier this session. Rewritten in all four.
+
+## 2026-10-07 -- Row blocking is worth 1%, and the op-count model that said 1.44x was wrong
+
+Follow-up to the `sdot` entry above, which closed by naming **blocking several rows per
+weight load** as "the real lever" for the remaining 56% of the Scaled8 arm's ceiling, and to
+a reply to the user that derived a 1.44x asymptote for the same idea on Scaled12. Measured,
+it is **0.8%**. The derivation was wrong and the reason is worth more than the number.
+
+### The measurement
+
+The 1M Scaled12 corpus had been deleted in the day's disk cleanup. Rebuilding 576 MB of it
+to settle a question about an instruction mix would have been the wrong instrument anyway:
+row blocking is a *kernel* restructure, so the kernel is what to measure. 110 000 synthetic
+rows, 63 MB so it streams from DRAM past the 8 MiB L3, real prepared weights so the `i32`
+narrowing is honest, one thread pinned, min idle 98% over all twenty cores.
+
+    arm                     ops a coordinate                 ms   MAC/cyc/thr   vs base
+    baseline ( real )       4 ld + 1 dup + 8 vmlal = 13   35.03         4.947     1.00x
+    weight loads hoisted    0 ld + 1 dup + 8 vmlal =  9   34.77         4.984     1.01x
+    decode constant         4 ld + 1 dup + 8 vmlal = 13   30.47         5.687     1.15x
+    macs only               0 ld + 0 dup + 8 vmlal =  8    1.42       122.457    24.75x
+
+**The fourth arm is broken and was discarded, not caveated.** 122 MAC/cycle against an
+`smlal` issue ceiling of 5.55 is 22x impossible. Removing both the loads and the decode
+leaves an inner loop body that is identical on every iteration, so LLVM hoists the whole
+accumulate out of it. The attribution lines that depended on it -- "both together 96%", "the
+eight `vmlal` 4%" -- are artifacts of that and say nothing. This is the third time this
+session an impossible ratio has been the thing that caught a bad instrument, after the
+`black_box( &acc )` burst at 230% of its own ceiling and the two-term fit returning 128%.
+
+### Why 1.44x was wrong
+
+Hoisting the weight loads out of the coordinate loop **is** the `R -> infinity` limit of row
+blocking, since blocking `R` rows pays `4/R` loads a coordinate. So 0.8% is not an estimate
+of the lever, it is its ceiling, and no amount of blocking recovers more.
+
+The op-count model priced all thirteen vector ops alike. It should not have: the weight
+array is 24 KB, it fits the 64 KiB L1d, and **it is the same array for every row**, so those
+four loads are L1 hits issuing at 0.91 a cycle against a three-a-cycle limit. They were
+never on the critical path. That is the *footprint-versus-cost* confusion already recorded
+one entry above -- there it was a 48 KiB-to-2 KiB ablation reporting 3% as the cost of
+weight streaming, here it is an op count reporting 31% of thirteen ops as removable time.
+Same error, opposite direction, and I walked into it while citing the first one.
+
+### What the valid rows do say
+
+The arm reaches **4.947 of the 5.55 MAC/cycle `smlal` ceiling, 89%**, so within this
+instruction there is 1.12x and the 13% decode is most of it. Instruction change is therefore
+the only Scaled12 lever, and correcting the same modelling flaw moves those estimates *up*,
+because excluding the free loads helps them too:
+
+    Scaled12 arm                useful ceiling   at 89%   vs today
+    smlal ( today )                       5.55     4.95      1.00x
+    mla i32, bounded depth               11.14     9.90      2.00x   conditional
+    sdot, 3-limb weights                 10.30     9.20      1.85x
+    sdot, 2-limb weights                 15.40    13.70      2.80x   conditional
+
+Both "conditional" rows depend on the **actual prepared weights**, not on a corpus sample.
+`mla` i32 holds a product ( `2047 * 488 520 = 1.0e9` ) but not a 384-deep accumulator, so it
+needs `floor( 2^31 / ( 2047 * W ) )` as its safe depth for the tile's real maximum `W`: at
+the analytic 488 520 that is **two coordinates**, useless, and only at the measured 16 482
+does it reach 63. Two-limb weights are the same shape of claim -- the analytic bound needs
+three limbs, and two reach 32 767. Each is admissible as a prepare-time test on the weights
+in hand; neither is admissible as an assumption.
+
+So Scaled12's realistic headroom is **1.85x to 2x**, needing a different instruction, and it
+still pays a 13% decode that Scaled8 does not pay at all: a 12-bit code is not a machine
+type. Against the 2.47x already measured for Scaled8 `sdot`, the **code width dominates the
+kernel choice**, and that is the consumer's model decision rather than a yesno one.
+
+### Carry away
+
+* **An ablation's ceiling is sometimes cheaper than the optimization's estimate.** One
+  existing arm answered in ten minutes what a row-blocked kernel would have taken a day to
+  write, and it answered in the negative.
+* **Do not price instructions by counting them.** Issue port, cache residency and reuse
+  decide cost; an op count assumes they are all equal and they are not.
+* The Scaled8 arm's remaining 56% is therefore **not** load reuse either. It is the per-row
+  overhead the `sdot` entry also names -- the accumulator zero/store, the 48-mul-add fold,
+  and a scorer behind a `fn` pointer that cannot inline. Those are the live leads.

@@ -899,8 +899,28 @@ What remains is **per-row overhead, not the kernel**: 9.016 useful MAC/cycle/thr
 of 20.6, and 1.69 `sdot`/cycle sits below both the 3.86 issue ceiling and the 3-load/cycle
 limit, so neither is saturated. The cost is twelve accumulators zeroed and stored per row,
 a 48-mul-add scalar fold per row, and a scorer behind a `fn` pointer that cannot inline.
-The real lever is **blocking several rows per weight load** -- loads and MACs are currently
-1:1 with no reuse -- which restructures the scan loop.
+
+**Row blocking was the obvious lever and it is dead -- measured 0.8% the same day.** The
+reasoning that proposed it counted thirteen vector ops a coordinate and priced them alike.
+Hoisting the weight loads out of the Scaled12 coordinate loop *is* the `R -> infinity` limit
+of blocking, and it returns 1.01x: the weight array is 24 KB, fits the 64 KiB L1d, and is
+the same array for every row, so those loads are L1 hits at 0.91 a cycle against a
+three-a-cycle limit and were never on the critical path. **Do not price instructions by
+counting them** -- issue port, cache residency and reuse decide cost. This is the
+footprint-versus-cost confusion recorded below for the 48 KiB-to-2 KiB ablation, in the
+opposite direction. What remains of the per-row overhead is the fold and the uninlinable
+scorer.
+
+That same measurement puts the Scaled12 `smlal` arm at **4.947 of its 5.55 MAC/cycle
+ceiling, 89%**, with the 12-bit decode costing 13%. So Scaled12 has ~1.12x left within the
+instruction, and its only real lever is a different one: `mla` i32 with a prepare-time
+accumulation depth, or `sdot` paying two code limbs, each landing near **1.85x to 2x**. Both
+of the better-looking variants are conditional on the *actual* prepared weights and not on a
+corpus sample -- `mla`'s safe depth is `floor( 2^31 / ( 2047 * W ) )`, which is **two
+coordinates** at the analytic bound of 488 520 and only reaches 63 at the measured 16 482.
+Admissible as a prepare-time test; never as an assumption. Against Scaled8's measured 2.47x,
+**code width dominates kernel choice**, and a 12-bit code additionally pays a decode that an
+8-bit code does not: it is not a machine type.
 
 `dotprod` is an **optional** aarch64 extension, unlike plain NEON, so it needs runtime
 detection; its intrinsics stabilized between Rust 1.97.1 and 1.98.0, which is why the
