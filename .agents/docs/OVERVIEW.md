@@ -26,7 +26,7 @@ which is why the server mirrors the struct instead of deriving on it.
 | `yesno-server-utils` | `yesnoctl` + `yesno-archive`: checkpoint, hot backup, restore, and continuous object archive |
 | `yesno-operator` | Kubernetes controller for retained-storage clusters, failover, and same-Pod plugin peers |
 | `yesno-e2e` | the scenario harness; Python driven by `monty` |
-| `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.95 floor |
+| `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.98 floor |
 | `yesno-mysql` | the embedded or remote MySQL 8.4 storage engine. Built and tested with pinned MySQL and Arrow source by Bazel |
 | `yesno-pg` | the PostgreSQL extension. Outside the cargo workspace, built by Bazel |
 | `yesno-flight-python/` | the pure-Python `yesnodb` Arrow Flight client |

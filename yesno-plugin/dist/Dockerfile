@@ -9,7 +9,7 @@
 # It is a real image rather than a test harness because the thing being proved --
 # that a peer in another container reaches the socket through a shared volume and
 # reads a real snapshot -- only exists once there are two containers.
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY . .

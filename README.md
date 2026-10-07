@@ -170,7 +170,7 @@ differential oracle; it is not a runtime dependency.
 
 ## Quick start
 
-The Cargo workspace, including `yesno-core`, requires Rust 1.95 or newer.
+The Cargo workspace, including `yesno-core`, requires Rust 1.98 or newer.
 The separate PostgreSQL extension requires Rust 1.96.
 
 ```console
@@ -520,7 +520,7 @@ network and query-engine dependency trees remain in satellite crates.
 library is compiled and tested against pinned PostgreSQL 17 and 18 server ABIs. Run
 `./scripts/gate-pg.sh` rather than `cargo pgrx test`.
 
-`yesno-c` is a separate Cargo workspace at the Rust 1.95 floor. It emits
+`yesno-c` is a separate Cargo workspace at the Rust 1.98 floor. It emits
 static and shared libraries independently. Bazel also builds its
 static library as the embedded Rust input to `yesno-mysql`; the MySQL gate also
 builds `yesno-flight-c++` against pinned Arrow C++ and compiles the plugin and

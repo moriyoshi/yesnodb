@@ -447,7 +447,7 @@ Four contract points matter when touching this module:
 
 ### Fused bitmap-DAG cardinality -- `yesno-core::jit`
 
-`yesno-core` shares the workspace's Rust 1.95 floor with Cranelift 0.135.
+`yesno-core` is at the workspace's Rust 1.98 floor, which since 2026-10-07 sits **above** Cranelift 0.135's 1.95 rather than being set by it -- the floor is now the AArch64 `dotprod` intrinsics'.
 Its opt-in `jit` feature owns the generator; the default feature set retains
 core's five-runtime-dependency contract. Flight's separate `jit` feature enables
 it for expression-cardinality terminals; the default `server` feature uses the

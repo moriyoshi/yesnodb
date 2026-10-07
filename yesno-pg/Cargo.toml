@@ -21,8 +21,12 @@ name = "yesno-pg"
 description = "PostgreSQL extension for yesno: foreign data wrapper, index access method, table access method"
 version = "0.1.0"
 edition = "2021"
-# pgrx 0.19 declares 1.96, above the workspace's Rust 1.95 floor. Keep
-# the extension's higher requirement explicit without raising core's floor.
+# pgrx 0.19 declares 1.96. That used to be *above* the workspace's 1.95 floor
+# and is now below its 1.98 one, so this is no longer the higher requirement --
+# it is kept explicit because this crate is a separate workspace whose
+# third-party floor is pgrx's, and because Bazel rather than cargo resolves its
+# first-party dependencies. The toolchain that actually compiles it is pinned in
+# `MODULE.bazel`, at or above the workspace floor.
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moriyoshi/yesnodb"

@@ -140,8 +140,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        # All workspace members now promise at least Rust 1.95, matching
-        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        # All workspace members promise at least Rust 1.98. The floor is set
+        # by the AArch64 `dotprod` intrinsics, which stabilized between 1.97.1
+        # and 1.98.0 -- no longer by Cranelift or Monty, which need only 1.95.
+        # Core's floor is checked by the `msrv` job.
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
@@ -184,8 +186,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        # All workspace members now promise at least Rust 1.95, matching
-        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        # All workspace members promise at least Rust 1.98. The floor is set
+        # by the AArch64 `dotprod` intrinsics, which stabilized between 1.97.1
+        # and 1.98.0 -- no longer by Cranelift or Monty, which need only 1.95.
+        # Core's floor is checked by the `msrv` job.
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
@@ -226,8 +230,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        # All workspace members now promise at least Rust 1.95, matching
-        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        # All workspace members promise at least Rust 1.98. The floor is set
+        # by the AArch64 `dotprod` intrinsics, which stabilized between 1.97.1
+        # and 1.98.0 -- no longer by Cranelift or Monty, which need only 1.95.
+        # Core's floor is checked by the `msrv` job.
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
@@ -295,8 +301,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        # All workspace members now promise at least Rust 1.95, matching
-        # Cranelift and Monty. Core's floor is checked by the `msrv` job.
+        # All workspace members promise at least Rust 1.98. The floor is set
+        # by the AArch64 `dotprod` intrinsics, which stabilized between 1.97.1
+        # and 1.98.0 -- no longer by Cranelift or Monty, which need only 1.95.
+        # Core's floor is checked by the `msrv` job.
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
@@ -397,19 +405,19 @@ jobs:
           python3 scripts/check-model-constants.py
 
   msrv:
-    name: msrv (workspace builds at 1.95)
+    name: msrv (workspace builds at 1.98)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install 1.95
+      - name: Install 1.98
         run: |
-          rustup toolchain install 1.95 --profile minimal
-          rustc +1.95 --version
+          rustup toolchain install 1.98 --profile minimal
+          rustc +1.98 --version
       - name: Check the Cargo workspace at its minimum
-        run: cargo +1.95 check --workspace --all-targets --all-features
+        run: cargo +1.98 check --workspace --all-targets --all-features
       - name: Check the standalone C ABI at its minimum
-        run: cargo +1.95 check --manifest-path yesno-c/Cargo.toml --all-targets
+        run: cargo +1.98 check --manifest-path yesno-c/Cargo.toml --all-targets
 
   lean-core:
     name: lean core (dependency guard)

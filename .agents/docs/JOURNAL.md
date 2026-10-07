@@ -2763,3 +2763,105 @@ Worth more than the results, because each looked conclusive.
   margin while the bound is 15x away -- which I had warned the consumer about an hour
   earlier, then committed one level down, in the comment whose whole purpose is to be
   checkable rather than believed.
+
+## 2026-10-07 -- `sdot` for Scaled8: the ceiling was not 2.5x, and an MSRV bump bought 5.47x
+
+Continues the four-optimizations entry above, whose last line was that the `smlal` arm sat
+at 3.652 useful MAC/cycle/thread against an `smlal` **issue** ceiling of 5.55 -- 1.52x left,
+with the arm and not the core as the limit. The user's instinct ( "I doubt the ceil is 2.5x
+or something" ) was right, and the instrument that settled it was the inline-asm burst in
+the prototype's `isa` binary: eight independent accumulators, two shared source registers,
+`nomem`, runtime trip count, so what is measured is issue throughput and not memory.
+
+    instruction          MAC/cycle
+    smlal  ( 2 MAC )          5.55
+    mla i32 ( 4 MAC )        11.14
+    mla i16 ( 8 MAC )        22.26
+    sdot   ( 16 MAC )        61.73
+
+`sdot` is 11x `smlal` because it does sixteen eight-bit multiply-accumulates per
+instruction. It is the `dotprod` extension, **optional** on aarch64 unlike plain NEON, and
+its intrinsics stabilized between Rust 1.97.1 and 1.98.0 -- so the workspace floor had to
+move before the kernel could be written in safe intrinsics rather than inline assembly.
+
+### The arm, and why the layout is the whole trick
+
+`vdotq_s32` is a *four-way* dot product: output lane `i` accumulates
+`sum( j in 0..4 ) a[4i+j] * b[4i+j]`. The obvious reading contracts within one lane and then
+needs a horizontal reduction per query. The layout that avoids it feeds `a` four coordinate
+codes replicated four times and `b` those same four coordinates' weights for four
+*different* queries, so one instruction advances four lanes by four coordinates and **the
+accumulator lane is the lane's score**. Twelve accumulators ( three limbs x four lane quads )
+stay in registers across the whole 384-coordinate loop; the disassembly confirms twelve
+`sdot` and seven paired loads per group with no spill.
+
+A weight does not fit `i8`, so each weight becomes three signed base-256 limbs and each
+product costs three `sdot` MACs. Useful ceiling `61.73 / 3 = 20.6` MAC/cycle, and the
+prediction against the `smlal` arm's 3.652 was therefore **5.6x**.
+
+Three limbs is not a round number chosen for comfort. They reach
+`127 * ( 1 + 256 + 65536 ) = 8 355 711`; the analytic weight bound is `QUERY_SCALE / max_code`,
+at eight bits `1e9 / 127 = 7 874 016`. **The margin is 1.06x** -- a fourth limb would be
+needed if `QUERY_SCALE` rose, and `limbs_of` asserts the residue is zero so an out-of-range
+weight panics rather than wrapping silently. The measured maximum over 799 queries is
+193 753, which is 40x inside the bound and is *corroboration, not the argument*; that
+distinction is the carry-away of the previous entry and is now enforced in code.
+
+The `i32` accumulators cannot overflow, again from the bound: one product per coordinate,
+384 of them, each at most `128 * 128 = 16 384`, so a lane holds at most **6 291 456** against
+`i32`'s 2 147 483 647 -- headroom 341x. Recombined in `i64` that is 4.1e11, beside the
+3.84e11 analytic row bound the `smlal` arm derives.
+
+### Measured, on the full 1 002 235-row Scaled8 corpus
+
+Single frame: same binary, same corpus, same sixteen-lane tile, eight pinned threads,
+foreign-core min idle 99% at both edges.
+
+    arm                           ms/query    vs scalar
+    scalar Scaled8 ( baseline )      7.482        1.00x
+    sdot, three limbs                1.368        5.47x
+
+Against the 5.6x prediction. Exactness is the precondition and was checked first: complete
+ordered `( id, score )` per lane over the full scan, **IDENTICAL**, plus four synthetic
+weight patterns x five code rows including every code at -128 and at +127, every weight at
+the three-limb ceiling with alternating sign, exact powers of the limb base, and zeros.
+
+**A third arm earns its place here.** A scalar path that reads the *same* limb layout runs
+beside the vector one, because a misplaced limb would make the vector arm self-consistent
+and wrong; the scalar arm disagrees with `score8_tile` instead, which localizes the fault to
+the layout rather than the intrinsics. It found nothing this time, which is the point -- it
+is cheap and the failure it catches is otherwise invisible.
+
+### What is left, stated as a ceiling and not a hope
+
+9.016 useful MAC/cycle/thread is **44% of the 20.6 useful ceiling**, so the arm is not
+`sdot`-bound either. 1152 `sdot` a row at 682 measured cycles a row is 1.69 `sdot`/cycle
+against an issue ceiling of 3.86 and a three-load/cycle limit that a 1:1 load-to-`sdot`
+ratio would hit at 3. Neither is saturated, so the gap is **per-row overhead**: twelve
+accumulators zeroed and stored every row, `fold_limbs` doing 48 scalar `i64` mul-adds every
+row, and a scorer reached through a `fn` pointer that therefore cannot inline into the scan.
+
+Two levers follow, in cost order. Vectorizing the fold is local and worth perhaps 15%.
+**Blocking several rows per weight load** is the real one: the weight tile is currently used
+once per `sdot`, so loads and MACs are 1:1 and no reuse exists; holding two or four rows'
+code vectors against one loaded tile halves or quarters the load stream and amortizes the
+prologue. That restructures the scan loop and is not done here.
+
+### The bump's own consequences, two of which were not obvious
+
+1. **`MODULE.bazel` had to move with it, and cargo cannot tell you so.** Bazel compiles
+   `yesno-core` and `yesno-wire` and does **not** read `rust-version`, so a Bazel toolchain
+   below the floor fails to build while `cargo` reports nothing. Its pin was 1.97.1, chosen
+   for pgrx 0.19's 1.96; the binding constraint is now the workspace, and pgrx's 1.96 is for
+   the first time *below* the floor rather than above it.
+2. **The machine's default toolchain is now below the repo's floor.** `rustup default` here
+   is 1.97.1, so a bare `cargo` -- which is exactly what `scripts/gate.sh` runs, deliberately
+   -- fails with `rustc 1.97.1 is not supported`. Both gates were run with
+   `RUSTUP_TOOLCHAIN=stable` ( 1.98.0 ). `+nightly` was checked to still win over that env
+   var, so the gate's nightly steps were not silently downgraded to stable. Moving the
+   machine default is host state shared with other checkouts and was left to the user.
+3. **Four copies of a rationale comment went stale in the same edit.** `ci.yml` said the
+   floor matched "Cranelift and Monty" in four jobs. That was true at 1.95 and is false at
+   1.98 -- both need only 1.95, and the floor is now the intrinsics'. Changing the *number*
+   in a comment and leaving its *reason* is the same failure as the renumbering that reached
+   the table and missed the paragraph, earlier this session. Rewritten in all four.

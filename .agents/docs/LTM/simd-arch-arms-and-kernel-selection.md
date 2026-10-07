@@ -432,7 +432,7 @@ form or the single dependency chain from this parity form.
 
 `libpopcnt` reports its SVE path beating its NEON one, **"especially on CPUs whose SVE vector width is larger than NEON's 128 bits"**. That qualifier is the whole result. On a Cortex-X925 with SVE and SVE2 both detected, `/proc/sys/abi/sve_default_vector_length` is **16 bytes = 128 bits**, exactly NEON's width -- and since the kernel is load-bound, identical width means identical loads for identical bytes, so there is no mechanism by which SVE moves the binding constraint. Predication would remove the scalar tail, a handful of words out of 1024.
 
-It also cannot ship regardless of width: SVE intrinsics are `stdarch_aarch64_sve`, nightly-only in rustc 1.97.1, against `yesno-core`'s stable MSRV **1.95**. Re-open only on a host where `sve_default_vector_length` exceeds 16 **and** once the intrinsics are stable -- both checkable in one command before any code is written.
+It also cannot ship regardless of width: SVE intrinsics are `stdarch_aarch64_sve`, nightly-only as of rustc 1.99, against `yesno-core`'s stable MSRV **1.98**. ( The floor moved from 1.95 on 2026-10-07 for `dotprod`, which *did* stabilize -- so the second precondition here is a question of when, not whether, and the remedy is an MSRV bump rather than a redesign. ) Re-open only on a host where `sve_default_vector_length` exceeds 16 **and** once the intrinsics are stable -- both checkable in one command before any code is written.
 
 ### Crate-level numbers are much harder to earn than kernel numbers
 
@@ -465,7 +465,7 @@ The bitmap figure matching the isolated kernel ( 1.62x popcount, 1.73x `and_card
 
 The production generator originally lived in `yesno-jit`; it moved into
 `yesno-core` behind the opt-in `jit` feature on 2026-09-21. Cranelift 0.135
-requires Rust 1.95, which core now promises. The default core graph still has
+requires Rust 1.95, which core's 1.98 floor exceeds. The default core graph still has
 five direct runtime dependencies. Flight's separate `jit` feature enables the JIT;
 default server and client-only PostgreSQL transport do not link it. The
 temporary `yesno-jit` compatibility re-export was removed on 2026-09-22;
@@ -843,3 +843,66 @@ were 0.675-0.688 at 256 chunks per leaf, 0.646-0.675 at 512, and
 0.702-0.721 at 1,024. Explicit seek/core ratios were 0.700-0.703,
 0.672-0.707 and 0.708-0.752 respectively. The path order was fixed, not
 randomized; compare ratios across runs, not absolute times across run batches.
+
+### The `sdot` arm: instruction choice beat every tuning knob ( 2026-10-07 )
+
+Durable record of the packed-integer-dot scoring arms, because the prototype that produced
+these numbers lives under `.agents-workspace/tmp/` and will be deleted.
+
+**Measure the instruction ceiling before optimizing toward it.** The method that settled a
+whole session of guesses is an inline-asm burst: eight independent accumulator registers,
+two shared source registers, `nomem` and `nostack`, a runtime trip count. No memory is
+touched and no dependency chain crosses iterations, so what is measured is issue throughput.
+An earlier version put `black_box( &acc )` inside the loop, which forced eight stores and
+eight reloads a trip, measured memory traffic, and made the kernel come out at 230% of its
+own supposed ceiling. **An impossible ratio is the cheapest signal that the instrument and
+not the subject is wrong.**
+
+On Cortex-X925 at 3.9 GHz:
+
+    instruction            MAC/instr    MAC/cycle
+    smlal  ( 2S -> 2D )            2         5.55
+    mla    ( 4S )                  4        11.14
+    mla    ( 8H )                  8        22.26
+    sdot   ( 16B -> 4S )          16        61.73
+
+Four tuning changes to the `smlal` arm returned null -- `i32` weights, loop unrolling, code
+width, and a weight-footprint ablation that measured footprint rather than load count. The
+instruction change returned 5.47x. The ceiling table predicts that in one division and
+would have predicted the nulls too.
+
+**The `sdot` layout is the trick, not the instruction.** `vdotq_s32` contracts four adjacent
+bytes per output lane. Contracting within one query's coordinates needs a horizontal
+reduction per query; instead feed `a` four coordinate codes replicated four times and `b`
+those four coordinates' weights for four *different* queries. One instruction then advances
+four lanes by four coordinates and the accumulator lane *is* the lane's score. Twelve
+accumulators ( three limbs x four lane quads ) hold in registers across a 384-coordinate row.
+
+**A weight needs three signed base-256 limbs**, so each product costs three `sdot` MACs and
+the useful ceiling is `61.73 / 3 = 20.6` MAC/cycle. Three limbs reach 8 355 711 against an
+analytic weight bound of `QUERY_SCALE / max_code = 1e9 / 127 = 7 874 016` -- **margin 1.06x**,
+so a larger `QUERY_SCALE` needs a fourth. `i32` accumulators hold 384 products of at most
+`128 * 128`, so at most 6 291 456 against 2 147 483 647, headroom 341x. Both figures are
+derived from bounds; the measured maximum weight of 193 753 is corroboration only.
+
+Measured on 1 002 235 Scaled8 rows, sixteen-lane tile, eight pinned threads, foreign-core
+min idle 99% at both edges: scalar 7.482 ms/query, `sdot` **1.368 ms/query, 5.47x**, with
+complete ordered `( id, score )` per lane bit-identical over the full scan. Exactness is
+checkable here and so must be checked exactly: the limb split, products, non-overflowing
+`i32` sum and `i64` recombination are all exact, so ranking agreement is not the bar.
+
+**Run a scalar arm over the same packed layout.** A misplaced limb leaves the vector arm
+self-consistent and wrong; a scalar path reading the identical layout disagrees with the
+reference instead, which localizes the fault to the layout rather than the intrinsics.
+
+What remains is **per-row overhead, not the kernel**: 9.016 useful MAC/cycle/thread is 44%
+of 20.6, and 1.69 `sdot`/cycle sits below both the 3.86 issue ceiling and the 3-load/cycle
+limit, so neither is saturated. The cost is twelve accumulators zeroed and stored per row,
+a 48-mul-add scalar fold per row, and a scorer behind a `fn` pointer that cannot inline.
+The real lever is **blocking several rows per weight load** -- loads and MACs are currently
+1:1 with no reuse -- which restructures the scan loop.
+
+`dotprod` is an **optional** aarch64 extension, unlike plain NEON, so it needs runtime
+detection; its intrinsics stabilized between Rust 1.97.1 and 1.98.0, which is why the
+workspace floor moved to 1.98 on 2026-10-07. Contrast SVE above, still nightly-only: the
+`dotprod` precedent shows that precondition is a question of when, not whether.

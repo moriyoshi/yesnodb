@@ -40,7 +40,7 @@ The project repeatedly found machinery that had been implemented and unit-tested
 - The `roaring` crate is a dev-dependency oracle, not a runtime implementation dependency.
 - Replication ships raw WAL frames because crash recovery is the canonical decoder. Query results use Flight because those payloads are genuinely columnar.
 - Flight SQL and `do_exchange` are deliberately absent. SQL composition belongs in DataFusion rather than in the storage engine.
-- Since 2026-09-21 the Cargo workspace, including `yesno-core` and `yesno-e2e`, promises Rust 1.95; `yesno-pg` separately requires 1.96. The MSRV change itself did not move JIT dependencies into core. A later opt-in `jit` feature moved the implementation into core while retaining its five-dependency default graph.
+- Since 2026-09-21 the Cargo workspace, including `yesno-core` and `yesno-e2e`, promised Rust 1.95; `yesno-pg` separately requires 1.96. **Raised to 1.98 on 2026-10-07** for the AArch64 `dotprod` intrinsics, which stabilized between 1.97.1 and 1.98.0 -- so `yesno-pg`'s 1.96 is now below the workspace floor rather than above it, and `MODULE.bazel`'s toolchain moved with it because Bazel compiles core and ignores `rust-version`. The MSRV change itself did not move JIT dependencies into core. A later opt-in `jit` feature moved the implementation into core while retaining its five-dependency default graph.
 - MIRI cannot execute the mmap boundary. Pure casts are covered by MIRI, while mmap lifetime and race properties are covered by Valgrind, ASan, TSan, and targeted tests.
 
 ### Post-milestone integration boundaries

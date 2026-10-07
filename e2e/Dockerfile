@@ -29,7 +29,7 @@
 # building them is part of what that gate asserts. Absorbing them would delete
 # the assertion.
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98
 
 # ---------------------------------------------------------------------------
 # Pinned external fixtures. Each is above the source-copy boundary so ordinary

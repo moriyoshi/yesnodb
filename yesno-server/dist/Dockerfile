@@ -12,7 +12,7 @@
 # reports I/O failure as SIGBUS, which is not catchable as a `Result` — so a
 # network-backed volume turns a transient error into a crash.
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 

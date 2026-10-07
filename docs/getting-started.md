@@ -21,7 +21,7 @@ by the release pipeline; see the [deployment guide](operations/deployment.md).
 | Experiment with MySQL integration | `yesno-mysql` |
 | Use an application client | Rust, Python, Go, C++, or Java Flight client |
 
-The Cargo workspace, including the core crate, needs Rust 1.95 or newer. The
+The Cargo workspace, including the core crate, needs Rust 1.98 or newer. The
 separate PostgreSQL extension needs Rust 1.96.
 The supported platforms are 64-bit Linux and macOS on local filesystems.
 Windows and network filesystems such as NFS are not supported.

@@ -2,7 +2,8 @@
 name = "yesno-e2e"
 version.workspace = true
 edition.workspace = true
-# The harness now shares the workspace's Rust 1.95 floor. Monty requires 1.95.
+# The harness shares the workspace's Rust 1.98 floor. Monty requires only 1.95,
+# so the floor is set by the `dotprod` intrinsics rather than by this harness.
 rust-version.workspace = true
 # Load-bearing. `src/bin/` gained `yesno-aws-cleanup` and `yesno-prepare-search`,
 # which made a bare `cargo run -p yesno-e2e` ambiguous and broke the deep gate's
