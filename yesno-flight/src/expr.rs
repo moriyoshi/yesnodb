@@ -372,6 +372,15 @@ fn eval_int(e: &IntExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
 
 /// Evaluate an arbitrary-precision expression.
 pub fn big(e: &BigExpr, snap: &Snapshot) -> yesno_core::Result<BigInt> {
+    // Tried **once**, at the root, and not inside `eval_big`. The admission test is itself
+    // a tree walk, so testing it at every node would make evaluation quadratic in the node
+    // count -- and `eval_i128` recurses over the whole expression anyway, so one attempt
+    // covers every node a successful run would have reached.
+    if leaves_fit(e) {
+        if let Some(v) = eval_i128(e, snap, None)? {
+            return Ok(big_from_i128(v));
+        }
+    }
     eval_big(e, snap, None)
 }
 
@@ -422,6 +431,336 @@ fn eval_vec_big(
                 .collect()
         }
     }
+}
+
+/// Could every *leaf* of this expression hold a machine integer?
+///
+/// # Why not `width_bound`
+///
+/// `width_bound` propagates: `Add` adds a bit at every node, so a chain of 4 096 additions
+/// bounds at 4 097 however small its operands are, and the pre-filter rejected exactly the
+/// arithmetic-heavy shape the fast path exists for. Measured: that chain declined at 180 us
+/// while the equivalent `fold`, whose bound is `widest + log2( arity )` and so stays at 20,
+/// engaged.
+///
+/// The leaves are the right question because only `Mul` and a `Mul` fold can grow a value
+/// past where it started, and **checked arithmetic already catches that** -- the pre-filter
+/// is not load-bearing for correctness, only for avoiding a traversal that will fail. So it
+/// asks the cheap, tight question: does every value this expression *starts* from fit?
+fn leaves_fit(e: &BigExpr) -> bool {
+    match e {
+        BigExpr::Lit(v) => v.bit_len() <= MACHINE_BITS,
+        BigExpr::Widen(_) => true,
+        BigExpr::Read(_, width) | BigExpr::ReadSigned(_, width) => {
+            u64::from(*width) <= MACHINE_BITS
+        }
+        BigExpr::Neg(a) | BigExpr::Truncate(a, _) | BigExpr::Saturate(a, _) => leaves_fit(a),
+        BigExpr::Add(a, b)
+        | BigExpr::Sub(a, b)
+        | BigExpr::Mul(a, b)
+        | BigExpr::Div(a, b)
+        | BigExpr::Rem(a, b) => leaves_fit(a) && leaves_fit(b),
+        BigExpr::Fold(v, _) => vec_leaves_fit(v),
+        // Barrett's cost is its own and a machine integer wins nothing here.
+        BigExpr::PowMod(..) => false,
+    }
+}
+
+fn vec_leaves_fit(v: &VecBigExpr) -> bool {
+    match v {
+        VecBigExpr::List(xs) => xs.iter().all(leaves_fit),
+        VecBigExpr::Map(_, body) => leaves_fit(body),
+        VecBigExpr::Zip(a, b, _) => vec_leaves_fit(a) && vec_leaves_fit(b),
+        VecBigExpr::Scale(a, x, _) => vec_leaves_fit(a) && leaves_fit(x),
+    }
+}
+
+/// Widest value a machine-integer evaluation will attempt.
+///
+/// 126, not 127, so that `Truncate` and `Saturate` can form `1 << bits` without reaching
+/// `i128::MIN`. It is a **pre-filter and not a correctness bound**: every operation below
+/// is checked, and `width_bound` on the root does not bound the intermediates --
+/// `truncate( mul( a, b ), 8 )` bounds at 8 while its product is 126 bits wide. So the
+/// bound only avoids attempting the fast path on obviously wide trees; what makes the
+/// result exact is that an overflow returns `None` and the whole expression is redone in
+/// `BigInt`.
+const MACHINE_BITS: u64 = 126;
+
+/// A little-endian byte string as `u128`, or `None` past sixteen bytes.
+///
+/// Direct, because the obvious spelling -- `BigUint::from_le_bytes` and then narrow --
+/// **allocates a limb vector per literal**, which is what this path exists to avoid. A
+/// 4096-add chain of small literals measured 26 ns an operation that way, against the
+/// 0.13 ns a native add costs, and the allocation was the whole difference.
+fn u128_of_le(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() > 16 {
+        return None;
+    }
+    let mut v = 0u128;
+    for (i, b) in bytes.iter().enumerate() {
+        v |= u128::from(*b) << (8 * i);
+    }
+    Some(v)
+}
+
+/// A `BigUint`'s value as `u128`, or `None` past two limbs.
+fn u128_of(v: &BigUint) -> Option<u128> {
+    match v.limbs() {
+        [] => Some(0),
+        [a] => Some(u128::from(*a)),
+        [a, b] => Some(u128::from(*a) | (u128::from(*b) << 64)),
+        _ => None,
+    }
+}
+
+/// `i128` back to the sort's own type, canonically.
+fn big_from_i128(v: i128) -> BigInt {
+    if let Ok(narrow) = i64::try_from(v) {
+        return BigInt::from_i64(narrow);
+    }
+    BigInt::from_magnitude(
+        v < 0,
+        BigUint::from_le_bytes(&v.unsigned_abs().to_le_bytes()),
+    )
+}
+
+/// `1 << bits` as `i128`, or `None` if it would not fit.
+fn pow2(bits: u32) -> Option<i128> {
+    (bits < 127).then(|| 1i128 << bits)
+}
+
+/// Evaluate a narrow expression in a machine integer, or `None` if it does not fit.
+///
+/// # Why this exists
+///
+/// The `Big` sort evaluates entirely in `BigInt`, and at the widths a caller calls fixed
+/// -- 4, 8, 16, 32, 64 bits -- that costs about **8 ns an operation against 0.13 ns for the
+/// native one**, measured on a quiet host and flat across every one of those widths. The
+/// flatness is the tell: both types hold such values in registers, so the cost is the
+/// type's own branching and its 40-byte moves rather than the arithmetic or any allocation.
+/// Two cheaper explanations were measured and refuted first -- a missing `#[inline]` on
+/// `BigInt`'s operators ( 1.00x to 1.20x interleaved, with the opaque arm sometimes
+/// winning ) and the heap, which `INLINE_LIMBS = 2` already removed below 128 bits.
+///
+/// So this is a **parallel implementation** of the numeric evaluator, and it is admitted on
+/// the terms this crate admits any specialized kernel: the generic one stays the oracle,
+/// and `a_machine_integer_evaluation_agrees_with_the_arbitrary_precision_one` holds the two
+/// against each other over every node and every edge of the fast path's range.
+///
+/// Every arm is checked. An overflow, a value past two limbs, a width past
+/// [`MACHINE_BITS`], or any node this does not implement returns `None`, and the caller
+/// evaluates the **whole** expression in `BigInt` instead -- never a mixture, which is what
+/// keeps the two paths from disagreeing about an intermediate.
+fn eval_i128(e: &BigExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<Option<i128>> {
+    // `?` on the inner options would be a return of `Ok( None )`, which is the bail; the
+    // macro keeps that from being written out eight times.
+    macro_rules! fits {
+        ($x:expr) => {
+            match $x {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        };
+    }
+    Ok(Some(match e {
+        BigExpr::Lit(v) => {
+            let magnitude = fits!(u128_of_le(v.magnitude_le()));
+            let signed = fits!(i128::try_from(magnitude).ok());
+            if v.is_negative() {
+                -signed
+            } else {
+                signed
+            }
+        }
+        // A `u64` count always fits, which is the whole content of the widening.
+        BigExpr::Widen(a) => i128::from(eval_int(a, snap, hole)?),
+        BigExpr::Read(a, width) => {
+            if u64::from(*width) > MACHINE_BITS {
+                return Ok(None);
+            }
+            let raw = fits!(u128_of(&read_raw(a, u64::from(*width), snap, hole)?));
+            fits!(i128::try_from(raw).ok())
+        }
+        BigExpr::ReadSigned(a, width) => {
+            if u64::from(*width) > MACHINE_BITS || *width == 0 {
+                return Ok(None);
+            }
+            let raw = fits!(u128_of(&read_raw(a, u64::from(*width), snap, hole)?));
+            let raw = fits!(i128::try_from(raw).ok());
+            // The top addressable bit is the sign, so a set one means the value counts
+            // down from the modulus. Identical to `BigExpr::ReadSigned`'s own arm.
+            let modulus = fits!(pow2(*width));
+            if raw >> (*width - 1) & 1 == 1 {
+                raw - modulus
+            } else {
+                raw
+            }
+        }
+        BigExpr::Neg(a) => fits!(fits!(eval_i128(a, snap, hole)?).checked_neg()),
+        BigExpr::Add(a, b) => {
+            let (x, y) = (
+                fits!(eval_i128(a, snap, hole)?),
+                fits!(eval_i128(b, snap, hole)?),
+            );
+            fits!(x.checked_add(y))
+        }
+        BigExpr::Sub(a, b) => {
+            let (x, y) = (
+                fits!(eval_i128(a, snap, hole)?),
+                fits!(eval_i128(b, snap, hole)?),
+            );
+            fits!(x.checked_sub(y))
+        }
+        BigExpr::Mul(a, b) => {
+            let (x, y) = (
+                fits!(eval_i128(a, snap, hole)?),
+                fits!(eval_i128(b, snap, hole)?),
+            );
+            fits!(x.checked_mul(y))
+        }
+        // A zero divisor is an **error and not a bail**: falling back would reach the same
+        // error one evaluation later, and raising it here keeps the two paths reporting the
+        // same failure for the same payload.
+        BigExpr::Div(a, b) => {
+            let (x, y) = (
+                fits!(eval_i128(a, snap, hole)?),
+                fits!(eval_i128(b, snap, hole)?),
+            );
+            if y == 0 {
+                return Err(DIVIDE_BY_ZERO);
+            }
+            fits!(x.checked_div(y))
+        }
+        BigExpr::Rem(a, b) => {
+            let (x, y) = (
+                fits!(eval_i128(a, snap, hole)?),
+                fits!(eval_i128(b, snap, hole)?),
+            );
+            if y == 0 {
+                return Err(DIVIDE_BY_ZERO);
+            }
+            fits!(x.checked_rem(y))
+        }
+        // The wrap, and it is a two's-complement wrap rather than a mask on the magnitude:
+        // the non-negative residue first, then the top bit folds it negative. Mirrors
+        // `BigInt::truncate` step for step, because a mask would differ on every negative
+        // value.
+        BigExpr::Truncate(a, bits) => {
+            if *bits == 0 {
+                0
+            } else {
+                let x = fits!(eval_i128(a, snap, hole)?);
+                let modulus = fits!(pow2(*bits));
+                let residue = x.rem_euclid(modulus);
+                if residue >> (*bits - 1) & 1 == 1 {
+                    residue - modulus
+                } else {
+                    residue
+                }
+            }
+        }
+        // The ceiling. The negative side reaches `2^( bits - 1 )` itself and the positive
+        // side stops one short, which is the asymmetry `BigInt::saturate` states.
+        BigExpr::Saturate(a, bits) => {
+            if *bits == 0 {
+                0
+            } else {
+                let x = fits!(eval_i128(a, snap, hole)?);
+                let ceiling = fits!(pow2(*bits - 1));
+                x.clamp(-ceiling, ceiling - 1)
+            }
+        }
+        BigExpr::Fold(v, op) => {
+            let arity = v.arity();
+            if arity == 0 {
+                return Err(yesno_core::CodecError::Invariant(
+                    "a fold over an empty vector has no value",
+                ));
+            }
+            let prepared = prepare(v, snap, hole)?;
+            let mut acc = fits!(element_i128(&prepared, 0, snap, hole)?);
+            for i in 1..arity {
+                let x = fits!(element_i128(&prepared, i, snap, hole)?);
+                acc = match op {
+                    BigFoldOp::Add => fits!(acc.checked_add(x)),
+                    BigFoldOp::Mul => fits!(acc.checked_mul(x)),
+                    BigFoldOp::Min => acc.min(x),
+                    BigFoldOp::Max => acc.max(x),
+                };
+            }
+            acc
+        }
+        // Modular exponentiation is wide by construction and its cost is Barrett's, not
+        // the operand width's. There is nothing here for a machine integer to win.
+        BigExpr::PowMod(..) => return Ok(None),
+    }))
+}
+
+/// [`element`], in a machine integer.
+fn element_i128(
+    p: &Prepared<'_>,
+    i: u32,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Option<i128>> {
+    Ok(Some(match p {
+        Prepared::List(xs) => return eval_i128(&xs[i as usize], snap, hole),
+        Prepared::Map(vector, body) => {
+            let part = lower_vec_at(vector, i, snap, hole)?.collect_set()?;
+            return eval_i128(body, snap, Some(&Arc::new(part)));
+        }
+        Prepared::Zip(a, b, op) => {
+            let x = match element_i128(a, i, snap, hole)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let y = match element_i128(b, i, snap, hole)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            match apply_bin_i128(*op, x, y)? {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        }
+        // The scalar was evaluated once, by `prepare`, in the generic type. Narrowing it
+        // here costs one conversion a fold rather than one an element.
+        Prepared::Scale(v, scalar, op) => {
+            let x = match element_i128(v, i, snap, hole)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            let y = match scalar.to_i128() {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            match apply_bin_i128(*op, x, y)? {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        }
+    }))
+}
+
+/// [`apply_bin`], in a machine integer. `None` is an overflow, `Err` a zero divisor.
+fn apply_bin_i128(op: BigBinOp, a: i128, b: i128) -> yesno_core::Result<Option<i128>> {
+    Ok(match op {
+        BigBinOp::Add => a.checked_add(b),
+        BigBinOp::Sub => a.checked_sub(b),
+        BigBinOp::Mul => a.checked_mul(b),
+        BigBinOp::Div => {
+            if b == 0 {
+                return Err(DIVIDE_BY_ZERO);
+            }
+            a.checked_div(b)
+        }
+        BigBinOp::Rem => {
+            if b == 0 {
+                return Err(DIVIDE_BY_ZERO);
+            }
+            a.checked_rem(b)
+        }
+    })
 }
 
 /// A vector readied for element-at-a-time evaluation.
@@ -2456,6 +2795,221 @@ mod big_fold_tests {
             .fold(BigInt::zero(), |a, x| a.add(&x));
         let got = big(&BigExpr::Fold(Box::new(v), BigFoldOp::Add), &snap).unwrap();
         assert_eq!(got, expected, "a folded scale did not broadcast its scalar");
+    }
+
+    /// The machine-integer evaluator must agree with the arbitrary-precision one
+    /// **exactly**, over every node and at the edges of its range.
+    ///
+    /// # Why this test is the fast path's whole licence
+    ///
+    /// `eval_i128` is a second implementation of the numeric evaluator. The generic one
+    /// stays the oracle, and nothing else can refuse a disagreement: a wrong `Truncate`
+    /// returns a well-formed number, and a `Saturate` clamped one short on the negative
+    /// side is wrong only for a single input. So the comparison is driven at the values
+    /// where the two implementations are most likely to part -- the signed boundaries, the
+    /// widths where `1 << bits` stops fitting, and the operands whose product overflows
+    /// `i128` and must therefore *fall back* rather than wrap.
+    #[test]
+    fn a_machine_integer_evaluation_agrees_with_the_arbitrary_precision_one() {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+
+        let interesting: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            7,
+            -7,
+            255,
+            -255,
+            256,
+            -256,
+            4095,
+            -4096,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            1 << 40,
+            -(1 << 40),
+        ];
+
+        // Unary nodes at every width that matters, including the ones that must bail.
+        let mut checked = 0usize;
+        for &v in &interesting {
+            for bits in [
+                0u32, 1, 2, 7, 8, 12, 16, 31, 32, 63, 64, 100, 126, 127, 128, 200,
+            ] {
+                for e in [
+                    BigExpr::Truncate(Box::new(lit(v)), bits),
+                    BigExpr::Saturate(Box::new(lit(v)), bits),
+                ] {
+                    // The generic path, reached by making the fast path decline.
+                    let want = super::eval_big(&e, &snap, None).unwrap();
+                    let got = big(&e, &snap).unwrap();
+                    assert_eq!(
+                        got, want,
+                        "{e:?} on {v}: fast path disagreed with the generic one"
+                    );
+                    assert!(
+                        got.is_canonical(),
+                        "{e:?} on {v} produced a non-canonical value"
+                    );
+                    checked += 1;
+                }
+            }
+            let neg = BigExpr::Neg(Box::new(lit(v)));
+            assert_eq!(
+                big(&neg, &snap).unwrap(),
+                super::eval_big(&neg, &snap, None).unwrap()
+            );
+            checked += 1;
+        }
+
+        // Binary nodes over every pair, which is where overflow and the zero divisor are.
+        for &a in &interesting {
+            for &b in &interesting {
+                for make in [
+                    BigExpr::Add as fn(_, _) -> _,
+                    BigExpr::Sub,
+                    BigExpr::Mul,
+                    BigExpr::Div,
+                    BigExpr::Rem,
+                ] {
+                    let e = make(Box::new(lit(a)), Box::new(lit(b)));
+                    let want = super::eval_big(&e, &snap, None);
+                    let got = big(&e, &snap);
+                    match (got, want) {
+                        (Ok(g), Ok(w)) => {
+                            assert_eq!(g, w, "{a} op {b} ( {e:?} ) disagreed");
+                            assert!(g.is_canonical());
+                        }
+                        // A zero divisor must fail on **both** paths, not one.
+                        (Err(_), Err(_)) => {}
+                        (g, w) => panic!("{a} op {b} ( {e:?} ): fast {g:?} generic {w:?}"),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+
+        // A product that overflows i128 must fall back and still be exact. 2^80 squared
+        // is 2^160, far past the fast path, and the generic answer is the only right one.
+        let big_lit = |n: u32| {
+            let mut m = vec![0u8; (n / 8) as usize];
+            m.push(1);
+            BigExpr::Lit(BigLit::from_le_bytes(false, m).unwrap())
+        };
+        for bits in [40u32, 64, 80, 120] {
+            let e = BigExpr::Mul(Box::new(big_lit(bits)), Box::new(big_lit(bits)));
+            let want = super::eval_big(&e, &snap, None).unwrap();
+            assert_eq!(big(&e, &snap).unwrap(), want, "a 2^{bits} square disagreed");
+            // And the result really is past what the fast path can hold, or this proves
+            // nothing about the fallback.
+            if bits >= 64 {
+                assert!(
+                    want.magnitude().bit_len() > 126,
+                    "the fixture must exceed MACHINE_BITS to exercise the fallback"
+                );
+            }
+            checked += 1;
+        }
+
+        // Folds, where the accumulator is what overflows.
+        for op in [
+            BigFoldOp::Add,
+            BigFoldOp::Mul,
+            BigFoldOp::Min,
+            BigFoldOp::Max,
+        ] {
+            for vals in [
+                vec![3i64, -7, 2, 10],
+                vec![i64::MAX, i64::MAX, i64::MAX],
+                vec![i64::MIN, -1, 1],
+                vec![0, 0, 0],
+            ] {
+                let v = VecBigExpr::List(vals.iter().copied().map(lit).collect());
+                let e = BigExpr::Fold(Box::new(v), op);
+                assert_eq!(
+                    big(&e, &snap).unwrap(),
+                    super::eval_big(&e, &snap, None).unwrap(),
+                    "fold {op:?} over {vals:?} disagreed"
+                );
+                checked += 1;
+            }
+        }
+
+        // A zip and a scale inside a fold, so `element_i128`'s own arms are covered.
+        let l = |vs: &[i64]| VecBigExpr::List(vs.iter().copied().map(lit).collect());
+        for v in [
+            VecBigExpr::Zip(
+                Box::new(l(&[3, -7, 2])),
+                Box::new(l(&[5, 5, -1])),
+                BigBinOp::Mul,
+            ),
+            VecBigExpr::Scale(Box::new(l(&[3, -7, 2])), Box::new(lit(-3)), BigBinOp::Sub),
+            VecBigExpr::Zip(
+                Box::new(VecBigExpr::Scale(
+                    Box::new(l(&[1, 2, 3])),
+                    Box::new(lit(4)),
+                    BigBinOp::Add,
+                )),
+                Box::new(l(&[9, 9, 9])),
+                BigBinOp::Mul,
+            ),
+        ] {
+            for op in [
+                BigFoldOp::Add,
+                BigFoldOp::Mul,
+                BigFoldOp::Min,
+                BigFoldOp::Max,
+            ] {
+                let e = BigExpr::Fold(Box::new(v.clone()), op);
+                assert_eq!(
+                    big(&e, &snap).unwrap(),
+                    super::eval_big(&e, &snap, None).unwrap(),
+                    "fold {op:?} over a composed vector disagreed"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 1500,
+            "only {checked} comparisons; the sweep shrank"
+        );
+    }
+
+    /// A stored integer read as a machine integer must equal the generic reading, signed
+    /// and unsigned, at the widths where sign extension and the fallback meet.
+    #[test]
+    fn a_narrow_read_agrees_on_both_paths() {
+        let db = Db::new();
+        // One key holding a value with bits set across the whole low region, so a signed
+        // read at each width lands on both sides of its own sign bit.
+        db.insert_many(
+            5,
+            &(0..200u64).filter(|j| j * 7 % 11 < 4).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let snap = db.snapshot().unwrap();
+        let mut checked = 0;
+        for width in [1u32, 2, 8, 12, 16, 32, 63, 64, 65, 100, 126, 127, 128, 192] {
+            for e in [
+                BigExpr::Read(Box::new(SetExpr::Key(5)), width),
+                BigExpr::ReadSigned(Box::new(SetExpr::Key(5)), width),
+            ] {
+                assert_eq!(
+                    big(&e, &snap).unwrap(),
+                    super::eval_big(&e, &snap, None).unwrap(),
+                    "{e:?} disagreed between the two paths"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 28);
     }
 
     /// All four operators, against the obvious reduction over machine ints.

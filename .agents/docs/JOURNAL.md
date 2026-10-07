@@ -2341,3 +2341,95 @@ were already public, which closes the three asks this investigation raised.
   right answer, fourteen times slower.
 * **No API was frozen**, deliberately, and no consumer file was created, modified or
   deleted from this session.
+
+## 2026-10-07 — A machine-integer evaluator for the narrow Big sort, and the two mistakes in it
+
+### What was built
+
+`eval_i128` in `yesno-flight/src/expr.rs`: a parallel implementation of the numeric
+evaluator that computes in `i128` and falls back to `BigInt` whenever it cannot. Twelve of
+the fourteen `BigExpr` nodes are implemented; `PowMod` declines because Barrett's cost is
+its own and a machine integer wins nothing, and any arm that overflows, exceeds two limbs,
+or exceeds [`MACHINE_BITS`] returns `None` -- at which point the **whole** expression is
+redone generically. Never a mixture, which is what keeps the two paths from disagreeing
+about an intermediate.
+
+The justification is the gap recorded on 2026-10-07 under the fixed-width investigation:
+at 4 through 64 bits, `BigInt` costs about **8 ns an operation against 0.13 ns native**,
+flat across every one of those widths. Flatness was the tell -- both types hold such values
+in registers, so neither the heap ( `INLINE_LIMBS = 2` removed it below 128 bits ) nor a
+missing `#[inline]` ( measured 1.00x to 1.20x interleaved, the opaque arm sometimes winning
+) explained it.
+
+### Admission is by the leaves, and that was the second attempt
+
+**`width_bound` is the wrong pre-filter and the measurement said so.** It propagates: `Add`
+adds a bit at every node, so a chain of 4 096 additions of 7-bit literals bounds at
+**4 097** and declined -- rejecting exactly the arithmetic-heavy shape the fast path exists
+for. The equivalent `fold`, whose bound is `widest + log2( arity )` and so stays at 20,
+engaged. Same values, same work, opposite verdicts.
+
+So admission now asks the tight question: does every **leaf** fit? Only `Mul` and a `Mul`
+fold can grow a value past where it started, and **checked arithmetic already catches
+that**, so the pre-filter is not load-bearing for correctness -- it exists only to avoid a
+traversal that will fail. `width_bound` on the root is not sound as a correctness bound
+either way: `truncate( mul( a, b ), 8 )` bounds at 8 while its product is 126 bits.
+
+### The other mistake: the fast path allocated
+
+`BigExpr::Lit` read its magnitude as `BigUint::from_le_bytes( .. )` and then narrowed,
+which **allocates a limb vector per literal** -- in the path whose entire purpose is to
+avoid the allocating type. A 4 096-add chain measured 26 ns an operation that way. Reading
+the bytes straight into a `u128` fixed it.
+
+### What it is worth
+
+Normalized against an in-run control that declines the fast path, because this host moved
+**2x on every row including the control** between back-to-back runs of one binary:
+
+| shape | before / control | after / control | |
+|---|---|---|---|
+| literal chain, 4 096 adds | 124 | 31 | **4x** |
+| literal fold, 4 096 values | 77 | 19 | **4x** |
+| narrow dot, 1 024 x 40-bit reads | 706-1151 | 638-706 | no measurable change |
+| wide read + truncate ( declines ) | control | control | unmoved |
+
+**4x on arithmetic-dominated expressions, nothing on read-dominated ones.** The second row
+is the honest limit: a narrow dot over 1 024 keys is ~1 600 us of which the arithmetic is
+tens, because the cost is the per-key plan recorded in
+`numeric-fold-cost-is-the-plan-not-the-arithmetic`. The fast path does not touch that.
+
+And the residue is **interpretation, not arithmetic**: 4 096 adds at 42.8 us is 10.5 ns an
+operation, against 0.13 ns for a native add. What is left is the recursive tree walk, the
+`Prepared` indirection and the per-element dispatch. That is the ceiling for a tree-walking
+evaluator and no further arithmetic work will move it.
+
+### The test is the licence, and it was checked by sabotage
+
+`a_machine_integer_evaluation_agrees_with_the_arbitrary_precision_one` drives both paths
+over 1 500+ comparisons: every unary node at sixteen widths including the ones that must
+bail, every binary node over all 400 operand pairs, products whose result exceeds 126 bits
+so the **fallback** is exercised rather than the fast path, folds whose accumulator
+overflows, and zips and scales nested so `element_i128` is reached. A zero divisor must
+fail on **both** paths, not one.
+
+**The test could have been vacuous and was proved not to be.** It compares `big()` against
+`eval_big()`, so if `eval_i128` always returned `None` both arms would be the generic path
+and every assertion would hold. Replacing the fast path's `Truncate` with a magnitude mask
+instead of a two's-complement wrap -- the exact mistake the arm's comment warns about --
+failed on the first case, `Truncate( 1, 1 )`. That is the control, and it is the reason to
+believe the rest.
+
+`a_narrow_read_agrees_on_both_paths` covers the reads separately at fourteen widths
+straddling 64, 126 and 128, signed and unsigned, where sign extension and the bail meet.
+
+### Carry away
+
+* **A propagated bound makes a bad admission test.** It answers "how wide could this get"
+  when the question is "where does this start", and the two differ by the shape of the tree
+  rather than by the data.
+* **A fast path that allocates is not a fast path.** The allocation was in the one arm that
+  looked too trivial to check.
+* Both defects were found by measuring the thing after building it, and neither was visible
+  as incorrectness -- the chain returned the right answer slowly, and the literal returned
+  the right answer after a malloc.
