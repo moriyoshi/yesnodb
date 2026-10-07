@@ -116,3 +116,86 @@ A measurement showing Flight-over-Unix is still far from the channel's block str
 cursor scan would move option A up. The opposite result retires option A entirely. Until
 that exists, option A's attraction is an inference from its frame set, and this document
 should not be read as evidence for it.
+
+---
+
+# Addendum, same day: where the channel seam belongs, and why not `yesno-c`
+
+Two facts found after the above, which together decide the shape.
+
+## The channel is a socket **and** a shared-memory arena
+
+`yesno-plugin/src/channel.rs` carries an `Arena` that is an anonymous `memfd`, mapped
+`MmapMut`, whose descriptor is handed to the peer over the socket with `SCM_RIGHTS`
+( `send_fd` / `recv_fd`, with a one-byte payload because `sendmsg` carrying only ancillary
+data is permitted but not reliably *received*, and that byte doubles as the protocol
+version ). The module records why `memfd` over POSIX or System V shared memory: it crosses a
+container boundary as a descriptor, it cannot leak because the region dies with the last
+descriptor and mapping, and it has no name to guess.
+
+So a C++ client would have to reimplement the frame codec **and** `recvmsg` with
+`SCM_RIGHTS`, **and** the mmap, **and** the lane and block lifetime rules. That is the
+argument for a single Rust implementation behind an ABI rather than a hand-written C++
+client, and the precedent is already in this repository: the Flight ticket header widened
+from 40 to 48 bytes and three independently written clients were not widened with it, which
+is why `check-gate-parity.py` now compares `*/gate.sh` too.
+
+## There is no client in `yesno-plugin` at all
+
+`channel.rs` is the **server**: `Session`, `serve_blocking`, `serve_locked`, `read_frame`.
+`ipc.rs` is the frame codec. **Nothing in the tree implements the client side** -- the
+existing consumer wrote its own. So the missing seam is not the C ABI; it is the Rust
+client, and both prospective consumers need it.
+
+## Why `yesno-c` is the wrong home
+
+Not primarily dependency weight, though that is real: `yesno-c` depends on exactly **one**
+crate, `yesno-core` by path, and the channel would add `yesno-plugin` and `memmap2` to it.
+Two stronger reasons:
+
+1. **It is an *embedding* ABI, and the channel exists because embedding does not work for
+   these callers.** Its surface is `yesno_db_open`, `yesno_db_insert`, `yesno_db_contains`,
+   `yesno_cursor_open` -- it opens a database, which takes the non-blocking exclusive
+   `flock`. That is exactly what PostgreSQL's fork-per-backend cannot do, and the whole
+   reason a socket is attractive. Putting both in one library means every embedder links a
+   socket client it will not use and every client links a storage engine it must not open.
+2. **Their defining design decisions are incompatible.** `yesno-c`'s cursor *deliberately*
+   materializes an immutable snapshot and spends `O( cardinality )` memory **to avoid
+   borrowed Rust lifetimes in foreign callers**. The channel's entire value is zero-copy
+   blocks in a shared arena. A materializing C cursor over the channel throws away the
+   reason to use the channel; a borrowing one contradicts the contract `yesno-c` is built
+   on. One ABI cannot hold both promises, and the right move is two contracts rather than a
+   weakened one.
+
+## Proposed layering, in build order
+
+    yesno-plugin::client          NEW, Rust -- the one implementation of the protocol:
+                                  connect, handshake, recv the arena fd, map it, typed
+                                  requests, lane and block lifetime
+        |
+        +-- yesno-pg  Transport::Channel { socket }    Rust, uses it directly, no C involved
+        |
+        +-- yesno-channel-c       NEW, a C ABI over the client, with an explicitly
+                |                 BORROWING block contract: pointer and length valid until
+                |                 the next advance or release, stated in the header
+                +-- yesno-mysql/backend_channel.cc     a third Backend implementation
+
+The order is load-bearing. The Rust client comes first because both consumers sit on it, and
+because designing the C borrow contract before the client's shape is known would be guessing
+at the thing hardest to change later. PostgreSQL needs no C at all, which is worth saying
+plainly: **the C seam serves MySQL**, and `Transport::Channel` serves PostgreSQL.
+
+## Before writing the client, read the existing one
+
+A working client exists in the consumer's tree. It is the existence proof of what the client
+side actually needs -- handshake ordering, where the fd arrives relative to `ServerHello`,
+how lanes are released on error -- and reading it is cheaper and more reliable than deriving
+all of that from the server plus the frame enum. Read only; it is not ours to edit.
+
+## Still unmeasured, and still the thing that decides whether any of this is worth it
+
+Everything above is shape, not justification. The case for the channel over Flight-on-a-Unix-
+socket rests on scan throughput that **has not been measured on one host**, and the
+Flight-over-Unix route costs MySQL a configuration string. If that measurement comes back
+showing Flight's framing is not the bottleneck, this addendum describes work that should not
+be done.
