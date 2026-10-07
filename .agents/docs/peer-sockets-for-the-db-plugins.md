@@ -199,3 +199,106 @@ socket rests on scan throughput that **has not been measured on one host**, and 
 Flight-over-Unix route costs MySQL a configuration string. If that measurement comes back
 showing Flight's framing is not the bottleneck, this addendum describes work that should not
 be done.
+
+---
+
+# Design: the `yesno-plugin` client, derived from the existing one
+
+## Source and its standing
+
+Read 2026-10-08 from `/home/moriyoshi/src/haiiie/haiiie-peer/src/lib.rs` ( 962 lines ),
+with `write.rs` and `control.rs` alongside it and tests in `haiiie-peer/tests/channel.rs`.
+**That is not a stable reference**: it is another project's code, authored by a Codex session,
+living in an **uncommitted** haiiie working tree, and unreleased. The peer session confirmed
+access and asked for exactly this citation, and stated it has **not** reviewed that code for
+the ordering questions below -- so those are taken from the code itself, not from anyone's
+summary of it. Nothing here was copied; what was taken is the list of things a from-scratch
+client gets wrong.
+
+Its shape is also not the shape we want. It implements haiiie's own `SetStore`,
+`SetSnapshot` and `Lanes` traits directly, so the transport and the consumer's abstractions
+are fused. Ours must be **transport-level and trait-free**, because `yesno-pg` and a C ABI
+have nothing in common above the wire.
+
+## Ten things a from-scratch client would get wrong
+
+These are the deliverable of the read, and most are invisible from the server plus `ipc.rs`.
+
+1. **In arena mode a one-byte version arrives with `SCM_RIGHTS` *before* `ServerHello`.**
+   Inline mode starts directly with the frame. So the first read **must** be `recvmsg`; an
+   ordinary `read` silently discards the descriptor and the client then fails much later
+   with a confusing error.
+2. **That same first `recvmsg` can also pull in part of `ServerHello`**, so the client must
+   buffer the remainder after skipping the version byte. A client that reads one byte and
+   then starts frame-decoding loses whatever arrived with it.
+3. **The fd and `arena_bytes` must agree in both directions**, and each direction is a
+   distinct fault: a descriptor with `arena_bytes == 0` is "sent an arena fd but advertised
+   inline mode"; `arena_bytes > 0` with no descriptor is "advertised an arena without an fd".
+4. **Length-check the descriptor before mapping it**, against the advertised `arena_bytes`,
+   and map **read-only**. More than one `ScmRights` descriptor is a fault, not a surplus.
+5. **Arena lane addressing is a fixed stride, not packed**:
+   `arena_off + block * max_lanes * LANE_BYTES + lane * LANE_BYTES`. Inline mode *is* packed,
+   by summing `kind.payload_bytes( count )`, and its total must equal the frame payload
+   length exactly. Two different addressing schemes behind one `advance`.
+6. **The response frame must match the mode.** `Blocks` only with an arena, `BlocksInline`
+   only without. Either crossed is a protocol fault rather than something to adapt to.
+7. **`BlockAdvanceMany` is lock-step, not pipelined**: one round trip per batch of at most
+   `max_blocks`, and an empty batch is the terminator. `max_blocks` is advertised precisely
+   because guessing low is slow for a reason the peer cannot see.
+8. **Teardown is RAII and its errors are deliberately dropped.** `LanesRelease` on the lane
+   handle's `Drop`, `SnapshotClose` on the connection's. There is no explicit error path to
+   write, which is the only way a release cannot be skipped on an early return.
+9. **Six `io::ErrorKind`s during a pinned snapshot are *expiry*, not failure** --
+   `NotConnected`, `ConnectionAborted`, `ConnectionReset`, `BrokenPipe`, `UnexpectedEof`,
+   `WriteZero` -- because yesnod disconnects every old session before a follower cutover and
+   need not get a notification out first. Mapping these to a generic I/O error would turn a
+   routine cutover into an incident; the right answer is a typed `SnapshotExpired` carrying
+   the version, and a latched `stale` flag so the handle cannot be reused.
+10. **The client validates the server's output.** Lanes per block within `max_lanes`, blocks
+    **strictly ascending** by prefix, lane payload within `LANE_BYTES`, arena slices inside
+    the mapping. A client that trusts its server cannot distinguish a yesnod bug from its own.
+
+## Proposed surface
+
+Synchronous, because every consumer is: `yesno-pg` runs inside a PostgreSQL backend and
+MySQL's handler is blocking C++, and a `tokio` runtime dragged into a `cdylib` that
+PostgreSQL `dlopen`s is a cost with no buyer. The server stays async; only the client is not.
+It reuses `ipc.rs` for framing, which is the entire point -- one codec, one implementation.
+
+    yesno-plugin/src/client.rs
+
+    pub struct Client                       socket, optional arena, advertised limits
+      connect( path, name ) -> Result<Client>
+      limits() -> &Limits                   generation, role, shards, max_* , arena_bytes
+      snapshot() -> Result<Snapshot>
+
+    pub struct Snapshot                     version-pinned for the connection's life
+      contains( key, ordinal ) -> Result<bool>
+      cardinality( key ) -> Result<u64>
+      max( key ) -> Result<Option<u64>>
+      key_range( .. ) -> Result<Vec<u64>>
+      apply( writes ) -> Result<Committed>
+      lanes( spec ) -> Result<LaneCursor>
+
+    pub struct LaneCursor
+      advance() -> Result<Option<Block<'_>>>    borrows: arena mode must not copy
+
+`Block<'_>` borrowing is the load-bearing choice and the reason this does not belong in
+`yesno-c`: the lifetime is what makes arena mode zero-copy, and the C ABI's job is to
+restate it as "pointer and length valid until the next advance or release" in a header,
+which is a contract a C caller can keep and `yesno-c`'s materializing cursor deliberately
+refuses to offer.
+
+Requests serialize behind one lock, because the protocol is strict request/response on one
+socket; that is a property to document rather than a limitation to engineer around, and
+`max_blocks` batching is what makes it adequate.
+
+## Status
+
+**Not implemented.** The peer session holds cores 5-9 and 15-17 for a multi-hour measurement
+and asked me to stay fully off -- including `cargo check`, which writes `target/` and could
+trip the disk half of their gate, a consideration I had missed when I asked whether a pinned
+build was acceptable. Their topology answer also retired my proposal outright: L3 #1 is cpus
+0-9 at 8 MiB and L3 #2 is cpus 10-19 at 16 MiB, and their pinned set **spans both**, so no
+core on this host is outside their cache footprint. Writing a new module without compiling it
+once is not a draft, it is a guess, so the code waits for their signal.
