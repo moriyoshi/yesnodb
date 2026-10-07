@@ -3310,3 +3310,85 @@ samples taken immediately around them -- min idle 95.3% to 99% over all twenty c
 nothing subtracted, which is the sound reading -- so I do not believe 5.47x is contaminated.
 But the gate that certified it was not sound, and the honest statement is that the figure
 rests on the raw samples beside it rather than on its own gate line.
+
+## 2026-10-08 -- Differential review of the two channel clients: four mine, one theirs
+
+The user asked me to look at the consumer's independently written client against the one
+I had just written. **Agreement between them is not evidence**, and that has to be said
+first: I read theirs before writing mine and took ten protocol facts from it, so the two are
+not independent and anywhere they agree may only mean I copied the understanding. The
+divergences are the whole value, and there are five.
+
+Four of the five are defects in **mine**, which is the useful fact about reading a reference
+first: it transferred the facts I knew to ask about and none of the ones I did not.
+
+### Mine: notices were all treated as informational
+
+My request loop collected `Unavailable`, `Available`, `GenerationChanged` and `RoleChanged`
+into a vector and kept waiting for a response. `GenerationChanged`'s own doc comment in
+`ipc.rs` reads "The database was replaced. Every handle the peer holds is stale, and every
+answer derived from one describes a database that no longer exists." So my loop would have
+let a caller **read on through a database replacement** and discover it later by inspecting
+a notice list, which is too late by construction. Now terminal, and it is the only notice
+that is.
+
+### Mine: `Frame::Fault` was flattened, and the status table had no interpreter
+
+I mapped every fault to one `Error::Fault { status, message }`. The consumer's client
+classifies against `yesno_plugin::abi::Status`: `SnapshotTooOld` and `GenerationChanged` are
+fatal, `Unavailable` is **retryable**, `WrongRole` means the caller reached a replica.
+
+**The architectural finding is where that knowledge was living.** `abi::Status` is declared
+in `yesno-plugin`, and until today the only code that interpreted it was in a consumer, so
+every future consumer would have had to rediscover that 4 and 5 are fatal, 3 is worth a
+backoff and 6 means try the leader. A status table shipped without an interpreter beside it
+is an invitation to N inconsistent interpreters. The classifier now lives next to the table.
+
+### Mine: one `SCM_RIGHTS` can carry several descriptors
+
+I checked `CMSG_NXTHDR` for a second ancillary *header* and assumed one descriptor inside
+the first. One `SCM_RIGHTS` can carry several, so a server sending two in one message would
+have had the first taken and the rest **leaked** -- on a path a misbehaving server controls.
+The count now comes from `cmsg_len`, and every descriptor is taken into an `OwnedFd`
+**before** anything is rejected, because the kernel has already installed all of them and
+returning early without owning them is the leak.
+
+### Mine: `apply` was on `Snapshot`
+
+Found before the review. `Frame::Apply` carries no snapshot id, so a write is
+connection-scoped; hanging it off a pinned read snapshot implied an isolation relationship
+the wire does not have. Moved to `Client`.
+
+### Theirs: `Frame::Unavailable` is treated as terminal, and their own code disagrees
+
+The one finding that goes the other way, and it is a real cost rather than a style
+difference. Their loop treats the `Unavailable` **notice** as terminal: latch `stale`,
+return `SnapshotExpired`. But the protocol documents that notice as *transient* -- "No
+database: a follower is rebootstrapping. Requests will fail until `Frame::Available`" -- and
+says nothing about handles dying. `GenerationChanged` is the frame that says that.
+
+What makes it more than pedantry is that **their own fault handling already does the right
+thing**: a request against an empty slot is answered by the server with
+`Fault( Status::Unavailable )` -- `channel.rs` is explicit, "An empty slot is `Unavailable`,
+not a wait" -- and their classifier maps that to a retryable error, with a comment saying a
+peer starting in that gap can retry. The notice short-circuits that path whenever it arrives
+first, which out-of-band `notify` makes likely. So the same condition yields a retryable
+error down one path and a discarded snapshot down the other, in one client.
+
+Mine now records the notice and keeps reading, so the server's own `Fault` arrives and is
+classified. That is also the **only** safe choice for a shared client: the frames carry no
+request identifiers, so returning early from a request loop leaves an unread response to be
+mispaired with the next request. Latching `stale` is what makes their early return safe --
+it guarantees there is no next request -- which means their conservatism is load-bearing
+rather than incidental, and a client that wants to recover cannot copy it.
+
+### Carry away
+
+* **Reading a reference implementation first is worth it and is not a substitute for
+  review.** It gave me eleven protocol facts I would have got wrong and left four defects it
+  could not have caught, because they were in the parts I wrote from the frame set.
+* **A protocol's error table belongs beside its interpreter.** The split here was invisible
+  until a second client existed.
+* **When two implementations disagree, check the specification before assuming the older one
+  is right.** I had already "fixed" my `Unavailable` handling to match theirs before reading
+  the doc comment that says they are stricter than the protocol, and had to reverse it.
