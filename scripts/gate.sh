@@ -489,6 +489,20 @@ step "the article's derived figures still follow from the constants"
 check python3 scripts/check-model-constants.py --self-test
 check python3 scripts/check-model-constants.py
 
+step "storage-format.md's size-class ladder follows from CLASS_SIZES"
+# The document states the ladder four times — a twelve-row table, a maximum
+# standalone payload column, the superblock field's element count *and* byte
+# range, and the bitmap class's per-slab capacity — and every one of them is
+# arithmetic on one array in `yesno-core`. This recomputes them rather than
+# comparing two copies, so a second hand-written list cannot become a third
+# place to drift.
+#
+# Reserving class 0 on 2026-10-07 had to edit all of it by hand and the same
+# drift was found **twice in one commit**: a row-numbering comment left pointing
+# at the wrong row, and a prose mention of "class-0" that survived until a human
+# asked. A ladder that is eleven-twelfths right reads as right.
+check python3 scripts/check-storage-ladder.py
+
 step "rustfmt"
 # Whole-tree, because the baseline is gone ( `fmt-baseline`, closed 2026-08-27 ).
 #

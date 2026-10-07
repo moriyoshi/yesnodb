@@ -410,6 +410,11 @@ jobs:
           set -euo pipefail
           python3 scripts/check-model-constants.py --self-test
           python3 scripts/check-model-constants.py
+      - name: storage-format.md's size-class ladder follows from CLASS_SIZES
+        # The ladder is stated four times in that document and every figure is
+        # arithmetic on one array in yesno-core. Reserving class 0 on
+        # 2026-10-07 drifted two of them in a single commit.
+        run: python3 scripts/check-storage-ladder.py
 
   msrv:
     name: msrv (workspace builds at 1.98)

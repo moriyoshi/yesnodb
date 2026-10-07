@@ -3136,3 +3136,67 @@ so in its docstring: it checks the tree's declared floors, and host state is not
   through a journal entry and a to-do without running the grep.
 * **A remedy is a measurement too, and ages.** This one asserted it "reproduces CI exactly";
   that assertion was true when written and nothing re-checked it for three weeks.
+
+## 2026-10-07 -- The storage-format ladder is now recomputed, and nine source comments are stale
+
+Closes `storage-format-ladder-is-unaudited`, opened this morning after reserving class 0
+drifted the same document twice in one commit. `scripts/check-storage-ladder.py` recomputes
+every ladder figure in `docs/storage-format.md` from `CLASS_SIZES` and is wired into both
+`scripts/gate.sh` and `.github/workflows/ci.yml`; gate parity now reports 19 shared scripts.
+
+### Four statements, one array
+
+The document states the ladder more times than the to-do credited:
+
+* the twelve-row table of class index to slot bytes;
+* a **maximum standalone payload** column, which equals the slot size exactly, because the
+  extent trailer moved to a table at the tail of the slab body and `class_for` sets
+  `need = payload_len` with nothing added;
+* the superblock field list's persisted-ladder row, whose element count **and** byte range
+  are both functions of the array's length -- `76..124` is `76 .. 76 + 4 * 12`, and
+  reserving a class moves the end of it;
+* the bitmap class's per-slab capacity, `floor( ( 2 MiB - 8192 ) / ( 8192 + 8 ) ) = 254`.
+
+It **recomputes** rather than comparing two copies, which matters: a hand-written expected
+ladder inside the checker would simply have become a third place to drift. The to-do named
+three statements; writing the thing found four, which is the ordinary outcome of mechanizing
+a count that was taken by eye.
+
+### Nine controls, including the two drifts that actually happened
+
+On a three-file copy under `.agents-workspace/tmp`, mutated one site at a time: class 11 left
+at the pre-trailer-move 8256; a table row misnumbered ( **this is the drift that happened
+twice today** ); the byte range left at `76..120`, which is precisely what reserving a class
+without widening the field produces; the element count left at 11; class 0 no longer marked
+reserved; the payload column reverted to the `size - 8` regime; the bitmap capacity stale;
+and a thirteenth class added to the source with the document untouched. All nine behaved.
+
+### What writing it turned up, and why it is not in it
+
+The per-row `//` comments beside `CLASS_SIZES` are **stale, nine of twelve**. Each states a
+maximum payload that is `slot - 8` -- `<= 568` for the 576 slot, through `<= 6200` for 6208
+-- which was the bound while every slot carried its own eight-byte trailer. The two
+`exact for N` annotations corroborate it rather than contradicting it:
+`round_up_64( 2048 + 8 ) = 2112` and `round_up_64( 4096 + 8 ) = 4160`, which is exactly what
+those rows claim to be exact for. Class 11's comment *was* rewritten when its size changed
+from 8256 to 8192, and explains the trailer move in detail; the other nine were left, so the
+array now carries one current comment and nine superseded ones.
+
+**The document is right and the comments are wrong**, which is the reverse of the direction
+this work expected. So the checker deliberately does not read them -- enforcing them would
+enforce the old regime -- and it says so in its docstring. Recorded as
+`class-sizes-row-comments-describe-the-old-trailer-regime` rather than fixed, because editing
+a Rust file obliges the lint gate and a peer holds cores 5-9 and 15-17 for a multi-hour
+measurement. The fix is comment text only; the values are a format decision with a recorded
+rationale and `AGENTS.md` forbids touching them casually.
+
+### Carry away
+
+* **Mechanizing a count usually revises it.** The to-do said three derived statements and
+  there were four; the MSRV to-do said fourteen sites and there were sixteen. Both counts
+  were taken by eye, which is the thing both scripts exist to replace.
+* **A derivation check can disagree with the code it derives from, in the code's favour.**
+  Here the prose was correct and the source comments beside the authoritative array were
+  not, so "check the doc against the source" would have been the wrong framing: what the
+  checker validates is the doc against `CLASS_SIZES`, and `CLASS_SIZES`'s own comments are a
+  third artifact that neither one audits.
