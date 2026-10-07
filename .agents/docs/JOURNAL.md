@@ -3251,3 +3251,62 @@ readable cannot currently make it work. Recorded on the entry.
 * **Grep for the *consumer*, not only the claim.** The entry asserted which arithmetic uses
   the compiled constants; asking instead who reads the decoded ones answered a strictly
   stronger question, and in one command.
+
+## 2026-10-08 -- The quiet-gate method I wrote into QUALITY_GATE was untested, and wrong
+
+Peer review from the consumer session on yesterday's `per-core-quiet-gate` work, landing two
+corrections. Both are right and the second is the one that matters.
+
+### The live evidence I offered was their own load, not a gate miss
+
+Handing the rule over, I sampled this host and reported host-wide idle at 92.0% with cpu5 at
+0.0% as a live instance of a host-wide gate failing to see a busy core. It was neither. That
+occupancy was the consumer's **own** sweep mid-cell, so it is not foreign load; and their
+gate samples at both edges **outside** timed work, so a mid-cell reading is not what their
+gate looks at. Their frame-2 and frame-3 gates are already per-core -- host-wide idle >= 85%,
+disk < 20 000, **and every pinned core >= 85%** -- which is stronger than the contract text
+they originally handed me.
+
+So I observed a busy core during someone's benchmark and inferred their gate was blind to
+it, without checking either whose load it was or when their gate samples. Two questions, one
+command each. The 2026-10-07 incident in the bullet is real and was **my** contaminated
+measurement; what was fabricated is the claim that it was still happening in front of me.
+
+### The method was one they had already tried and dropped
+
+Worse, because it is prescriptive. §4 told the reader to subtract their own threads by
+crediting each thread's `utime + stime` to its last-run core from `/proc/self/task/*/stat`.
+The consumer had tried that and abandoned it for two reasons:
+
+1. **Threads migrate within a pinned set.** Crediting a thread's time to the core it last
+   ran on can cancel a *co-tenant's* real load on that core. Clamped at 100%, the result is
+   **a gate that always passes** -- which is the exact failure class I had catalogued three
+   times in two days under "an impossible ratio is the cheapest signal the instrument is
+   wrong", and then wrote into the standing document as the remedy.
+2. **A per-thread sum loses threads that exited during the interval.** That broke their own
+   validation once.
+
+Their method sidesteps attribution instead of attempting it: retake the edge sample until
+this process's own CPU -- read **process-wide** from `/proc/self/stat`, so exited threads
+still count -- is within a few jiffies over the interval, then judge **raw** per-core idle
+with nothing subtracted. No migration to misattribute, no vanished threads, nothing clamped.
+Validated in both directions: an idle host and transient own load pass; persistent own load
+and a separate spinning process pinned to one of the cores fail. §4 now carries that.
+
+### The actual lesson, which is not about `/proc`
+
+**A measurement method put into a standing document needs the same positive control a
+checker does, and this one had none.** It came from a prototype's `foreign_core_idle`, which
+had never been run against foreign load from a separate process -- the single control that
+would have exposed it. In the same week I gave `check-msrv-consistency.py` five controls and
+`check-storage-ladder.py` nine, and refused to trust either without them, while promoting an
+unvalidated measurement method into the document that tells everyone else how to measure.
+A threshold you can state is not a method you have tested.
+
+**What this does to yesterday's numbers.** The `sdot` binary's in-cell gate used
+`foreign_core_idle`, so its printed "foreign-core min idle 99% -> 99%" was produced by the
+unsound method and is not evidence. The runs are corroborated by *separate* raw per-core
+samples taken immediately around them -- min idle 95.3% to 99% over all twenty cores, with
+nothing subtracted, which is the sound reading -- so I do not believe 5.47x is contaminated.
+But the gate that certified it was not sound, and the honest statement is that the figure
+rests on the raw samples beside it rather than on its own gate line.

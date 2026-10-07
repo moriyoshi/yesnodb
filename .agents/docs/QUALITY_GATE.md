@@ -333,13 +333,35 @@ the anecdote.
   edges and passed** while a peer session held all eight of the cores the
   measurement was pinned to; both sides were contaminated and both had to be
   rerun.
-  The naive per-core fix is unsatisfiable, which is the part worth writing down:
-  during your own cell your own workers hold those cores at 0% idle, so a
-  per-core gate fails on your own load. It has to subtract your own threads --
-  read `/proc/self/task/*/stat` and difference it against `/proc/stat` per core,
-  parsing fields **after the last `)`** because the `comm` field can itself
-  contain spaces and parentheses. Keep the disk half ( `bi+bo` ) and keep
-  sampling at both edges; it is only the CPU half whose resolution was wrong.
+  Sample at both edges and **outside timed work**, keep the disk half
+  ( `bi+bo` ), and keep the host-wide reading as well -- it is only the CPU
+  half's *resolution* that was wrong, not the rest of the gate.
+  The naive per-core fix looks unsatisfiable, because during your own cell your
+  own workers hold those cores at 0% idle. **Do not solve that by subtracting
+  your own threads.** An earlier version of this bullet prescribed exactly that
+  -- crediting each thread's `utime + stime` to its last-run core from
+  `/proc/self/task/*/stat` -- and the consumer had already tried and dropped it
+  for two reasons, both fatal:
+  threads **migrate within a pinned set**, so crediting a thread's time to the
+  core it last ran on can cancel a *co-tenant's* real load on that core, and
+  clamped at 100% that yields **a gate that always passes**; and a per-thread
+  sum silently **loses threads that exited during the interval**, which broke
+  their validation once.
+  What works, and is validated in both directions: **retake the edge sample
+  until this process's own CPU is near zero, then judge raw per-core idle with
+  nothing subtracted.** Read your own usage process-wide from `/proc/self/stat`
+  rather than summing tasks, so exited threads still count, and require it to be
+  within a few jiffies over the interval before accepting the sample. That
+  sidesteps attribution entirely: no migration to misattribute, no vanished
+  threads, nothing clamped. Their validation passes an idle host and transient
+  own load, and **fails** persistent own load and a separate spinning process
+  pinned to one of the cores.
+  **A measurement method put in this document needs the same positive control a
+  checker does.** The subtracting version was written here from a prototype that
+  had never been run against foreign load from a separate process -- the one
+  control that would have exposed it -- in the same week two new `scripts/`
+  checkers were each given five and nine controls before being trusted. A
+  threshold you can state is not a method you have tested.
   Note that `scripts/` carries no quiet gate -- there is nothing to run, so the
   obligation lives here and in each harness, and a harness that times anything
   should cite this bullet rather than invent a threshold.
