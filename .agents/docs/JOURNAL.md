@@ -3200,3 +3200,54 @@ rationale and `AGENTS.md` forbids touching them casually.
   not, so "check the doc against the source" would have been the wrong framing: what the
   checker validates is the doc against `CLASS_SIZES`, and `CLASS_SIZES`'s own comments are a
   third artifact that neither one audits.
+
+## 2026-10-07 -- Verifying two old to-dos instead of dispatching them, and one sharpening
+
+A peer holds cores 5-9 and 15-17 for a multi-hour measurement, so nothing that compiles
+could run. The `tackle-todos` discipline that *does* run under that constraint is its step
+2b -- verify an aged entry against the code before anyone works it, because closing a stale
+entry is cheaper than implementing one. Two entries picked for having claims that are a
+grep away. **Both are accurate and still applicable; neither was closed**, which is a
+legitimate outcome and worth recording so the next session does not re-verify them.
+
+### `mysql-records-in-range-is-whole-key`: unchanged
+
+`ha_yesno::records_in_range` refuses any index but 0, answers a `min_key`-only
+`HA_READ_KEY_EXACT` through `Backend::Contains` as an exact 0 or 1, and falls through to
+`records()` for every other shape. So a bounded range still reports the whole-key
+cardinality to the optimizer. Nothing has moved since 2026-09-18.
+
+### `decoded-geometry-does-not-drive-address-calculation`: accurate, and understated
+
+The entry says the allocator's capacity, slot lookup and new-allocation arithmetic use the
+**compiled** ladder rather than the decoded one. Grepping for the decoded field found
+something stronger: `class_sizes` has **no consumer anywhere outside `superblock.rs`** --
+only its own field declaration, builder, encoder, decoder and tests. It is not merely
+unused by the allocator; it is read by nothing.
+
+What makes that safe is the line immediately after `validate_ladder`:
+
+    if class_sizes != CLASS_SIZES {
+        return Err( CodecError::Invariant(
+            "shard was written with a size-class ladder this build does not implement" ) );
+    }
+
+with the module's own comment stating the reasoning -- "a well-formed ladder that is not
+*this* ladder is worse than a malformed one, because nothing downstream would notice."
+`page_size` and `node_size` carry the same guard, each treating a stored zero as a file
+written before the field was compared.
+
+So the entry's framing is right but its cost is understated, and the sharpening is what a
+later session needs: the gap is not a latent correctness risk, because a geometry this build
+cannot honour is **refused** rather than misread. It is a *format* cost -- retuning the
+ladder is a format break, not a configuration change, and the fields that exist to make it
+readable cannot currently make it work. Recorded on the entry.
+
+### Carry away
+
+* **A verification pass that closes nothing is still a result**, provided it is dated and
+  recorded. Both entries now say what was checked and when, so the next reader inherits the
+  check rather than the doubt.
+* **Grep for the *consumer*, not only the claim.** The entry asserted which arithmetic uses
+  the compiled constants; asking instead who reads the decoded ones answered a strictly
+  stronger question, and in one command.
