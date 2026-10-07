@@ -353,6 +353,13 @@ jobs:
         # arm. Only this connects the three. Building the image to find out
         # costs an hour of cross-compilation; this costs a second.
         run: python3 scripts/check-image-binaries.py
+      - name: every declared Rust floor agrees with the workspace's
+        # Sixteen sites: five manifests, four Dockerfiles, this job's own four
+        # mentions of the floor, and `MODULE.bazel`. The last is the one that
+        # fails silently -- Bazel compiles yesno-core and ignores
+        # `rust-version`, so a stale toolchain there breaks `gate-pg.sh` while
+        # cargo reports success.
+        run: python3 scripts/check-msrv-consistency.py
       - name: the image entrypoint parses as POSIX sh
         run: sh -n dist/entrypoint.sh
       - name: policy R1 (no Arrow types in yesno-core's public API)

@@ -3003,3 +3003,76 @@ is the configuration the served path runs. The other two are not better versions
 * The live leads are now **the scan** -- block reads, LIVE masks and a heap push per row --
   and **memory contention at eight workers**, where Scaled8's 0.667x bytes against Scaled12
   already helps. The fold and the uninlinable scorer are real but bounded by 1.34x together.
+
+## 2026-10-07 -- A checker for the Rust floor, and the count was sixteen not fourteen
+
+Closes `msrv-is-declared-in-fourteen-places-and-checked-in-none`, opened this morning while
+bumping the floor 1.95 -> 1.98 by hand. `scripts/check-msrv-consistency.py` now derives the
+floor from `Cargo.toml`'s `[workspace.package] rust-version` and verifies every other site
+against it, wired into both `scripts/gate.sh` and `.github/workflows/ci.yml`.
+
+**The entry said fourteen sites and there are sixteen.** The checker counts what it actually
+reads: four manifests at the workspace floor ( the root plus `yesno-wire`, `yesno-plugin`,
+`yesno-c` ), two at pgrx's independent 1.96, four `ARG RUST_VERSION` lines, `MODULE.bazel`,
+and **four** mentions in the `msrv` CI job rather than the three the entry credited -- the
+job's own name, the `rustup toolchain install`, the `rustc +<ver> --version`, and two
+`cargo +<ver> check` invocations. Counting by hand is the thing this script exists to
+replace, so it is fitting that the hand count was wrong, and mildly embarrassing that it was
+wrong in an entry whose whole point was that eyeballing sixteen numbers does not work.
+
+Eleven other manifests inherit with `rust-version.workspace = true` and need no check;
+`yesno-core/fuzz` declares no floor at all and is allowlisted, being outside
+`[workspace] members` and needing nightly regardless.
+
+### Two rules rather than one
+
+Most sites must **equal** the floor. `MODULE.bazel` must be **at or above** it, because
+`rules_rust` needs a full patch version where `rust-version` names only major.minor -- it
+reads `1.98.0` against a floor of `1.98`. A positive control confirms `1.99.0` passes and
+`1.97.1` fails, so the comparison is a real inequality and not a string match that happens
+to work today.
+
+The two pgrx manifests are an allowlist **with their expected value asserted**, not an
+exemption. If pgrx's floor moves, this fails and someone updates the expectation
+deliberately. An exemption would have made the one case a reader cannot distinguish by eye
+also the one case the machine stops looking at.
+
+### Five positive controls, because a checker that cannot fail is worthless
+
+Run against a 25-file copy of the tree under `.agents-workspace/tmp`, mutated one site at a
+time, never against the real tree:
+
+    satellite manifest left at 1.95            fails, names yesno-wire/Cargo.toml
+    MODULE.bazel left at 1.97.1                fails, "expected >= 1.98"
+    MODULE.bazel at 1.99.0, above the floor    passes
+    one of four CI mentions left at 1.95       fails, names the cargo invocation
+    pgrx's own floor drifted to 1.97           fails, quotes the allowlist reason
+
+The third is the one worth having: without it the Bazel rule could have been an equality
+check that passed by coincidence. The `rerun-the-unwired-sweep` entry's standing complaint
+is that its positive control was never run, so running these was the price of adding another
+script to `scripts/`.
+
+### What it deliberately does not check, recorded in its own docstring
+
+**Host state.** `rustup default` and `RUSTUP_TOOLCHAIN` decide which compiler runs and
+neither is in the tree. This morning the machine default was 1.97.1 against a tree asking
+for 1.98, so a bare `cargo` failed outright; `RUSTUP_TOOLCHAIN` additionally outranks a
+`rust-toolchain.toml` pin, which is how the haiiie session nearly measured under the wrong
+compiler. A pass here says the tree is self-consistent, not that a host can build it.
+
+**That the CI `msrv` job tests the floor's exact patch.** It runs
+`rustup toolchain install 1.98`, which resolves to the channel's latest patch -- 1.98.1
+today -- so it tests above the 1.98.0 the floor literally promises, and something depending
+on a 1.98.1 stabilization would keep it green. Pre-existing, identical at 1.95, and not
+touched here; the checker verifies the job names the right floor, not that the floor is the
+minimum that works.
+
+### Verification deferred, and saying so rather than implying otherwise
+
+`bash -n scripts/gate.sh` and a YAML parse both pass, `check-gate-parity.py` passes at 18
+shared scripts, and the new checker exits 0 on the real tree. **The full `gate.sh` has not
+been run with the new step in place**, because a peer session holds cores 5-9 and 15-17 for
+a multi-hour measurement and compiling would contaminate it. Nothing here touches Rust, and
+the added step is the same `check python3 ...` shape as thirteen existing call sites, but
+that is an argument for low risk and not a substitute for the run.

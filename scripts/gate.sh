@@ -326,6 +326,23 @@ step "the unified image's binary set matches the workspace"
 # surfaces in a cluster rather than here.
 check python3 scripts/check-image-binaries.py
 
+step "every declared Rust floor agrees with the workspace's"
+# The floor is written in sixteen places and until 2026-10-07 nothing checked
+# that they agree, so the 1.95 -> 1.98 bump was a hand search across five
+# manifests, four Dockerfiles, four lines of the `msrv` CI job and
+# `MODULE.bazel`.
+#
+# `MODULE.bazel` is why this is a script and not a convention. Bazel compiles
+# `yesno-core` and `yesno-wire` and **does not read `rust-version`**, so a
+# toolchain left below the floor builds nothing while `cargo` reports success —
+# and the failure surfaces in `gate-pg.sh`, as a compile error inside
+# first-party code, a long way from the manifest that looks correct.
+#
+# Two of the sixteen are deliberately a different number ( pgrx's floor ), which
+# is exactly why eyeballing cannot distinguish a stale site from an intended
+# one. Those are asserted too, so pgrx moving fails here rather than later.
+check python3 scripts/check-msrv-consistency.py
+
 step "the image entrypoint parses as POSIX sh"
 # It is the image's ENTRYPOINT and it is not covered by any Rust test. A syntax
 # error is a container that exits immediately with nothing useful on stderr.
