@@ -3392,3 +3392,71 @@ rather than incidental, and a client that wants to recover cannot copy it.
 * **When two implementations disagree, check the specification before assuming the older one
   is right.** I had already "fixed" my `Unavailable` handling to match theirs before reading
   the doc comment that says they are stricter than the protocol, and had to reverse it.
+
+## 2026-10-08 -- The client compiles, two more protocol findings, and an over-claim retracted
+
+The peer's queue finished and released cores 5-9 and 15-17, so the client written blind
+yesterday could finally meet a compiler.
+
+### It compiled on the first attempt, which proves less than it looks like
+
+Zero errors, zero warnings, and clippy clean at `-D warnings`. That is worth recording but it
+is not evidence the thing works, and the mechanical pre-checks are the reason rather than
+luck: every `Frame` variant and field name had been verified against the enum by script, and
+every braced use checked for exhaustiveness. Those two checks cover exactly the class of
+error a compiler would have caught cheapest, which is why there was nothing left for it.
+
+What makes it *work* is the new `tests/client_roundtrip.rs`: two tests driving the client
+against `serve_blocking` over a real Unix socket -- handshake ordering, point reads,
+`key_range`, the block walk, and the empty-key case. Both green. **Arena mode is still
+untested**, because `serve_blocking` sends the greeting but not a descriptor; passing the
+`memfd` is `yesno-server`'s job on accept. The inline and arena branches compute lane offsets
+two different ways and only one is exercised, which is recorded in the test's own header.
+
+### Two findings, and they are against both clients equally
+
+**`ipc.rs` already ships the arena arithmetic and neither client called it.**
+`batched_lane_offset( arena_off, max_lanes, block, lane )` exists, and its doc gives the
+reason: "the two sides getting it separately right is the failure this layout exists to
+prevent." Both clients hand-rolled the same expression. Both happened to agree with the
+helper, so nothing was broken -- but hand-rolling it in the one place the protocol warns
+about is how a stride drifts later. Mine now calls it.
+
+**"Fewer blocks than asked for means the scan ended", and both clients tested for empty.**
+The `Blocks` frame documents the convention plainly: a short batch is final, exactly as many
+may or may not have more. Terminating on `blocks.is_empty()` instead costs **one wasted round
+trip at the end of every lane handle** -- correct, just slower than the protocol intends.
+`done = blocks.len() < max_blocks` now, and the new test uses `max_blocks: 4` against a
+single-chunk key precisely so a short batch is distinguishable from a full one; at
+`max_blocks: 1` the rule would go unexercised.
+
+### Retracted: the `Unavailable` finding I reported to the consumer
+
+Yesterday I reported that their client treats the `Unavailable` notice as terminal where the
+protocol calls it transient, and said it costs them retries. **On the server's actual
+behaviour it costs them nothing, and I should have checked the senders.**
+
+There are four `notify` sites in `yesno-server` and they make the shape plain:
+`before_close` sends `Unavailable` and then **disconnects peers**, with a comment saying the
+notice is "a courtesy so a peer can stop issuing requests it knows will fail"; a rebootstrap
+sends `GenerationChanged` then `Available { generation }`; and first serve sends
+`Available { generation: 1 }` to peers already attached. So **`Unavailable` is only ever sent
+immediately before a deliberate disconnect**. Their latch is harmless on every path that
+exists, and their retryable `Fault( Unavailable )` branch is not bypassed -- it serves the
+peer that connects during the bootstrap gap, which is the case its own comment describes.
+The divergence is latent, not live.
+
+**That is the third time in two days** that reasoning from a definition's doc comment to a
+consequence, without looking at the call sites, produced a wrong answer -- after an op-count
+model that priced free L1 hits as costly, and a kernel-overhead attribution that turned out
+to be the scan. The pattern is specific enough to name: *a doc comment says what a thing
+means, not how often or in what company it happens*, and the consequence lives at the call
+sites.
+
+### Carry away
+
+* **Verify the frame names mechanically and you take the compiler's job away from it.** Two
+  scripts over the enum left nothing for a first build to find across 847 lines.
+* **Check the senders before reporting a consequence.** Three for three now.
+* A shared helper that both sides are told to use, and that neither side used, is a finding
+  even when both hand-rolled it correctly.

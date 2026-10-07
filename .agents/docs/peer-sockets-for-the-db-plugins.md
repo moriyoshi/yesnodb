@@ -293,9 +293,28 @@ Requests serialize behind one lock, because the protocol is strict request/respo
 socket; that is a property to document rather than a limitation to engineer around, and
 `max_blocks` batching is what makes it adequate.
 
-## Status
+## Status, updated 2026-10-08
 
-**Not implemented.** The peer session holds cores 5-9 and 15-17 for a multi-hour measurement
+**Implemented and tested.** `yesno-plugin/src/client.rs` exists, compiles clean, passes
+clippy at `-D warnings`, and `yesno-plugin/tests/client_roundtrip.rs` drives it against
+`serve_blocking` over a real Unix socket: handshake ordering, point reads, `key_range`, the
+block walk with short-batch termination, and the empty-key case.
+
+It deviates from the sketch above in one place. `advance()` returns `Result<bool>` with
+separate `prefix()` and `lane( i )` accessors rather than a borrowing `Block<'_>`; both work
+in Rust, but the point of this type is that a C ABI restates it, and `advance` / `prefix` /
+`lane` map onto C functions one-for-one where a borrowing return does not. Arena mode stays
+zero-copy -- `lane()` returns a slice of the mapping, valid until the next `advance`.
+
+**Known gap: arena mode is untested.** `serve_blocking` sends the greeting but not a
+descriptor, because passing the `memfd` is `yesno-server`'s work on accept. The inline and
+arena branches compute lane offsets two different ways and only the inline one is exercised.
+Closing it needs a harness that sends the descriptor, or an integration test against a real
+`yesnod` with `plugin.channel_socket` set.
+
+### What the original status said, kept because the reason still matters
+
+**Not implemented**, at the time of writing. The peer session holds cores 5-9 and 15-17 for a multi-hour measurement
 and asked me to stay fully off -- including `cargo check`, which writes `target/` and could
 trip the disk half of their gate, a consideration I had missed when I asked whether a pinned
 build was acceptable. Their topology answer also retired my proposal outright: L3 #1 is cpus

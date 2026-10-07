@@ -37,6 +37,7 @@ use yesno_core::Db;
 
 pub mod abi;
 pub mod channel;
+pub mod client;
 pub mod ipc;
 
 /// The slot a server keeps its database in. `None` during a rebootstrap.

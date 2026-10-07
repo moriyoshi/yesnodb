@@ -79,7 +79,17 @@ client_skips=()
 # addition next to the other test steps, and a run with it printed the rustfmt
 # steps and the `skipped ( use --deep )` banner, so it reached the end and the
 # mismatch was the addition rather than an early exit.
-EXPECT_STEPS=19
+# **Raised 19 -> 21 and 25 -> 27 on 2026-10-08** for two derivation checks added the
+# same day -- "every declared Rust floor agrees with the workspace's"
+# ( `check-msrv-consistency.py` ) and "storage-format.md's size-class ladder follows
+# from CLASS_SIZES" ( `check-storage-ladder.py` ). Diagnosed before raising, exactly
+# as the paragraph above demands: the failing run printed both new steps as `ok`,
+# then the rustfmt steps and the `skipped ( use --deep )` banner, so it reached the
+# end and the mismatch was the two additions rather than an early exit. Both are
+# unconditional `check` calls next to the other policy checks, so they count in both
+# modes. **The guard did its job**: both checkers ran and passed, and the only thing
+# wrong was that the person who added them did not come here.
+EXPECT_STEPS=21
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -126,7 +136,7 @@ EXPECT_STEPS=19
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=25
+EXPECT_STEPS_DEEP=27
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
