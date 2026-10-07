@@ -2945,3 +2945,61 @@ kernel choice**, and that is the consumer's model decision rather than a yesno o
 * The Scaled8 arm's remaining 56% is therefore **not** load reuse either. It is the per-row
   overhead the `sdot` entry also names -- the accumulator zero/store, the 48-mul-add fold,
   and a scorer behind a `fn` pointer that cannot inline. Those are the live leads.
+
+## 2026-10-07 -- The `sdot` arm's missing 56% is the scan and contention, not the kernel
+
+Third correction in a day on the same arm, and the one that matters most, because the
+previous two left a live optimization pointed at the wrong thing.
+
+The `sdot` entry recorded the arm at 44% of its useful ceiling and attributed the gap to
+**per-row overhead inside the kernel**: twelve accumulators zeroed and stored every row,
+`fold_limbs` doing 48 scalar `i64` mul-adds every row, and a scorer behind a `fn` pointer
+that cannot inline. That attribution was a guess dressed as a finding, and it is wrong.
+
+### Measured, by isolating the kernel from the scan in one frame
+
+A synthetic 63 MB Scaled8 row buffer past the 8 MiB L3, one pinned thread, min idle 95%, is
+the kernel alone. The same arms run through the real scan at `THREADS=1` is the kernel plus
+the scan. Differencing those two is legitimate; differencing either against the recorded
+8-worker figure is not, and keeping the frames straight is the whole method here.
+
+    frame                                     sdot MAC/cyc/thr   share lost
+    useful ceiling ( 61.73 raw / 3 limbs )                20.60   --
+    kernel alone                                          15.43   kernel at 75%
+    inside the real scan, 1 thread                        11.40   scan costs 26%
+    inside the real scan, 8 threads                        9.02   contention costs 21%
+
+`0.749 * 0.739 * 0.791 = 0.438`, which is the 44% that was recorded. **The decomposition
+closes to within rounding**, which is the check that makes it worth believing rather than
+three unrelated measurements laid side by side.
+
+So the kernel has **1.34x** left, the scan **1.35x**, and eight-way contention **1.27x**.
+The three things the earlier entry named are all inside the kernel, so together they were
+never worth more than 1.34x, and the two larger shares were not mentioned at all. Had this
+not been measured, the next session would have vectorized a 48-mul-add fold for a few
+percent while a quarter of the time sat in block reads, LIVE masks and heap pushes.
+
+### Amdahl, arriving on schedule
+
+The same scan costs the **scalar** arm 5.3% ( kernel-only 1.797, in-scan 1.702 ) and the
+`sdot` arm **26%**. The scan's work did not change; the kernel got 8.6x faster and the fixed
+cost became a visible share. This is also why the arm's speedup has three different honest
+values, and why any one of them quoted without its frame is misleading:
+
+    kernel only, 1 thread                8.58x
+    in the real scan, 1 thread           6.70x
+    in the real scan, 8 threads          5.47x
+
+The 5.47x already committed is the right number to quote for the served path, because that
+is the configuration the served path runs. The other two are not better versions of it.
+
+### Carry away
+
+* **An efficiency figure needs its denominators separated before it suggests an
+  optimization.** "44% of ceiling" invited a kernel change; it was three multiplicative
+  factors, only one of which was the kernel, and the smallest one at that.
+* **Check a decomposition by multiplying it back.** Three ratios that reproduce the
+  aggregate are evidence; three ratios that do not would have meant a missing term.
+* The live leads are now **the scan** -- block reads, LIVE masks and a heap push per row --
+  and **memory contention at eight workers**, where Scaled8's 0.667x bytes against Scaled12
+  already helps. The fold and the uninlinable scorer are real but bounded by 1.34x together.

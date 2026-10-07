@@ -895,10 +895,29 @@ checkable here and so must be checked exactly: the limb split, products, non-ove
 self-consistent and wrong; a scalar path reading the identical layout disagrees with the
 reference instead, which localizes the fault to the layout rather than the intrinsics.
 
-What remains is **per-row overhead, not the kernel**: 9.016 useful MAC/cycle/thread is 44%
-of 20.6, and 1.69 `sdot`/cycle sits below both the 3.86 issue ceiling and the 3-load/cycle
-limit, so neither is saturated. The cost is twelve accumulators zeroed and stored per row,
-a 48-mul-add scalar fold per row, and a scorer behind a `fn` pointer that cannot inline.
+**The 44%-of-ceiling figure decomposes into three factors, and the kernel is the
+smallest.** Measured by isolating the kernel over a synthetic 63 MB row buffer past L3 and
+comparing against the real scan at the same single-thread setting:
+
+    frame                                     sdot MAC/cyc/thr   share lost
+    useful ceiling ( 61.73 raw / 3 limbs )                20.60   --
+    kernel alone                                          15.43   kernel at 75%
+    inside the real scan, 1 thread                        11.40   scan costs 26%
+    inside the real scan, 8 threads                        9.02   contention costs 21%
+
+`0.749 * 0.739 * 0.791 = 0.438`, reproducing the 44%; a decomposition that multiplies back
+to the aggregate is evidence, one that does not means a missing term. So the kernel has
+**1.34x** left, the scan **1.35x** and eight-way contention **1.27x**. An earlier version of
+this record attributed the whole gap to per-row kernel overhead -- accumulator zero/store,
+the 48-mul-add fold, the uninlinable `fn`-pointer scorer. Those are all *inside* the kernel
+and so are jointly bounded by that 1.34x; the two larger shares were missed entirely.
+**Separate an efficiency figure's denominators before letting it suggest an optimization.**
+
+The same scan costs the scalar arm 5.3% and the `sdot` arm 26% -- identical work, a kernel
+8.6x faster, Amdahl. Which is why the speedup has three honest values and none of them
+travels without its frame: **8.58x** kernel-only, **6.70x** in-scan single-thread, **5.47x**
+in-scan eight-thread. Quote the last for a served path, because that is what the served path
+runs.
 
 **Row blocking was the obvious lever and it is dead -- measured 0.8% the same day.** The
 reasoning that proposed it counted thirteen vector ops a coordinate and priced them alike.
