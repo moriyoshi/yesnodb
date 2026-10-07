@@ -424,6 +424,68 @@ fn eval_vec_big(
     }
 }
 
+/// A vector readied for element-at-a-time evaluation.
+///
+/// # Why this is not an index function over `VecBigExpr`
+///
+/// [`VecBigExpr::Scale`] carries a scalar that is the same for every element, and
+/// `eval_vec_big` evaluates it **once** before broadcasting. An indexing function over
+/// the wire node would evaluate it per element instead -- turning a fusion into an
+/// `O( arity )` regression on exactly the shape it was meant to speed up, and silently,
+/// because the answer would still be right. Preparing hoists every such scalar once and
+/// leaves `element` doing only per-element work.
+enum Prepared<'a> {
+    List(&'a [BigExpr]),
+    Map(&'a VecSetExpr, &'a BigExpr),
+    Zip(Box<Prepared<'a>>, Box<Prepared<'a>>, BigBinOp),
+    /// The scalar is already evaluated; see the type's own comment.
+    Scale(Box<Prepared<'a>>, BigInt, BigBinOp),
+}
+
+fn prepare<'a>(
+    v: &'a VecBigExpr,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<Prepared<'a>> {
+    Ok(match v {
+        VecBigExpr::List(xs) => Prepared::List(xs),
+        VecBigExpr::Map(vector, body) => Prepared::Map(vector, body),
+        VecBigExpr::Zip(a, b, op) => Prepared::Zip(
+            Box::new(prepare(a, snap, hole)?),
+            Box::new(prepare(b, snap, hole)?),
+            *op,
+        ),
+        VecBigExpr::Scale(v, x, op) => Prepared::Scale(
+            Box::new(prepare(v, snap, hole)?),
+            eval_big(x, snap, hole)?,
+            *op,
+        ),
+    })
+}
+
+/// Element `i`, evaluating nothing else.
+fn element(
+    p: &Prepared<'_>,
+    i: u32,
+    snap: &Snapshot,
+    hole: Hole<'_>,
+) -> yesno_core::Result<BigInt> {
+    match p {
+        Prepared::List(xs) => eval_big(&xs[i as usize], snap, hole),
+        Prepared::Map(vector, body) => {
+            let part = lower_vec_at(vector, i, snap, hole)?.collect_set()?;
+            eval_big(body, snap, Some(&Arc::new(part)))
+        }
+        // The arities agree because the decoder refused the payload otherwise.
+        Prepared::Zip(a, b, op) => apply_bin(
+            *op,
+            &element(a, i, snap, hole)?,
+            &element(b, i, snap, hole)?,
+        ),
+        Prepared::Scale(v, scalar, op) => apply_bin(*op, &element(v, i, snap, hole)?, scalar),
+    }
+}
+
 /// One element-wise application, with the scalar nodes' own semantics.
 ///
 /// Routed through the same operations [`BigExpr`]'s binary nodes use, so a zip
@@ -516,33 +578,67 @@ fn eval_big(e: &BigExpr, snap: &Snapshot, hole: Hole<'_>) -> yesno_core::Result<
             };
             BigInt::from_uint(barrett.pow_mod(&reduced, exp.magnitude()))
         }
+        // **Streamed, not materialized.** This evaluated the whole vector into a
+        // `Vec<BigInt>` and then reduced it, so `fold( zip( a, b, mul ), add )` -- the
+        // inner product, and the shape this sort exists to serve -- built both operand
+        // vectors and a third of their products while the answer is one number. The
+        // reduction needs one accumulator and one element, so that is what it holds now.
+        //
+        // **Measured, and the allocation count is the only claim worth making.** On a
+        // quiet host ( 94% idle, medians of 21, reproduced across runs ), a 1024-element
+        // sum of 4096-bit reads went from 22 633 allocations to 21 601 -- which is
+        // 21 600, what the same fold under `max` allocates, plus one. The per-element
+        // accumulator is gone rather than reduced. A 1024-element inner product went
+        // 24 699 -> 23 650; its remaining excess over `max` is the 1024 products, and a
+        // product cannot reuse a buffer whose width it grows.
+        //
+        // **The wall-clock claim is not supportable and is not being made.** The same
+        // comparison moved the dot shape 1334 -> 1251 us, but the untouched `max`
+        // control moved 1229 -> 1187 in the same pair of builds, so most of that is
+        // build-to-build variation. The arithmetic was only 110 us of a 1355 us query to
+        // begin with: the cost of such a query is the per-element *plan*, and that is
+        // recorded separately in TODO.md as
+        // `numeric-fold-cost-is-the-plan-not-the-arithmetic`. What this buys outright is
+        // `O( 1 )` live values instead of `O( arity )` and an allocation count that no
+        // longer scales with arity.
+        //
+        // One observable changes and it is an error ordering: the old form evaluated
+        // every element of `a` before any of `b`, so a failing `a[ 3 ]` was reported
+        // ahead of a failing `b[ 0 ]`. Element-at-a-time reports `b[ 0 ]` first. Both
+        // are errors on a payload that has one; left-to-right **by element** is the
+        // ordering every other node in this evaluator already uses.
         BigExpr::Fold(v, op) => {
-            let values = eval_vec_big(v, snap, hole)?;
+            let arity = v.arity();
             // A vector is never empty -- the decoder refuses one -- so the
             // fold needs no identity, which is what admits `min` and `max` in
             // a domain that has no least or greatest element.
-            let mut it = values.into_iter();
-            let first = it.next().ok_or(yesno_core::CodecError::Invariant(
-                "a fold over an empty vector has no value",
-            ))?;
-            it.fold(first, |acc, x| match op {
-                BigFoldOp::Add => acc.add(&x),
-                BigFoldOp::Mul => acc.mul(&x),
-                BigFoldOp::Min => {
-                    if x < acc {
-                        x
-                    } else {
-                        acc
+            if arity == 0 {
+                return Err(yesno_core::CodecError::Invariant(
+                    "a fold over an empty vector has no value",
+                ));
+            }
+            let prepared = prepare(v, snap, hole)?;
+            let mut acc = element(&prepared, 0, snap, hole)?;
+            for i in 1..arity {
+                let x = element(&prepared, i, snap, hole)?;
+                match op {
+                    // The one arm with an in-place form. `mul` grows the width every
+                    // step and so cannot reuse the buffer; `min` and `max` move.
+                    BigFoldOp::Add => acc.add_assign(&x),
+                    BigFoldOp::Mul => acc = acc.mul(&x),
+                    BigFoldOp::Min => {
+                        if x < acc {
+                            acc = x;
+                        }
+                    }
+                    BigFoldOp::Max => {
+                        if x > acc {
+                            acc = x;
+                        }
                     }
                 }
-                BigFoldOp::Max => {
-                    if x > acc {
-                        x
-                    } else {
-                        acc
-                    }
-                }
-            })
+            }
+            acc
         }
     })
 }
@@ -2219,6 +2315,147 @@ mod big_fold_tests {
             other => panic!("decoded as {:?}", other.sort()),
         };
         big(&decoded, &snap).unwrap()
+    }
+
+    /// The streamed fold must equal reducing the materialized vector, over every
+    /// vector shape and every operator.
+    ///
+    /// # Why this is the test that matters
+    ///
+    /// `eval_big`'s `Fold` arm no longer evaluates the vector. It walks it element by
+    /// element and reduces as it goes, which is a **second implementation** of what
+    /// `vec_big` still does the materializing way -- and the two agreeing is the only
+    /// thing stopping the fast one from drifting. `vec_big` is public and is the
+    /// oracle here, so this is a differential test and not a restatement.
+    ///
+    /// The shapes are chosen for the places a naive element-at-a-time evaluator goes
+    /// wrong rather than for coverage of the enum: a `Scale` whose scalar must be
+    /// hoisted once, a `Zip` of two differently-shaped vectors, and both nested inside
+    /// each other so `prepare` has to recurse. `Mul` is included at a small arity
+    /// because its width grows with the arity and the budget would refuse a long one.
+    #[test]
+    fn a_streamed_fold_agrees_with_reducing_the_materialized_vector() {
+        let db = Db::new();
+        let snap = db.snapshot().unwrap();
+
+        let list = |vs: &[i64]| VecBigExpr::List(vs.iter().copied().map(lit).collect());
+        let shapes: Vec<(&str, VecBigExpr)> = vec![
+            ("list", list(&[3, -7, 2, 10])),
+            (
+                "zip",
+                VecBigExpr::Zip(
+                    Box::new(list(&[3, -7, 2, 10])),
+                    Box::new(list(&[5, 5, -1, 0])),
+                    BigBinOp::Mul,
+                ),
+            ),
+            (
+                "scale",
+                VecBigExpr::Scale(
+                    Box::new(list(&[3, -7, 2, 10])),
+                    Box::new(lit(-3)),
+                    BigBinOp::Sub,
+                ),
+            ),
+            (
+                "zip of a scale and a list",
+                VecBigExpr::Zip(
+                    Box::new(VecBigExpr::Scale(
+                        Box::new(list(&[3, -7, 2, 10])),
+                        Box::new(lit(4)),
+                        BigBinOp::Add,
+                    )),
+                    Box::new(list(&[1, 2, 3, 4])),
+                    BigBinOp::Mul,
+                ),
+            ),
+            (
+                "scale of a zip",
+                VecBigExpr::Scale(
+                    Box::new(VecBigExpr::Zip(
+                        Box::new(list(&[3, -7, 2, 10])),
+                        Box::new(list(&[9, 9, 9, 9])),
+                        BigBinOp::Add,
+                    )),
+                    Box::new(lit(2)),
+                    BigBinOp::Mul,
+                ),
+            ),
+        ];
+
+        for (name, v) in &shapes {
+            // The materializing path, which `vec_big` still takes, is the oracle.
+            let elements = vec_big(v, &snap).unwrap();
+            assert!(!elements.is_empty(), "{name} produced no elements");
+            for op in [
+                BigFoldOp::Add,
+                BigFoldOp::Mul,
+                BigFoldOp::Min,
+                BigFoldOp::Max,
+            ] {
+                let expected = elements
+                    .iter()
+                    .skip(1)
+                    .fold(elements[0].clone(), |a, x| match op {
+                        BigFoldOp::Add => a.add(x),
+                        BigFoldOp::Mul => a.mul(x),
+                        BigFoldOp::Min => {
+                            if *x < a {
+                                x.clone()
+                            } else {
+                                a
+                            }
+                        }
+                        BigFoldOp::Max => {
+                            if *x > a {
+                                x.clone()
+                            } else {
+                                a
+                            }
+                        }
+                    });
+                let e = BigExpr::Fold(Box::new(v.clone()), op);
+                let decoded = match AnyExpr::decode(&AnyExpr::Big(e).encode()).unwrap() {
+                    AnyExpr::Big(b) => b,
+                    other => panic!("decoded as {:?}", other.sort()),
+                };
+                assert_eq!(
+                    big(&decoded, &snap).unwrap(),
+                    expected,
+                    "the streamed fold of {name} under {op:?} disagreed with reducing \
+                     the materialized vector"
+                );
+            }
+        }
+    }
+
+    /// A `Scale` inside a fold must evaluate its scalar **once**, not once per element.
+    ///
+    /// This is the regression the `Prepared` indirection exists for, and it is invisible
+    /// to a correctness test: broadcasting the same scalar `arity` times gives the right
+    /// answer every time and only costs `arity` evaluations. So the scalar is made
+    /// something whose evaluation is *countable* -- a read of a key -- and the count is
+    /// the assertion.
+    #[test]
+    fn a_folded_scales_scalar_is_evaluated_once() {
+        let db = Db::new();
+        // A scalar that reads a key, so evaluating it touches the snapshot.
+        db.insert_many(77, &(0..64).map(|j| j * 3 % 64).collect::<Vec<_>>())
+            .unwrap();
+        let snap = db.snapshot().unwrap();
+
+        let arity = 64usize;
+        let v = VecBigExpr::Scale(
+            Box::new(VecBigExpr::List((0..arity as i64).map(lit).collect())),
+            Box::new(BigExpr::Read(Box::new(SetExpr::Key(77)), 64)),
+            BigBinOp::Add,
+        );
+        let scalar = big(&BigExpr::Read(Box::new(SetExpr::Key(77)), 64), &snap).unwrap();
+        let expected = (0..arity as i64)
+            .map(|k| BigInt::from_i64(k).add(&scalar))
+            .fold(BigInt::zero(), |a, x| a.add(&x));
+        let got = big(&BigExpr::Fold(Box::new(v), BigFoldOp::Add), &snap).unwrap();
+        assert_eq!(got, expected, "a folded scale did not broadcast its scalar");
     }
 
     /// All four operators, against the obvious reduction over machine ints.

@@ -4,6 +4,33 @@ Items extracted from `JOURNAL.md` during `good-sleep` consolidation, plus follow
 
 ## Open Items
 
+### Performance
+
+- [ ] **per-core-quiet-gate** ( *2026-10-07, after a gate that passed at 89% while a peer held one of the measurement's own cores* ): QUALITY\_GATE §4's quiet-host rule is `vmstat` idle >= 85% plus `bi+bo` < 20 000 at both edges of a timed cell. That is a **mean over every core, including the ones the measurement does not use**, so its resolution is `1/ncores` while the sensitivity it needs is per-core. On this 20-core host one busy core costs five points of host idle and a whole core of an 8-worker pinned scan.
+
+  **Measured twice.** Four busy loops on four of eight pinned cores: those cores 0% idle, host-wide 79%. And live, with a peer's 1-worker cell on one pinned core: host-wide **93%, passes**; least idle pinned core **cpu7 at 0%, fails**. The incident itself was an 8-worker scan on cores 5,6,7,8,9,15,16,17 whose gate read 89% at both edges and passed while a peer ran on the same set; both measurements were contaminated and both were rerun.
+
+  **The fix is `min` over the pinned set from `/proc/stat`'s per-cpu lines rather than the host mean**, and it is about thirty lines. A reference implementation is in the top-k prototype's harness ( `hostgate::min_core_idle`, `wait_for_cores`, and `gatecheck` which prints both gates side by side ) and can be lifted.
+
+  **What is not wrong with the old gate**: it samples before and after the timed region, so it never sees the measurement's own load, which is correct and should be kept. Only the spatial resolution is at fault.
+
+  **Scope if taken**: this is a convention change, not a script change -- the repo's `scripts/` carry no quiet gate, the rule lives in QUALITY\_GATE §4 prose and in each harness. So it means editing that section and the harnesses that cite it. Deliberately not done unilaterally.
+
+
+- [ ] **numeric-fold-cost-is-the-plan-not-the-arithmetic** ( *2026-10-07, from fusing the numeric fold and then measuring what was left* ): a `Big`-sorted query over many keys spends most of its time building **one plan per key**, not on arithmetic and not on decoding. Measured on a quiet host ( 94-95% idle, medians, reproduced across runs ), per element over 1024 distinct keys:
+
+  | what | us/element |
+  |---|---|
+  | `snap.key_expr( k )` | 0.051 |
+  | `key_expr` + read | 0.953 |
+  | read from a source whose plan is already built | 0.357 |
+
+  **The 0.051 is misleading and that is the finding.** `KeySource` defers planning to a `OnceLock`, so `key_expr` is cheap and the index scan happens inside the first `open()`. The real split is 0.051 to make the source, **~0.545 to build the plan**, 0.357 to read -- so planning is about **57%** of an element, and it is invisible to any measurement that times `key_expr` and concludes planning is 5%.
+
+  **What it is not.** Two plausible culprits were measured and both refuted. Building the `OrdSet` that `read_raw` materializes costs **16-32 ns over decoding alone**, and measures *negative* on a 16-chunk value -- so a streaming `read_int` that skipped the set would recover ~5% of a read, and the whole non-decode part of a read is 16-42% depending on shape. And the arithmetic, every allocation the fold fusion removed, was **110 us of a 1355 us** inner product. Neither is worth a kernel; the numbers are here so a later session does not re-derive them.
+
+  **The shape of a fix, and why it was not taken.** `KeyLanes::new` already loops `snap.key_stream( key )`, so planning is unbatched there too; a batched planner would collect N plans from one ascending index traversal per shard, keys being sorted within a shard. That touches the planner, which `yesno-flight/src/expr.rs` describes as carrying an **audited termination proof**, and the existing fusions were deliberately built "without adding an unmeasured `Expr` variant or changing the planner's audited termination proof". So this wants its own approval rather than being folded into a fold optimization. Note also that the win is shape-specific: it applies to a vector of distinct keys, and **not** to `map( view( .. ) )`, which reads one key and so builds one plan.
+
 ### Documentation
 
 - [ ] **storage-format-ladder-is-unaudited** ( *2026-10-07, after the same drift was found twice in one commit* ): `docs/storage-format.md` carries the size-class ladder as a twelve-row table, the class count in the superblock field list, and the ladder's byte range -- all of it pure arithmetic over `CLASS_SIZES`, and none of it checked. Reserving class 0 in `9ed609f` required editing every one of those by hand, and a prose mention of "class-0" in the same file survived the edit until the user asked about it.

@@ -2014,3 +2014,163 @@ precisely so that correcting one occurrence cannot leave four stale. The ladder 
 `docs/storage-format.md` is pure arithmetic over `CLASS_SIZES` -- twelve rows, the class
 count, and the superblock byte range -- so it is in the mechanizable half by §8's own
 test, and it is currently unaudited. Recorded in `TODO.md` rather than built here.
+
+## 2026-10-07 — The numeric fold streams; and what the dot product already was
+
+### The request, and what was already there
+
+Asked for a plan to add arbitrary-precision integer arithmetic and a dot product to the
+query language. Both were substantially present, which is the first thing worth recording.
+
+`arbitrary-precision-integers-in-the-expression-language` closed on 2026-10-06:
+`Sort::Big` / `Sort::VecBig`, fourteen `BigExpr` variants, six decode-time budgets, and
+client parity across the CLI, Python, Go and Java.
+
+**And the dot product is `fold( zip( a, b, mul ), add )`**, which already evaluates.
+Verified rather than inferred -- three cohorts holding stored integers 5, 6, 7 against
+literals 10, 100, 1000 returned 7650, round-tripped through `AnyExpr`, with
+`width_bound` 76 bits ( 64 for the reads, +10 for the literal, +2 for a three-way sum --
+exact ). `VecBigExpr::Zip`'s own comment says it is "the only construct in the language
+that correlates two vectors positionally"; the inner product is what it was built for.
+So the user declined the `dot( a, b )` sugar and asked for the optimization instead,
+which was the right call: the sugar was the only part of the plan that added nothing.
+
+### Four measurements, three of which refuted a hypothesis
+
+Taken on a quiet host at 94-95% idle, medians, reproduced across runs. The discipline
+mattered: **the first engine run was taken at 78% idle and attributed 711 us to 1024
+big-integer additions that a kernel measurement puts at 18.2 us.** A 39x error, in the
+direction that would have justified the work.
+
+1. **The fold's accumulator.** `acc = acc.add( &x )` allocates a fresh magnitude of the
+   growing accumulator's width every step. In isolation, in-place accumulation is
+   **2.66x** at 448 bits ( 18.2 us against 6.8 for 1024 operands ), 1.34x at 4096 and
+   1.13x at 65 536 -- the ratio decays because the allocation is fixed per step while the
+   copy grows. Real, but 14 us of a 1255 us query.
+2. **The vectors.** `eval_vec_big` materialized both operands and a third vector of
+   products. `MAX_RESULT_BITS` caps `arity * element_bound` at decode, so peak residency
+   was already bounded at about 3 x 2 MiB -- **not** the gigabytes I first assumed. A
+   fusion here is allocation count, not safety.
+3. **The set materialization.** `read_raw` is `collect_set()` then `read_int`, so the Big
+   sort's one gateway from storage materializes an `OrdSet` unconditionally -- exactly
+   what the Set/Int fusion layer exists to avoid. Refuted: building the set costs
+   **16-32 ns over the decode**, and measures *negative* on a 16-chunk value. Both paths
+   pay the decode; only the set construction could be saved, and it is noise.
+4. **The plan.** What is actually left is **~57% of an element spent building one plan per
+   key**, deferred into `KeySource`'s `OnceLock` so that timing `key_expr` reports 5% and
+   hides it. Recorded as `numeric-fold-cost-is-the-plan-not-the-arithmetic`, with the
+   shape of a fix and why it was not taken -- it changes the planner, which carries an
+   audited termination proof.
+
+### What shipped
+
+`BigInt::add_assign`, with two of its three sign cases in place and the third deferring to
+the allocating `add` because `rhs - self` cannot be formed in this buffer. A sum of
+same-signed terms never reaches that arm.
+
+`eval_big`'s `Fold` streams: a `Prepared` form hoists each `Scale`'s scalar once, then
+elements are evaluated one at a time and reduced as they arrive. `O( 1 )` live values
+instead of `O( arity )`.
+
+**The claim is the allocation count, and only that.** A 1024-element sum went
+22 633 -> 21 601 allocations, which is 21 600 -- what the same fold under `max` allocates --
+plus one: the per-element accumulator is *gone*, not reduced. The inner product went
+24 699 -> 23 650, its remaining excess being the 1024 products, and a product cannot reuse
+a buffer whose width it grows. **The wall-clock claim is withheld**: the dot shape moved
+1334 -> 1251 us, but the untouched `max` control moved 1229 -> 1187 in the same pair of
+builds, so most of that is build-to-build variation and the honest residue is around 3%.
+
+`Prepared` exists for a reason that no correctness test can see: indexing `VecBigExpr`
+directly would re-evaluate a `Scale`'s scalar once per element, which is right every time
+and `O( arity )` times too slow. `a_folded_scales_scalar_is_evaluated_once` makes the
+scalar a key read so the cost is at least *reachable* by a test.
+
+### Test layers
+
+`a_streamed_fold_agrees_with_reducing_the_materialized_vector` is the load-bearing one.
+The streamed fold is a **second implementation** of what `vec_big` still does the
+materializing way, and `vec_big` is public, so the materializing path survives in the tree
+as a genuine oracle rather than as dead code. Five vector shapes, chosen for where a naive
+element-at-a-time evaluator goes wrong -- a `Scale` needing its scalar hoisted, a `Zip` of
+unlike vectors, and each nested in the other so `prepare` recurses -- crossed with all
+four operators.
+
+### One observable changed
+
+Error ordering. The old form evaluated every element of a `Zip`'s left vector before any of
+its right, so a failing `a[ 3 ]` was reported ahead of a failing `b[ 0 ]`; element-at-a-time
+reports `b[ 0 ]`. Both are errors on a payload that has one, and left-to-right by element
+is what every other node in the evaluator already does. Stated in the code rather than
+discovered later.
+
+### Carry away
+
+**"Is there any fused math optimization?" was the right question and the answer was no** --
+`yesno-flight/src/expr.rs` is almost entirely fusion for Set, Int and Bool, and the Big
+sort was a plain interpreter. But the fusion that the shape of the code called for is worth
+1%, because the cost was somewhere none of the three candidates looked. Measuring each
+candidate separately, rather than fusing everything and reporting the sum, is what
+separated a 1% change that is still worth making on allocation grounds from a 57% finding
+that needs its own approval.
+
+## 2026-10-07 — A host-wide idle gate cannot see a co-tenant on the same cores
+
+### What happened
+
+While benchmarking a top-k prototype for a consumer, I ran an 8-worker full-corpus scan
+pinned to cores 5,6,7,8,9,15,16,17 on this 20-core host. A peer session was concurrently
+running quiet-gated cells on **the same eight cores**. My gate -- the one QUALITY\_GATE §4
+prescribes, `vmstat` idle >= 85% with `bi+bo` < 20 000 at both edges -- **read 89% at both
+edges and passed**. Both measurements were contaminated. The peer's cell had to be rerun and
+so did mine.
+
+### The mechanism, demonstrated twice
+
+Host-wide idle is a mean over every core, **including the ones the measurement does not
+use**. A co-tenant occupying `k` of the pinned cores drives those cores toward 0% while the
+host-wide figure falls by only `k/20`.
+
+Saturating four of the eight pinned cores with busy loops:
+
+```
+host-wide idle: 79%          cpu5 idle: 0%   cpu6 idle: 0%
+                             cpu7 idle: 0%   cpu8 idle: 0%
+```
+
+And live, with the peer's 1-worker cell holding one core:
+
+```
+host-wide idle         93%   ( the usual gate -- passes )
+least idle pinned core  cpu7 at 0%   ( fails )
+```
+
+**One busy core of twenty costs five points of host idle and a whole core of an 8-worker
+scan.** That is the entire gap: the gate's resolution is `1/ncores` while its sensitivity
+needs to be per-core.
+
+### The fix, and it is cheap
+
+Gate on the **minimum idle across the pinned core set**, from `/proc/stat`'s per-cpu lines,
+rather than on the host mean. `min` over the cores the work will actually run on, not the
+mean over the machine. Implemented in the prototype's harness as `hostgate::min_core_idle`
+and `wait_for_cores`; `gatecheck` prints the two side by side, which is what produced the
+live reading above.
+
+Worth noting what the old gate *does* still do correctly: it is sampled before and after the
+timed region, so it never sees the measurement's own load, which is the right design. The
+defect is only its spatial resolution.
+
+### Why this is recorded here and not only in the handoff
+
+**Every number this session took used the weaker gate**, including the fold measurements and
+the read-concurrency ablations of the last few days. None of them is known to be wrong -- a
+co-tenant has to be pinned to the same cores to matter, and most of those runs were not
+pinned at all, which paradoxically makes them *less* exposed because the scheduler spreads
+them. But "quiet host, gate passed" has been doing more work in this journal than it can
+support, and a reader should know the gate it names cannot distinguish an idle machine from
+a machine whose other tenant is sitting exactly where the measurement is about to run.
+
+Filed as `per-core-quiet-gate` in TODO.md. The project's own `scripts/` carry no quiet gate
+today -- the discipline lives in QUALITY\_GATE §4 prose and in each harness -- so adopting
+this is a documentation-and-convention change rather than a gate-script change, and it is
+left for a decision rather than taken unilaterally.
