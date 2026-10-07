@@ -3076,3 +3076,63 @@ been run with the new step in place**, because a peer session holds cores 5-9 an
 a multi-hour measurement and compiling would contaminate it. Nothing here touches Rust, and
 the added step is the same `check python3 ...` shape as thirteen existing call sites, but
 that is an argument for low risk and not a substitute for the run.
+
+## 2026-10-07 -- The quiet-host rule was never in QUALITY_GATE, and the lint remedy had gone stale
+
+Closes `per-core-quiet-gate`. Setting out to move one rule into `QUALITY_GATE.md` turned up
+two things wrong with that document and one thing wrong with my own record of it.
+
+### The rule was not where I said it was, twice
+
+This morning's entry on the contaminated gate says "the one QUALITY\_GATE §4 prescribes,
+`vmstat` idle >= 85% with `bi+bo` < 20 000 at both edges", and the to-do repeated it as "the
+rule lives in QUALITY\_GATE §4 prose". **§4 contained no quiet-host rule at all** -- grep
+for `vmstat`, `85%` or `bi+bo` in that file returns one unrelated hit about iteration counts.
+The threshold came from the **consumer's handoff contract**, which asked for cells gated at
+both edges on CPU idle >= 85% and `bi+bo` < 20 000. I attributed a peer's requirement to my
+own standing document, then cited my own document as the authority for it, then wrote a
+to-do whose scope paragraph described editing a section that did not say what I claimed.
+
+Nothing downstream could catch that, because an attribution reads as true if the rule
+itself is real and the document plausibly would carry it. The check is one grep and I did
+not run it until I went to make the edit. §4 now carries the rule properly, per-core and
+foreign-only, with the note that `scripts/` has no quiet gate to run -- so harnesses should
+cite the bullet rather than invent a threshold, which is how the number drifted in the first
+place.
+
+### The lint remedy for staleness had itself gone stale, in the same direction
+
+§1 has carried, since 2026-09-15, "local is **1.97.1** and `stable` is **1.98.0**", with
+`cargo +stable clippy ...` prescribed as the command that "reproduces CI exactly". After
+today's default change that passage was wrong in every part, and the interesting error is
+not the version numbers:
+
+    local default   1.98.1   ( was 1.97.1 until today )
+    local `stable`  1.98.0   ( whatever was last downloaded )
+    true stable     1.99.0   ( what CI's clean runner installs )
+
+CI runs `rustup toolchain install stable` on a fresh runner and gets 1.99.0. A local
+`stable` is whatever was last pulled and **nothing refreshes it**, so it had drifted a month
+behind. `cargo +stable clippy` therefore reproduced neither CI nor even the new default, and
+**the gap the bullet exists to close was still open while the bullet read as satisfied**.
+`rustup check` shows it in one line; `rustup update stable` fixes it. Both are now stated as
+preconditions of the remedy.
+
+**Why the morning's sweep missed it.** I swept the tree for the floor's value, 1.95, and
+this site names the *installed compiler's* value. Two different quantities, both spelled as
+a Rust version, and only one of them was what I was searching for -- so a complete and
+careful grep for the floor walked straight past the one passage whose advice the floor
+change invalidated. It was found by reading §1 for another reason, not by searching.
+`scripts/check-msrv-consistency.py`, added two commits ago, cannot see this either and says
+so in its docstring: it checks the tree's declared floors, and host state is not in the tree.
+
+### Carry away
+
+* **Grep for the quantity, then read the section.** A value-based sweep finds every site
+  that spells the quantity the same way and none that spells a *different* quantity the same
+  way. The second class is where stale advice lives.
+* **Check an attribution before building on it.** "Document X requires this" is a claim
+  about a file, cheaper to verify than any claim about code, and I propagated one for a day
+  through a journal entry and a to-do without running the grep.
+* **A remedy is a measurement too, and ages.** This one asserted it "reproduces CI exactly";
+  that assertion was true when written and nothing re-checked it for three weeks.

@@ -26,13 +26,24 @@ python3 scripts/check-r1.py        # no new Arrow types in yesno-core's public A
 - `cargo test --workspace` runs unit tests, `yesno-core`'s nine integration suites, the satellite crates' suites, `yesno-e2e`'s Python scenarios, and doc tests. Do not filter it down for the final gate run, only while iterating. ( `-p yesno-core` is the right filter *while* iterating on core. )
 - `cargo bench --bench setops` is **not** part of the gate. Benchmarks are a finding-generator, not a pass/fail criterion.
 - **Lint with CI's toolchain, not only the repo's.** There is no
-  `rust-toolchain.toml`, so the local default and CI's `stable` drift apart:
-  measured 2026-09-15, local is **1.97.1** and `stable` is **1.98.0**. A lint that
-  exists only in the newer one is **structurally invisible** to `scripts/gate.sh`
-  -- `clippy::chunks_exact_to_as_chunks` reported green locally through twelve
-  consecutive red CI runs. Before trusting the lint gate, run
-  `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`,
-  which reproduces CI exactly.
+  `rust-toolchain.toml`, so the local default and CI's `stable` drift apart. A
+  lint that exists only in the newer one is **structurally invisible** to
+  `scripts/gate.sh` -- `clippy::chunks_exact_to_as_chunks` reported green locally
+  through twelve consecutive red CI runs. Before trusting the lint gate, run
+  `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings`.
+- **And check that your `stable` is CI's `stable`, because the remedy above goes
+  stale the same way the problem does.** CI runs `rustup toolchain install
+  stable` on a clean runner and gets whatever is current; a local `stable` is
+  whatever was last downloaded, and nothing refreshes it. Measured 2026-10-07:
+  the local default was **1.98.1**, local `stable` was **1.98.0**, and true
+  stable was **1.99.0** -- a month behind, so `+stable` reproduced neither CI nor
+  anything newer than the default, and the gap it exists to close was still open
+  while appearing closed. `rustup check` reports this in one line and is the
+  precondition; `rustup update stable` is the fix.
+  **Raising the MSRV floor does not close this**, and the floor is not the thing
+  to grep for: the floor and the installed compiler are different quantities, so
+  the 1.95 -> 1.98 sweep on 2026-10-07 walked straight past this site. It was
+  found by reading the section, not by searching it.
 - **A change to `yesno-core` or `yesno-flight` must run `scripts/gate-pg.sh` as
   well.** Bazel compiles those crates too, so a change satisfying cargo can still
   break that build through a stale `Cargo.lock` resolution, and **neither gate
@@ -313,6 +324,25 @@ the anecdote.
   looked free cost 12%, a "17% win" was a 10% loss at a different shard count,
   and a rejected variant turned out to be the better one. Every one of them read
   the other way on a single run.
+- **A quiet-host check must be per-core over the cores the measurement will
+  use, and it must count only *foreign* work.** A host-wide mean has resolution
+  `1/ncores` where the sensitivity needed is per-core: on this 20-core host one
+  fully busy core costs five points of host idle, so a `vmstat` idle of 95%
+  passes an 85% threshold while an 8-worker pinned scan has silently lost a
+  whole worker. On 2026-10-07 a cell gated on host-wide idle **read 89% at both
+  edges and passed** while a peer session held all eight of the cores the
+  measurement was pinned to; both sides were contaminated and both had to be
+  rerun.
+  The naive per-core fix is unsatisfiable, which is the part worth writing down:
+  during your own cell your own workers hold those cores at 0% idle, so a
+  per-core gate fails on your own load. It has to subtract your own threads --
+  read `/proc/self/task/*/stat` and difference it against `/proc/stat` per core,
+  parsing fields **after the last `)`** because the `comm` field can itself
+  contain spaces and parentheses. Keep the disk half ( `bi+bo` ) and keep
+  sampling at both edges; it is only the CPU half whose resolution was wrong.
+  Note that `scripts/` carries no quiet gate -- there is nothing to run, so the
+  obligation lives here and in each harness, and a harness that times anything
+  should cite this bullet rather than invent a threshold.
 - **Print something whose right answer you already know, and look at it.** Three
   instrument defects in a day were each caught by a *derived* quantity that was
   impossible -- an implied CRC throughput of 218 GB/s against hardware's 10-25,
