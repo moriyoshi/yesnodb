@@ -2174,3 +2174,170 @@ Filed as `per-core-quiet-gate` in TODO.md. The project's own `scripts/` carry no
 today -- the discipline lives in QUALITY\_GATE §4 prose and in each harness -- so adopting
 this is a documentation-and-convention change rather than a gate-script change, and it is
 left for a decision rather than taken unilaterally.
+
+## 2026-10-07 — Exact top-k offloading: a measured prototype, and it wins on traffic
+
+Folded in from `REPORT-664-topk-offload.md`, which was written for the consumer and lives
+with the prototype under `.agents-workspace/tmp/topk/`. That path is cited in the
+consumer's own records, so the file stays; this is the durable copy of its findings.
+
+### The ask, and what already existed
+
+A consumer asked for a candidate-aware, snapshot-scoped, Scaled12 packed-integer-dot top-k
+prototype over persisted rows, benchmarked against borrowed-row and peer scoring **before**
+any API was frozen, preserving complete `( id, signed score )` order, ties and LIVE
+semantics. The boundary that motivated it is new: `yesnod` is now the sole database owner
+and the consumer's peer reads forward blocks through the Unix channel, which exposes
+snapshot, lane and block reads and **no top-k request**.
+
+`matrix::reduce::top_k` exists but is over an in-memory `BitMatrix`; it is not a persisted,
+snapshot-scoped, candidate-aware scored-row terminal. Nothing else in the crate fits, and
+the blocked-view count decomposition the consumer measured at 4.27-4.72x slower in 2026-09
+was explicitly ruled out as the execution path and was not used.
+
+### Verdict
+
+**The terminal wins the served path, and it wins on traffic rather than on scan speed.**
+A server-side scan is at **parity** with the embedded borrowed-row control -- 0.95x to
+1.08x across four cells, exact in every one -- while the request/response boundary is
+**7 845x** cheaper in bytes than shipping forward rows. The scan is not the reason to move
+it; the 586 MB is.
+
+| cell | control ms/q | terminal ms/q | ratio |
+|---|---|---|---|
+| batch 1, k 100 | 174.939 | 161.323 | 1.08x |
+| batch 8, k 100 | 22.803 | 22.675 | 1.01x |
+| batch 16, k 100 | 11.450 | 10.923 | 1.05x |
+| batch 16, k 10 | 10.858 | 11.447 | 0.95x |
+
+The spread straddles 1.0, so the honest reading is parity and not a win. **Both arms ran
+interleaved in one process**, which is the only construction this host supports -- a
+cross-build A-then-B here swung 50% between back-to-back runs of one binary. That measures
+what had to be measured, that the scan loses nothing when the server runs it, and it does
+**not** measure IPC latency. No served Scaled12 consumer exists to measure that.
+
+### Exactness
+
+**All 799 MIRACL EN e5 queries, complete ordered `( id, score )` top-100, zero mismatches**
+against the consumer's own `search_batch_on_snapshot`, over the real 1 002 235-row D=384
+persisted fixture, scoring every row.
+
+The oracle is the consumer's scorer, **linked**, not a reimplementation of it --
+`haiiie-embed` was added as a path dependency for exactly this. That is load-bearing
+because `score12_tile` and the query-weight preparation are private and had to be rebuilt
+on this side: a misplaced shift or a weight rounded the other way yields a **well-formed
+wrong ranking** that no self-consistency check refuses. `round_ties_even` in the weight
+derivation is the sharpest instance.
+
+Fifteen semantics cases against a brute-force oracle that cannot share a bug with the
+heap-and-merge path: ties breaking on ascending id, negatives at k = 1/10/40/100, k = 0,
+k > live, sparse LIVE, delete, re-add, **a pinned snapshot still seeing deleted rows**,
+gather-path agreement, out-of-range candidates, and a partial tile's zero lane scoring zero.
+
+### Two defects found by measuring, and the first is one the consumer's own comment predicts
+
+**`SetSnapshot::load_block` costs 1.97 ms a block against 0.0027 ms through a held lane --
+730x, flat at every selectivity.** A clustered 10 000-candidate query took 1 394 ms where
+the whole corpus takes 175. `load_block` builds a plan and opens a stream per call. The
+consumer's `keyspace.rs` already names this: "a fresh stream open per chunk -- the forward
+path's dominant cost at exactly the selectivities it is chosen for". A gather path must
+hold **one** cursor; `Lanes::read` accepts out-of-sequence blocks by contract and per-lane
+block sequences are independent, so one cursor serves forward rows and LIVE together.
+
+**Then holding the cursor but visiting per *candidate* rather than per *prefix* made the
+clustered cell 14x worse** -- precisely the fourteen rows a block the geometry puts there --
+while staying correct, because the answer is identical either way. Grouping the run of
+candidates sharing a prefix into one visit is what produced:
+
+| cell | terminal ms | rows scored | block reads | vs broad scan |
+|---|---|---|---|---|
+| clustered 10 000 | 11.855 | 10 000 | 716 | 14.7x faster |
+| scattered 10 000 ( stride 100 ) | 15.654 | 10 000 | 10 016 | 11.2x |
+| scattered 1 000 ( stride 1000 ) | 4.026 | 1 000 | 1 016 | 43x |
+
+**A gather path's cost is block visits, not rows.** Scattered 10 000 costs more than
+clustered 10 000 at identical row counts, which is the property any eventual API has to
+expose: a candidate set's *shape* matters more than its size.
+
+### The boundary, and an arithmetic error worth recording
+
+The first version of the report printed 577 287 360 B and attributed it to
+`71 589 x 8 192`. **That product is 586 457 088.** The 577 MB figure is
+`1 002 235 rows x 576 B` -- useful code bytes with no block padding -- because the harness
+computed `n * row_words * 8` while the prose described block transfer. One number wearing
+another's formula, caught by a reader rather than by me.
+
+Three frames, the third **measured** rather than inferred:
+
+| frame | bytes | vs terminal's 74 752 B |
+|---|---|---|
+| useful code bytes ( rows x 576 ) | 577 287 360 | 7 723x |
+| full forward blocks ( 71 589 x 8 192 ) | 586 457 088 | **7 845x** |
+| actual channel containers ( measured ) | 586 457 088 | **7 845x** |
+
+**Frames two and three coincide, and that is a finding.** A `LaneKind`-framed channel read
+carries whatever container is actually stored -- `n*2` for an array, `n*4` for a run, `n*8`
+for a bitmap -- so the channel cost is not derivable from geometry. Counted on the fixture:
+**all 71 589 forward chunks are bitmaps**, none array and none run, because 50.05% code
+density leaves nothing sparse. So there is no container-kind discount here, 7 845x is the
+figure to cite, and 7 723x is the weaker useful-payload ratio. Minimum **560 round trips**
+at `MAX_INLINE_PAYLOAD`'s 1 MiB cap against the terminal's one.
+
+### Pins, and the gate they were taken under
+
+Fixture `scaled-9ed609f/db/new-s12`, copied to scratch and opened `OpenMode::Reader` so the
+consumer's original was untouched. Geometry read from the index rather than assumed:
+**namespace 1**, not 0; `dims` 4608 bits, `row_bits` 4608, **14 rows a block**, 72 words a
+row; LIVE 1 002 235 with dense ids; forward 2 311 172 165 set bits, 50.05% of
+`1 002 235 x 4608`. The meta blob's `model_id` **is** the model file's SHA-256, so the
+stored rows are provably that model's.
+
+`haiiie-core` depends on `yesno-core` by relative path, so linking it compiled the consumer
+against the revision under test -- "rebuild under the revision under test" satisfied
+structurally rather than by procedure.
+
+**Every timed cell met the host-wide criterion only**, and that criterion cannot see a
+co-tenant on the measurement's own cores -- see the gate entry above. The ratios survive it
+( both arms interleave, so a co-tenant degrades them together ); what it attacks is the
+cross-process comparison against the consumer's own cell, which is the one figure that
+spans rigs. One later cell of mine demonstrably collided with a consumer cell and gated at
+89% at both edges. That cell is labelled contaminated rather than restated as better than
+it is.
+
+### The seam, and why not a callback
+
+A **declarative packed-integer-dot** form, not a bounded server-side scoring callback. The
+callback was considered and rejected on a ground that is not about convenience: it would
+run untrusted code inside the sole database owner, in the scan's hot loop, per row, and
+there is no sandbox here worth that. The declarative form also needs far less consumer
+format knowledge than it appears to -- code width, coordinate count, packing order,
+signedness, four numbers and an enum. It does **not** need the model, the ranges or the
+query preparation, because weights arrive already prepared as `i64`, which keeps the
+quantization entirely consumer-side.
+
+Narrowest viable seam: *packed signed integer codes of width W, C coordinates a row,
+little-endian, dot with a caller-supplied `i64` weight vector a lane, rank descending then
+by ascending id.* Scaled12 is `W=12, C=384`; Scaled8 is the same seam at `W=8`.
+
+### Settled by the consumer, 2026-10-07
+
+Proceed with the narrow versioned prototype, **with a real separate-process served latency
+and traffic check before any latency win is claimed**. Snapshot expiry is **Strict**: on
+expiry or generation change, return the existing typed `SNAPSHOT_TOO_OLD` or
+`GENERATION_CHANGED` fault and **no partial top-k**; the client restarts the whole query or
+batch on a new snapshot, explicitly, and nothing resumes across versions. An
+oldest-live-version field is optional and not a contract blocker. Gather must hold a cursor
+and group ascending candidates per forward prefix, which the measured table above already
+does. Consumer-side, `ScaledQuery::weights()` was added and `row_bits` / `rows_per_block`
+were already public, which closes the three asks this investigation raised.
+
+### What a later session should take from this
+
+* **The served check is the only thing standing between this and a latency claim**, and
+  everything timed so far is in-process by construction. That is stated here because a
+  7 845x byte ratio reads like a latency result and is not one.
+* **Both gather-path defects cost nothing in correctness**, which is why only measurement
+  found them. A gather path that visits per row instead of per block returns exactly the
+  right answer, fourteen times slower.
+* **No API was frozen**, deliberately, and no consumer file was created, modified or
+  deleted from this session.
