@@ -12,7 +12,13 @@ Items extracted from `JOURNAL.md` during `good-sleep` consolidation, plus follow
 
   **The fix is `min` over the pinned set from `/proc/stat`'s per-cpu lines rather than the host mean**, and it is about thirty lines. A reference implementation is in the top-k prototype's harness ( `hostgate::min_core_idle`, `wait_for_cores`, and `gatecheck` which prints both gates side by side ) and can be lifted.
 
-  **What is not wrong with the old gate**: it samples before and after the timed region, so it never sees the measurement's own load, which is correct and should be kept. Only the spatial resolution is at fault.
+  **What is not wrong with the old gate**: it samples before and after the timed region, which is correct and should be kept. Only the spatial resolution is at fault.
+
+  **A SECOND DEFECT, 2026-10-07, in the per-core fix itself.** `/proc/stat`'s per-cpu counters are system-wide, so a per-core gate sampled at the **end** edge sees the measurement's own workers winding down as a busy pinned core and rejects a clean cell. Confirmed rather than assumed: one thread of the measuring process pinned to cpu0 reads **100% idle before and 0.0% after**, with no foreign load at all. The fix subtracts the process's own ticks from `/proc/self/task/*/stat`, credited per thread to the core `processor` reports it last ran on -- field offsets taken after the **last** `)` of `comm`, so field N is at index N-3 ( utime 11, stime 12, processor 36 ).
+
+  **And that fix can make the gate unable to fail, which is the worse direction.** The clamp it needs -- `( d_idle + d_mine ).min( d_total )`, because `processor` is a last-seen core and a migrated thread is credited entirely to where it ended -- saturates at 100% idle when own-ticks are over-credited. So it admits contaminated cells rather than rejecting clean ones: exact for pinned threads where migration cannot happen, silently always-pass for unpinned work. **A positive control is therefore part of this item, not a follow-on**: genuine foreign load from a separate process on a pinned core must still read not-quiet. The negative control alone ( own-load-reads-quiet ) is precisely the half that cannot catch an always-pass. Not yet done, and the gate must not be cited until it is.
+
+  Reference implementation with both the host-wide and foreign-only forms is in the top-k prototype's `hostgate.rs`; `selfload.rs` demonstrates the defect and the negative control only.
 
   **Scope if taken**: this is a convention change, not a script change -- the repo's `scripts/` carry no quiet gate, the rule lives in QUALITY\_GATE §4 prose and in each harness. So it means editing that section and the harnesses that cite it. Deliberately not done unilaterally.
 
