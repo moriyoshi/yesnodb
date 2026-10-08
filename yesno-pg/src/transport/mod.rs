@@ -18,6 +18,11 @@
 //! lowered qual identically by construction rather than by agreement, which is
 //! the property that lets this trait hide which one a deployment chose.
 //!
+//! A `yesnod` can be configured to evaluate none ( `channel_max_expr_bytes = 0`
+//! ), which it reports only in its greeting -- so the planner is told by the
+//! `pushdown` server option rather than by a probe it has no connection to make.
+//! See `options::ServerOptions::pushdown`.
+//!
 //! # Why `Local` is absent
 //!
 //! `Db::open` takes a **non-blocking exclusive `flock`** on the database

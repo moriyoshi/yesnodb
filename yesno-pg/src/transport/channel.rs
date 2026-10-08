@@ -29,14 +29,23 @@
 //! correctness difference, and the only way to be sure they agree is for there
 //! to be one implementation rather than two.
 //!
-//! A server may still decline. `max_expr_bytes` is advertised in the greeting
-//! and zero means it evaluates none, which is a deployment an operator can
-//! choose -- so [`cmd_of`] reports rather than guessing, and the client refuses
-//! locally before spending a round trip. The planner is not consulted about
-//! that, because it cannot be: `plan_pushdown` runs before anything connects.
-//! A channel server configured to evaluate nothing therefore fails a pushed-down
-//! scan rather than falling back, which is the one rough edge left here and is
-//! recorded as such.
+//! # A server may still decline, and the operator declares that
+//!
+//! `max_expr_bytes` is advertised in the greeting and zero means this `yesnod`
+//! evaluates none, which is a deployment an operator can choose. The greeting
+//! is read at connect time, and `plan_pushdown` holds no connection -- so the
+//! planner is told by a **server option**, `pushdown 'off'`, which is the other
+//! half of `channel_max_expr_bytes = 0` on the daemon.
+//!
+//! Probing instead was rejected: the planner would open a connection per planned
+//! scan to learn a fact that cannot change between statements, and planning
+//! would begin to fail when the server was merely unreachable.
+//!
+//! The two settings disagreeing is a **query that fails naming the option**, by
+//! [`ChannelTransport::refuse_if_not_evaluated`], and not a wrong answer. The
+//! client refuses it as well, before spending a round trip; this layer repeats
+//! the check because it is the one that knows the message is read from a SQL
+//! prompt and that the remedy is spelled `ALTER SERVER`.
 use yesno_channel::client::{Client, Error as ClientError, Snapshot};
 use yesno_channel::ipc::{Write, WriteOp};
 
@@ -89,8 +98,25 @@ enum Cmd {
 /// the subtler check: a bare key is eight arbitrary bytes and keys are commonly
 /// hashes, so one can begin with the `YSNX` magic by coincidence -- which is why
 /// that function tests the length first and no valid expression is eight bytes.
+///
+/// # A bare-key expression is a key, and spending an evaluation on it is waste
+///
+/// `lower_all` returns `SetExpr::Key( k )` when **no** qual lowered, so an
+/// unfiltered scan arrives here as an encoded expression rather than as eight
+/// bytes. Served as an expression that costs `collect_set` -- the whole key
+/// materialized in the server, per page -- where the key form is a streaming
+/// chunk walk with a seek.
+///
+/// It is the same set either way, so this is a normalization and not a policy:
+/// the planner is free to describe an unfiltered scan as `Key( k )`, and the
+/// transport is free to notice that is not a filter. Caught the day pushdown was
+/// enabled for this transport, because every unfiltered channel scan had been
+/// taking the bare-key path by accident while `plan_pushdown` refused.
 fn cmd_of(cmd: &[u8]) -> Result<Cmd, TransportError> {
     if yesno_wire::SetExpr::looks_like_expr(cmd) {
+        if let Ok(yesno_wire::SetExpr::Key(key)) = yesno_wire::SetExpr::decode(cmd) {
+            return Ok(Cmd::Key(key));
+        }
         return Ok(Cmd::Expr(cmd.to_vec()));
     }
     if cmd.len() != 8 {
@@ -142,6 +168,26 @@ impl ChannelTransport {
         Ok(self.pinned.as_ref().expect("just assigned"))
     }
 
+    /// Refuse an expression this server will not evaluate, naming the remedy.
+    ///
+    /// The client refuses it too, and says so accurately -- "it advertised
+    /// max_expr_bytes 0" -- but that names a *daemon* setting to someone holding
+    /// a SQL prompt. Reaching here means the planner lowered a qual because the
+    /// `SERVER` says `pushdown` is on while the daemon says it evaluates
+    /// nothing, and the fix is on the side the message is read from.
+    fn refuse_if_not_evaluated(&mut self) -> Result<(), TransportError> {
+        if self.client()?.limits().evaluates_expressions() {
+            return Ok(());
+        }
+        Err(TransportError::Rpc(format!(
+            "this yesnod evaluates no set expressions ( it advertised max_expr_bytes 0 ), \
+             but a filter was pushed down to it. Set channel_max_expr_bytes on the \
+             daemon, or ALTER SERVER ... OPTIONS ( ADD pushdown 'off' ) so the planner \
+             filters in PostgreSQL instead. The socket is {}",
+            self.socket
+        )))
+    }
+
     fn commit(&mut self, writes: Vec<Write>) -> Result<u64, TransportError> {
         let client = self.client()?;
         let allowed = client.limits().max_writes as usize;
@@ -175,6 +221,9 @@ fn rpc(error: ClientError) -> TransportError {
 impl Transport for ChannelTransport {
     fn cardinality(&mut self, cmd: &[u8]) -> Result<u64, TransportError> {
         let cmd = cmd_of(cmd)?;
+        if matches!(cmd, Cmd::Expr(_)) {
+            self.refuse_if_not_evaluated()?;
+        }
         let snapshot = self.pin()?;
         match &cmd {
             Cmd::Key(key) => snapshot.cardinality(*key),
@@ -187,6 +236,9 @@ impl Transport for ChannelTransport {
 
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError> {
         let cmd = cmd_of(cmd)?;
+        if matches!(cmd, Cmd::Expr(_)) {
+            self.refuse_if_not_evaluated()?;
+        }
         self.pin()?;
         self.scan = Some(Scan {
             cmd,
@@ -212,8 +264,12 @@ impl Transport for ChannelTransport {
     /// the two paths cannot disagree about what a ticket meant.
     fn ticket_for(&mut self, cmd: &[u8]) -> Result<Vec<u8>, TransportError> {
         // Classified before minting, so a descriptor this transport cannot serve
-        // fails here rather than at the first page of a replay.
-        cmd_of(cmd)?;
+        // fails here rather than at the first page of a replay -- including the
+        // server-evaluates-nothing case, which a ticket would otherwise carry
+        // all the way to `next_batch`.
+        if matches!(cmd_of(cmd)?, Cmd::Expr(_)) {
+            self.refuse_if_not_evaluated()?;
+        }
         let version = self.pin()?.version();
         let mut ticket = Vec::with_capacity(8 + cmd.len());
         ticket.extend_from_slice(&version.to_le_bytes());

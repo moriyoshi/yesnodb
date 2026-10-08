@@ -285,20 +285,26 @@ unsafe fn plan_pushdown(
     quals: &[*mut pg_sys::Node],
 ) -> Option<(SetExpr, Vec<bool>)> {
     let (server, table) = unsafe { options_for(relid) }.ok()?;
-    // **Both transports push down, since 2026-10-09.** This used to return
-    // `None` for a channel server, because a lowered qual becomes an encoded
-    // `yesno-wire` expression in the descriptor and the channel had no frame
-    // that carried one. It has two now, answered by the same evaluator Flight
-    // uses, so the refusal that lived here would cost a channel deployment every
-    // filter for no remaining reason.
+    // **Both transports push down, since 2026-10-09**, and whether *this*
+    // server will is a declaration rather than a guess.
     //
-    // Nothing is asked of the transport here, and nothing can be: planning runs
-    // before anything connects, so whether *this* server evaluates expressions
-    // -- it may advertise `max_expr_bytes` 0 -- is not knowable yet. A channel
-    // server configured that way fails a pushed-down scan rather than falling
-    // back to filtering in PostgreSQL. That is the narrow case the old refusal
-    // covered by refusing always, and it is recorded rather than papered over:
-    // the fix is a per-server option read at plan time, not a guess here.
+    // This used to return `None` for every channel server, because a lowered
+    // qual becomes an encoded `yesno-wire` expression and the channel had no
+    // frame that carried one. It has two now, answered by the same evaluator
+    // Flight uses. What remained was narrower: a channel `yesnod` can be
+    // configured to evaluate nothing ( `channel_max_expr_bytes = 0` ) and says
+    // so only in its greeting, which nothing here has read -- the planner holds
+    // no connection, and opening one per planned scan to learn a fact that
+    // cannot change between statements would make planning fail whenever the
+    // server was merely unreachable.
+    //
+    // So the operator declares it. `pushdown 'off'` on the `SERVER` is the
+    // other half of `channel_max_expr_bytes = 0` on the daemon, and the two
+    // disagreeing is a query that fails naming the option rather than one that
+    // quietly loses its filters. See `options::ServerOptions::pushdown`.
+    if !server.pushdown {
+        return None;
+    }
     let attno = unsafe { ordinal_attno(relid) }?;
     let clauses: Vec<Clause> = quals
         .iter()

@@ -27,6 +27,13 @@ CREATE FOREIGN TABLE c42 ( ordinal bigint ) SERVER yesno_channel OPTIONS ( key '
 CREATE FOREIGN TABLE c43 ( ordinal bigint ) SERVER yesno_channel OPTIONS ( key '43' );
 CREATE FOREIGN TABLE c7 ( ordinal bigint ) SERVER yesno_channel OPTIONS ( key '7' );
 
+-- The same socket a third time, with pushdown declined. A `yesnod` can be
+-- configured to evaluate no expressions and says so only in its greeting, which
+-- the planner has not read and cannot -- so the operator declares it here.
+CREATE SERVER yesno_channel_nopush FOREIGN DATA WRAPPER yesno_fdw
+    OPTIONS ( socket :'channel_socket', pushdown 'off' );
+CREATE FOREIGN TABLE n42 ( ordinal bigint ) SERVER yesno_channel_nopush OPTIONS ( key '42' );
+
 -- First, that the channel returned anything at all. A zero disagreement count
 -- is also what two empty scans produce, so the agreement below is only
 -- meaningful beside a row count that is not zero.
@@ -82,10 +89,27 @@ UNION ALL ( SELECT ordinal FROM c7 WHERE ordinal < 0
         EXCEPT SELECT ordinal FROM f7 WHERE ordinal < 0 )
 ) d;
 
+-- ── And declining it is a declaration, not a guess ──────────────────────────
+-- The same qual against the same socket, differing only in `pushdown 'off'`.
+-- `yesno: key 42, unfiltered` is worded to be unmistakable: "key 42" would mean
+-- a pushed expression that happens to be the bare key, and this means no
+-- pushdown happened at all. The surviving `Filter:` is the other half of it.
+EXPLAIN ( COSTS OFF ) SELECT ordinal FROM n42 WHERE ordinal = 21;
+SELECT ordinal FROM n42 WHERE ordinal = 21;
+
+-- Declining pushdown must not change the answer, only who computes it.
+SELECT count(*) AS nopush_disagreements FROM (
+      ( SELECT ordinal FROM c42 WHERE ordinal = 21
+        EXCEPT SELECT ordinal FROM n42 WHERE ordinal = 21 )
+UNION ALL ( SELECT ordinal FROM n42 WHERE ordinal = 21
+        EXCEPT SELECT ordinal FROM c42 WHERE ordinal = 21 )
+) d;
+
 -- Dropped explicitly rather than with CASCADE: the notice CASCADE emits lists
 -- every dependent object, and its wording and order are not this fixture's to
 -- assert. Naming them keeps the oracle about the comparison above.
-DROP FOREIGN TABLE c7, c43, c42, f7, f43, f42;
+DROP FOREIGN TABLE n42, c7, c43, c42, f7, f43, f42;
+DROP SERVER yesno_channel_nopush;
 DROP SERVER yesno_channel;
 DROP SERVER yesno_flight;
 DROP EXTENSION yesno_pg;

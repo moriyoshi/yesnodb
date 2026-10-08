@@ -4165,3 +4165,88 @@ means making the choice a per-server option read at plan time, which is recorded
   new section -- including the channel table's `yesno: (key 42 AND [21, 22))` plan line, the
   proof the filter is pushed down at all -- matched on the first run, because the generator
   was validated by regenerating the *reviewed* prefix of the same file byte for byte first.
+
+## 2026-10-09 -- The `pushdown` server option, and a cost asymmetry it exposed
+
+Yesterday's entry left one thing open: `plan_pushdown` no longer refuses channel servers,
+but a `yesnod` configured with `channel_max_expr_bytes = 0` advertises that only in its
+greeting, which the planner has not read. A channel server set that way would **fail** a
+pushed-down scan rather than fall back.
+
+### The option, and why not a probe
+
+`pushdown 'on' | 'off'` on the `SERVER`, default on, in every spelling
+`defGetBoolean` accepts. `plan_pushdown` returns `None` when it is off, which is exactly
+what the blanket channel refusal used to do -- except that now it is the operator's
+declaration rather than the wrapper's guess.
+
+**Probing was the obvious alternative and it is worse.** The FDW does already connect during
+planning -- `get_foreign_rel_size` opens a transport to get the exact row count -- so my own
+note that "planning runs before anything connects" was too strong, and the real objections
+are different ones. Three call sites reach `plan_pushdown` ( `get_foreign_plan`,
+`encode_private_parts` for `count(*)`, `side_expr` for a join ), none holds a transport, and
+each would have to open one to learn a fact that cannot change between statements. Worse,
+planning would begin to **fail when the server was merely unreachable**, where today it
+falls back to an estimated row count and plans anyway.
+
+The default is on, and which way the failure points is the whole argument. On here with zero
+there is a query that fails naming the option. Off here with evaluation available is a silent
+loss of every filter, showing up as a query that got slower -- the misconfiguration that
+cannot be noticed. A misspelled value is refused rather than read as false for the same
+reason.
+
+`ChannelTransport::refuse_if_not_evaluated` makes the mismatch legible. The client already
+refuses accurately -- "it advertised max_expr_bytes 0" -- but that names a *daemon* setting
+to someone holding a SQL prompt, so this layer repeats the check and names
+`ALTER SERVER ... OPTIONS ( ADD pushdown 'off' )` and the socket.
+
+### `unfiltered-scan-sent-an-expression-descriptor`
+
+Enabling pushdown for the channel introduced a performance regression the same day, and
+finding it was the useful part of this change.
+
+`lower_all` returns `SetExpr::Key( k )` when **no** qual lowered. So an unfiltered scan
+produces a non-null `fdw_private` and its descriptor is an *encoded expression*, not eight
+bytes -- which `fdw_qual.out` has been showing as `yesno: key 42` the whole time. While
+`plan_pushdown` refused channel servers this never reached the channel; the moment it stopped
+refusing, **every unfiltered channel scan** began going through `load_expr`, which means
+`lower` then `collect_set`: the whole key materialized in the server, per page, where the key
+form is a streaming chunk walk with a seek.
+
+`cmd_of` now decodes a descriptor that looks like an expression and treats `SetExpr::Key( k )`
+as `Cmd::Key( k )`. It is the same set either way, so this is a normalization and not a
+policy: the planner may describe an unfiltered scan however it likes, and the transport may
+notice that the description is not a filter.
+
+**And the same bug was already in Flight, on its most common query.** `windowed_source`
+matched `Some( AnyExpr::Set( e ) )` and materialized for any `e`, bare key included --
+`Ticket::with_expr` inherits `whole_key`'s full `prefix_lo .. prefix_hi` window, so the
+streaming arm below it reads exactly the same set. One line fixed it. It had been there since
+the expression ticket was added and nothing found it, because a materialization that returns
+the right rows is invisible to every correctness fixture.
+
+That is the sharpest argument yet for one evaluator behind both transports: the asymmetry was
+in **cost**, not in results, and it surfaced only because the second transport was being made
+to match the first. A second implementation would have hidden it indefinitely.
+
+### Coverage
+
+`fdw_transport_fidelity.sql` gains a third server over the same socket differing only in
+`pushdown 'off'`, and asserts the plan: `Filter: (ordinal = 21)` survives and the payload
+line reads `yesno: key 42, unfiltered`. That wording exists precisely for this -- "key 42"
+means a pushed expression that happens to be the bare key, "key 42, unfiltered" means no
+pushdown at all, and a fixture that could not tell them apart could not see a pushdown
+regress. Beside it, the same qual through the pushing server, and zero disagreements between
+the two.
+
+### Carry away
+
+* **Check the claim before writing it down as a limit.** "Planning runs before anything
+  connects" was wrong -- `get_foreign_rel_size` connects -- and I had recorded it in two
+  module headers and a TODO entry. The conclusion survived on better grounds; the reasoning
+  did not.
+* **A normalization is not a policy.** `Key( k )` and the bare key denote one set, so
+  collapsing them needs no option and no negotiation. The question to ask of a descriptor is
+  not "what shape is it" but "does this shape cost more than it has to".
+* **A cost regression passes every correctness gate.** Both of these returned exactly the
+  right rows. Nothing in the suite was going to notice, and nothing will next time either.

@@ -77,6 +77,22 @@ fn windowed_source(
     from: yesno_core::Prefix48,
 ) -> std::result::Result<yesno_core::stream::BoxedStream, Status> {
     match &t.expr {
+        // **A bare-key expression is not a filter**, and materializing it is
+        // pure loss: `Ticket::with_expr` inherits `whole_key`'s full window, so
+        // the arm below reads exactly the same set by streaming it. The
+        // descriptor arrives in this shape routinely rather than exotically --
+        // `yesno-pg`'s `lower_all` returns `SetExpr::Key( k )` whenever no qual
+        // lowered, which is every unfiltered scan of a foreign table -- so this
+        // was the common case taking the expensive path.
+        //
+        // Found on 2026-10-09 while giving the plugin channel the same
+        // normalization, which is the argument for having one evaluator behind
+        // both transports: a cost asymmetry between them is a bug in exactly
+        // the way a result asymmetry would be.
+        Some(AnyExpr::Set(SetExpr::Key(_))) => Ok(Box::new(
+            snap.key_stream_prefix_range(t.key, from, t.prefix_hi)
+                .map_err(engine_status)?,
+        )),
         Some(AnyExpr::Set(e)) => {
             let set = Arc::new(
                 expr::lower(e, snap)

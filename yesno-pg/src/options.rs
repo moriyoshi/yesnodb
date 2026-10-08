@@ -169,6 +169,31 @@ pub struct ServerOptions {
     pub transport: Transport,
     pub dictionary: Option<Dictionary>,
     pub batch_rows: usize,
+    /// Whether the planner may lower quals into a pushed-down expression.
+    ///
+    /// # Why this is a server option and not a probe
+    ///
+    /// Both transports evaluate expressions, but a plugin-channel `yesnod` can
+    /// be configured not to -- `channel_max_expr_bytes = 0` -- and it says so
+    /// only in its greeting, which is to say only once something has connected.
+    /// `plan_pushdown` runs in the planner and holds no connection, so the fact
+    /// has to be *declared* rather than discovered. An operator who turned
+    /// evaluation off on the server sets this to `off` on the matching `SERVER`.
+    ///
+    /// Probing instead was considered and rejected. The planner would have to
+    /// connect once per planned scan -- three call sites reach `plan_pushdown`
+    /// -- to learn a fact that cannot change between statements, and planning
+    /// would start to fail when the server was merely unreachable.
+    ///
+    /// # Default, and which way the failure points
+    ///
+    /// `true`, because every server evaluates expressions unless configured
+    /// otherwise, so the default is right for every deployment that did not go
+    /// out of its way. The mismatch -- on here, zero there -- is a query that
+    /// **fails** naming this option, not a wrong answer. The reverse default
+    /// would have made the mismatch a silent loss of every filter, which is the
+    /// failure that cannot be noticed.
+    pub pushdown: bool,
 }
 
 impl ServerOptions {
@@ -180,6 +205,7 @@ impl ServerOptions {
         let mut term_column = None;
         let mut key_column = None;
         let mut batch_rows = DEFAULT_BATCH_ROWS;
+        let mut pushdown = true;
 
         for (name, value) in opts {
             match name.as_str() {
@@ -201,6 +227,7 @@ impl ServerOptions {
                                 why: "expected a positive integer",
                             })?
                 }
+                "pushdown" => pushdown = parse_bool("pushdown", value)?,
                 _ => {
                     return Err(OptionError::Unknown {
                         catalog: "SERVER",
@@ -261,7 +288,28 @@ impl ServerOptions {
             transport,
             dictionary,
             batch_rows,
+            pushdown,
         })
+    }
+}
+
+/// A boolean option, in the spellings PostgreSQL's own `defGetBoolean` accepts.
+///
+/// Those spellings and no others. A user who writes `pushdown 'yes'` is writing
+/// something every other PostgreSQL option would accept, and an FDW that took
+/// only `'true'` would be the odd one out for no reason. Equally, a value
+/// outside the set is **refused rather than read as false**: a typo that
+/// silently turned pushdown off would show up as a query that got slower, which
+/// is the hardest kind of misconfiguration to trace back to its cause.
+fn parse_bool(name: &'static str, value: &str) -> Result<bool, OptionError> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        _ => Err(OptionError::BadValue {
+            name,
+            value: value.to_owned(),
+            why: "expected a boolean: on, off, true, false, yes, no, 1 or 0",
+        }),
     }
 }
 
@@ -425,6 +473,66 @@ mod tests {
     fn an_unknown_table_option_is_an_error() {
         let err = TableOptions::parse(&o(&[("key", "1"), ("keyy", "2")])).unwrap_err();
         assert!(matches!(err, OptionError::Unknown { .. }), "{err}");
+    }
+
+    /// Pushdown is on unless the operator says otherwise.
+    ///
+    /// The default is load-bearing and not a convenience: it is right for every
+    /// deployment that did not go out of its way, and the reverse default would
+    /// have turned a mismatch between this and the daemon's own setting into a
+    /// silent loss of every filter rather than a query that fails and says why.
+    #[test]
+    fn pushdown_defaults_to_on() {
+        let s = ServerOptions::parse(&o(&[("endpoint", "grpc://x")])).unwrap();
+        assert!(s.pushdown);
+    }
+
+    /// Every spelling `defGetBoolean` takes, because a user writing
+    /// `pushdown 'yes'` is writing what every other PostgreSQL option accepts.
+    #[test]
+    fn pushdown_takes_every_postgresql_boolean_spelling() {
+        for yes in ["on", "true", "yes", "1", "ON", "True", "YES"] {
+            let s = ServerOptions::parse(&o(&[("endpoint", "grpc://x"), ("pushdown", yes)]))
+                .unwrap_or_else(|e| panic!("{yes:?} should parse: {e}"));
+            assert!(s.pushdown, "{yes:?} should be true");
+        }
+        for no in ["off", "false", "no", "0", "OFF", "False", "No"] {
+            let s = ServerOptions::parse(&o(&[("endpoint", "grpc://x"), ("pushdown", no)]))
+                .unwrap_or_else(|e| panic!("{no:?} should parse: {e}"));
+            assert!(!s.pushdown, "{no:?} should be false");
+        }
+    }
+
+    /// A value outside the set is refused, **not read as false**.
+    ///
+    /// A typo that silently turned pushdown off would surface as a query that
+    /// got slower, which is the hardest misconfiguration to trace to its cause.
+    #[test]
+    fn a_misspelled_pushdown_value_is_refused_rather_than_read_as_off() {
+        for bad in ["", "nope", "offf", "2", "-1", "t"] {
+            let err = ServerOptions::parse(&o(&[("endpoint", "grpc://x"), ("pushdown", bad)]))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OptionError::BadValue {
+                        name: "pushdown",
+                        ..
+                    }
+                ),
+                "pushdown={bad:?} should be rejected, got {err}"
+            );
+        }
+    }
+
+    /// It applies to a channel server, which is the case it exists for, and to
+    /// a Flight one, which is where it is a diagnostic rather than a necessity.
+    #[test]
+    fn pushdown_is_independent_of_the_transport() {
+        for (name, value) in [("endpoint", "grpc://x"), ("socket", "/run/y.sock")] {
+            let s = ServerOptions::parse(&o(&[(name, value), ("pushdown", "off")])).unwrap();
+            assert!(!s.pushdown, "{name} should honour pushdown");
+        }
     }
 
     /// The pre-commit flush reopens a connection from a buffer key alone, so a
