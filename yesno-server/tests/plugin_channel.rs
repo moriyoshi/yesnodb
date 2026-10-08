@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use yesno_core::{Db, DbOptions};
 use yesno_plugin::abi::Role;
 use yesno_plugin::channel::recv_fd;
+use yesno_plugin::client::Client;
 use yesno_plugin::ipc::{lane_offset, Frame, LaneKind};
 use yesno_plugin::Host;
 use yesno_server::config::Config;
@@ -206,6 +207,98 @@ fn a_peer_scans_through_the_socket_and_the_arena() {
     );
 
     assert_eq!(channel.peers(), 1);
+    channel.stop();
+}
+
+/// `yesno_plugin::client` against a running channel, not against a test harness.
+///
+/// The `Peer` above is a deliberately low-level harness: it exists so these tests can
+/// drive one frame at a time and poke at edges a real client validates away. It is
+/// **not** the client anyone ships, so until now the shipped client had never spoken
+/// to a live server -- every test of it drove `serve_blocking` in-process. That is
+/// the gap this closes, and it is the one that matters before the client is public.
+///
+/// What is live here and nowhere else: `Channel::start` binds the socket and spawns a
+/// serving thread per connection, the server creates a real `memfd` arena and sends
+/// its descriptor with `SCM_RIGHTS` before any frame, and the client receives it,
+/// maps it, and reads payloads out of the server's own shared region.
+///
+/// `channel_max_blocks` is 4 and key 10 spans three chunks, so one batch comes back
+/// **short and multi-block** -- which exercises the batched arena stride at block 1
+/// and block 2 against memory the server actually wrote. At block 0 the stride term
+/// is multiplied by zero, so a single-block check would pass against a wrong
+/// `max_lanes` factor.
+#[test]
+fn the_shipped_client_reads_through_a_live_channel_and_its_real_arena() {
+    let (_c, cfg, host, sock, _slot) = setup("client");
+    let channel = Channel::start(&cfg, host).unwrap().unwrap();
+
+    let client = Client::connect(&sock, "integration").unwrap();
+    assert!(
+        client.is_arena(),
+        "a configured channel hands over a descriptor, so this is the zero-copy path"
+    );
+    assert!(client.limits().arena_bytes > 0);
+    assert_eq!(client.limits().max_blocks, 4);
+
+    let snap = client.snapshot().unwrap();
+
+    // Key 10 is three chunks of three ordinals. Key 30 is one `insert_range`, which
+    // is **inclusive of both endpoints** -- `3 * 65536 ..= 3 * 65536 + 4096` is 4097
+    // ordinals, not 4096. Spelled out because it is an off-by-one that reads as
+    // correct either way.
+    assert_eq!(snap.cardinality(10).unwrap(), 9);
+    assert_eq!(snap.cardinality(30).unwrap(), 4097);
+    assert!(snap.contains(10, 7).unwrap());
+    assert!(!snap.contains(10, 6).unwrap());
+    assert_eq!(snap.max(10).unwrap(), Some(5 * 65536 + 9));
+
+    let (ordinals, more) = snap.load(10, None, 64).unwrap();
+    assert_eq!(
+        ordinals,
+        vec![7, 8, 9, 65543, 65544, 65545, 327687, 327688, 327689]
+    );
+    assert!(!more);
+
+    // The block walk, out of the server's arena.
+    let mut cursor = snap.lanes(vec![10]).unwrap();
+    let mut prefixes = Vec::new();
+    while cursor.advance().unwrap() {
+        let prefix = cursor.prefix().expect("a current block while advancing");
+        assert_eq!(cursor.lane_count(), 1, "one key, so one lane a block");
+        let (lane, bytes) = cursor.lane(0).unwrap();
+        // The declared geometry and the bytes delivered have to agree; this is the
+        // arithmetic both sides compute separately.
+        assert_eq!(bytes.len(), lane.kind.payload_bytes(lane.count));
+        assert_eq!(lane.kind, LaneKind::Array);
+        assert_eq!(lane.count, 3);
+        let lows: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        assert_eq!(lows, vec![7, 8, 9], "chunk-local lows of block {prefix}");
+        prefixes.push(prefix);
+    }
+    assert_eq!(
+        prefixes,
+        vec![0, 1, 5],
+        "three chunks, ascending, one batch"
+    );
+
+    // A second handle over a different shape: 4096 contiguous ordinals in chunk 3.
+    let mut run = snap.lanes(vec![30]).unwrap();
+    assert!(run.advance().unwrap());
+    assert_eq!(run.prefix(), Some(3));
+    let (lane, bytes) = run.lane(0).unwrap();
+    assert_eq!(bytes.len(), lane.kind.payload_bytes(lane.count));
+    assert!(!run.advance().unwrap());
+
+    assert_eq!(channel.peers(), 1, "the client is one peer, not two");
+    // Stopped with the client still alive on purpose: its handles then drop against a
+    // closed socket, which is the path where a release must fail silently rather than
+    // panic in a destructor.
     channel.stop();
 }
 
