@@ -26,6 +26,8 @@ use crate::world::{HandleKind, World};
 pub const OWNS: &[&str] = &[
     "fx_flight_start",
     "fx_flight_stop",
+    "fx_channel_start",
+    "fx_channel_stop",
     "fx_resource",
     "fx_temp",
     "fx_join",
@@ -50,6 +52,7 @@ pub const OWNS: &[&str] = &[
 #[derive(Default)]
 pub struct FixtureState {
     flight: Option<FlightFixture>,
+    channel: Option<ChannelFixture>,
     processes: Vec<Option<ManagedProcess>>,
 }
 
@@ -107,6 +110,36 @@ impl World {
                     .map_err(|error| fixture_err(verb, error))?;
                 self.fixture.flight = Some(flight);
                 Ok(MontyObject::String(location))
+            }
+            "fx_channel_start" => {
+                a.exact(3)?;
+                a.no_kwargs()?;
+                if self.fixture.channel.is_some() {
+                    return Err(value_err(format!(
+                        "{verb}(): fixture plugin channel is already running"
+                    )));
+                }
+                let dir = std::path::PathBuf::from(a.str_at(0)?);
+                let keys = a.u64_list(1)?;
+                let ordinals = a.u64_list(2)?;
+                if keys.len() != ordinals.len() {
+                    return Err(value_err(format!(
+                        "{verb}(): key and ordinal lists differ in length"
+                    )));
+                }
+                let (channel, socket) = ChannelFixture::start(keys, ordinals, dir)
+                    .map_err(|error| fixture_err(verb, error))?;
+                self.fixture.channel = Some(channel);
+                Ok(MontyObject::String(socket))
+            }
+            "fx_channel_stop" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                let channel = self.fixture.channel.take().ok_or_else(|| {
+                    value_err(format!("{verb}(): fixture plugin channel is not running"))
+                })?;
+                drop(channel);
+                Ok(MontyObject::None)
             }
             "fx_flight_stop" => {
                 a.exact(0)?;
@@ -687,6 +720,134 @@ fn fixture_err(verb: &str, message: impl Into<String>) -> MontyException {
 struct FlightFixture {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+/// A real plugin channel over a real socket, for a scenario that drives a peer.
+///
+/// **Serves the channel itself rather than borrowing `yesno-server`'s**, which
+/// is not a shortcut but the constraint this target is built around: the Bazel
+/// `fixture_host` deliberately depends on `yesno-core` and `yesno-flight` only,
+/// so that backend identity stays scenario data. Reaching for
+/// `yesno_server::plugin::Channel` compiled under cargo and broke that target
+/// immediately. The accept loop below needs nothing but `yesno-plugin`.
+///
+/// It hands over an arena, exactly as yesnod does on accept: a `memfd` whose
+/// descriptor goes first with the protocol version as its single byte, then the
+/// greeting. Inline mode is the fallback if the arena cannot be created, which
+/// is the same decision the server makes, so a scenario exercises the zero-copy
+/// path rather than a simpler one that would hide its arithmetic.
+struct ChannelFixture {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ChannelFixture {
+    fn limits() -> yesno_plugin::channel::Limits {
+        yesno_plugin::channel::Limits {
+            max_handles: 4,
+            max_lanes: 8,
+            // Larger than one, so a batch can come back short and a peer's
+            // termination rule is exercised rather than assumed.
+            max_blocks: 8,
+            max_snapshots: 16,
+            max_writes: yesno_plugin::ipc::MAX_WRITES,
+        }
+    }
+
+    fn start(
+        keys: Vec<u64>,
+        ordinals: Vec<u64>,
+        dir: std::path::PathBuf,
+    ) -> Result<(Self, String), String> {
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let db = Db::new();
+        for (key, ordinal) in keys.into_iter().zip(ordinals) {
+            db.insert(key, ordinal)
+                .map_err(|error| format!("cannot seed key {key}: {error}"))?;
+        }
+        let slot: yesno_plugin::DbSlot = Arc::new(std::sync::RwLock::new(Some(Arc::new(db))));
+        let host = yesno_plugin::Host::new(slot, 1, yesno_plugin::abi::Role::Leader);
+
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create the channel directory: {error}"))?;
+        let socket = dir.join("plugin.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket)
+            .map_err(|error| format!("cannot bind the channel socket: {error}"))?;
+        // Non-blocking so the accept loop can notice `stop` instead of needing a
+        // self-connect to wake it.
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("cannot set the channel socket non-blocking: {error}"))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("yesno-e2e-channel-fixture".to_owned())
+            .spawn(move || {
+                let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+                while !stop_loop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let host = host.clone();
+                            workers.push(thread::spawn(move || {
+                                // The listener is non-blocking; the accepted
+                                // stream must not be, or `serve_blocking` spins.
+                                if stream.set_nonblocking(false).is_err() {
+                                    return;
+                                }
+                                Self::serve_one(stream, host);
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            })
+            .map_err(|error| format!("cannot spawn the channel fixture: {error}"))?;
+
+        Ok((
+            Self {
+                stop,
+                thread: Some(thread),
+            },
+            socket.to_string_lossy().into_owned(),
+        ))
+    }
+
+    fn serve_one(stream: std::os::unix::net::UnixStream, host: yesno_plugin::Host) {
+        use yesno_plugin::channel::{send_fd, serve_blocking, Arena, Session};
+        let limits = Self::limits();
+        match Arena::new(limits.arena_bytes()) {
+            Ok(arena) => {
+                if send_fd(&stream, arena.as_fd()).is_err() {
+                    return;
+                }
+                let mut session = Session::new(host, arena, limits);
+                let _ = serve_blocking(&mut session, stream);
+            }
+            Err(_) => {
+                let mut session = Session::new_inline(host, limits);
+                let _ = serve_blocking(&mut session, stream);
+            }
+        }
+    }
+}
+
+impl Drop for ChannelFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl FlightFixture {

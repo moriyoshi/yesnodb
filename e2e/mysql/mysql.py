@@ -454,3 +454,24 @@ run_backend(
     True,
 )
 fx_flight_stop()
+
+# The plugin-channel leg: a real yesnod channel over a real Unix socket, with
+# mysqld talking to it as an out-of-process peer. Same cases again, including
+# the byte-exact fixture, so all three supported backends are held to one
+# standard rather than each to its own.
+#
+# The socket goes in its own short directory because a Unix socket path is
+# capped near 108 bytes and a scenario's scratch path is already deep.
+channel_dir = fx_join(fx_temp("chan"), "s")
+channel_socket = fx_channel_start(channel_dir, [], [])
+run_backend(
+    "channel",
+    [
+        "--plugin-load-add=ha_yesno.so",
+        "--yesno-backend=channel",
+        "--yesno-channel-socket=" + channel_socket,
+    ],
+    True,
+    True,
+)
+fx_channel_stop()

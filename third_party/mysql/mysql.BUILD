@@ -15,6 +15,8 @@ cmake(
     build_data = [
         "@@//yesno-c:yesno_c",
         "@@//yesno-c:yesno_header",
+        "@@//yesno-plugin:yesno_channel_header",
+        "@@//yesno-plugin:yesno_plugin_staticlib",
     ],
     cache_entries = {
         # rules_foreign_cc's host GCC toolchain uses the gcc driver for C++ too
@@ -38,6 +40,12 @@ cmake(
         "YESNO_BAZEL_BUNDLE": "ON",
         "YESNO_C_HEADER": "$$EXT_BUILD_ROOT/$(location @@//yesno-c:yesno_header)",
         "YESNO_C_PREBUILT_LIBRARY": "$$EXT_BUILD_ROOT/$(location @@//yesno-c:yesno_c)",
+        # The plugin-channel backend, built the same way the C ABI is: a
+        # prebuilt staticlib and its header handed to CMake, rather than cargo
+        # running inside a foreign build action.
+        "YESNO_WITH_CHANNEL": "ON",
+        "YESNO_PLUGIN_CHANNEL_HEADER": "$$EXT_BUILD_ROOT/$(location @@//yesno-plugin:yesno_channel_header)",
+        "YESNO_PLUGIN_PREBUILT_LIBRARY": "$$EXT_BUILD_ROOT/$(location @@//yesno-plugin:yesno_plugin_staticlib)",
     },
     deps = [
         "@apache_arrow_25_0_1//:arrow_cpp",

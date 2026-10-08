@@ -1,0 +1,51 @@
+"""`yesno-plugin` as a Bazel static library, for the MySQL channel backend.
+
+This exists **only** so `yesno-mysql`'s `backend_channel.cc` can link the
+channel client without invoking cargo from inside a foreign build action --
+the same reason `yesno-c` has a target, and the same arrangement.
+
+Cargo stays the authority for this crate's own tests, clippy, fmt and MSRV:
+76 tests, the C fixture and the shared-cursor fixture all run from
+`scripts/gate.sh`. Do not add `rust_test` targets here on the reasoning that
+Bazel could also run them. That would make a channel regression something
+either caught or missed in two places, and the cargo gate is the one
+`QUALITY_GATE.md` documents.
+"""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "include/yesno_channel.h",
+])
+
+# For Rust consumers -- the e2e fixture host starts a real channel with it.
+rust_library(
+    name = "yesno_plugin",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_plugin",
+    edition = "2021",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//yesno-core:yesno_core"],
+)
+
+# For C consumers: `yesno-mysql`'s channel backend links this.
+rust_static_library(
+    name = "yesno_plugin_staticlib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_plugin",
+    edition = "2021",
+    # The MySQL plugin is a shared object, so everything it links has to be
+    # position-independent. `yesno-c` carries the same flag for the same reason.
+    rustc_flags = ["-Crelocation-model=pic"],
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//yesno-core:yesno_core"],
+)
+
+filegroup(
+    name = "yesno_channel_header",
+    srcs = ["include/yesno_channel.h"],
+)

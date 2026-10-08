@@ -40,6 +40,10 @@ yesno-flight = { workspace = true, features = ["server"] }
 # without a recompile, which is exactly TESTING.md's admission test — the
 # daemon's fixed-shape lifecycle assertions stay in its own integration tests.
 yesno-server = { path = "../yesno-server", version = "0.1.0" }
+# For `fx_channel_start`: constructing a `Host` and a `DbSlot` to hand the
+# channel needs the plugin crate by name. A harness dependency, never a core
+# one, exactly as `yesno-server` above.
+yesno-plugin = { path = "../yesno-plugin", version = "0.1.0" }
 # The `srv_basebackup` and `srv_archive_*` verbs drive the same library entry
 # points as the two thin binaries. Process, filesystem, and Protobuf inspection
 # stay in the host; scenarios only script the operational sequence.

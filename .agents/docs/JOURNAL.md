@@ -3720,3 +3720,55 @@ only `ha_yesno.cc` does, and `gate-mysql` covers it.
 The payoff is at the snapshot-open sites. Three of them read
 `if (!snapshot.Open(...)) return kError`, which would have discarded the classification at
 the exact step most likely to produce a retryable one. They forward it now.
+
+## 2026-10-08 -- The MySQL channel leg: built, and held to the same cases
+
+Closes `the-mysql-channel-backend-has-no-bazel-build-and-no-e2e-leg`, opened hours earlier
+in the same session. All three backends now compile in the Bazel MySQL build and all three
+run the **same** cases, byte-exact fixture included. `gate-mysql` passes with
+`Executed 1 out of 1 test` after 26 seconds in the sandbox, so the leg ran rather than
+being served from cache.
+
+### What it took, and the constraint that shaped it
+
+Two Bazel targets for `yesno-plugin`, not one. A `rust_static_library` for
+`backend_channel.cc` to link, and a `rust_library` because a staticlib is not usable as a
+Rust dependency and the e2e fixture needs one. `mysql.BUILD` gained `YESNO_WITH_CHANNEL` and
+the prebuilt library and header, following `yesno-c`'s arrangement exactly.
+
+The E2E leg ran into a design I had to be taught by a compile failure. My first
+`ChannelFixture` used `yesno_server::plugin::Channel::start`, which compiles under cargo and
+**breaks the Bazel `fixture_host` target** -- that target deliberately depends on
+`yesno-core` and `yesno-flight` only, with a comment saying backend identity is scenario
+data and never a Rust feature or entrypoint. So the fixture serves the channel itself: bind
+a `UnixListener`, create an `Arena`, `send_fd` the descriptor, `Session::new`,
+`serve_blocking`. That needs `yesno-plugin` and nothing else, and `fixture_host` gained
+exactly that one dependency.
+
+Serving it by hand turned out better than borrowing the server's. The fixture hands over an
+**arena** with inline as the fallback, which is the same decision yesnod makes, so a
+scenario exercises the zero-copy path and its stride arithmetic rather than the simpler
+inline one. And `max_blocks` is 8 against keys with fewer chunks, so a batch comes back
+short and a peer's termination rule is exercised instead of assumed.
+
+### What the three-way fidelity check is worth
+
+The fixture comparison is byte-exact, and it now runs against an embedded database, a Flight
+client and an out-of-process channel peer. Three transports, one expected file. That is a
+differential test in the sense this repository already uses for `roaring` and for
+inline-versus-arena payloads: not "does each backend work" but "do they agree", which is
+the property a storage engine's users actually depend on and which per-backend subsets
+cannot establish.
+
+It also passed first time, which is worth recording as information rather than relief: the
+channel backend's `Apply` is one commit where Flight's is two batches, its cursor
+materializes through a different paging primitive, and its errors arrive classified -- and
+none of that changed a single byte of output.
+
+### Carry away
+
+* **A restricted build target is a design statement, and compiling under cargo does not
+  test it.** `fixture_host`'s dependency list is the thing that says backend identity is
+  data; reaching past it broke a build that cargo could not see.
+* Serving a protocol in a fixture, rather than importing the server that serves it, kept the
+  dependency narrow *and* made the fixture exercise the harder path.

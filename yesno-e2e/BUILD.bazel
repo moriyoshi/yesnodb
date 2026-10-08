@@ -41,5 +41,12 @@ rust_library(
             "tonic",
         ],
         package_name = "yesno-e2e",
-    ) + ["//yesno-core:yesno_core", "//yesno-flight:yesno_flight"],
+    ) + [
+        "//yesno-core:yesno_core",
+        "//yesno-flight:yesno_flight",
+        # `fx_channel_start` serves a real plugin channel. Only this crate is
+        # needed, not `yesno-server`: the fixture runs its own accept loop over
+        # `channel::serve_blocking`, which is what keeps this target generic.
+        "//yesno-plugin:yesno_plugin",
+    ],
 )
