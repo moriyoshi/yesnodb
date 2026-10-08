@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["yesno-core", "yesno-arrow", "yesno-opencl", "yesno-wire", "yesno-channel", "yesno-datafusion", "yesno-flight", "yesno-tantivy", "yesno-plugin", "yesno-server", "yesno-server-utils", "yesno-operator", "yesno-e2e"]
+members = ["yesno-core", "yesno-arrow", "yesno-opencl", "yesno-wire", "yesno-eval", "yesno-channel", "yesno-datafusion", "yesno-flight", "yesno-tantivy", "yesno-plugin", "yesno-server", "yesno-server-utils", "yesno-operator", "yesno-e2e"]
 
 # DataFusion is a very large dependency tree and this crate is a satellite, not
 # part of the core product. Excluding it from the default set keeps the routine
@@ -70,6 +70,7 @@ yesno-arrow = { path = "yesno-arrow", version = "0.1.0" }
 yesno-flight = { path = "yesno-flight", version = "0.1.0", default-features = false }
 yesno-server-utils = { path = "yesno-server-utils", version = "0.1.0" }
 yesno-wire = { path = "yesno-wire", version = "0.1.0" }
+yesno-eval = { path = "yesno-eval", version = "0.1.0" }
 # Pinned to the DataFusion release this satellite tracks. DataFusion 55 depends
 # on arrow ^59.2, so the pair aligns with the rest of the workspace exactly.
 datafusion = { version = "55", default-features = false, features = ["sql"] }

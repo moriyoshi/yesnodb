@@ -4042,3 +4042,126 @@ empty table. Its TIDs are predicted rather than discovered: ordinal `o` sits at 
   is what turned a silent miss into a one-line diff. Everything else in the file matched the
   prediction byte for byte on that first run, the error line and the `DROP ... CASCADE`
   notice included.
+
+## 2026-10-09 -- Filter pushdown over the plugin channel, and `yesno-eval`
+
+The first of the four stated limits of `Transport::Channel` was that a channel server got
+no filter pushdown: a lowered qual becomes an encoded `yesno-wire` expression in the
+descriptor, the channel served keys only, and `plan_pushdown` declined rather than emitting
+a plan that would fail at execution. Closing it needed an expression frame, which needed an
+evaluator on the host, which is where the interesting part was.
+
+### The evaluator was in the wrong crate, and had been all along
+
+`SetExpr -> yesno_core::Expr` lowering lived in `yesno-flight/src/expr.rs` -- 3,346 lines --
+because Flight was the only surface that accepted an expression. The channel's host half is
+`yesno-plugin`, which builds a `cdylib` and a `staticlib` that C links ( `yesno-mysql`'s
+channel backend links the staticlib ). Depending on `yesno-flight` to reach `expr` would
+have put **tonic, prost and arrow in both artifacts** to use a module that depends on
+none of them: `expr` is gated behind `yesno-flight`'s `server` feature, which also pulls
+`yesno-arrow` and `tracing`.
+
+**The decisive evidence was free to collect**: `grep -c 'crate::' yesno-flight/src/expr.rs`
+answered **0**. A module that imports only other crates is already a crate. So it moved to
+`yesno-eval`, re-exported as `pub use yesno_eval as expr` behind the same `server` feature,
+and **no consumer changed** -- four `yesno-flight` integration tests call `expr::vec_int`
+and `expr::lower` and were untouched. This is the same test and the same conclusion as
+splitting `yesno-channel` out of `yesno-plugin` the day before; the pattern is worth naming.
+
+The alternative considered and rejected was a `dyn ExprEval` hook on `Session` that
+`yesno-server` would install, which needs no crate split. It was rejected because it makes a
+core protocol operation optional at runtime *for no reason but a dependency*, and then every
+peer has to handle its absence forever.
+
+**One evaluator, two transports, is the correctness claim.** Flight and the channel must
+answer a pushed-down filter identically or the choice between them stops being a deployment
+decision; the only way to be sure of that is for there to be one implementation rather than
+two that agree.
+
+### The protocol, and why the version moved
+
+`Kind::SnapshotEvalCardinality` and `Kind::SnapshotEvalLoad` carry `snapshot` and an opaque
+length-prefixed expression, answered by the existing `Count` and `Ordinals`. The expression
+is **opaque to `yesno-channel`**, which is what keeps the peer half free of both the engine
+and an expression decoder: a peer that builds expressions already has `yesno-wire`, and one
+that does not has no use for the frames.
+
+`ipc::VERSION` went 2 -> 3, and the rule above it says a bump is for a field changing meaning
+and *never for a new kind*. Both halves of that are right here. The kinds alone would not
+have needed it -- an old server faults on one it does not know, which is a clean refusal --
+but `ServerHello` grew `max_expr_bytes` and `decode` refuses trailing bytes, so a new peer
+reading an old greeting gets `Malformed`. A shape change is a version change.
+
+`max_expr_bytes` is **one field doing two jobs**, and that was the choice worth making:
+zero means "this server evaluates no expressions", so the same number answers *may I push a
+filter down* and *how large may it be*. A separate capability bit would have answered the
+first and left a peer to guess the second -- which is exactly the mistake the `max_writes`
+doc records, where a consumer trusted a published constant the frame could not honour and
+got `TooLarge` from its own encoder.
+
+### Paging a computed answer
+
+`load_page` seeks: a key's ordinals are on disk in ascending order, so `after` is a
+`ChunkStream::seek`. **An expression's answer is computed**, with nothing to seek into, so
+`eval_page` has to build the set -- the same choice `yesno-flight`'s `windowed_source`
+records, in the same words.
+
+That makes a page an evaluation rather than a seek, and paging therefore costs one evaluation
+per page. What stops it from being quadratic is that the expression is intersected with
+`Range( after + 1, u64::MAX )` **before** lowering, so a later page evaluates only what is
+left above `after` and the engine's streams prune on it. `ChannelTransport::next_batch`
+asks for the whole `batch_rows` page every time for the same reason, and the frame's own
+documentation tells a peer to ask for one large page rather than many small ones -- the
+advice `SnapshotKeyRange` already gives for keys, where a 2026-09-29 review named small
+pages as request amplification.
+
+### Three things fell out
+
+**`cmd_of` classifies a descriptor with `SetExpr::looks_like_expr`**, which is the function
+the Flight server uses, rather than a length test of its own. It is also the subtler check:
+a bare key is eight arbitrary bytes and keys are commonly hashes, so one *can* begin with the
+`YSNX` magic -- there are 2^32 such keys -- and `looks_like_expr` tests the length first
+because no valid expression is eight bytes.
+
+**A channel ticket is now a version and the descriptor**, not a version and a key. It was 16
+fixed bytes when a key was all this transport served; carrying the `cmd` means a ticket
+replays the same scan whichever form it is, and it is the same bytes `open_scan` classifies,
+so the two paths cannot disagree about what a ticket meant.
+
+**`ChannelTransport::contains` became one frame.** It was a `load( key, ordinal - 1, 1 )`
+probe -- correct, and written that way yesterday because the channel could not evaluate the
+`And( Key, Range )` the trait's default builds. `Frame::SnapshotContains` has been in the
+protocol all along and is exactly this question. The default would work now that the channel
+evaluates expressions, and the override stays anyway: running a one-ordinal probe through the
+evaluator would materialize a set to look at one element of it.
+
+### The refusal is checked twice, on purpose
+
+`yesno-channel`'s client refuses an over-cap or unsupported expression locally, naming the
+limit, so a peer spends no round trip. The host checks again. That is not redundancy: **the
+greeting has to be the authority on what the server does**, not a hint a peer may decline to
+read. A server that advertised zero and evaluated anyway would make the field describe
+nothing, and the operator who set `channel_max_expr_bytes = 0` would have no way to know it
+took effect.
+
+### What is left, and it is narrower than what was closed
+
+`plan_pushdown` no longer refuses channel servers -- and it still cannot ask whether *this*
+server evaluates expressions, because planning runs before anything connects. A channel
+server advertising `max_expr_bytes` 0 therefore **fails** a pushed-down scan rather than
+falling back to filtering in PostgreSQL. The old blanket refusal covered that case by
+refusing always, at the cost of every filter on every channel deployment. Closing it properly
+means making the choice a per-server option read at plan time, which is recorded in
+`TODO.md` rather than guessed at here.
+
+### Carry away
+
+* **`grep -c 'crate::'` is the crate-boundary test.** Zero means the module is already a
+  separate crate and the only question is whether anything needs it to be one. Twice in two
+  days that number decided a split that would otherwise have been argued about.
+* **A capability and its limit are one question.** Advertising "can you" without "how much"
+  leaves the peer guessing at the number, which is where the failure actually lands.
+* **Predicting an expected file is cheaper than accepting one.** The PostgreSQL fixture's
+  new section -- including the channel table's `yesno: (key 42 AND [21, 22))` plan line, the
+  proof the filter is pushed down at all -- matched on the first run, because the generator
+  was validated by regenerating the *reviewed* prefix of the same file byte for byte first.

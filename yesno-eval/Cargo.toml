@@ -1,0 +1,24 @@
+[package]
+name = "yesno-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Executing a yesno-wire set expression against a yesno-core snapshot."
+
+[dependencies]
+# The two halves this crate bridges, and nothing else. It was
+# `yesno-flight/src/expr.rs` until 2026-10-09 and had **zero** `crate::`
+# references the whole time, so it was already a separate crate in all but
+# name. What forced the issue was the plugin channel learning to evaluate
+# expressions: `yesno-plugin` builds a `cdylib` and a `staticlib` that C links,
+# and reaching the evaluator through `yesno-flight` would have pulled tonic,
+# prost and arrow into those artifacts for a dependency on neither.
+yesno-core = { workspace = true }
+yesno-wire.workspace = true
+
+[features]
+# Forwarded by every consumer that has one. The evaluator's only use of it is
+# `expr_cardinality`, which routes through `yesno_core::jit` when it is on.
+jit = ["yesno-core/jit"]

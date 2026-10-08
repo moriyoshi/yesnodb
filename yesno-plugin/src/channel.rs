@@ -71,6 +71,17 @@ pub struct Limits {
     /// clamps lanes, and for the reason recorded there -- an advertised limit the transport
     /// cannot honour is worse than a low one, because the peer cannot negotiate past it.
     pub max_writes: usize,
+    /// Bytes one pushed-down set expression may carry, or **0 to evaluate none**.
+    ///
+    /// Zero is a real configuration and not merely a disabled default: a
+    /// deployment that does not want peers buying server-side evaluation sets it
+    /// and the greeting says so, which is what lets a peer decline to push a
+    /// filter down rather than discover the refusal at execution.
+    ///
+    /// Clamped to `ipc::MAX_EXPR_BYTES` by `Session`, for the reason
+    /// `max_writes` records: an advertised limit the frame cannot carry is worse
+    /// than a low one, because a peer cannot negotiate past it.
+    pub max_expr_bytes: usize,
 }
 
 impl Default for Limits {
@@ -81,6 +92,7 @@ impl Default for Limits {
             max_blocks: 1,
             max_snapshots: 64,
             max_writes: crate::ipc::MAX_WRITES,
+            max_expr_bytes: crate::ipc::MAX_EXPR_BYTES,
         }
     }
 }
@@ -312,6 +324,12 @@ impl Session {
         // not about the arena: it is advertising an entry limit the frame cannot carry,
         // which is what shipped on 2026-10-03 and what a consumer found by exceeding it.
         limits.max_writes = limits.max_writes.clamp(1, crate::ipc::MAX_WRITES);
+        // **`min`, not `clamp`**, and that is the whole difference between this
+        // and the line above: zero is a legal configuration here -- it is how a
+        // deployment says "evaluate no expressions" -- so a lower bound of one
+        // would turn that off into a one-byte allowance, which encodes no
+        // expression and which the greeting would advertise as a capability.
+        limits.max_expr_bytes = limits.max_expr_bytes.min(crate::ipc::MAX_EXPR_BYTES);
         Session {
             host,
             arena,
@@ -347,6 +365,7 @@ impl Session {
             max_handles: self.limits.max_handles as u32,
             max_blocks: self.limits.max_blocks.max(1) as u32,
             max_writes: self.limits.max_writes as u32,
+            max_expr_bytes: self.limits.max_expr_bytes as u32,
         }
     }
 
@@ -440,6 +459,28 @@ impl Session {
                 let after = (has_after == 1).then_some(after);
                 let want = (limit as usize).clamp(1, MAX_PAGE);
                 self.with_snapshot(snapshot, |s| load_page(s, key, after, want))
+            }
+            Frame::SnapshotEvalCardinality { snapshot, expr } => {
+                match self.decode_pushed_down(&expr) {
+                    Err(fault) => fault,
+                    Ok(e) => self.with_snapshot(snapshot, |s| {
+                        yesno_eval::cardinality(&e, s).map(|value| Frame::Count { value })
+                    }),
+                }
+            }
+            Frame::SnapshotEvalLoad {
+                snapshot,
+                expr,
+                after,
+                has_after,
+                limit,
+            } => {
+                let after = (has_after == 1).then_some(after);
+                let want = (limit as usize).clamp(1, MAX_PAGE);
+                match self.decode_pushed_down(&expr) {
+                    Err(fault) => fault,
+                    Ok(e) => self.with_snapshot(snapshot, |s| eval_page(s, &e, after, want)),
+                }
             }
             Frame::SnapshotKeyRange {
                 snapshot,
@@ -701,6 +742,46 @@ impl Session {
             Ok(frame) => frame,
             Err(e) => Self::fault(status_from_core(&e), "the read failed"),
         }
+    }
+
+    /// Decode an expression a peer pushed down, or the fault to answer with.
+    ///
+    /// # Both refusals are checked here even though the greeting answered them
+    ///
+    /// A peer learns `max_expr_bytes` before it sends anything, and
+    /// `yesno-channel`'s client refuses locally on both counts. This checks
+    /// again because **the advertisement must be the authority on what this
+    /// server does**, not a hint a peer may decline to read: a server that
+    /// advertised zero and then evaluated anyway would make the field describe
+    /// nothing, and the operator who set it to zero would have no way to know.
+    ///
+    /// `InvalidArgument` for a malformed expression rather than `Internal`. It
+    /// is the peer's bytes that are wrong, and the distinction is what tells an
+    /// operator whether to look at their own client or at the server.
+    fn decode_pushed_down(&self, bytes: &[u8]) -> Result<yesno_wire::SetExpr, Frame> {
+        if self.limits.max_expr_bytes == 0 {
+            return Err(Self::fault(
+                Status::InvalidArgument,
+                "this server evaluates no set expressions; its greeting advertised \
+                 max_expr_bytes 0",
+            ));
+        }
+        if bytes.len() > self.limits.max_expr_bytes {
+            return Err(Self::fault(
+                Status::InvalidArgument,
+                &format!(
+                    "this expression is {} bytes and this server accepts {}",
+                    bytes.len(),
+                    self.limits.max_expr_bytes
+                ),
+            ));
+        }
+        yesno_wire::SetExpr::decode(bytes).map_err(|e| {
+            Self::fault(
+                Status::InvalidArgument,
+                &format!("this is not a decodable set expression: {e}"),
+            )
+        })
     }
 
     fn snapshot_open(&mut self) -> Frame {
@@ -1318,6 +1399,63 @@ where
 /// The `after` ordinal may sit in the middle of a chunk, so the chunk containing it
 /// is decoded and its ordinals at or below it are skipped. Only that first chunk
 /// pays that.
+/// One page of the ordinals an expression selects.
+///
+/// # Why this materializes where [`load_page`] seeks
+///
+/// A key's page is a seek into a persisted stream, because the answer is on
+/// disk in ascending order. **An expression's answer is computed**, so there is
+/// nothing to seek into and the set has to be built. The Flight surface records
+/// the same choice for the same reason.
+///
+/// What stops paging from costing a whole evaluation per page is the bound: the
+/// expression is intersected with everything above `after` *before* it is
+/// evaluated, so a later page builds only what is left. A peer reading a whole
+/// filtered set should still ask for one large page rather than many small ones
+/// -- one evaluation beats several -- which is what the frame's own
+/// documentation tells it.
+fn eval_page(
+    snap: &Snapshot,
+    expr: &yesno_wire::SetExpr,
+    after: Option<u64>,
+    want: usize,
+) -> yesno_core::Result<Frame> {
+    let bounded = match after {
+        None => expr.clone(),
+        Some(a) => match a.checked_add(1) {
+            // `u64::MAX` is reserved and unstorable, so a resume from
+            // `u64::MAX - 1` is the end of the set rather than an empty range
+            // worth evaluating.
+            None => {
+                return Ok(Frame::Ordinals {
+                    values: Vec::new(),
+                    more: 0,
+                })
+            }
+            Some(lo) => yesno_wire::SetExpr::And(vec![
+                expr.clone(),
+                yesno_wire::SetExpr::Range(lo, u64::MAX),
+            ]),
+        },
+    };
+    let set = yesno_eval::lower(&bounded, snap)?.collect_set()?;
+    // One more than asked, so `more` is answered by what was found rather than
+    // inferred from the page being full -- exactly as `load_page` does.
+    let mut values: Vec<u64> = Vec::with_capacity(want.min(1024) + 1);
+    for ordinal in set.iter() {
+        values.push(ordinal);
+        if values.len() > want {
+            break;
+        }
+    }
+    let more = values.len() > want;
+    values.truncate(want);
+    Ok(Frame::Ordinals {
+        values,
+        more: u8::from(more),
+    })
+}
+
 fn load_page(
     snap: &Snapshot,
     key: u64,

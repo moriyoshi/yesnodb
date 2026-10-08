@@ -16,12 +16,20 @@ default = ["server"]
 # stays the single definition in `yesno-arrow` rather than being copied here, which is how
 # two spellings of one wire format start to drift.
 containers = ["dep:yesno-arrow"]
-server = ["dep:yesno-core", "dep:yesno-arrow", "dep:tracing", "yesno-core/tracing", "containers"]
-jit = ["server", "yesno-core/jit"]
+server = ["dep:yesno-core", "dep:yesno-arrow", "dep:yesno-eval", "dep:tracing", "yesno-core/tracing", "containers"]
+# Forwarded to `yesno-eval` as well, not only to `yesno-core`. The evaluator has
+# its own `#[cfg(feature = "jit")]` and a crate does not inherit a feature from
+# its dependent, so without the third entry a `jit` build would compile the
+# interpreter path here and nothing would say so.
+jit = ["server", "yesno-core/jit", "yesno-eval/jit"]
 
 [dependencies]
 yesno-core = { workspace = true, optional = true }
 yesno-arrow = { workspace = true, optional = true }
+# The expression evaluator, re-exported as `expr`. Optional for the reason
+# `yesno-core` is: a client build must not link the engine, and this crate is
+# the engine-side half of running an expression.
+yesno-eval = { workspace = true, optional = true }
 yesno-wire.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true

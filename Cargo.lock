@@ -7654,6 +7654,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yesno-eval"
+version = "0.1.0"
+dependencies = [
+ "yesno-core",
+ "yesno-wire",
+]
+
+[[package]]
 name = "yesno-flight"
 version = "0.1.0"
 dependencies = [
@@ -7670,6 +7678,7 @@ dependencies = [
  "tracing",
  "yesno-arrow",
  "yesno-core",
+ "yesno-eval",
  "yesno-wire",
 ]
 
@@ -7714,6 +7723,8 @@ dependencies = [
  "memmap2",
  "yesno-channel",
  "yesno-core",
+ "yesno-eval",
+ "yesno-wire",
 ]
 
 [[package]]

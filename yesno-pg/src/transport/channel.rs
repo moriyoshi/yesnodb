@@ -14,20 +14,29 @@
 //! same rule by depending on `yesno-channel`, the peer half of the protocol,
 //! which was split out of `yesno-plugin` for exactly this reason.
 //!
-//! # What it gives up: filter pushdown
+//! # Filter pushdown, which this used to give up
 //!
 //! A `cmd` in this trait is either a bare 8-byte key or an encoded `yesno-wire`
-//! expression, and **the channel evaluates no expressions**. So a channel server
-//! gets no pushdown: `plan_pushdown` declines to lower quals when it sees one,
-//! and PostgreSQL applies every filter itself.
+//! expression, and **both are served**. Until 2026-10-09 only the first was: the
+//! channel had no expression frame, so `plan_pushdown` declined to lower quals
+//! for a channel server and PostgreSQL applied every filter itself.
 //!
-//! That is a refusal to generate what the transport cannot serve, not a silent
-//! fallback. The alternative -- letting the planner push down and failing at
-//! execution -- turns a configuration choice into a query that breaks, which is
-//! strictly worse than one that is merely slower. [`key_of`] still rejects a
-//! non-key `cmd` rather than trusting the gate, because a defensive check at the
-//! boundary costs nothing and a planner change elsewhere must not become a wrong
-//! answer here.
+//! What closed it is `Frame::SnapshotEvalCardinality` and
+//! `Frame::SnapshotEvalLoad`, which carry the encoded expression to the server
+//! and are answered by the **same evaluator the Flight surface uses**. That
+//! identity is the point and not an implementation detail: two transports
+//! answering one filter differently would make a deployment choice into a
+//! correctness difference, and the only way to be sure they agree is for there
+//! to be one implementation rather than two.
+//!
+//! A server may still decline. `max_expr_bytes` is advertised in the greeting
+//! and zero means it evaluates none, which is a deployment an operator can
+//! choose -- so [`cmd_of`] reports rather than guessing, and the client refuses
+//! locally before spending a round trip. The planner is not consulted about
+//! that, because it cannot be: `plan_pushdown` runs before anything connects.
+//! A channel server configured to evaluate nothing therefore fails a pushed-down
+//! scan rather than falling back, which is the one rough edge left here and is
+//! recorded as such.
 use yesno_channel::client::{Client, Error as ClientError, Snapshot};
 use yesno_channel::ipc::{Write, WriteOp};
 
@@ -45,7 +54,7 @@ const PEER_NAME: &str = "yesno-pg";
 /// what makes resuming from a value yield a consistent sequence rather than a
 /// smear of two states.
 struct Scan {
-    key: u64,
+    cmd: Cmd,
     after: Option<u64>,
     done: bool,
 }
@@ -60,19 +69,40 @@ pub struct ChannelTransport {
     scan: Option<Scan>,
 }
 
-/// A `cmd` must be a bare little-endian key here.
-fn key_of(cmd: &[u8]) -> Result<u64, TransportError> {
+/// What a descriptor is asking for.
+///
+/// The two forms the [`Transport`] trait defines, kept as a decoded value rather
+/// than re-examined at each use so that a scan cannot classify its descriptor
+/// one way when it opens and the other way when it pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cmd {
+    Key(u64),
+    /// The encoded expression, carried rather than decoded: the server decodes
+    /// it, and this crate holds no evaluator.
+    Expr(Vec<u8>),
+}
+
+/// Classify a descriptor exactly as the Flight server does.
+///
+/// `SetExpr::looks_like_expr` and not a length test of this crate's own, because
+/// **the two transports must disagree about nothing**, this included. It is also
+/// the subtler check: a bare key is eight arbitrary bytes and keys are commonly
+/// hashes, so one can begin with the `YSNX` magic by coincidence -- which is why
+/// that function tests the length first and no valid expression is eight bytes.
+fn cmd_of(cmd: &[u8]) -> Result<Cmd, TransportError> {
+    if yesno_wire::SetExpr::looks_like_expr(cmd) {
+        return Ok(Cmd::Expr(cmd.to_vec()));
+    }
     if cmd.len() != 8 {
-        return Err(TransportError::Rpc(format!(
-            "the channel transport serves bare keys and this descriptor is {} bytes, \
-             so it is a pushed-down expression the channel cannot evaluate; a channel \
-             server should not have had quals lowered for it",
+        return Err(TransportError::Schema(format!(
+            "a descriptor is a bare 8-byte key or an encoded expression, and this is \
+             {} bytes of neither",
             cmd.len()
         )));
     }
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(cmd);
-    Ok(u64::from_le_bytes(bytes))
+    Ok(Cmd::Key(u64::from_le_bytes(bytes)))
 }
 
 impl ChannelTransport {
@@ -144,15 +174,22 @@ fn rpc(error: ClientError) -> TransportError {
 
 impl Transport for ChannelTransport {
     fn cardinality(&mut self, cmd: &[u8]) -> Result<u64, TransportError> {
-        let key = key_of(cmd)?;
-        self.pin()?.cardinality(key).map_err(rpc)
+        let cmd = cmd_of(cmd)?;
+        let snapshot = self.pin()?;
+        match &cmd {
+            Cmd::Key(key) => snapshot.cardinality(*key),
+            // Exact, not estimated, for the same reason the key form is: the
+            // server counts container popcounts without materializing the set.
+            Cmd::Expr(bytes) => snapshot.cardinality_expr(bytes),
+        }
+        .map_err(rpc)
     }
 
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError> {
-        let key = key_of(cmd)?;
+        let cmd = cmd_of(cmd)?;
         self.pin()?;
         self.scan = Some(Scan {
-            key,
+            cmd,
             after: None,
             done: false,
         });
@@ -163,29 +200,38 @@ impl Transport for ChannelTransport {
     ///
     /// The channel has no frame for "open a snapshot at version V", so a ticket
     /// cannot be a self-contained reconstruction the way a Flight ticket is.
-    /// Instead the pin is held here and the ticket names it: version and key, so
-    /// that [`Transport::open_scan_with_ticket`] can verify it is being handed
-    /// back the pin it was minted from rather than silently reading a newer one.
+    /// Instead the pin is held here and the ticket names it: the version, then
+    /// the descriptor verbatim, so that [`Transport::open_scan_with_ticket`] can
+    /// verify it is being handed back the pin it was minted from rather than
+    /// silently reading a newer one.
+    ///
+    /// **The descriptor rather than a key**, since 2026-10-09. It was a key when
+    /// a key was all this transport served, and a fixed 16 bytes; carrying the
+    /// `cmd` means a ticket replays the same scan whether it is a key or a
+    /// pushed-down expression, and it is what `open_scan` already classifies, so
+    /// the two paths cannot disagree about what a ticket meant.
     fn ticket_for(&mut self, cmd: &[u8]) -> Result<Vec<u8>, TransportError> {
-        let key = key_of(cmd)?;
+        // Classified before minting, so a descriptor this transport cannot serve
+        // fails here rather than at the first page of a replay.
+        cmd_of(cmd)?;
         let version = self.pin()?.version();
-        let mut ticket = Vec::with_capacity(16);
+        let mut ticket = Vec::with_capacity(8 + cmd.len());
         ticket.extend_from_slice(&version.to_le_bytes());
-        ticket.extend_from_slice(&key.to_le_bytes());
+        ticket.extend_from_slice(cmd);
         Ok(ticket)
     }
 
     fn open_scan_with_ticket(&mut self, ticket: &[u8]) -> Result<(), TransportError> {
-        if ticket.len() != 16 {
+        if ticket.len() < 16 {
             return Err(TransportError::Schema(format!(
-                "a channel ticket is 16 bytes and this one is {}",
+                "a channel ticket is a version and a descriptor, so at least 16 bytes, \
+                 and this one is {}",
                 ticket.len()
             )));
         }
         let mut version = [0u8; 8];
-        let mut key = [0u8; 8];
         version.copy_from_slice(&ticket[..8]);
-        key.copy_from_slice(&ticket[8..]);
+        let cmd = cmd_of(&ticket[8..])?;
         let want = u64::from_le_bytes(version);
 
         // The pin is this transport's, so a ticket from a different connection
@@ -208,7 +254,7 @@ impl Transport for ChannelTransport {
             }
         }
         self.scan = Some(Scan {
-            key: u64::from_le_bytes(key),
+            cmd,
             after: None,
             done: false,
         });
@@ -222,13 +268,21 @@ impl Transport for ChannelTransport {
         if scan.done {
             return Ok(None);
         }
-        let (key, after) = (scan.key, scan.after);
+        let (cmd, after) = (scan.cmd.clone(), scan.after);
         let limit = self.batch_rows as u32;
         let snapshot = self
             .pinned
             .as_ref()
             .ok_or_else(|| TransportError::Rpc("the scan has no pinned snapshot".into()))?;
-        let (ordinals, more) = snapshot.load(key, after, limit).map_err(rpc)?;
+        let (ordinals, more) = match &cmd {
+            Cmd::Key(key) => snapshot.load(*key, after, limit),
+            // **Ask for the whole page every time.** Each page of an expression
+            // costs the server an evaluation -- its answer is computed, so there
+            // is nothing to seek into -- and `batch_rows` is what bounds that, so
+            // a small one buys several evaluations for one filtered set.
+            Cmd::Expr(bytes) => snapshot.load_expr(bytes, after, limit),
+        }
+        .map_err(rpc)?;
 
         let scan = self.scan.as_mut().expect("checked above");
         if let Some(last) = ordinals.last() {
@@ -285,18 +339,14 @@ impl Transport for ChannelTransport {
         self.commit(writes)
     }
 
-    /// Probe one ordinal, because this transport evaluates no expressions.
+    /// One frame, because the protocol has had this exact question all along.
     ///
-    /// `load` resumes **strictly above** `after`, so asking from `ordinal - 1`
-    /// returns the first ordinal at or above `ordinal`; it is a member exactly
-    /// when that first one is `ordinal` itself. At zero there is nothing below
-    /// to resume from, which is what `checked_sub` says.
+    /// `Frame::SnapshotContains` is a membership test at the snapshot, so the
+    /// default's `And( Key, Range )` expression is not needed here even now that
+    /// this transport can evaluate one -- and a one-ordinal probe through the
+    /// evaluator would materialize a set to look at one element of it.
     fn contains(&mut self, key: u64, ordinal: u64) -> Result<bool, TransportError> {
-        let (page, _more) = self
-            .pin()?
-            .load(key, ordinal.checked_sub(1), 1)
-            .map_err(rpc)?;
-        Ok(page.first() == Some(&ordinal))
+        self.pin()?.contains(key, ordinal).map_err(rpc)
     }
 
     fn keys(&mut self) -> Result<Vec<u64>, TransportError> {

@@ -19,6 +19,17 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 yesno-core = { path = "../yesno-core" }
+# Serving a pushed-down filter: `yesno-wire` decodes the expression a peer sent
+# and `yesno-eval` runs it. **`yesno-eval` rather than `yesno-flight`**, which
+# is where that evaluator lived until 2026-10-09: this crate builds a `cdylib`
+# and a `staticlib` that C links, and reaching it through the Flight crate would
+# have put tonic, prost and arrow in both for a dependency on none of them.
+#
+# One evaluator for both transports is the correctness claim. Flight and this
+# channel must answer one filter identically, and the only way to be sure is for
+# there to be one implementation rather than two that agree.
+yesno-eval = { workspace = true }
+yesno-wire = { workspace = true }
 # The peer half: wire format, client and status codes. Split out so a peer can
 # link it without the engine; this crate is the host half and needs both.
 yesno-channel = { path = "../yesno-channel", version = "0.1.0" }
@@ -32,3 +43,7 @@ bytemuck.workspace = true
 [dev-dependencies]
 # The scan test maps the arena as a peer would, through the descriptor.
 memmap2 = "0.9"
+# Already a normal dependency; repeated here because an integration test under
+# `tests/` links only the crate's public API and its dev-dependencies, and the
+# expression tests build a `SetExpr` to push down.
+yesno-wire = { workspace = true }

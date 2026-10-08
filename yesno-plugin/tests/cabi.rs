@@ -30,6 +30,7 @@ fn limits() -> Limits {
         max_blocks: 4,
         max_snapshots: 8,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     }
 }
 

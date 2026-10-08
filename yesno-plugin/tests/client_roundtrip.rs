@@ -44,6 +44,7 @@ fn limits() -> Limits {
         max_blocks: 4,
         max_snapshots: 8,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     }
 }
 
@@ -292,6 +293,108 @@ fn ordinals_page_by_value_and_resume_strictly_above() {
         let (empty, more) = snap.load(999, None, 16).unwrap();
         assert!(empty.is_empty());
         assert!(!more);
+    }
+
+    server.join().unwrap();
+}
+
+/// The shipped client pushes a filter down, over a real socket.
+///
+/// `channel_session.rs` proves the evaluation; this proves the two halves a peer
+/// actually uses -- `Limits::evaluates_expressions` read from the greeting, and
+/// the client's own refusal when the answer is no -- and that an expression
+/// survives the framing in both directions.
+#[test]
+fn the_client_pushes_a_filter_down_and_pages_the_filtered_set() {
+    let (_clean, host, sock) = setup("eval");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = serve_inline(listener, host);
+
+    {
+        let client = Client::connect(&sock, "eval-test").unwrap();
+        assert!(
+            client.limits().evaluates_expressions(),
+            "this server evaluates expressions, and the greeting is how a peer knows"
+        );
+        assert_eq!(
+            client.limits().max_expr_bytes as usize,
+            yesno_plugin::ipc::MAX_EXPR_BYTES
+        );
+        let snap = client.snapshot().unwrap();
+
+        // Key 3 holds 1, 2, 65546, 65547, 131092 across three chunks. A window
+        // that cuts inside the first chunk and ends inside the second, so
+        // neither boundary falls on a chunk edge.
+        let expr = yesno_wire::SetExpr::And(vec![
+            yesno_wire::SetExpr::Key(3),
+            yesno_wire::SetExpr::Range(2, 65547),
+        ])
+        .encode();
+
+        assert_eq!(snap.cardinality_expr(&expr).unwrap(), 2);
+        let (got, more) = snap.load_expr(&expr, None, 16).unwrap();
+        assert_eq!(got, vec![2, 65546]);
+        assert!(!more);
+
+        // Paged by value, exactly as a key is, and the continuation is the last
+        // ordinal returned rather than a cursor.
+        let (first, more) = snap.load_expr(&expr, None, 1).unwrap();
+        assert_eq!(first, vec![2]);
+        assert!(more);
+        let (rest, more) = snap.load_expr(&expr, Some(2), 1).unwrap();
+        assert_eq!(rest, vec![65546]);
+        assert!(!more, "a one-row page at the end must not promise another");
+
+        // An expression selecting nothing is empty rather than an error.
+        let empty = yesno_wire::SetExpr::And(vec![
+            yesno_wire::SetExpr::Key(3),
+            yesno_wire::SetExpr::Range(10, 20),
+        ])
+        .encode();
+        assert_eq!(snap.cardinality_expr(&empty).unwrap(), 0);
+        assert!(snap.load_expr(&empty, None, 16).unwrap().0.is_empty());
+
+        // The peer refuses an over-cap expression itself, naming the limit,
+        // rather than sending a frame the server would fault on.
+        let huge = vec![0u8; yesno_plugin::ipc::MAX_EXPR_BYTES + 1];
+        let err = snap.load_expr(&huge, None, 16).unwrap_err().to_string();
+        assert!(
+            err.contains(&yesno_plugin::ipc::MAX_EXPR_BYTES.to_string()),
+            "the refusal should name the limit, got {err:?}"
+        );
+    }
+
+    server.join().unwrap();
+}
+
+/// A server that evaluates nothing is declined by the client, not asked.
+#[test]
+fn a_peer_declines_to_push_down_when_the_greeting_says_zero() {
+    let (_clean, host, sock) = setup("noeval");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut session = Session::new_inline(
+            host,
+            Limits {
+                max_expr_bytes: 0,
+                ..limits()
+            },
+        );
+        let _ = serve_blocking(&mut session, stream);
+    });
+
+    {
+        let client = Client::connect(&sock, "noeval-test").unwrap();
+        assert!(!client.limits().evaluates_expressions());
+        let snap = client.snapshot().unwrap();
+        let expr = yesno_wire::SetExpr::Key(3).encode();
+        // Refused locally. The connection must still be usable afterwards,
+        // which is the difference between declining and faulting: a peer that
+        // sent the frame would have spent a round trip and taken a `Fault`.
+        assert!(snap.cardinality_expr(&expr).is_err());
+        assert!(snap.load_expr(&expr, None, 16).is_err());
+        assert_eq!(snap.cardinality(3).unwrap(), 5);
     }
 
     server.join().unwrap();

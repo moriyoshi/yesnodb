@@ -160,6 +160,24 @@ pub struct Limits {
     pub max_handles: u32,
     pub max_blocks: u32,
     pub max_writes: u32,
+    /// Bytes one encoded set expression may carry, or **0 when this server
+    /// evaluates none**.
+    ///
+    /// A peer that pushes filters down reads this before deciding to, and reads
+    /// it rather than `ipc::MAX_EXPR_BYTES`: the constant is what the protocol
+    /// permits, this is what the server configured.
+    pub max_expr_bytes: u32,
+}
+
+impl Limits {
+    /// Whether this server will evaluate a pushed-down set expression.
+    ///
+    /// A method rather than a bare field comparison, because every caller wants
+    /// the question and not the number, and `max_expr_bytes > 0` read at four
+    /// call sites is four places to get the sense of the test backwards.
+    pub fn evaluates_expressions(&self) -> bool {
+        self.max_expr_bytes > 0
+    }
 }
 
 /// A server-initiated frame that arrived while we were waiting for a response.
@@ -440,6 +458,7 @@ impl Client {
             max_handles,
             max_blocks,
             max_writes,
+            max_expr_bytes,
         } = greeting
         else {
             return protocol("the first frame from yesnod was not ServerHello");
@@ -456,6 +475,10 @@ impl Client {
             || max_writes == 0
             || max_lanes as usize > ipc::MAX_LANES
             || max_writes as usize > ipc::MAX_WRITES
+            // Zero is legal here and means "no expressions", so only the upper
+            // bound is a fault: a server advertising more than the protocol
+            // allows would have a peer encode a frame it cannot send.
+            || max_expr_bytes as usize > ipc::MAX_EXPR_BYTES
         {
             return protocol("yesnod advertised an unusable channel limit");
         }
@@ -513,6 +536,7 @@ impl Client {
                 max_handles,
                 max_blocks,
                 max_writes,
+                max_expr_bytes,
             },
         })
     }
@@ -579,6 +603,7 @@ impl Client {
             version,
             max_lanes: self.limits.max_lanes,
             max_blocks: self.limits.max_blocks,
+            max_expr_bytes: self.limits.max_expr_bytes,
         })
     }
 }
@@ -591,6 +616,9 @@ pub struct Snapshot {
     version: u64,
     max_lanes: u32,
     max_blocks: u32,
+    /// Copied from the greeting, as `max_lanes` and `max_blocks` are: a snapshot
+    /// outlives no connection, so the limit cannot change under it.
+    max_expr_bytes: u32,
 }
 
 impl Snapshot {
@@ -684,6 +712,77 @@ impl Snapshot {
             Frame::Ordinals { values, more } => Ok((values, more != 0)),
             _ => protocol("yesnod did not answer SnapshotLoad with Ordinals"),
         }
+    }
+
+    /// How many ordinals an encoded `SetExpr` selects, evaluated by the server.
+    ///
+    /// `expr` is opaque to this crate. That is deliberate and is why the peer
+    /// half of the channel still links no engine and no expression decoder: a
+    /// caller that builds expressions already has `yesno-wire`, and one that
+    /// does not has no use for this.
+    ///
+    /// Checked against the server's advertised cap before anything is sent, so
+    /// the failure names the limit rather than surfacing as a refused frame
+    /// from this peer's own encoder.
+    pub fn cardinality_expr(&self, expr: &[u8]) -> Result<u64> {
+        self.check_expr(expr)?;
+        match self.request(Frame::SnapshotEvalCardinality {
+            snapshot: self.id,
+            expr: expr.to_vec(),
+        })? {
+            Frame::Count { value } => Ok(value),
+            _ => protocol("yesnod did not answer SnapshotEvalCardinality with Count"),
+        }
+    }
+
+    /// One page of the ordinals an encoded `SetExpr` selects, ascending.
+    ///
+    /// [`Snapshot::load`] for an expression, with the same by-value
+    /// continuation. **Each page costs an evaluation** -- an expression's answer
+    /// is computed and there is nothing on disk to seek -- so a caller reading a
+    /// whole filtered set should ask for the largest page it can use rather than
+    /// many small ones. The server bounds the work per page by intersecting the
+    /// expression with everything above `after`, so paging is not quadratic, but
+    /// one large page is still one evaluation instead of several.
+    pub fn load_expr(
+        &self,
+        expr: &[u8],
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<(Vec<u64>, bool)> {
+        self.check_expr(expr)?;
+        match self.request(Frame::SnapshotEvalLoad {
+            snapshot: self.id,
+            expr: expr.to_vec(),
+            after: after.unwrap_or(0),
+            has_after: u8::from(after.is_some()),
+            limit,
+        })? {
+            Frame::Ordinals { values, more } => Ok((values, more != 0)),
+            _ => protocol("yesnod did not answer SnapshotEvalLoad with Ordinals"),
+        }
+    }
+
+    /// Refuse an expression this server cannot take, before sending it.
+    ///
+    /// Both failures are the peer's to report: a server that evaluates nothing
+    /// said so in its greeting, and one that named a smaller cap than the
+    /// expression needs said that too. Sending anyway would answer a question
+    /// already answered, with a `Fault` that reads like a server problem.
+    fn check_expr(&self, expr: &[u8]) -> Result<()> {
+        let allowed = self.max_expr_bytes as usize;
+        if allowed == 0 {
+            return protocol(
+                "this yesnod evaluates no set expressions; it advertised max_expr_bytes 0",
+            );
+        }
+        if expr.len() > allowed {
+            return protocol(format!(
+                "this expression is {} bytes and this yesnod accepts {allowed}",
+                expr.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Acquire a lane handle over `keys` and read their blocks in order.

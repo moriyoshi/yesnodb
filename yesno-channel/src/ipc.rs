@@ -133,7 +133,12 @@
 pub const MAGIC: &[u8; 4] = b"YSNL";
 
 /// Protocol version. Bumped when a field changes meaning, never for a new kind.
-pub const VERSION: u8 = 2;
+///
+/// 3 since 2026-10-09, when [`Frame::ServerHello`] grew `max_expr_bytes`. A new
+/// *kind* would not have needed this -- an old server faults on one it does not
+/// know, which is a clean refusal -- but a greeting one field longer is a shape
+/// change, and `decode` refuses trailing bytes, so the two builds must not try.
+pub const VERSION: u8 = 3;
 
 /// Magic, version, flags, kind, reserved, length.
 pub const HEADER_LEN: usize = 12;
@@ -517,6 +522,22 @@ const _: () = assert!(MAX_WRITES <= u32::MAX as usize);
 /// frame around it and for the cap to rise without the two colliding.
 pub const MAX_PAGE: usize = 4096;
 
+/// Largest encoded set expression a request may carry.
+///
+/// `yesno-wire` already bounds an expression's *tree* -- `MAX_DEPTH`,
+/// `MAX_NODES` and `MAX_WORK` -- and a decoder enforces those. This bounds the
+/// **bytes**, which is a different question: the tree limits stop a small
+/// payload buying unbounded work, and this stops a large payload buying a large
+/// allocation before any of them has been consulted.
+///
+/// Far below [`MAX_PAYLOAD`] on purpose, so that an expression plus the fixed
+/// fields around it always fits a frame with room left. A peer does not read
+/// this constant, it reads the server's advertised `max_expr_bytes`; see
+/// [`Frame::ServerHello`] for why that distinction has already cost someone a
+/// debugging session.
+pub const MAX_EXPR_BYTES: usize = 16 * 1024;
+const _: () = assert!(MAX_EXPR_BYTES + 32 <= MAX_PAYLOAD);
+
 /// Most blocks one [`Frame::Blocks`] may carry.
 ///
 /// Bounds the arena a batched handle reserves -- `max_blocks * max_lanes *
@@ -568,6 +589,8 @@ pub enum Kind {
     SnapshotKeyRange = 13,
     Apply = 14,
     ChunkPut = 15,
+    SnapshotEvalCardinality = 16,
+    SnapshotEvalLoad = 17,
     // responses, 64..127
     ServerHello = 64,
     SnapshotOpened = 65,
@@ -609,6 +632,8 @@ impl Kind {
             13 => Kind::SnapshotKeyRange,
             14 => Kind::Apply,
             15 => Kind::ChunkPut,
+            16 => Kind::SnapshotEvalCardinality,
+            17 => Kind::SnapshotEvalLoad,
             64 => Kind::ServerHello,
             65 => Kind::SnapshotOpened,
             66 => Kind::LanesAcquired,
@@ -808,6 +833,61 @@ pub enum Frame {
         hi: u64,
         limit: u32,
     },
+    /// How many ordinals a `yesno-wire` set expression selects.
+    ///
+    /// The server evaluates it; `expr` is opaque to this crate, which carries
+    /// bytes and does not link a decoder -- the peer half of the channel must
+    /// stay free of the engine, and an expression is only meaningful beside
+    /// one. The host decodes it with `yesno-wire` and runs it with
+    /// `yesno-eval`, which is the **same evaluator the Flight surface uses**:
+    /// two transports answering one filter differently would turn a deployment
+    /// choice into a correctness difference.
+    ///
+    /// Exact rather than estimated, like [`Frame::SnapshotCardinality`]: a
+    /// filtered count is computed from container popcounts without
+    /// materializing the set.
+    ///
+    /// Answered with [`Frame::Count`], or a [`Frame::Fault`] carrying
+    /// `InvalidArgument` when the bytes are not a decodable set expression.
+    SnapshotEvalCardinality {
+        snapshot: u64,
+        /// An encoded `SetExpr`, at most [`MAX_EXPR_BYTES`] bytes.
+        expr: Vec<u8>,
+    },
+    /// One page of the ordinals a set expression selects, ascending.
+    ///
+    /// [`Frame::SnapshotLoad`] for an expression instead of a bare key, with the
+    /// same by-value continuation and for the same reason: `after` resumes
+    /// strictly above an ordinal the caller already holds, so there is no
+    /// server-side cursor to leak or expire, and the snapshot pinning the version
+    /// is what makes that sound.
+    ///
+    /// # Each page costs an evaluation, and `after` is what bounds it
+    ///
+    /// A key's page is a seek into a persisted stream. An expression's answer is
+    /// **computed**, with nothing on disk to seek, so a page is an evaluation --
+    /// the same choice the Flight surface records for its own windowing. Paging
+    /// an expression therefore costs one evaluation per page rather than one per
+    /// query.
+    ///
+    /// What keeps that from being quadratic is that the host intersects the
+    /// expression with `Range( after + 1, u64::MAX )` before evaluating, so a
+    /// later page evaluates only what is left above `after`. A peer that wants
+    /// one evaluation asks for one large page: `limit` is capped at
+    /// [`MAX_PAGE`], and asking for that is the cheapest way to read a filtered
+    /// set, exactly as [`Frame::SnapshotKeyRange`] advises for keys.
+    ///
+    /// Answered with [`Frame::Ordinals`].
+    SnapshotEvalLoad {
+        snapshot: u64,
+        /// An encoded `SetExpr`, at most [`MAX_EXPR_BYTES`] bytes.
+        expr: Vec<u8>,
+        /// Resume strictly above this ordinal when `has_after` is 1.
+        after: u64,
+        has_after: u8,
+        /// Capped at [`MAX_PAGE`] by the server whatever is asked.
+        limit: u32,
+    },
     /// Advance up to `max_blocks` at once, releasing the previous batch implicitly.
     ///
     /// **The implicit release is the point, and it is safe here for a reason the
@@ -853,6 +933,17 @@ pub enum Frame {
         /// trust is this one -- it is the server's configured limit, already clamped to
         /// what the protocol and the frame allow.
         max_writes: u32,
+        /// Bytes one encoded set expression may carry, for this server.
+        ///
+        /// **Zero means this server evaluates no expressions**, so one field
+        /// answers both "may I push a filter down" and "how large may it be".
+        /// A separate capability bit would have said the first and left a peer
+        /// to guess the second, which is the mistake `max_writes` records.
+        ///
+        /// A peer must read this rather than [`MAX_EXPR_BYTES`]: the constant is
+        /// what the protocol permits and this is what the server configured,
+        /// and the two are only equal by default.
+        max_expr_bytes: u32,
     },
     SnapshotOpened {
         snapshot: u64,
@@ -991,6 +1082,8 @@ impl Frame {
             Frame::SnapshotMax { .. } => Kind::SnapshotMax,
             Frame::SnapshotLoad { .. } => Kind::SnapshotLoad,
             Frame::SnapshotKeyRange { .. } => Kind::SnapshotKeyRange,
+            Frame::SnapshotEvalCardinality { .. } => Kind::SnapshotEvalCardinality,
+            Frame::SnapshotEvalLoad { .. } => Kind::SnapshotEvalLoad,
             Frame::ServerHello { .. } => Kind::ServerHello,
             Frame::SnapshotOpened { .. } => Kind::SnapshotOpened,
             Frame::LanesAcquired { .. } => Kind::LanesAcquired,
@@ -1079,6 +1172,7 @@ impl Frame {
                 max_handles,
                 max_blocks,
                 max_writes,
+                max_expr_bytes,
             } => {
                 p.extend_from_slice(&protocol.to_le_bytes());
                 p.extend_from_slice(&generation.to_le_bytes());
@@ -1089,6 +1183,7 @@ impl Frame {
                 p.extend_from_slice(&max_handles.to_le_bytes());
                 p.extend_from_slice(&max_blocks.to_le_bytes());
                 p.extend_from_slice(&max_writes.to_le_bytes());
+                p.extend_from_slice(&max_expr_bytes.to_le_bytes());
             }
             Frame::SnapshotOpened { snapshot, version } => {
                 p.extend_from_slice(&snapshot.to_le_bytes());
@@ -1196,6 +1291,31 @@ impl Frame {
                 p.extend_from_slice(&snapshot.to_le_bytes());
                 p.extend_from_slice(&lo.to_le_bytes());
                 p.extend_from_slice(&hi.to_le_bytes());
+                p.extend_from_slice(&limit.to_le_bytes());
+            }
+            Frame::SnapshotEvalCardinality { snapshot, expr } => {
+                if expr.len() > MAX_EXPR_BYTES {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&(expr.len() as u32).to_le_bytes());
+                p.extend_from_slice(expr);
+            }
+            Frame::SnapshotEvalLoad {
+                snapshot,
+                expr,
+                after,
+                has_after,
+                limit,
+            } => {
+                if expr.len() > MAX_EXPR_BYTES {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&(expr.len() as u32).to_le_bytes());
+                p.extend_from_slice(expr);
+                p.extend_from_slice(&after.to_le_bytes());
+                p.push(*has_after);
                 p.extend_from_slice(&limit.to_le_bytes());
             }
             Frame::Count { value } => p.extend_from_slice(&value.to_le_bytes()),
@@ -1374,6 +1494,7 @@ impl Frame {
                 max_handles: r.u32()?,
                 max_blocks: r.u32()?,
                 max_writes: r.u32()?,
+                max_expr_bytes: r.u32()?,
             },
             Kind::SnapshotOpened => Frame::SnapshotOpened {
                 snapshot: r.u64()?,
@@ -1499,6 +1620,17 @@ impl Frame {
                 hi: r.u64()?,
                 limit: r.u32()?,
             },
+            Kind::SnapshotEvalCardinality => Frame::SnapshotEvalCardinality {
+                snapshot: r.u64()?,
+                expr: r.expr()?,
+            },
+            Kind::SnapshotEvalLoad => Frame::SnapshotEvalLoad {
+                snapshot: r.u64()?,
+                expr: r.expr()?,
+                after: r.u64()?,
+                has_after: r.u8()?,
+                limit: r.u32()?,
+            },
             Kind::Count => Frame::Count { value: r.u64()? },
             Kind::Bool => Frame::Bool { value: r.u8()? },
             Kind::Ordinal => Frame::Ordinal {
@@ -1606,6 +1738,19 @@ impl Reader<'_> {
         core::str::from_utf8(b)
             .map(|s| s.to_string())
             .map_err(|_| IpcError::Malformed)
+    }
+    /// A length-prefixed opaque expression, bounded before anything is copied.
+    ///
+    /// Checked against the cap first, like every other counted field here: a
+    /// declared length is peer-controlled, and allocating on it is what
+    /// `an_enormous_declared_length_is_refused_before_allocating` exists to
+    /// prevent.
+    fn expr(&mut self) -> Result<Vec<u8>, IpcError> {
+        let n = self.u32()? as usize;
+        if n > MAX_EXPR_BYTES {
+            return Err(IpcError::TooLarge);
+        }
+        Ok(self.take(n)?.to_vec())
     }
     fn done(&self) -> bool {
         self.at == self.b.len()
@@ -1754,6 +1899,36 @@ mod tests {
                 hi: u64::MAX,
                 limit: 64,
             },
+            // Both bounds of the expression blob. Empty is not a decodable
+            // expression, but it is a legal *frame*, and the decoder must not
+            // confuse "no bytes" with "no field" -- the length prefix is what
+            // tells the two apart and a reader that skipped it on zero would
+            // desynchronise everything after.
+            Frame::SnapshotEvalCardinality {
+                snapshot: 3,
+                expr: vec![],
+            },
+            Frame::SnapshotEvalCardinality {
+                snapshot: 3,
+                expr: vec![0xff; MAX_EXPR_BYTES],
+            },
+            // `has_after` both ways, because the field is a flag beside a value
+            // that is meaningless without it, and the pair is what a resumed
+            // page depends on.
+            Frame::SnapshotEvalLoad {
+                snapshot: 4,
+                expr: vec![1, 2, 3, 4, 5],
+                after: 0,
+                has_after: 0,
+                limit: MAX_PAGE as u32,
+            },
+            Frame::SnapshotEvalLoad {
+                snapshot: 4,
+                expr: vec![9],
+                after: u64::MAX - 1,
+                has_after: 1,
+                limit: 1,
+            },
             Frame::Count { value: 5000 },
             Frame::Bool { value: 1 },
             Frame::Ordinal {
@@ -1831,6 +2006,7 @@ mod tests {
                 max_handles: 8,
                 max_blocks: 16,
                 max_writes: MAX_WRITES as u32,
+                max_expr_bytes: MAX_EXPR_BYTES as u32,
             },
             Frame::SnapshotOpened {
                 snapshot: 7,
@@ -1997,6 +2173,8 @@ mod tests {
                 | Kind::SnapshotMax
                 | Kind::SnapshotLoad
                 | Kind::SnapshotKeyRange
+                | Kind::SnapshotEvalCardinality
+                | Kind::SnapshotEvalLoad
                 | Kind::Apply
                 | Kind::ChunkPut => Direction::Request,
                 Kind::ServerHello
@@ -2391,6 +2569,57 @@ mod page_tests {
             Frame::decode(&forged),
             Err(IpcError::TooLarge),
             "an over-cap declaration must be refused, not buffered"
+        );
+    }
+
+    /// The expression blob's cap holds on both sides, the second one mattering most.
+    ///
+    /// An encoder refusing its own over-cap frame is a convenience. **A decoder
+    /// refusing a forged length is the security property**: the field is
+    /// length-prefixed and peer-controlled, so a reader that allocated on the
+    /// declared size before checking it would let a 12-byte frame ask for any
+    /// allocation `u32` can name. This is the same shape as `Apply`'s cap test
+    /// and exists for the same reason.
+    #[test]
+    fn the_widest_legal_expression_round_trips_and_one_more_is_refused() {
+        let widest = Frame::SnapshotEvalLoad {
+            snapshot: 1,
+            expr: vec![0xab; MAX_EXPR_BYTES],
+            after: 7,
+            has_after: 1,
+            limit: 64,
+        };
+        let bytes = widest
+            .encode()
+            .expect("an expression at the advertised limit must encode");
+        let (back, used) = Frame::decode(&bytes).expect("and must decode");
+        assert_eq!(used, bytes.len());
+        assert_eq!(back, widest);
+
+        let over = Frame::SnapshotEvalLoad {
+            snapshot: 1,
+            expr: vec![0xab; MAX_EXPR_BYTES + 1],
+            after: 7,
+            has_after: 1,
+            limit: 64,
+        };
+        assert_eq!(over.encode(), Err(IpcError::TooLarge));
+
+        // Decode-side, and the length is forged **without** the bytes behind it:
+        // a refusal that depended on the payload actually being present would be
+        // no protection at all, because the allocation is what it prevents.
+        let mut forged = bytes.clone();
+        let declared = (MAX_EXPR_BYTES + 1) as u32;
+        forged[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&declared.to_le_bytes());
+        assert_eq!(
+            Frame::decode(&forged),
+            Err(IpcError::TooLarge),
+            "an over-cap expression length must be refused before it is buffered"
+        );
+        assert_eq!(
+            Frame::decode(&forged[..HEADER_LEN + 12]),
+            Err(IpcError::Truncated),
+            "and a frame whose own header is short asks for more rather than failing"
         );
     }
 

@@ -29,6 +29,8 @@ rust_library(
     deps = all_crate_deps(normal = True) + [
         "//yesno-arrow:yesno_arrow",
         "//yesno-core:yesno_core",
+        # Re-exported as `yesno_flight::expr`; see this crate's `lib.rs`.
+        "//yesno-eval:yesno_eval",
         "//yesno-wire:yesno_wire",
     ],
 )

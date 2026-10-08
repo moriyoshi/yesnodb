@@ -377,6 +377,14 @@ impl Channel {
                 .plugin
                 .channel_max_writes
                 .clamp(1, yesno_plugin::ipc::MAX_WRITES),
+            // `min` rather than `clamp`: zero is how an operator refuses
+            // server-side expression evaluation, and a lower bound of one would
+            // turn that into a one-byte allowance -- a capability advertised
+            // that no expression can use.
+            max_expr_bytes: cfg
+                .plugin
+                .channel_max_expr_bytes
+                .min(yesno_plugin::ipc::MAX_EXPR_BYTES),
         };
         let peers: Arc<std::sync::Mutex<Vec<Arc<PeerHandle>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));

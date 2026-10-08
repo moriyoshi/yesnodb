@@ -1,13 +1,33 @@
 //! Executing a wire [`SetExpr`] against a snapshot.
 //!
-//! The **format** lives in `yesno-wire`, a dependency-free crate both this
-//! server and `yesno-pg` compile, so there is exactly one definition of the
-//! encoding. What lives here is the half that needs `yesno-core`: turning a
-//! decoded expression into a `yesno_core::Expr` the engine can evaluate.
+//! The **format** lives in `yesno-wire`, a dependency-free crate every client
+//! compiles, so there is exactly one definition of the encoding. What lives
+//! here is the half that needs `yesno-core`: turning a decoded expression into
+//! a `yesno_core::Expr` the engine can evaluate.
 //!
 //! That split is the point. A client must be able to *build* an expression
-//! without linking a storage engine, and the server must be able to *run* one
+//! without linking a storage engine, and a server must be able to *run* one
 //! without the client's dependencies. Bytes are the only thing that crosses.
+//!
+//! # Why this is its own crate
+//!
+//! It was `yesno-flight/src/expr.rs` until 2026-10-09, because Flight was the
+//! only surface that accepted an expression. It is still re-exported there as
+//! `yesno_flight::expr`, so no consumer changed.
+//!
+//! The plugin channel learning to evaluate expressions is what forced the move.
+//! `yesno-plugin` is the channel's host half and builds a `cdylib` and a
+//! `staticlib` that C links; reaching this code through `yesno-flight` would
+//! have pulled tonic, prost and arrow into those artifacts to use a module that
+//! depends on none of them. **It had zero `crate::` references for its whole
+//! life in `yesno-flight`**, which is the same evidence that justified splitting
+//! `yesno-channel` out of `yesno-plugin` a day earlier: a module importing only
+//! other crates is already a crate.
+//!
+//! One evaluator, two transports, is the property that matters. Flight and the
+//! channel must answer a pushed-down filter identically or a deployment choice
+//! becomes a correctness difference, and the only way to be sure of that is for
+//! there to be one implementation rather than an agreement between two.
 //!
 //! A view has no core expression node, so unsupported shapes retain an eager
 //! packed `OrdSet` boundary. Exact terminal fusions avoid unnecessary

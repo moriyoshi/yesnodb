@@ -32,6 +32,11 @@ rust_library(
     deps = all_crate_deps(normal = True) + [
         "//yesno-core:yesno_core",
         "//yesno-channel:yesno_channel",
+        # Serving a pushed-down filter. `//yesno-eval` and not
+        # `//yesno-flight`: the staticlib below is linked into C, and the
+        # Flight crate would bring tonic, prost and arrow with it.
+        "//yesno-eval:yesno_eval",
+        "//yesno-wire:yesno_wire",
     ],
 )
 
@@ -48,6 +53,11 @@ rust_static_library(
     deps = all_crate_deps(normal = True) + [
         "//yesno-core:yesno_core",
         "//yesno-channel:yesno_channel",
+        # Serving a pushed-down filter. `//yesno-eval` and not
+        # `//yesno-flight`: this target is what C links, and the Flight
+        # crate would bring tonic, prost and arrow into it.
+        "//yesno-eval:yesno_eval",
+        "//yesno-wire:yesno_wire",
     ],
 )
 

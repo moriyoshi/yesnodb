@@ -81,6 +81,7 @@ fn serve(tag: &str, keys: &[u64]) -> (Clean, std::path::PathBuf, Arc<Db>) {
         max_blocks: 4,
         max_snapshots: 8,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -228,6 +229,7 @@ fn a_peer_waits_for_a_database_that_is_not_open_yet() {
         max_blocks: 4,
         max_snapshots: 8,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     std::thread::spawn(move || {
         for incoming in listener.incoming() {

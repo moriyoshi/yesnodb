@@ -751,6 +751,7 @@ impl ChannelFixture {
             max_blocks: 8,
             max_snapshots: 16,
             max_writes: yesno_plugin::ipc::MAX_WRITES,
+            max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
         }
     }
 

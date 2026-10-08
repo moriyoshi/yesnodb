@@ -80,10 +80,12 @@ pub enum Transport {
     /// per connection; a socket inverts that -- one owner, N connections --
     /// without needing a multi-process reader in the engine.
     ///
-    /// It costs filter pushdown. The channel serves keys, not `yesno-wire`
-    /// expressions, so the planner does not lower quals for a channel server
-    /// and PostgreSQL applies every filter itself. That is a refusal to
-    /// generate what the transport cannot serve, not a silent fallback.
+    /// It used to cost filter pushdown, and no longer does. The channel grew
+    /// `SnapshotEvalCardinality` and `SnapshotEvalLoad` on 2026-10-09, answered
+    /// by the same evaluator the Flight surface uses, so a lowered qual reaches
+    /// a channel server and is evaluated there. One evaluator for both
+    /// transports is what makes the choice between them a deployment decision
+    /// rather than a correctness one.
     Channel {
         socket: String,
     },

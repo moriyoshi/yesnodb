@@ -395,6 +395,20 @@ pub struct PluginConfig {
     /// discovering it as an encoder error.
     pub channel_max_writes: usize,
 
+    /// Bytes one pushed-down set expression may carry, clamped to
+    /// `ipc::MAX_EXPR_BYTES`. **Zero evaluates none.**
+    ///
+    /// A peer may push a filter down as an encoded `yesno-wire` expression and
+    /// have the server evaluate it, which is what lets a foreign data wrapper
+    /// return the rows a query asked for rather than the whole key. Set it to
+    /// zero to refuse that: the value is advertised in the greeting, so a peer
+    /// declines to push down rather than discovering the refusal at execution.
+    ///
+    /// The cost it bounds is **server-side work bought by a small request**, not
+    /// bytes held. `yesno-wire`'s own `MAX_NODES` and `MAX_WORK` bound the tree
+    /// and its evaluation; this bounds how large a tree may arrive at all.
+    pub channel_max_expr_bytes: usize,
+
     /// Permission bits for the channel socket, as a string such as `"0600"`.
     ///
     /// Empty leaves the umask-derived mode. There is a window between `bind` and
@@ -428,6 +442,7 @@ impl Default for PluginConfig {
             channel_max_peers: 8,
             channel_max_snapshots: 64,
             channel_max_writes: yesno_plugin::ipc::MAX_WRITES,
+            channel_max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
             channel_socket_mode: String::new(),
             channel_allow_uids: Vec::new(),
         }

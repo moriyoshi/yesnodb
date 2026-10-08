@@ -1,0 +1,34 @@
+"""`yesno-eval` as a Bazel target: a wire expression run against a snapshot.
+
+Two consumers, which is why it is a crate at all -- `//yesno-flight` re-exports
+it as `expr`, and `//yesno-plugin` serves the channel's expression frames with
+it. One evaluator for both transports is the correctness property: Flight and
+the plugin channel must answer a pushed-down filter identically.
+
+See `//yesno-core:BUILD.bazel` for why these satellite BUILD files carry no test
+targets. Cargo stays the authority for this crate's tests, clippy, fmt and MSRV.
+"""
+
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "yesno_eval",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = select({
+        "//:jit_enabled": ["jit"],
+        "//conditions:default": [],
+    }),
+    crate_name = "yesno_eval",
+    edition = "2021",
+    version = "0.1.0",
+    # No `all_crate_deps`: every dependency is first-party, so there is nothing
+    # for `crate_universe` to resolve here.
+    deps = [
+        "//yesno-core:yesno_core",
+        "//yesno-wire:yesno_wire",
+    ],
+)

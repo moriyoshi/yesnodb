@@ -28,6 +28,7 @@ fn limits() -> Limits {
         max_blocks: 1,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     }
 }
 
@@ -101,6 +102,7 @@ fn the_greeting_declares_the_arena_and_the_limits() {
             max_handles,
             max_blocks,
             max_writes,
+            max_expr_bytes,
         } => {
             assert_eq!(protocol, yesno_plugin::ipc::VERSION as u32);
             assert_eq!(generation, 1);
@@ -116,6 +118,15 @@ fn the_greeting_declares_the_arena_and_the_limits() {
                 max_writes as usize,
                 yesno_plugin::ipc::MAX_WRITES,
                 "the write cap must be advertised, and be the one enforced"
+            );
+            // And the expression cap, which carries a second meaning the others
+            // do not: zero is how a server says it evaluates no pushed-down
+            // filters, so a peer reads this to decide whether to push one down
+            // at all rather than to size it.
+            assert_eq!(
+                max_expr_bytes as usize,
+                yesno_plugin::ipc::MAX_EXPR_BYTES,
+                "the expression cap must be advertised, and be the one enforced"
             );
             assert_eq!(arena_bytes as usize, 2 * 4 * LANE_BYTES);
         }
@@ -468,6 +479,7 @@ fn a_batched_scan_sees_exactly_what_the_unbatched_one_sees() {
         max_blocks: 3,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     let (_c2, _h2, _s2) = setup("batch-unused");
     let (_c3, host, _drop) = setup("batch-many");
@@ -524,6 +536,7 @@ fn a_batch_is_capped_by_the_server_not_the_request() {
         max_blocks: 2,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     let (_c, host, _drop) = setup("batch-cap");
     let arena = Arena::new(l.arena_bytes()).unwrap();
@@ -775,6 +788,7 @@ fn a_wide_query_splits_across_handles_without_splitting_the_snapshot() {
         max_blocks: 1,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     let arena = Arena::new(l.arena_bytes()).unwrap();
     let mut s = Session::new(host, arena, l);
@@ -997,6 +1011,224 @@ fn paging_a_load_reassembles_the_whole_set() {
     s.handle(Frame::SnapshotClose { snapshot });
 }
 
+/// A pushed-down filter is evaluated by the server, and narrows the same answer.
+///
+/// # The oracle is the unfiltered page, filtered here
+///
+/// Not a list of expected ordinals, because that would only prove the evaluator
+/// is self-consistent. Reading key 20 whole through the **key** path and
+/// applying the predicate in the test gives an answer this frame did not
+/// produce, and comparing the two is what makes it an assertion. It is also the
+/// property a peer actually depends on: a pushed-down filter must return what
+/// the client would have computed itself.
+#[test]
+fn a_pushed_down_expression_is_evaluated_against_the_snapshot() {
+    let (_c, _h, mut s) = setup("eval");
+    greet(&mut s);
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+
+    // Key 20 whole, through the path that pushes nothing down.
+    let mut whole: Vec<u64> = Vec::new();
+    let mut after: Option<u64> = None;
+    loop {
+        match s.handle(Frame::SnapshotLoad {
+            snapshot,
+            key: 20,
+            after: after.unwrap_or(0),
+            has_after: u8::from(after.is_some()),
+            limit: 4096,
+        }) {
+            Frame::Ordinals { values, more } => {
+                after = values.last().copied();
+                whole.extend(&values);
+                if more == 0 {
+                    break;
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(whole.len(), 5000, "key 20 holds five thousand ordinals");
+
+    // A half-open window well inside it, so both ends of the range do work.
+    let (lo, hi) = (65536 + 1000, 65536 + 9000);
+    let want: Vec<u64> = whole
+        .iter()
+        .copied()
+        .filter(|o| *o >= lo && *o < hi)
+        .collect();
+    assert!(
+        !want.is_empty() && want.len() < whole.len(),
+        "the window must select some and exclude some, or this proves nothing: {} of {}",
+        want.len(),
+        whole.len()
+    );
+
+    let expr = yesno_wire::SetExpr::And(vec![
+        yesno_wire::SetExpr::Key(20),
+        yesno_wire::SetExpr::Range(lo, hi),
+    ])
+    .encode();
+
+    match s.handle(Frame::SnapshotEvalCardinality {
+        snapshot,
+        expr: expr.clone(),
+    }) {
+        Frame::Count { value } => assert_eq!(
+            value,
+            want.len() as u64,
+            "a filtered count must equal the filter applied to the whole key"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // And paged, at several page sizes, because the page boundary is where a
+    // resumed evaluation can lose or repeat an ordinal.
+    for page in [1u32, 2, 7, 999, 4096] {
+        let mut got: Vec<u64> = Vec::new();
+        let mut after: Option<u64> = None;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 20_000, "paging did not terminate at page {page}");
+            match s.handle(Frame::SnapshotEvalLoad {
+                snapshot,
+                expr: expr.clone(),
+                after: after.unwrap_or(0),
+                has_after: u8::from(after.is_some()),
+                limit: page,
+            }) {
+                Frame::Ordinals { values, more } => {
+                    assert!(
+                        values.len() <= page as usize,
+                        "a page returned more than asked"
+                    );
+                    after = values.last().copied();
+                    got.extend(&values);
+                    if more == 0 {
+                        break;
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(got, want, "paged at {page}, the filtered set must be exact");
+    }
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// Bytes that are not an expression are the peer's fault, and are named as such.
+///
+/// `InvalidArgument` rather than `Internal`: what an operator needs to know from
+/// this is whether to look at their client or at the server.
+#[test]
+fn bytes_that_are_not_an_expression_are_refused_as_invalid_argument() {
+    let (_c, _h, mut s) = setup("eval-bad");
+    greet(&mut s);
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    for bad in [vec![], vec![0xff; 3], b"YSNX not really".to_vec()] {
+        assert_eq!(
+            fault_status(&s.handle(Frame::SnapshotEvalCardinality {
+                snapshot,
+                expr: bad.clone(),
+            })),
+            Status::InvalidArgument as u32,
+            "{bad:?} is not an expression"
+        );
+        assert_eq!(
+            fault_status(&s.handle(Frame::SnapshotEvalLoad {
+                snapshot,
+                expr: bad.clone(),
+                after: 0,
+                has_after: 0,
+                limit: 16,
+            })),
+            Status::InvalidArgument as u32,
+        );
+    }
+    s.handle(Frame::SnapshotClose { snapshot });
+}
+
+/// A server configured to evaluate nothing refuses, having advertised zero.
+///
+/// **The refusal is checked even though the greeting answered it**, and that is
+/// the point of the test rather than an aside: the advertisement has to be the
+/// authority on what the server does. A peer that ignored it must not get the
+/// capability anyway, or an operator who set the limit to zero has no way to
+/// know it took effect.
+#[test]
+fn a_server_that_advertises_no_expressions_refuses_one() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-chan-noeval-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let clean = Clean(dir.clone());
+    let db = Db::open_with(
+        &dir,
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut b = db.batch();
+    b.insert(1, 5);
+    b.commit().unwrap();
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    let l = Limits {
+        max_expr_bytes: 0,
+        ..limits()
+    };
+    let arena = Arena::new(l.arena_bytes()).expect("memfd arena");
+    let mut s = Session::new(host, arena, l);
+    greet(&mut s);
+
+    match s.hello() {
+        Frame::ServerHello { max_expr_bytes, .. } => {
+            assert_eq!(max_expr_bytes, 0, "zero is how the greeting says so")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    // A *valid* expression, so the refusal is about the policy rather than the
+    // bytes. Both frames, because a peer could reach either.
+    let expr = yesno_wire::SetExpr::Key(1).encode();
+    assert_eq!(
+        fault_status(&s.handle(Frame::SnapshotEvalCardinality {
+            snapshot,
+            expr: expr.clone(),
+        })),
+        Status::InvalidArgument as u32,
+    );
+    assert_eq!(
+        fault_status(&s.handle(Frame::SnapshotEvalLoad {
+            snapshot,
+            expr,
+            after: 0,
+            has_after: 0,
+            limit: 16,
+        })),
+        Status::InvalidArgument as u32,
+    );
+    // The key path still works: refusing expressions is not refusing reads.
+    match s.handle(Frame::SnapshotCardinality { snapshot, key: 1 }) {
+        Frame::Count { value } => assert_eq!(value, 1),
+        other => panic!("{other:?}"),
+    }
+    s.handle(Frame::SnapshotClose { snapshot });
+    drop(clean);
+}
+
 /// A page is capped by the server, and `more` reports honestly at the boundary.
 #[test]
 fn a_page_is_capped_and_more_is_honest() {
@@ -1131,6 +1363,7 @@ fn a_wide_block_of_dense_lanes_is_served_in_both_transports() {
         max_blocks: 16,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
 
     // --- inline ---
@@ -1283,6 +1516,7 @@ fn a_persisted_run_with_a_nonzero_start_round_trips_through_both_transports() {
         max_blocks: 1,
         max_snapshots: 64,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
 
     /// Rebuild a lane's ordinals from `[ start, end ]` pairs, the way a peer must.
@@ -1434,6 +1668,7 @@ fn a_session_may_not_open_snapshots_without_bound() {
         max_blocks: 1,
         max_snapshots: 3,
         max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
     };
     let mut s = Session::new_inline(host, l);
     greet(&mut s);

@@ -140,8 +140,15 @@ fn engine_status(e: CodecError) -> Status {
 }
 
 pub mod client;
+/// Executing a wire expression against a snapshot, re-exported from `yesno-eval`.
+///
+/// It was a module of this crate until 2026-10-09 and moved out so that
+/// `yesno-plugin` -- whose `cdylib` C links -- can evaluate a pushed-down
+/// filter without tonic and arrow coming with it. Re-exported under the name it
+/// always had, so `yesno_flight::expr::lower` and every test that calls it are
+/// unchanged.
 #[cfg(feature = "server")]
-pub mod expr;
+pub use yesno_eval as expr;
 pub mod ticket;
 
 /// What a `FlightDescriptor` resolves to.

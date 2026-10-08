@@ -49,6 +49,39 @@ SELECT ( SELECT count(*) FROM ( SELECT * FROM flight EXCEPT SELECT * FROM channe
      + ( SELECT count(*) FROM ( SELECT * FROM channel EXCEPT SELECT * FROM flight ) b )
        AS disagreements;
 
+-- ── A pushed-down filter reaches both, and they still agree ─────────────────
+-- Until 2026-10-09 the planner refused to lower a qual for a channel server,
+-- because the channel served keys and evaluated no expressions. Both halves of
+-- closing that are asserted here.
+--
+-- First the plan. A `yesno:` line is the expression actually sent; a `Filter:`
+-- line in its place would mean PostgreSQL is doing the work and the pushdown
+-- never happened, which no count below could distinguish from a pushdown that
+-- worked.
+EXPLAIN ( COSTS OFF ) SELECT ordinal FROM c42 WHERE ordinal = 21;
+
+-- Then the answers, over a window with both ends inside the key so neither
+-- bound is a no-op.
+SELECT count(*) AS channel_window FROM c42 WHERE ordinal >= 21 AND ordinal < 50;
+SELECT count(*) AS window_disagreements FROM (
+      ( SELECT ordinal FROM f42 WHERE ordinal >= 21 AND ordinal < 50
+        EXCEPT SELECT ordinal FROM c42 WHERE ordinal >= 21 AND ordinal < 50 )
+UNION ALL ( SELECT ordinal FROM c42 WHERE ordinal >= 21 AND ordinal < 50
+        EXCEPT SELECT ordinal FROM f42 WHERE ordinal >= 21 AND ordinal < 50 )
+) d;
+
+-- Key 7 again, where a pushed-down bound has to survive the `bigint` sign
+-- reinterpretation: three of its four ordinals arrive negative, so `< 0` selects
+-- exactly those three. An expression that lost the mapping would select none of
+-- them, and would look like an empty result rather than a wrong one.
+SELECT count(*) AS channel_negative FROM c7 WHERE ordinal < 0;
+SELECT count(*) AS negative_disagreements FROM (
+      ( SELECT ordinal FROM f7 WHERE ordinal < 0
+        EXCEPT SELECT ordinal FROM c7 WHERE ordinal < 0 )
+UNION ALL ( SELECT ordinal FROM c7 WHERE ordinal < 0
+        EXCEPT SELECT ordinal FROM f7 WHERE ordinal < 0 )
+) d;
+
 -- Dropped explicitly rather than with CASCADE: the notice CASCADE emits lists
 -- every dependent object, and its wording and order are not this fixture's to
 -- assert. Naming them keeps the oracle about the comparison above.

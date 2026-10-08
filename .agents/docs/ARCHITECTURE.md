@@ -188,6 +188,15 @@ yesno/
                                 #   resolve third-party crates through different Bazel hubs.
                                 #   The interface between them is bytes, so two copies of
                                 #   the code are harmless and two *implementations* are not.
+  yesno-eval/                   # runs a yesno-wire SetExpr against a yesno-core Snapshot.
+                                #   Was yesno-flight/src/expr.rs until 2026-10-09, where it
+                                #   had zero crate:: references for its whole life; split out
+                                #   when the plugin channel learned to evaluate a pushed-down
+                                #   filter, because yesno-plugin's cdylib is linked by C and
+                                #   reaching it through yesno-flight would have dragged tonic,
+                                #   prost and arrow in. Re-exported as yesno_flight::expr, so
+                                #   one evaluator answers a filter on both transports -- which
+                                #   is the correctness claim, not a convenience.
   yesno-flight/                 # Arrow Flight for query results and DoPut ingest
   yesno-flight-c++/             # synchronous native Arrow C++ client; Bazel pins Arrow
   yesno-flight-go/              # Go 1.25 native Arrow Flight client; standalone module

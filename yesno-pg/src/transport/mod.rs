@@ -9,10 +9,14 @@
 //! must hold the directory lock while PostgreSQL forks a backend per
 //! connection. [`channel::ChannelTransport`] does not solve that, it sidesteps
 //! it -- `yesnod` owns the directory and every backend is a peer on a socket --
-//! and it needs no multi-process reader in the engine. It costs filter
-//! pushdown, because the channel serves keys rather than `yesno-wire`
-//! expressions; the planner declines to lower quals for a channel server rather
-//! than emitting a plan the transport cannot execute.
+//! and it needs no multi-process reader in the engine.
+//!
+//! It cost filter pushdown until 2026-10-09, because the channel served keys
+//! rather than `yesno-wire` expressions. It no longer does: the protocol carries
+//! an encoded expression and the host evaluates it with `yesno-eval`, **the same
+//! crate behind the Flight surface**. The two transports therefore answer a
+//! lowered qual identically by construction rather than by agreement, which is
+//! the property that lets this trait hide which one a deployment chose.
 //!
 //! # Why `Local` is absent
 //!
@@ -104,11 +108,19 @@ pub trait Transport {
     ///
     /// The default asks for the cardinality of `Key( key ) AND [ordinal,
     /// ordinal + 1 )`, which is how the table AM wrote it when Flight was the
-    /// only transport. **A transport that evaluates no expressions must
-    /// override this**, and that is the whole reason it is a trait method
-    /// rather than an expression built at the call site: built there, a
-    /// channel server answered "absent" for every live row, because `key_of`
-    /// rejected the descriptor and the caller read the failure as a miss.
+    /// only transport.
+    ///
+    /// **It is a trait method because that spelling was once a wrong answer.**
+    /// Built at the call site, it reached a channel transport that evaluated no
+    /// expressions, which rejected the descriptor correctly -- and the caller
+    /// read the rejection as "absent", so every live row vanished through a TID
+    /// fetch. The channel evaluates expressions now, so the default would work
+    /// there; it still overrides, because the protocol has a membership frame
+    /// and running a one-ordinal probe through the evaluator would materialize a
+    /// set to look at one element of it.
+    ///
+    /// A transport that cannot serve the default must override it. One that can
+    /// should still override when it has something cheaper.
     fn contains(&mut self, key: u64, ordinal: u64) -> Result<bool, TransportError> {
         let expr = yesno_wire::SetExpr::And(vec![
             yesno_wire::SetExpr::Key(key),
