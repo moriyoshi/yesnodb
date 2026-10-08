@@ -309,6 +309,7 @@ client_gate uv yesno-flight-python/gate.sh "python client"
 client_gate go yesno-flight-go/gate.sh "go client"
 client_gate javac yesno-flight-java/gate.sh "java client"
 client_gate cc yesno-c/gate.sh "c abi"
+client_gate cc yesno-channel-c/gate.sh "channel c abi"
 
 step "ARCHITECTURE.md layout matches the tree"
 # Cheap, and it catches a class review cannot: a diagram that is 90% right reads

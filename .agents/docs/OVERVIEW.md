@@ -27,6 +27,7 @@ which is why the server mirrors the struct instead of deriving on it.
 | `yesno-operator` | Kubernetes controller for retained-storage clusters, failover, and same-Pod plugin peers |
 | `yesno-e2e` | the scenario harness; Python driven by `monty` |
 | `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.98 floor |
+| `yesno-channel-c` | the C ABI for the **plugin channel client**, a separate cargo workspace. Distinct from `yesno-c` because that one embeds a database and takes its exclusive lock, while this connects to a running `yesnod` and hands C a *borrowed* pointer into the shared arena -- one library cannot keep both contracts |
 | `yesno-mysql` | the embedded or remote MySQL 8.4 storage engine. Built and tested with pinned MySQL and Arrow source by Bazel |
 | `yesno-pg` | the PostgreSQL extension. Outside the cargo workspace, built by Bazel |
 | `yesno-flight-python/` | the pure-Python `yesnodb` Arrow Flight client |
