@@ -56,7 +56,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use pgrx::prelude::*;
 
 use super::scan::options_for_pub;
-use crate::options::Transport as TransportKind;
 use crate::transport::flight::FlightTransport;
 use crate::transport::Transport;
 
@@ -475,11 +474,8 @@ unsafe fn buffer_row(
         Ok(v) => v,
         Err(e) => error!("yesno_fdw: {e}"),
     };
-    let endpoint = match &server.transport {
-        TransportKind::Flight { endpoint } => endpoint.clone(),
-        TransportKind::Local { .. } => error!(
-            "yesno_fdw: the \"data_dir\" transport cannot write; it is not available at all yet"
-        ),
+    let Some(endpoint) = server.transport.buffer_key().map(str::to_owned) else {
+        error!("yesno_fdw: the \"data_dir\" transport cannot write; it is not available at all yet")
     };
 
     let Some(attno) = (unsafe { super::scan::ordinal_attno_pub(relid) }) else {

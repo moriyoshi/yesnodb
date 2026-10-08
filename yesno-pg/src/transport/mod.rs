@@ -1,7 +1,18 @@
 //! How the extension reaches yesno.
 //!
 //! One trait, so the scan callbacks never learn which deployment they are in.
-//! Two implementations were planned; only one exists.
+//! Two exist: Flight over gRPC, and the plugin channel over a Unix socket.
+//!
+//! # The channel is what `Local` was reaching for
+//!
+//! The note below explains why an in-process transport cannot work: one process
+//! must hold the directory lock while PostgreSQL forks a backend per
+//! connection. [`channel::ChannelTransport`] does not solve that, it sidesteps
+//! it -- `yesnod` owns the directory and every backend is a peer on a socket --
+//! and it needs no multi-process reader in the engine. It costs filter
+//! pushdown, because the channel serves keys rather than `yesno-wire`
+//! expressions; the planner declines to lower quals for a channel server rather
+//! than emitting a plan the transport cannot execute.
 //!
 //! # Why `Local` is absent
 //!
@@ -18,6 +29,7 @@
 //! `Db::open`. It works for exactly one backend and then fails in a way that
 //! looks like a locking bug rather than a design gap.
 
+pub mod channel;
 pub mod flight;
 
 /// A batch of ordinals, already mapped to the `bigint` PostgreSQL will see.

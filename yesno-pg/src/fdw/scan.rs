@@ -23,6 +23,7 @@ use crate::fdw::qual::{lower_all, Clause};
 use crate::fdw::relation_options;
 use crate::fdw::walk::walk;
 use crate::options::{ServerOptions, TableOptions, Transport as TransportKind};
+use crate::transport::channel::ChannelTransport;
 use crate::transport::flight::FlightTransport;
 use crate::transport::{OrdinalBatch, Transport};
 
@@ -76,11 +77,18 @@ unsafe fn options_for(relid: pg_sys::Oid) -> Result<(ServerOptions, TableOptions
 }
 
 /// Build a transport from parsed server options.
-fn connect(server: &ServerOptions) -> Result<FlightTransport, String> {
+/// Boxed rather than concrete, because there are two implementations now.
+///
+/// The callbacks only ever use the trait, so this costs one indirection per
+/// call on a path that already does a round trip.
+fn connect(server: &ServerOptions) -> Result<Box<dyn Transport>, String> {
     match &server.transport {
-        TransportKind::Flight { endpoint } => {
-            FlightTransport::new(endpoint).map_err(|e| e.to_string())
-        }
+        TransportKind::Flight { endpoint } => FlightTransport::new(endpoint)
+            .map(|t| Box::new(t) as Box<dyn Transport>)
+            .map_err(|e| e.to_string()),
+        TransportKind::Channel { socket } => ChannelTransport::new(socket, server.batch_rows)
+            .map(|t| Box::new(t) as Box<dyn Transport>)
+            .map_err(|e| e.to_string()),
         // Not "unimplemented" in the sense of work that only needs writing.
         // `Db::open` takes an exclusive `flock` and PostgreSQL forks a backend
         // per connection, so this needs a multi-process reader in `yesno-core`
@@ -96,7 +104,7 @@ fn connect(server: &ServerOptions) -> Result<FlightTransport, String> {
 
 /// [`connect`], for the `IMPORT FOREIGN SCHEMA` path, which has a server but no
 /// table to derive one from.
-pub fn connect_pub(server: &ServerOptions) -> Result<FlightTransport, String> {
+pub fn connect_pub(server: &ServerOptions) -> Result<Box<dyn Transport>, String> {
     connect(server)
 }
 
@@ -294,7 +302,17 @@ unsafe fn plan_pushdown(
     varno: i32,
     quals: &[*mut pg_sys::Node],
 ) -> Option<(SetExpr, Vec<bool>)> {
-    let (_, table) = unsafe { options_for(relid) }.ok()?;
+    let (server, table) = unsafe { options_for(relid) }.ok()?;
+    // **No pushdown for a channel server.** A lowered qual becomes an encoded
+    // `yesno-wire` expression in the descriptor, and the channel serves keys
+    // only -- it evaluates nothing. Declining here means PostgreSQL applies the
+    // filter itself and the query is merely slower; pushing down anyway would
+    // produce a plan that fails at execution, turning a deployment choice into
+    // a broken query. Refusing to generate what the transport cannot serve is
+    // the whole of the fix.
+    if matches!(server.transport, TransportKind::Channel { .. }) {
+        return None;
+    }
     let attno = unsafe { ordinal_attno(relid) }?;
     let clauses: Vec<Clause> = quals
         .iter()
@@ -666,7 +684,7 @@ unsafe fn list_nodes(list: *mut pg_sys::List) -> Vec<*mut pg_sys::Node> {
 /// Holds the transport ( which owns a tokio runtime ) and the batch currently
 /// being handed out one ordinal at a time.
 struct ScanState {
-    transport: FlightTransport,
+    transport: Box<dyn Transport>,
     /// The Flight descriptor payload: a bare key, or the pushed-down expression.
     cmd: Vec<u8>,
     batch: OrdinalBatch,
@@ -1079,7 +1097,11 @@ fn pending_overlay(
     let empty = (BTreeSet::new(), BTreeSet::new());
 
     let _ = mode;
-    let TransportKind::Flight { endpoint } = &server.transport else {
+    // Keyed by the same identity the write path buffers under -- the endpoint
+    // for Flight, the socket for a channel. Gating this on Flight alone, as it
+    // used to, would have made a channel server's uncommitted writes invisible
+    // to a later scan in the same transaction.
+    let Some(endpoint) = server.transport.buffer_key() else {
         return empty;
     };
 

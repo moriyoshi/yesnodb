@@ -69,8 +69,49 @@ impl fmt::Display for OptionError {
 /// `multiprocess-read-only-reader` in `TODO.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    Flight { endpoint: String },
-    Local { data_dir: String },
+    Flight {
+        endpoint: String,
+    },
+    /// A `yesnod` plugin channel on a Unix socket.
+    ///
+    /// **This is the answer to `Local`'s problem rather than another spelling
+    /// of it.** The reason an in-process transport cannot work is that one
+    /// process must hold the directory lock while PostgreSQL forks a backend
+    /// per connection; a socket inverts that -- one owner, N connections --
+    /// without needing a multi-process reader in the engine.
+    ///
+    /// It costs filter pushdown. The channel serves keys, not `yesno-wire`
+    /// expressions, so the planner does not lower quals for a channel server
+    /// and PostgreSQL applies every filter itself. That is a refusal to
+    /// generate what the transport cannot serve, not a silent fallback.
+    Channel {
+        socket: String,
+    },
+    Local {
+        data_dir: String,
+    },
+}
+
+impl Transport {
+    /// A stable per-server identity, for keying this backend's pending writes.
+    ///
+    /// The buffer that makes `INSERT` visible to a later `SELECT` in the same
+    /// transaction is keyed by `( server, key )`, and "server" was the Flight
+    /// endpoint string because Flight was the only transport. A channel server
+    /// has no endpoint, so without this the buffer would be keyed by nothing
+    /// and **uncommitted writes would be invisible to a scan** -- a wrong
+    /// answer, not a missing feature.
+    ///
+    /// The write path and the scan overlay must agree on it, which is why it
+    /// lives here rather than being derived at each of the two call sites.
+    pub fn buffer_key(&self) -> Option<&str> {
+        match self {
+            Transport::Flight { endpoint } => Some(endpoint),
+            Transport::Channel { socket } => Some(socket),
+            // Not reachable: this transport refuses to connect at all.
+            Transport::Local { .. } => None,
+        }
+    }
 }
 
 /// Where a term's `u64` key comes from.
@@ -96,6 +137,7 @@ pub struct ServerOptions {
 impl ServerOptions {
     pub fn parse(opts: &[(String, String)]) -> Result<Self, OptionError> {
         let mut endpoint = None;
+        let mut socket = None;
         let mut data_dir = None;
         let mut dictionary = None;
         let mut term_column = None;
@@ -105,6 +147,7 @@ impl ServerOptions {
         for (name, value) in opts {
             match name.as_str() {
                 "endpoint" => endpoint = Some(value.clone()),
+                "socket" => socket = Some(value.clone()),
                 "data_dir" => data_dir = Some(value.clone()),
                 "dictionary" => dictionary = Some(value.clone()),
                 "term_column" => term_column = Some(value.clone()),
@@ -130,21 +173,31 @@ impl ServerOptions {
             }
         }
 
-        let transport = match (endpoint, data_dir) {
-            (Some(_), Some(_)) => {
-                return Err(OptionError::Conflict(
-                    "options \"endpoint\" and \"data_dir\" are mutually exclusive: \
-                     one names a yesnod to connect to, the other a database directory \
-                     to open in-process",
-                ))
-            }
-            (Some(e), None) => Transport::Flight { endpoint: e },
-            (None, Some(d)) => Transport::Local { data_dir: d },
-            (None, None) => {
-                return Err(OptionError::Missing(
-                    "one of \"endpoint\" or \"data_dir\" is required",
-                ))
-            }
+        // Counted rather than enumerated: three options make six pairwise
+        // conflicts, and a match over tuples would grow quadratically while
+        // saying the same thing.
+        let named = [endpoint.is_some(), socket.is_some(), data_dir.is_some()]
+            .into_iter()
+            .filter(|named| *named)
+            .count();
+        if named > 1 {
+            return Err(OptionError::Conflict(
+                "options \"endpoint\", \"socket\" and \"data_dir\" are mutually \
+                 exclusive: they are three different deployments, not three \
+                 spellings of one -- a yesnod over gRPC, a yesnod over a Unix \
+                 socket, or a database directory opened in-process",
+            ));
+        }
+        let transport = if let Some(e) = endpoint {
+            Transport::Flight { endpoint: e }
+        } else if let Some(s) = socket {
+            Transport::Channel { socket: s }
+        } else if let Some(d) = data_dir {
+            Transport::Local { data_dir: d }
+        } else {
+            return Err(OptionError::Missing(
+                "one of \"endpoint\", \"socket\" or \"data_dir\" is required",
+            ));
         };
 
         // `term_column` and `key_column` describe the dictionary, so naming

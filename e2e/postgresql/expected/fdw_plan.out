@@ -10,11 +10,11 @@ CREATE EXTENSION yesno_pg;
 -- turn a typo into a silent default taking effect on the first query.
 -- A server with no transport at all.
 CREATE SERVER bad_none FOREIGN DATA WRAPPER yesno_fdw;
-psql:e2e/postgresql/sql/fdw_plan.sql:15: ERROR:  one of "endpoint" or "data_dir" is required
+psql:e2e/postgresql/sql/fdw_plan.sql:15: ERROR:  one of "endpoint", "socket" or "data_dir" is required
 -- Both transports at once: they are different deployments, not two spellings.
 CREATE SERVER bad_both FOREIGN DATA WRAPPER yesno_fdw
     OPTIONS ( endpoint 'grpc://127.0.0.1:0', data_dir '/var/lib/yesno' );
-psql:e2e/postgresql/sql/fdw_plan.sql:19: ERROR:  options "endpoint" and "data_dir" are mutually exclusive: one names a yesnod to connect to, the other a database directory to open in-process
+psql:e2e/postgresql/sql/fdw_plan.sql:19: ERROR:  options "endpoint", "socket" and "data_dir" are mutually exclusive: they are three different deployments, not three spellings of one -- a yesnod over gRPC, a yesnod over a Unix socket, or a database directory opened in-process
 -- A misspelled option name.
 CREATE SERVER bad_typo FOREIGN DATA WRAPPER yesno_fdw
     OPTIONS ( endpiont 'grpc://127.0.0.1:0' );

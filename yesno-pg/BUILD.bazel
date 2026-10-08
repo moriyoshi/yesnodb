@@ -44,7 +44,11 @@ rust_shared_library(
     crate_name = "yesno_pg",
     edition = "2021",
     version = "0.1.0",
-    deps = _PG_DEPS + ["//yesno-flight:yesno_flight_client_pg", "//yesno-wire:yesno_wire"],
+    deps = _PG_DEPS + [
+        "//yesno-channel:yesno_channel",
+        "//yesno-flight:yesno_flight_client_pg",
+        "//yesno-wire:yesno_wire",
+    ],
 )
 
 rust_test(
@@ -54,5 +58,9 @@ rust_test(
     # These are the crate plain `#[test]`s: pure functions only. Anything
     # that needs a backend belongs in `//e2e/postgresql:regress`, because
     # `#[pg_test]` needs the machine-local state this build exists to eliminate.
-    deps = _PG_DEPS + ["//yesno-flight:yesno_flight_client_pg", "//yesno-wire:yesno_wire"],
+    deps = _PG_DEPS + [
+        "//yesno-channel:yesno_channel",
+        "//yesno-flight:yesno_flight_client_pg",
+        "//yesno-wire:yesno_wire",
+    ],
 )

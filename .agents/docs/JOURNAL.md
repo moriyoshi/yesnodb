@@ -3832,3 +3832,62 @@ before writing any of it: `cmd` may be an encoded `yesno-wire` expression and th
 has no expression evaluation, so the planner must not lower quals for a channel server; and
 the index and table AMs are configured by a `yesno_pg.endpoint` GUC rather than by server
 options, so they are a separate change.
+
+## 2026-10-08 -- `Transport::Channel` for PostgreSQL, and the correctness bug the gate caught
+
+The PostgreSQL half of the peer-socket work. `gate-pg` passes, which is the only way to know:
+`yesno-pg` cannot be compiled locally at all -- pgrx wants `$PGRX_HOME` and `cargo pgrx init`
+is forbidden -- so every iteration costs a gate run and the change was written in one pass.
+
+### What it is for
+
+`Transport::Local` is declared and unimplemented because `Db::open` takes a non-blocking
+exclusive `flock` while PostgreSQL forks a backend per connection, so N backends means N-1
+failures. The channel does not work around that; **it makes it moot** -- one process owns the
+directory and every backend is a peer on a socket -- and it needs no multi-process reader in
+the engine. The module header had described a second implementation as planned since the
+first was written.
+
+### The thing I nearly shipped wrong
+
+The pending-write buffer -- what makes an `INSERT` visible to a later `SELECT` in the same
+transaction -- is keyed by `( server, key )`, and "server" was the **Flight endpoint
+string**, because Flight was the only transport. `pending_overlay` opened with
+`let TransportKind::Flight { endpoint } = ... else { return empty }`.
+
+Left alone, a channel server would have taken that early return and **uncommitted writes
+would have been invisible to its own scans**. Not a missing feature: a wrong answer, and one
+that only shows up in a transaction that writes and then reads. `Transport::buffer_key()`
+now derives the identity from the transport -- the endpoint for Flight, the socket for a
+channel -- and both the write path and the scan overlay use it, which is why it lives on the
+enum rather than being re-derived at the two call sites that have to agree.
+
+Worth noting how it was found: not by testing, but by grepping every match on the enum
+before paying for a gate run, because adding a variant breaks exhaustive matches and I wanted
+the list. The `let ... else` was not an exhaustive match and would have compiled silently.
+**Adding an enum variant makes the compiler find your `match` arms and say nothing about
+your `if let`s.**
+
+### Pushdown is refused rather than attempted
+
+A `cmd` is a bare key or an encoded `yesno-wire` expression, and the channel evaluates
+nothing. So `plan_pushdown` returns `None` for a channel server and PostgreSQL filters for
+itself. The query is slower; it is not broken. Pushing down anyway would turn a deployment
+choice into a failing query, which is strictly worse than a slower one -- and `key_of` still
+rejects a non-key descriptor at the boundary rather than trusting the gate, because a
+planner change elsewhere must not become a wrong answer here.
+
+### The oracle changed for a real reason
+
+`e2e/postgresql/expected/fdw_plan.out` asserts option errors byte-exactly, and two lines
+moved: the "one of ... is required" list and the mutual-exclusion message, both because there
+is a third transport now. `AGENTS.md` requires reading and explaining such a diff rather
+than regenerating it, and that is the whole diff -- two messages that correctly name one
+more option. No plan line and no row changed.
+
+Four limits are recorded in `TODO.md` as
+`the-pg-channel-transport-has-four-stated-limits` rather than left to be discovered: no
+pushdown, a ticket that cannot outlive its transport instance, write batches refused above
+`max_writes` instead of split, and the index and table AMs still Flight-only because they are
+GUC-configured. Also recorded: no fixture creates a channel server yet, which is the same
+gap the MySQL channel leg had until it was closed.
