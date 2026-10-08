@@ -551,12 +551,13 @@ pub unsafe extern "C-unwind" fn relation_nontransactional_truncate(rel: pg_sys::
 ///
 /// `rel` must be a valid `Relation`.
 unsafe fn clear_relation(rel: pg_sys::Relation) {
-    let Some((endpoint, key)) = (unsafe { index_target_for_table(rel) }) else {
+    let Some((_identity, key)) = (unsafe { index_target_for_table(rel) }) else {
         return;
     };
-    // Read then remove, rather than a "delete key" call: the Flight surface
-    // exposes `do_put` in remove mode and nothing that drops a whole key.
-    let mut transport = match crate::transport::flight::FlightTransport::new(&endpoint) {
+    // Read then remove, rather than a "delete key" call: neither transport
+    // offers one -- the Flight surface exposes `do_put` in remove mode and the
+    // channel's `Apply` carries ranges, and neither drops a whole key.
+    let mut transport = match unsafe { open_transport_for_table(rel) } {
         Ok(t) => t,
         Err(e) => error!("yesno_tam: {e}"),
     };
@@ -933,11 +934,11 @@ unsafe fn fetch_tid_into(
         unsafe { clear(slot) };
         return false;
     };
-    let expr = yesno_wire::SetExpr::And(vec![
-        yesno_wire::SetExpr::Key(key),
-        yesno_wire::SetExpr::Range(o, o + 1),
-    ]);
-    let present = transport.cardinality(&expr.encode()).unwrap_or(0) > 0;
+    // `Transport::contains` rather than an `And( Key, Range )` built here: the
+    // plugin channel evaluates no expressions, so the descriptor this used to
+    // encode was rejected at the transport boundary and the `unwrap_or` read
+    // the rejection as "deleted" -- every live row, on a channel deployment.
+    let present = transport.contains(key, o).unwrap_or(false);
     if present {
         unsafe { store_ordinal(slot, o) };
     } else {

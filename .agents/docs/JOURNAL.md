@@ -3944,3 +3944,101 @@ all.
   which way it is expressed.
 * **Pair an agreement check with a liveness check.** Any comparison that can pass on two
   empty inputs needs a second assertion that the inputs were not empty.
+
+## 2026-10-08 -- `yesno_pg.channel_socket`, and two bugs the GUC exposed
+
+Closing the fourth stated limit of `Transport::Channel` -- the index and table access
+methods were configured by `yesno_pg.endpoint` and so were Flight-only -- meant adding a
+second GUC. Adding it uncovered two correctness bugs that had shipped with the transport
+and that no fixture could have caught, because both are on the **write** and **fetch**
+paths and `fdw_transport_fidelity.sql` only reads.
+
+### `the-pg-buffer-identity-did-not-name-its-transport`
+
+A transaction's writes buffer under `( server, key )`, and `Transport::buffer_key` was
+widened on 2026-10-08 to return the socket for a channel server so that the scan overlay
+would find them. That fixed the read. It did not fix the **flush**: `fdw::modify::flush`
+runs at pre-commit, by which time the server options are long out of scope, and it had
+nothing but that string -- which it handed to `FlightTransport::new` unconditionally. So a
+channel-backed foreign table buffered happily and then failed at `COMMIT`, dialing a Unix
+socket path as a gRPC endpoint.
+
+The fix is not to sniff the string. A `grpc://` prefix or a leading slash is a guess, and a
+guess at commit time is a wrong answer waiting for the first endpoint that does not look
+like one. `buffer_key` now emits a **tagged** identity ( `flight:` / `channel:` ) and
+`Transport::from_buffer_key` decodes it, so the flush reopens the transport the writes were
+buffered for. Four unit tests cover the round trip, including a socket path spelled
+`grpc://not-a-host` and an endpoint spelled like a path -- each of which defeats a sniff and
+neither of which the tag notices.
+
+### `a-tid-fetch-was-an-expression-the-channel-could-not-evaluate`
+
+`tam::exec::fetch_tid_into` checks that the ordinal a TID names is still present, rather
+than synthesising the row from the TID, so that an index's stale TID does not resurrect a
+deleted row. It did that by encoding `And( Key( k ), Range( o, o + 1 ) )` and asking for its
+cardinality -- and the channel evaluates no `yesno-wire` expressions. `key_of` rejected the
+descriptor, correctly and loudly, and the caller's `.unwrap_or( 0 ) > 0` read the rejection
+as **absent**. Every live row would have vanished through that path on a channel
+deployment.
+
+So the probe became a trait method. `Transport::contains( key, ordinal )` defaults to the
+expression -- which is what Flight wants and what the call site used to build -- and
+`ChannelTransport` overrides it with `load( key, ordinal - 1, 1 )`, since `load` resumes
+strictly above `after` and the first ordinal at or above `o` is `o` exactly when `o` is a
+member. **That is the general lesson: a capability a transport lacks belongs behind a
+method it can override, not in an expression a call site builds for it.** Built at the call
+site, the gap became a wrong answer; behind the method, it is a different implementation.
+
+### Ambiguity must not read as empty
+
+`configured_transport` first returned `Result<Transport, _>`, with "neither GUC set" and
+"both GUCs set" as the same `Err`. `index_target_for_table` converts that to `Option`, and
+every caller reads `None` as *no server configured* and answers an empty set -- so a cluster
+with both GUCs set would have reported an empty table rather than a misconfiguration. It
+now returns `Result<Option<Transport>>`: `Ok( None )` is unset, `Err` is ambiguous, and the
+ambiguous case is `error!`ed where the identity is derived. Both set is reported rather than
+resolved by precedence, because a precedence would let a stale `yesno_pg.endpoint` win over
+the socket an operator had just configured and the failure would look like the socket being
+ignored.
+
+### What was consolidated
+
+Four construction sites wanted a transport -- the FDW from server options, the index AM and
+the table AM from GUCs, and the flush from a buffer key -- and three of them had their own
+`match` over the three variants. `transport::open( kind, batch_rows )` is now the only one,
+so a fourth variant cannot be something three call sites quietly fail to handle.
+`open_transport_for_index` and `open_transport_for_table` return `Box<dyn Transport>` and no
+longer read their relation argument; the argument stays because the server is a per-relation
+fact that a reloption would make per-relation for real, and dropping it would have to be put
+back by every caller on the day that changes.
+
+### Coverage
+
+`e2e/postgresql/sql/tam_channel.sql` runs the table access method over the channel: a write
+that must survive its own commit ( the flush ), a transaction reading its own writes ( the
+overlay ), a `ROLLBACK`, a fetch by TID with the **plan asserted** -- a Seq Scan filtering on
+`ctid` would return the same rows without ever fetching one by TID, so `Tid Scan` in the
+expected output is load-bearing -- and both GUCs set, which must be an error and not an
+empty table. Its TIDs are predicted rather than discovered: ordinal `o` sits at block
+`o / 1024`, offset `o % 1024 + 1`, so ordinal 3 is `( 0, 4 )`.
+
+### Carry away
+
+* **A string that will be used to reconnect must name what it connects to.** The identity
+  was correct for keying and useless for reopening, and nothing distinguished the two uses
+  until the second one existed.
+* **`.unwrap_or( default )` on a transport call converts a refusal into data.** Here the
+  refusal was a *correct* rejection by a boundary check, which is the worst case: the
+  defensive check worked and the caller discarded it.
+* **A read-only fidelity fixture certifies reads.** The channel transport's fixture compared
+  two transports over seeded data and passed, while neither the write path nor the TID fetch
+  had ever run against a channel.
+* **"The plan is part of the assertion" is only true if the plan is pinned.** The first run
+  of `tam_channel.sql` came back `Seq Scan on sc` with `Filter: ( ctid = '(0,4)'::tid )`:
+  the table is one page, so a Seq Scan costs less than a Tid Scan and the planner took it.
+  Both ctid queries returned the right answers through the ordinary scan, so the fixture
+  would have passed while the TID path it exists to exercise never ran. `enable_seqscan =
+  off` around those three statements is what makes it real -- and the `EXPLAIN` beside them
+  is what turned a silent miss into a one-line diff. Everything else in the file matched the
+  prediction byte for byte on that first run, the error line and the `DROP ... CASCADE`
+  notice included.

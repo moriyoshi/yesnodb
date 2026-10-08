@@ -7581,6 +7581,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yesno-channel"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "libc",
+ "memmap2",
+]
+
+[[package]]
 name = "yesno-core"
 version = "0.1.0"
 dependencies = [
@@ -7639,6 +7648,7 @@ dependencies = [
  "yesno-core",
  "yesno-datafusion",
  "yesno-flight",
+ "yesno-plugin",
  "yesno-server",
  "yesno-server-utils",
 ]
@@ -7702,6 +7712,7 @@ dependencies = [
  "bytemuck",
  "libc",
  "memmap2",
+ "yesno-channel",
  "yesno-core",
 ]
 

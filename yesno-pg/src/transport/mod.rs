@@ -96,12 +96,66 @@ pub trait Transport {
     /// both.
     fn apply(&mut self, ops: &[(u64, u64, bool)]) -> Result<u64, TransportError>;
 
+    /// Whether one ordinal is in one key.
+    ///
+    /// A membership probe rather than a scan, because the table AM asks it per
+    /// TID an index handed back: such a TID may name a row that has since been
+    /// deleted, and synthesising the row from the TID alone would resurrect it.
+    ///
+    /// The default asks for the cardinality of `Key( key ) AND [ordinal,
+    /// ordinal + 1 )`, which is how the table AM wrote it when Flight was the
+    /// only transport. **A transport that evaluates no expressions must
+    /// override this**, and that is the whole reason it is a trait method
+    /// rather than an expression built at the call site: built there, a
+    /// channel server answered "absent" for every live row, because `key_of`
+    /// rejected the descriptor and the caller read the failure as a miss.
+    fn contains(&mut self, key: u64, ordinal: u64) -> Result<bool, TransportError> {
+        let expr = yesno_wire::SetExpr::And(vec![
+            yesno_wire::SetExpr::Key(key),
+            // Saturating because `u64::MAX` is reserved and unstorable, so the
+            // empty range it produces is the right answer rather than a wrap.
+            yesno_wire::SetExpr::Range(ordinal, ordinal.saturating_add(1)),
+        ]);
+        Ok(self.cardinality(&expr.encode())? > 0)
+    }
+
     /// Every populated key, ascending.
     ///
     /// Needed by the index AM's `ambulkdelete`, which must visit every key
     /// when VACUUM removes heap tuples — there is no reverse map from an ordinal
     /// to the keys containing it. A key it skips leaves dangling TIDs.
     fn keys(&mut self) -> Result<Vec<u64>, TransportError>;
+}
+
+/// Open whichever transport a parsed [`crate::options::Transport`] names.
+///
+/// One place, because four call sites need one: the FDW from server options,
+/// the index AM and the table AM from GUCs, and the pre-commit flush from a
+/// buffer key. A fifth variant arriving must not be something three of them
+/// can quietly fail to handle.
+pub fn open(
+    kind: &crate::options::Transport,
+    batch_rows: usize,
+) -> Result<Box<dyn Transport>, TransportError> {
+    match kind {
+        crate::options::Transport::Flight { endpoint } => {
+            flight::FlightTransport::new(endpoint).map(|t| Box::new(t) as Box<dyn Transport>)
+        }
+        crate::options::Transport::Channel { socket } => {
+            channel::ChannelTransport::new(socket, batch_rows)
+                .map(|t| Box::new(t) as Box<dyn Transport>)
+        }
+        // Not "unimplemented" in the sense of work that only needs writing.
+        // See this module's header: it needs a multi-process reader in the
+        // engine first.
+        crate::options::Transport::Local { data_dir } => Err(TransportError::Connect {
+            endpoint: data_dir.clone(),
+            why: "the \"data_dir\" transport is not available: it needs a multi-process \
+                  read-only reader in yesno-core, which does not exist yet. Use \
+                  \"endpoint\" or \"socket\" to reach a running yesnod"
+                .into(),
+        }),
+    }
 }
 
 #[derive(Debug)]

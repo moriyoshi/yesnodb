@@ -285,6 +285,20 @@ impl Transport for ChannelTransport {
         self.commit(writes)
     }
 
+    /// Probe one ordinal, because this transport evaluates no expressions.
+    ///
+    /// `load` resumes **strictly above** `after`, so asking from `ordinal - 1`
+    /// returns the first ordinal at or above `ordinal`; it is a member exactly
+    /// when that first one is `ordinal` itself. At zero there is nothing below
+    /// to resume from, which is what `checked_sub` says.
+    fn contains(&mut self, key: u64, ordinal: u64) -> Result<bool, TransportError> {
+        let (page, _more) = self
+            .pin()?
+            .load(key, ordinal.checked_sub(1), 1)
+            .map_err(rpc)?;
+        Ok(page.first() == Some(&ordinal))
+    }
+
     fn keys(&mut self) -> Result<Vec<u64>, TransportError> {
         let limit = self.batch_rows as u32;
         let snapshot = self.pin()?;

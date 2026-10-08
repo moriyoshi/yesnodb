@@ -56,7 +56,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use pgrx::prelude::*;
 
 use super::scan::options_for_pub;
-use crate::transport::flight::FlightTransport;
 use crate::transport::Transport;
 
 /// Pending writes for the current transaction, keyed by yesno key.
@@ -474,7 +473,7 @@ unsafe fn buffer_row(
         Ok(v) => v,
         Err(e) => error!("yesno_fdw: {e}"),
     };
-    let Some(endpoint) = server.transport.buffer_key().map(str::to_owned) else {
+    let Some(endpoint) = server.transport.buffer_key() else {
         error!("yesno_fdw: the \"data_dir\" transport cannot write; it is not available at all yet")
     };
 
@@ -748,6 +747,11 @@ fn flush() {
     // table set spanning two yesnod servers is two commits, because there is
     // no distributed transaction between them and this does not pretend
     // otherwise. The common case is one endpoint.
+    //
+    // The key is the tagged identity `Transport::buffer_key` produced, so the
+    // transport can be reopened from it. Before it was tagged, this path dialed
+    // the string as a Flight endpoint unconditionally, so **a channel server's
+    // transaction failed at pre-commit** rather than committing.
     let mut by_endpoint: BTreeMap<String, Vec<(u64, u64, bool)>> = BTreeMap::new();
     for ((endpoint, key), writes) in work {
         let ops = by_endpoint.entry(endpoint).or_default();
@@ -762,7 +766,14 @@ fn flush() {
         // a WAL or a trace of one. It costs nothing the commit does not
         // already pay: the engine sorts by key anyway.
         ops.sort_unstable();
-        let mut transport = match FlightTransport::new(&endpoint) {
+        let Some(kind) = crate::options::Transport::from_buffer_key(&endpoint) else {
+            error!(
+                "yesno_fdw: cannot tell which transport {endpoint:?} names, so this \
+                    transaction's writes have nowhere to go"
+            );
+        };
+        let mut transport = match crate::transport::open(&kind, crate::options::DEFAULT_BATCH_ROWS)
+        {
             Ok(t) => t,
             Err(e) => error!("yesno_fdw: {e}"),
         };

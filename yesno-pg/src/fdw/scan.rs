@@ -23,7 +23,6 @@ use crate::fdw::qual::{lower_all, Clause};
 use crate::fdw::relation_options;
 use crate::fdw::walk::walk;
 use crate::options::{ServerOptions, TableOptions, Transport as TransportKind};
-use crate::transport::channel::ChannelTransport;
 use crate::transport::flight::FlightTransport;
 use crate::transport::{OrdinalBatch, Transport};
 
@@ -82,24 +81,7 @@ unsafe fn options_for(relid: pg_sys::Oid) -> Result<(ServerOptions, TableOptions
 /// The callbacks only ever use the trait, so this costs one indirection per
 /// call on a path that already does a round trip.
 fn connect(server: &ServerOptions) -> Result<Box<dyn Transport>, String> {
-    match &server.transport {
-        TransportKind::Flight { endpoint } => FlightTransport::new(endpoint)
-            .map(|t| Box::new(t) as Box<dyn Transport>)
-            .map_err(|e| e.to_string()),
-        TransportKind::Channel { socket } => ChannelTransport::new(socket, server.batch_rows)
-            .map(|t| Box::new(t) as Box<dyn Transport>)
-            .map_err(|e| e.to_string()),
-        // Not "unimplemented" in the sense of work that only needs writing.
-        // `Db::open` takes an exclusive `flock` and PostgreSQL forks a backend
-        // per connection, so this needs a multi-process reader in `yesno-core`
-        // first. See `crate::transport`.
-        TransportKind::Local { .. } => Err(
-            "the \"data_dir\" transport is not available: it needs a multi-process \
-             read-only reader in yesno-core, which does not exist yet. Use \
-             \"endpoint\" to reach a running yesnod."
-                .into(),
-        ),
-    }
+    crate::transport::open(&server.transport, server.batch_rows).map_err(|e| e.to_string())
 }
 
 /// [`connect`], for the `IMPORT FOREIGN SCHEMA` path, which has a server but no
@@ -1104,6 +1086,7 @@ fn pending_overlay(
     let Some(endpoint) = server.transport.buffer_key() else {
         return empty;
     };
+    let endpoint = endpoint.as_str();
 
     // A bare 8-byte key, or an encoded expression.
     let (keys, expr) = match yesno_wire::SetExpr::decode(cmd) {

@@ -104,15 +104,50 @@ impl Transport {
     ///
     /// The write path and the scan overlay must agree on it, which is why it
     /// lives here rather than being derived at each of the two call sites.
-    pub fn buffer_key(&self) -> Option<&str> {
+    ///
+    /// # It names its transport, and that is not decoration
+    ///
+    /// The pre-commit flush reopens a connection with **nothing but this
+    /// string**: the buffer outlives the `ModifyTable` node and the server
+    /// options are long out of scope by then. An untagged identity therefore
+    /// has to be guessed at -- a `grpc://` prefix means Flight, a leading
+    /// slash means a socket -- and a guess at commit time is a wrong answer
+    /// waiting for the first endpoint that does not look like one. Tagging it
+    /// here makes [`Transport::from_buffer_key`] a decode rather than a sniff.
+    pub fn buffer_key(&self) -> Option<String> {
         match self {
-            Transport::Flight { endpoint } => Some(endpoint),
-            Transport::Channel { socket } => Some(socket),
+            Transport::Flight { endpoint } => Some(format!("{TAG_FLIGHT}{endpoint}")),
+            Transport::Channel { socket } => Some(format!("{TAG_CHANNEL}{socket}")),
             // Not reachable: this transport refuses to connect at all.
             Transport::Local { .. } => None,
         }
     }
+
+    /// The inverse of [`Transport::buffer_key`].
+    ///
+    /// `None` for a string this did not produce. The caller is the flush, and
+    /// an identity it cannot decode is a bug rather than a configuration
+    /// error, so it reports instead of falling back to a transport of its
+    /// choosing -- committing a transaction to the wrong server is worse than
+    /// refusing to commit it.
+    pub fn from_buffer_key(key: &str) -> Option<Transport> {
+        if let Some(endpoint) = key.strip_prefix(TAG_FLIGHT) {
+            Some(Transport::Flight {
+                endpoint: endpoint.to_owned(),
+            })
+        } else {
+            key.strip_prefix(TAG_CHANNEL)
+                .map(|socket| Transport::Channel {
+                    socket: socket.to_owned(),
+                })
+        }
+    }
 }
+
+/// Buffer-key tags. A colon cannot start a `grpc://` endpoint or an absolute
+/// path, so neither tag can be confused with the identity that follows it.
+const TAG_FLIGHT: &str = "flight:";
+const TAG_CHANNEL: &str = "channel:";
 
 /// Where a term's `u64` key comes from.
 ///
@@ -388,5 +423,67 @@ mod tests {
     fn an_unknown_table_option_is_an_error() {
         let err = TableOptions::parse(&o(&[("key", "1"), ("keyy", "2")])).unwrap_err();
         assert!(matches!(err, OptionError::Unknown { .. }), "{err}");
+    }
+
+    /// The pre-commit flush reopens a connection from a buffer key alone, so a
+    /// key that cannot be decoded back into the transport it came from is a
+    /// transaction with nowhere to commit.
+    #[test]
+    fn a_buffer_key_decodes_back_to_its_own_transport() {
+        for t in [
+            Transport::Flight {
+                endpoint: "grpc://127.0.0.1:50051".into(),
+            },
+            Transport::Channel {
+                socket: "/run/yesno/plugin.sock".into(),
+            },
+            // A socket path that looks like an endpoint, and an endpoint that
+            // looks like a path. Either one defeats a sniff; the tag does not
+            // care what follows it.
+            Transport::Channel {
+                socket: "grpc://not-a-host".into(),
+            },
+            Transport::Flight {
+                endpoint: "/unix/socket/shaped/endpoint".into(),
+            },
+        ] {
+            let key = t.buffer_key().expect("both transports have an identity");
+            assert_eq!(Transport::from_buffer_key(&key), Some(t), "key={key:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_transports_never_share_a_buffer_key() {
+        let flight = Transport::Flight {
+            endpoint: "x".into(),
+        }
+        .buffer_key();
+        let channel = Transport::Channel { socket: "x".into() }.buffer_key();
+        assert_ne!(flight, channel);
+    }
+
+    /// `data_dir` has no identity because it cannot connect, and the write
+    /// path reports rather than buffering under a key no flush could reopen.
+    #[test]
+    fn an_in_process_transport_has_no_buffer_key() {
+        assert_eq!(
+            Transport::Local {
+                data_dir: "/var/lib/yesno".into()
+            }
+            .buffer_key(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_untagged_identity_is_not_decoded() {
+        for bad in [
+            "grpc://127.0.0.1:50051",
+            "/run/yesno/plugin.sock",
+            "",
+            "x:y",
+        ] {
+            assert_eq!(Transport::from_buffer_key(bad), None, "{bad:?}");
+        }
     }
 }
