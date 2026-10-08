@@ -237,6 +237,66 @@ fn a_client_completes_the_handshake_and_reads_what_the_server_holds() {
     server.join().unwrap();
 }
 
+/// Paged ordinal loading: the whole set, a short page, resumption, and the edges.
+///
+/// Key 3's ordinals are 1, 2, 65546, 65547 and 131092 -- spanning three chunks, so
+/// the page crosses chunk boundaries rather than stopping at one, which a
+/// chunk-at-a-time implementation would get wrong.
+#[test]
+fn ordinals_page_by_value_and_resume_strictly_above() {
+    let (_clean, host, sock) = setup("load");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = serve_inline(listener, host);
+
+    {
+        let client = Client::connect(&sock, "load-test").unwrap();
+        let snap = client.snapshot().unwrap();
+        let all = vec![1u64, 2, 65546, 65547, 131092];
+
+        // The whole set in one page, across all three chunks.
+        let (got, more) = snap.load(3, None, 16).unwrap();
+        assert_eq!(got, all);
+        assert!(!more);
+
+        // A limit below the total reports that more follow.
+        let (first_two, more) = snap.load(3, Some(0), 2).unwrap();
+        assert_eq!(first_two, vec![1, 2]);
+        assert!(more);
+
+        // `after` is **strictly** above, so resuming from 2 excludes 2 itself and
+        // continues into the next chunk.
+        let (rest, more) = snap.load(3, Some(2), 16).unwrap();
+        assert_eq!(rest, vec![65546, 65547, 131092]);
+        assert!(!more);
+
+        // Paging the whole set two at a time by feeding the last value back, which is
+        // the documented way to continue and the thing a cursor would do.
+        let mut page = snap.load(3, None, 2).unwrap();
+        let mut seen = page.0.clone();
+        while page.1 {
+            page = snap.load(3, Some(*seen.last().unwrap()), 2).unwrap();
+            seen.extend_from_slice(&page.0);
+        }
+        assert_eq!(
+            seen, all,
+            "value-based paging reassembles the set exactly once"
+        );
+
+        // Above the maximum is empty rather than an error, and `Some(0)` is not the
+        // same as `None`: it excludes ordinal 0, which this key does not hold anyway.
+        let (none_left, more) = snap.load(3, Some(131092), 16).unwrap();
+        assert!(none_left.is_empty());
+        assert!(!more);
+
+        // An unwritten key loads empty.
+        let (empty, more) = snap.load(999, None, 16).unwrap();
+        assert!(empty.is_empty());
+        assert!(!more);
+    }
+
+    server.join().unwrap();
+}
+
 /// A key with no ordinals yields no blocks at all, and the walk says so immediately.
 #[test]
 fn an_empty_key_yields_an_empty_walk() {

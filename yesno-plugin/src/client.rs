@@ -652,6 +652,40 @@ impl Snapshot {
         }
     }
 
+    /// One page of `key`'s ordinals, ascending, resuming **strictly above** `after`.
+    ///
+    /// `None` starts from the beginning. The flag is `true` when another page follows,
+    /// and the server caps `limit` at [`ipc::MAX_PAGE`] whatever is asked for.
+    ///
+    /// # Continuation is by value, and that is why there is no cursor to close
+    ///
+    /// Paging resumes from an ordinal the caller already holds rather than from a
+    /// server-side position, so there is no handle to leak, to expire, or to
+    /// invalidate -- and it is sound only *because the snapshot pins the version*,
+    /// which is what makes resuming from a value yield a consistent sequence. A
+    /// caller pages by passing the last value it received back as `after`.
+    ///
+    /// This is the frame an ordered SQL cursor is built on: `First` is `after: None`,
+    /// `Next` resumes above the current ordinal, and a `>=` seek resumes above
+    /// `target - 1`. `Last` is [`Snapshot::max`]. **`Prev` has no counterpart here**
+    /// and is the one cursor operation this protocol does not serve directly, because
+    /// every continuation is forward.
+    ///
+    /// Lanes are the hot path; this pages in the frame rather than the arena because
+    /// it is not.
+    pub fn load(&self, key: u64, after: Option<u64>, limit: u32) -> Result<(Vec<u64>, bool)> {
+        match self.request(Frame::SnapshotLoad {
+            snapshot: self.id,
+            key,
+            after: after.unwrap_or(0),
+            has_after: u8::from(after.is_some()),
+            limit,
+        })? {
+            Frame::Ordinals { values, more } => Ok((values, more != 0)),
+            _ => protocol("yesnod did not answer SnapshotLoad with Ordinals"),
+        }
+    }
+
     /// Acquire a lane handle over `keys` and read their blocks in order.
     pub fn lanes(&self, keys: Vec<u64>) -> Result<LaneCursor> {
         let frame = self.request(Frame::LanesAcquire {
