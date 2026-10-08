@@ -3891,3 +3891,56 @@ pushdown, a ticket that cannot outlive its transport instance, write batches ref
 `max_writes` instead of split, and the index and table AMs still Flight-only because they are
 GUC-configured. Also recorded: no fixture creates a channel server yet, which is the same
 gap the MySQL channel leg had until it was closed.
+
+## 2026-10-08 -- PostgreSQL transport fidelity, asserted inside one fixture
+
+Closes the fixture gap recorded with the channel transport an hour earlier. `gate-pg` passes
+and the two transports agree.
+
+### Why not the MySQL shape
+
+MySQL got this by running one byte-exact fixture against every backend, because there the
+backend is chosen by `mysqld` flags and is invisible to the SQL. PostgreSQL's fixtures
+**echo their own SQL** -- `psql -a` -- so the server's `OPTIONS` clause appears in the
+expected output, and a second pass under a different transport would need a duplicate
+expected file per fixture. Eleven fixtures, twenty-two oracles, every one of them a place for
+the two copies to drift.
+
+So the agreement is asserted *inside* one fixture instead: create a Flight server and a
+channel server over the same seed, and compare them in SQL. Same property, one oracle, and
+the oracle is a pair of integers rather than a transcript.
+
+### What makes it a real check rather than a shape
+
+**Key 7 is the reason it is worth doing.** Its ordinals are 0, 2^63, 2^63+1 and 2^64-2, and
+the mapping from a `u64` ordinal to `bigint` is a reinterpretation -- so three of those four
+arrive negative. Two transports that disagreed about that would each look plausible alone.
+`EXCEPT` runs in both directions over the `( key, ordinal )` pair, so a transport that
+returned the right ordinals under the wrong key fails too, not just one that lost or
+invented a row.
+
+And the row count sits beside it on purpose: **zero disagreements is also what two empty
+scans produce**, so the agreement means nothing without a count that is not zero. 24 rows,
+0 disagreements.
+
+### The oracle was predicted, not generated
+
+`psql -a -q`'s format was read off an existing expected file rather than guessed: header is
+`" " + name + " "`, the rule is `len( name ) + 2` dashes, and a value line is
+`" " + value.rjust( len( name ) )`. It matched first run.
+
+Two things were removed from the fixture rather than predicted. `DROP EXTENSION ... CASCADE`
+emits a notice listing every dependent object, whose wording and order are not this
+fixture's business, so the six tables and two servers are dropped by name. And the echoed
+`OPTIONS ( socket :'channel_socket' )` shows the **variable, unexpanded** -- which is what
+keeps a machine-specific socket path out of a byte-exact oracle, and is why this works at
+all.
+
+### Carry away
+
+* **A differential assertion inside a fixture can be the better shape when the fixture is a
+  transcript.** Running the same cases twice is right when the variable is invisible to the
+  output and wrong when it is not; the property being tested -- agreement -- does not care
+  which way it is expressed.
+* **Pair an agreement check with a liveness check.** Any comparison that can pass on two
+  empty inputs needs a second assertion that the inputs were not empty.

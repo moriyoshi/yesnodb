@@ -76,6 +76,15 @@ for ordinal in [0, 9223372036854775808, 9223372036854775809, 1844674407370955161
 endpoint = fx_flight_start(seed_keys, seed_ords)
 assert endpoint.startswith("http://127.0.0.1:")
 
+# A second transport over the same seed, so a fixture can compare the two.
+# `fdw_transport_fidelity.sql` is the one that does; the others ignore the
+# variable, which psql allows.
+#
+# Its own short directory, because a Unix socket path is capped near 108 bytes
+# and this one sits beside PostgreSQL's, which is already under that budget.
+channel_socket = fx_channel_start(fx_join(work, "chan"), seed_keys, seed_ords)
+assert channel_socket.endswith("plugin.sock")
+
 
 def psql_run(args, stdin=""):
     return fx_run_merged(psql, ["-X"] + args, env, stdin)
@@ -104,7 +113,18 @@ def expected_for(name):
 for sql_file in sql_files:
     filename = sql_file.rsplit("/", 1)[-1]
     name = filename[:-4]
-    out = psql_run(["-a", "-q", "-v", "endpoint=" + endpoint, "-f", sql_file])
+    out = psql_run(
+        [
+            "-a",
+            "-q",
+            "-v",
+            "endpoint=" + endpoint,
+            "-v",
+            "channel_socket=" + channel_socket,
+            "-f",
+            sql_file,
+        ]
+    )
     checked(out, name)
     actual = out["stdout"]
     expected = fx_read(expected_for(name))
@@ -189,5 +209,6 @@ for spec in specs:
     )
     assert fx_alive(server), f"PostgreSQL died during {name}"
 
+fx_channel_stop()
 fx_flight_stop()
 fx_stop(server)
