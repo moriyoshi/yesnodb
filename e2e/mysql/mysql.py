@@ -432,6 +432,14 @@ def run_backend(label, backend_args, plugin_preloaded, run_fixture):
     checked(fx_close(server, 10000), label + " mysqld exit")
 
 
+# Every supported backend runs the SAME cases, including the byte-exact
+# mysqltest fixture. That is the point: a storage engine's answers must not
+# depend on which backend is underneath it, and the only way to know is to
+# compare the same SQL against each one rather than giving each its own subset.
+#
+# The flight leg used to pass `run_fixture=False`, so it ran the Python-driven
+# contract exercises and skipped the fixture comparison -- which left the one
+# check that is byte-exact covering a single backend.
 run_backend("embedded", [], False, True)
 flight_http = fx_flight_start([], [])
 flight_grpc = "grpc://" + flight_http[7:]
@@ -443,6 +451,6 @@ run_backend(
         "--yesno-flight-endpoint=" + flight_grpc,
     ],
     True,
-    False,
+    True,
 )
 fx_flight_stop()

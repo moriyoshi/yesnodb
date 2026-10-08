@@ -24,12 +24,12 @@ class FlightBackend final : public Backend {
   explicit FlightBackend(std::unique_ptr<yesno::flight::Client> client)
       : client_(std::move(client)) {}
 
-  bool Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     return Assign(client_->Insert(key, ordinal), changed, error);
   }
-  bool Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     return Assign(client_->Remove(key, ordinal), changed, error);
@@ -49,7 +49,7 @@ class FlightBackend final : public Backend {
   /// operations on one key in the order they were staged. Grouping them by
   /// kind would still commit atomically and would turn a whole-key
   /// replacement into an empty key.
-  bool Apply(const std::vector<KeyWrites> &writes,
+  BackendStatus Apply(const std::vector<KeyWrites> &writes,
              std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     std::vector<yesno::flight::Client::Mutation> mutations;
@@ -69,13 +69,13 @@ class FlightBackend final : public Backend {
     }
     if (mutations.empty()) {
       error->clear();
-      return true;
+      return BackendStatus::kOk;
     }
 
     auto txn = client_->BeginWrite();
     if (!txn.ok()) {
       *error = txn.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     auto staged = client_->Stage(*txn, mutations);
     if (!staged.ok()) {
@@ -83,74 +83,76 @@ class FlightBackend final : public Backend {
       // for the deadline. The staging failure is what the caller must see.
       static_cast<void>(client_->AbortWrite(*txn));
       *error = staged.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     auto version = client_->CommitWrite(*txn);
     if (!version.ok()) {
       static_cast<void>(client_->AbortWrite(*txn));
       *error = version.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
-  bool Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
+  BackendStatus Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
                 std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     return Assign(client_->Contains(key, ordinal), present, error);
   }
-  bool Cardinality(std::uint64_t key, std::uint64_t *cardinality,
+  BackendStatus Cardinality(std::uint64_t key, std::uint64_t *cardinality,
                    std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     return Assign(client_->Cardinality(key), cardinality, error);
   }
-  bool Clear(std::uint64_t key, std::string *error) override {
+  BackendStatus Clear(std::uint64_t key, std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     return Discard(client_->Clear(key), error);
   }
-  bool Checkpoint(std::string *error) override {
+  BackendStatus Checkpoint(std::string *error) override {
     // The remote server owns its checkpoint policy and deliberately exposes no
     // administrative checkpoint action on the public Flight surface. MySQL
     // shutdown only needs to release this client's connection.
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
-  bool OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
+  BackendStatus OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
                   std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     auto result = client_->Get(key);
     if (!result.ok()) {
       *error = result.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     *cursor =
         std::make_unique<VectorCursor>(std::move(result).ValueOrDie());
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
  private:
   template <typename T>
-  static bool Assign(arrow::Result<T> result, T *output,
+  static BackendStatus Assign(arrow::Result<T> result, T *output,
                      std::string *error) {
     if (!result.ok()) {
+      // The Flight surface carries no equivalent of the channel's retryable or
+      // stale statuses, so this stays unclassified rather than guessing one.
       *error = result.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     *output = std::move(result).ValueOrDie();
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
   template <typename T>
-  static bool Discard(arrow::Result<T> result, std::string *error) {
+  static BackendStatus Discard(arrow::Result<T> result, std::string *error) {
     if (!result.ok()) {
       *error = result.status().ToString();
-      return false;
+      return BackendStatus::kError;
     }
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
   std::mutex mutex_;

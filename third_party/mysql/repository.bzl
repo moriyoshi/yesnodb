@@ -38,6 +38,8 @@ def _mysql_repository_impl(ctx):
     ctx.symlink(ctx.path(ctx.attr.backend_header), "storage/yesno/backend.h")
     ctx.symlink(ctx.path(ctx.attr.embedded_backend_source), "storage/yesno/backend_embedded.cc")
     ctx.symlink(ctx.path(ctx.attr.flight_backend_source), "storage/yesno/backend_flight.cc")
+    ctx.symlink(ctx.path(ctx.attr.channel_backend_source), "storage/yesno/backend_channel.cc")
+    ctx.symlink(ctx.path(ctx.attr.vector_cursor_header), "storage/yesno/vector_cursor.h")
     ctx.symlink(ctx.path(ctx.attr.plugin_source), "storage/yesno/ha_yesno.cc")
     ctx.symlink(ctx.path(ctx.attr.plugin_header), "storage/yesno/ha_yesno.h")
     ctx.symlink(ctx.path(ctx.attr.flight_cpp_cmake), "storage/yesno/flight-cpp/CMakeLists.txt")
@@ -53,6 +55,13 @@ mysql_repository = repository_rule(
         "backend_header": attr.label(mandatory = True, allow_single_file = True),
         "embedded_backend_source": attr.label(mandatory = True, allow_single_file = True),
         "flight_backend_source": attr.label(mandatory = True, allow_single_file = True),
+        "channel_backend_source": attr.label(mandatory = True, allow_single_file = True),
+        # Shared by the flight and channel backends. Not optional even when
+        # neither optional backend is enabled: `backend_flight.cc` includes it
+        # unconditionally, and a file this rule does not symlink simply is not
+        # in the tree -- which is how a missing entry here became a fatal
+        # include error rather than anything that looked like a build config.
+        "vector_cursor_header": attr.label(mandatory = True, allow_single_file = True),
         "flight_cpp_cmake": attr.label(mandatory = True, allow_single_file = True),
         "flight_cpp_header": attr.label(mandatory = True, allow_single_file = True),
         "flight_cpp_internal_header": attr.label(mandatory = True, allow_single_file = True),

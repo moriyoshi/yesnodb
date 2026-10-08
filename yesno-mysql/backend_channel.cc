@@ -38,27 +38,33 @@ constexpr std::size_t kPage = 1024;
 /// `Backend` returns a bool and a string, so none of that reaches MySQL as
 /// anything it can branch on. The code is put in the message so an operator can
 /// see it, and widening `Backend` is what it would take to act on it.
-bool Fail(yesno_channel_status status, const char *buffer, std::string *error) {
+BackendStatus Fail(yesno_channel_status status, const char *buffer,
+                   std::string *error) {
   const char *name = "error";
+  BackendStatus mapped = BackendStatus::kError;
   switch (status) {
     case YESNO_CHANNEL_RETRY:
       name = "unavailable (retryable)";
+      mapped = BackendStatus::kRetry;
       break;
     case YESNO_CHANNEL_STALE:
       name = "stale (reconnect)";
+      mapped = BackendStatus::kStale;
       break;
     case YESNO_CHANNEL_EXPIRED:
       name = "snapshot expired";
+      mapped = BackendStatus::kExpired;
       break;
     case YESNO_CHANNEL_WRONG_ROLE:
       name = "read-only replica";
+      mapped = BackendStatus::kWrongRole;
       break;
     case YESNO_CHANNEL_OK:
     case YESNO_CHANNEL_ERROR:
       break;
   }
   *error = std::string("yesno channel ") + name + ": " + buffer;
-  return false;
+  return mapped;
 }
 
 /// A snapshot handle that closes itself.
@@ -74,12 +80,16 @@ class ScopedSnapshot {
   ScopedSnapshot(const ScopedSnapshot &) = delete;
   ScopedSnapshot &operator=(const ScopedSnapshot &) = delete;
 
-  bool Open(yesno_channel *channel, char *buffer, std::size_t capacity,
-            std::string *error) {
+  /// Returns a [`BackendStatus`] rather than a bool so that a snapshot the
+  /// server refused for a *classified* reason -- a follower mid-rebootstrap,
+  /// say -- reaches the caller as that reason and not as a bare failure. Every
+  /// read below forwards it unchanged.
+  BackendStatus Open(yesno_channel *channel, char *buffer,
+                     std::size_t capacity, std::string *error) {
     const yesno_channel_status status =
         yesno_channel_snapshot_open(channel, &handle_, buffer, capacity);
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
-    return true;
+    return BackendStatus::kOk;
   }
   yesno_channel_snapshot *get() const { return handle_; }
 
@@ -92,11 +102,11 @@ class ChannelBackend final : public Backend {
   explicit ChannelBackend(yesno_channel *channel) : channel_(channel) {}
   ~ChannelBackend() override { yesno_channel_close(channel_); }
 
-  bool Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     return One(key, ordinal, YESNO_CHANNEL_INSERT, changed, error);
   }
-  bool Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     return One(key, ordinal, YESNO_CHANNEL_REMOVE, changed, error);
   }
@@ -112,7 +122,7 @@ class ChannelBackend final : public Backend {
   /// **error rather than a split**. Splitting would silently give up the
   /// atomicity this paragraph just promised, and a transaction that half
   /// applied would be worse than one refused.
-  bool Apply(const std::vector<KeyWrites> &writes,
+  BackendStatus Apply(const std::vector<KeyWrites> &writes,
              std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     std::vector<yesno_channel_write> flat;
@@ -133,7 +143,7 @@ class ChannelBackend final : public Backend {
     }
     if (flat.empty()) {
       error->clear();
-      return true;
+      return BackendStatus::kOk;
     }
     char buffer[512] = {0};
     yesno_channel_limits limits{};
@@ -145,7 +155,7 @@ class ChannelBackend final : public Backend {
                std::to_string(flat.size()) + " writes and the server accepts " +
                std::to_string(limits.max_writes) +
                " in one commit; splitting it would give up atomicity";
-      return false;
+      return BackendStatus::kError;
     }
     std::uint64_t version = 0;
     std::uint64_t changed = 0;
@@ -154,38 +164,48 @@ class ChannelBackend final : public Backend {
                             &changed, buffer, sizeof buffer);
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
-  bool Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
+  BackendStatus Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
                 std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
-    if (!snapshot.Open(channel_, buffer, sizeof buffer, error)) return false;
+    const BackendStatus opened =
+        snapshot.Open(channel_, buffer, sizeof buffer, error);
+    // Forwarded, not flattened: a snapshot refused because a follower is
+    // rebootstrapping is retryable, and collapsing it to kError here would
+    // discard exactly what the widening exists to carry.
+    if (opened != BackendStatus::kOk) return opened;
     std::uint8_t found = 0;
     const yesno_channel_status status = yesno_channel_contains(
         snapshot.get(), key, ordinal, &found, buffer, sizeof buffer);
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
     *present = found != 0;
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
-  bool Cardinality(std::uint64_t key, std::uint64_t *cardinality,
+  BackendStatus Cardinality(std::uint64_t key, std::uint64_t *cardinality,
                    std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
-    if (!snapshot.Open(channel_, buffer, sizeof buffer, error)) return false;
+    const BackendStatus opened =
+        snapshot.Open(channel_, buffer, sizeof buffer, error);
+    // Forwarded, not flattened: a snapshot refused because a follower is
+    // rebootstrapping is retryable, and collapsing it to kError here would
+    // discard exactly what the widening exists to carry.
+    if (opened != BackendStatus::kOk) return opened;
     const yesno_channel_status status = yesno_channel_cardinality(
         snapshot.get(), key, cardinality, buffer, sizeof buffer);
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
-  bool Clear(std::uint64_t key, std::string *error) override {
+  BackendStatus Clear(std::uint64_t key, std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     const yesno_channel_write write{key, 0, 0, YESNO_CHANNEL_DELETE_KEY};
     char buffer[512] = {0};
@@ -195,7 +215,7 @@ class ChannelBackend final : public Backend {
         channel_, &write, 1, &version, &changed, buffer, sizeof buffer);
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
   /// A no-op that succeeds, for the reason the Flight backend's does.
@@ -206,9 +226,9 @@ class ChannelBackend final : public Backend {
   /// committed server-side by the time it returns -- so there is nothing a
   /// checkpoint here could flush. MySQL shutdown only needs the socket closed,
   /// which the destructor does.
-  bool Checkpoint(std::string *error) override {
+  BackendStatus Checkpoint(std::string *error) override {
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
   /// Materialize the key's ordinals and hand back a [`VectorCursor`].
@@ -221,12 +241,17 @@ class ChannelBackend final : public Backend {
   ///
   /// It materializes because MySQL needs `Prev` and a backward `Seek` and the
   /// protocol has no backward continuation at all -- see `vector_cursor.h`.
-  bool OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
+  BackendStatus OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
                   std::string *error) override {
     std::lock_guard<std::mutex> guard(mutex_);
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
-    if (!snapshot.Open(channel_, buffer, sizeof buffer, error)) return false;
+    const BackendStatus opened =
+        snapshot.Open(channel_, buffer, sizeof buffer, error);
+    // Forwarded, not flattened: a snapshot refused because a follower is
+    // rebootstrapping is retryable, and collapsing it to kError here would
+    // discard exactly what the widening exists to carry.
+    if (opened != BackendStatus::kOk) return opened;
 
     std::vector<std::uint64_t> ordinals;
     std::uint64_t page[kPage];
@@ -245,18 +270,18 @@ class ChannelBackend final : public Backend {
         // The server said more follow and sent none. Believing it would spin
         // forever, so this reports instead of hanging.
         *error = "yesno channel: a page was empty but more were promised";
-        return false;
+        return BackendStatus::kError;
       }
       after = ordinals.back();
       has_after = 1;
     }
     *cursor = std::make_unique<VectorCursor>(std::move(ordinals));
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
  private:
-  bool One(std::uint64_t key, std::uint64_t ordinal,
+  BackendStatus One(std::uint64_t key, std::uint64_t ordinal,
            yesno_channel_write_op op, bool *changed, std::string *error) {
     std::lock_guard<std::mutex> guard(mutex_);
     const yesno_channel_write write{key, ordinal, ordinal,
@@ -269,7 +294,7 @@ class ChannelBackend final : public Backend {
     if (status != YESNO_CHANNEL_OK) return Fail(status, buffer, error);
     *changed = count != 0;
     error->clear();
-    return true;
+    return BackendStatus::kOk;
   }
 
   yesno_channel *channel_;

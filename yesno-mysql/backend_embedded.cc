@@ -46,7 +46,9 @@ class EmbeddedCursor final : public Cursor {
         cursor_, target, static_cast<yesno_seek_mode>(mode), ordinal, &value,
         message.data(), message.size());
     *found = value != 0;
-    return Finish(result, message, error);
+    // `Cursor` stays `bool` by design -- see `backend.h` -- so the status is
+    // compared here rather than forwarded.
+    return Finish(result, message, error) == BackendStatus::kOk;
   }
 
  private:
@@ -60,18 +62,20 @@ class EmbeddedCursor final : public Cursor {
     const int result =
         call(cursor_, ordinal, &value, message.data(), message.size());
     *found = value != 0;
-    return Finish(result, message, error);
+    return Finish(result, message, error) == BackendStatus::kOk;
   }
 
-  static bool Finish(int result,
+  static BackendStatus Finish(int result,
                      const std::array<char, kErrorCapacity>& message,
                      std::string *error) {
     if (result == YESNO_OK) {
       error->clear();
-      return true;
+      return BackendStatus::kOk;
     }
+    // The embedded database has no peer to be stale against and no server to
+    // be unavailable, so every failure here is unclassified by construction.
     *error = message.data();
-    return false;
+    return BackendStatus::kError;
   }
 
   yesno_cursor *cursor_;
@@ -82,11 +86,11 @@ class EmbeddedBackend final : public Backend {
   explicit EmbeddedBackend(yesno_db *database) : database_(database) {}
   ~EmbeddedBackend() override { yesno_db_close(database_); }
 
-  bool Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     return Change(yesno_db_insert, key, ordinal, changed, error);
   }
-  bool Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  BackendStatus Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
               std::string *error) override {
     return Change(yesno_db_remove, key, ordinal, changed, error);
   }
@@ -95,18 +99,18 @@ class EmbeddedBackend final : public Backend {
   /// the success and the failure path, and by `yesno_batch_abort` if we give up
   /// before committing -- leaking it would hold a `Db` clone for the life of
   /// the server.
-  bool Apply(const std::vector<KeyWrites> &writes,
+  BackendStatus Apply(const std::vector<KeyWrites> &writes,
              std::string *error) override {
     if (writes.empty()) {
       error->clear();
-      return true;
+      return BackendStatus::kOk;
     }
     std::array<char, kErrorCapacity> message{};
     yesno_batch *batch = nullptr;
     if (yesno_batch_begin(database_, &batch, message.data(), message.size()) !=
         YESNO_OK) {
       *error = message.data();
-      return false;
+      return BackendStatus::kError;
     }
     for (const KeyWrites &w : writes) {
       int result = YESNO_OK;
@@ -127,7 +131,7 @@ class EmbeddedBackend final : public Backend {
       if (result != YESNO_OK) {
         *error = message.data();
         yesno_batch_abort(batch);
-        return false;
+        return BackendStatus::kError;
       }
     }
     std::uint64_t changed = 0;
@@ -136,7 +140,7 @@ class EmbeddedBackend final : public Backend {
     return Finish(result, message, error);
   }
 
-  bool Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
+  BackendStatus Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
                 std::string *error) override {
     std::array<char, kErrorCapacity> message{};
     std::uint8_t value = 0;
@@ -145,34 +149,35 @@ class EmbeddedBackend final : public Backend {
     *present = value != 0;
     return Finish(result, message, error);
   }
-  bool Cardinality(std::uint64_t key, std::uint64_t *cardinality,
+  BackendStatus Cardinality(std::uint64_t key, std::uint64_t *cardinality,
                    std::string *error) override {
     std::array<char, kErrorCapacity> message{};
     const int result = yesno_db_cardinality(
         database_, key, cardinality, message.data(), message.size());
     return Finish(result, message, error);
   }
-  bool Clear(std::uint64_t key, std::string *error) override {
+  BackendStatus Clear(std::uint64_t key, std::string *error) override {
     std::array<char, kErrorCapacity> message{};
     const int result =
         yesno_db_clear(database_, key, message.data(), message.size());
     return Finish(result, message, error);
   }
-  bool Checkpoint(std::string *error) override {
+  BackendStatus Checkpoint(std::string *error) override {
     std::array<char, kErrorCapacity> message{};
     const int result =
         yesno_db_checkpoint(database_, message.data(), message.size());
     return Finish(result, message, error);
   }
-  bool OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
+  BackendStatus OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
                   std::string *error) override {
     std::array<char, kErrorCapacity> message{};
     yesno_cursor *raw = nullptr;
     const int result = yesno_cursor_open(database_, key, &raw, message.data(),
                                          message.size());
-    if (!Finish(result, message, error)) return false;
+    const BackendStatus opened = Finish(result, message, error);
+    if (opened != BackendStatus::kOk) return opened;
     *cursor = std::make_unique<EmbeddedCursor>(raw);
-    return true;
+    return BackendStatus::kOk;
   }
 
  private:
@@ -180,7 +185,7 @@ class EmbeddedBackend final : public Backend {
                                       std::uint64_t, std::uint8_t *, char *,
                                       std::size_t);
 
-  bool Change(ChangeCall call, std::uint64_t key, std::uint64_t ordinal,
+  BackendStatus Change(ChangeCall call, std::uint64_t key, std::uint64_t ordinal,
               bool *changed, std::string *error) {
     std::array<char, kErrorCapacity> message{};
     std::uint8_t value = 0;
@@ -190,15 +195,17 @@ class EmbeddedBackend final : public Backend {
     return Finish(result, message, error);
   }
 
-  static bool Finish(int result,
+  static BackendStatus Finish(int result,
                      const std::array<char, kErrorCapacity>& message,
                      std::string *error) {
     if (result == YESNO_OK) {
       error->clear();
-      return true;
+      return BackendStatus::kOk;
     }
+    // The embedded database has no peer to be stale against and no server to
+    // be unavailable, so every failure here is unclassified by construction.
     *error = message.data();
-    return false;
+    return BackendStatus::kError;
   }
 
   yesno_db *database_;

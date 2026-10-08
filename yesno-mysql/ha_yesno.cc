@@ -42,6 +42,51 @@ int bridge_error(const std::string &error) {
   return HA_ERR_INTERNAL_ERROR;
 }
 
+/// Report a classified backend failure.
+///
+/// The single place a `BackendStatus` becomes a MySQL error, which is the point
+/// of widening `Backend`: the plugin channel distinguishes a transient
+/// unavailability from a dead handle from an expired snapshot from a write sent
+/// to a replica, and before this the distinction stopped at the ABI boundary.
+///
+/// **Every status still returns `HA_ERR_INTERNAL_ERROR` today, deliberately.**
+/// Only six `HA_ERR_*` constants are known to be available in this build and
+/// none of them is a clean match -- picking `HA_ERR_LOCK_WAIT_TIMEOUT` so the
+/// client retries, or a read-only code for `kWrongRole`, means verifying those
+/// exist against the pinned MySQL headers, which is a separate change with its
+/// own build. What this does now is make the *message* say which class the
+/// failure was and whether retrying is sensible, and put the mapping in one
+/// function instead of nine call sites. Improving the codes is an edit to this
+/// body alone.
+int bridge_status(yesno_mysql::BackendStatus status, const std::string &error) {
+  const char *classification = nullptr;
+  switch (status) {
+    case yesno_mysql::BackendStatus::kOk:
+      return 0;
+    case yesno_mysql::BackendStatus::kRetry:
+      classification = "backend temporarily unavailable, retrying may succeed";
+      break;
+    case yesno_mysql::BackendStatus::kStale:
+      classification = "backend handles are stale, the connection must be remade";
+      break;
+    case yesno_mysql::BackendStatus::kExpired:
+      classification = "the read snapshot expired, a fresh read may succeed";
+      break;
+    case yesno_mysql::BackendStatus::kWrongRole:
+      classification = "the backend is a read-only replica";
+      break;
+    case yesno_mysql::BackendStatus::kError:
+      break;
+  }
+  if (classification == nullptr) {
+    my_printf_error(ER_UNKNOWN_ERROR, "YESNO: %s", MYF(0), error.c_str());
+  } else {
+    my_printf_error(ER_UNKNOWN_ERROR, "YESNO: %s (%s)", MYF(0), error.c_str(),
+                    classification);
+  }
+  return HA_ERR_INTERNAL_ERROR;
+}
+
 int command_error(const char *message) {
   my_printf_error(ER_UNKNOWN_ERROR, "YESNO: %s", MYF(0), message);
   return HA_ERR_WRONG_COMMAND;
@@ -530,7 +575,8 @@ int yesno_commit(handlerton *, THD *thd, bool all) {
   forget_txn_state(thd);
   if (plan.empty()) return 0;
   std::string error;
-  if (!yesno_backend->Apply(plan, &error)) return bridge_error(error);
+  const yesno_mysql::BackendStatus applied = yesno_backend->Apply(plan, &error);
+  if (applied != yesno_mysql::BackendStatus::kOk) return bridge_status(applied, error);
   return 0;
 }
 
@@ -657,7 +703,8 @@ int yesno_init_func(void *plugin) {
 int yesno_deinit_func(void *) {
   DBUG_TRACE;
   std::string error;
-  if (yesno_backend != nullptr && !yesno_backend->Checkpoint(&error)) {
+  if (yesno_backend != nullptr &&
+      yesno_backend->Checkpoint(&error) != yesno_mysql::BackendStatus::kOk) {
     my_printf_error(ER_UNKNOWN_ERROR,
                     "YESNO: checkpoint during plugin shutdown failed: %s",
                     MYF(0), error.c_str());
@@ -875,8 +922,8 @@ int ha_yesno::view_contains(ulonglong ordinal, bool *present) {
     return 0;
   }
   std::string error;
-  if (!yesno_backend->Contains(key_, ordinal, present, &error))
-    return bridge_error(error);
+  const yesno_mysql::BackendStatus looked = yesno_backend->Contains(key_, ordinal, present, &error);
+  if (looked != yesno_mysql::BackendStatus::kOk) return bridge_status(looked, error);
   return 0;
 }
 
@@ -977,7 +1024,7 @@ int ha_yesno::rnd_init(bool scan) {
 /// statement at a time per connection anyway.
 bool ha_yesno::open_cursor(std::string *error) {
   std::unique_ptr<yesno_mysql::Cursor> base;
-  if (!yesno_backend->OpenCursor(key_, &base, error)) return false;
+  if (yesno_backend->OpenCursor(key_, &base, error) != yesno_mysql::BackendStatus::kOk) return false;
   Settled view = settled_view(ha_thd(), key_);
   if (view.empty()) {
     cursor_ = std::move(base);
@@ -1032,21 +1079,25 @@ int ha_yesno::records(ha_rows *num_rows) {
   const Settled view = settled_view(ha_thd(), key_);
   if (view.base_suppressed) {
     count = 0;
-  } else if (!yesno_backend->Cardinality(key_, &count, &error)) {
-    return bridge_error(error);
+  } else {
+    const yesno_mysql::BackendStatus counted = yesno_backend->Cardinality(key_, &count, &error);
+    if (counted != yesno_mysql::BackendStatus::kOk) return bridge_status(counted, error);
   }
   for (const std::uint64_t ordinal : view.inserts) {
     bool present = false;
-    if (!view.base_suppressed &&
-        !yesno_backend->Contains(key_, ordinal, &present, &error))
-      return bridge_error(error);
+    if (!view.base_suppressed) {
+      const yesno_mysql::BackendStatus seen =
+          yesno_backend->Contains(key_, ordinal, &present, &error);
+      if (seen != yesno_mysql::BackendStatus::kOk) return bridge_status(seen, error);
+    }
     if (!present) ++count;
   }
   if (!view.base_suppressed) {
     for (const std::uint64_t ordinal : view.removes) {
       bool present = false;
-      if (!yesno_backend->Contains(key_, ordinal, &present, &error))
-        return bridge_error(error);
+      const yesno_mysql::BackendStatus seen =
+          yesno_backend->Contains(key_, ordinal, &present, &error);
+      if (seen != yesno_mysql::BackendStatus::kOk) return bridge_status(seen, error);
       if (present) --count;
     }
   }
@@ -1098,7 +1149,7 @@ ha_rows ha_yesno::records_in_range(uint index, key_range *min_key,
     std::string error;
     bool present = false;
     const ulonglong ordinal = uint8korr(min_key->key);
-    if (!yesno_backend->Contains(key_, ordinal, &present, &error))
+    if (yesno_backend->Contains(key_, ordinal, &present, &error) != yesno_mysql::BackendStatus::kOk)
       return HA_POS_ERROR;
     return present;
   }
@@ -1110,7 +1161,8 @@ int ha_yesno::delete_table(const char *, const dd::Table *table_def) {
   ulonglong key = 0;
   if (!key_from_table_def(table_def, &key)) return invalid_connection();
   std::string error;
-  return yesno_backend->Clear(key, &error) ? 0 : bridge_error(error);
+  const yesno_mysql::BackendStatus cleared = yesno_backend->Clear(key, &error);
+  return cleared == yesno_mysql::BackendStatus::kOk ? 0 : bridge_status(cleared, error);
 }
 
 int ha_yesno::rename_table(const char *, const char *, const dd::Table *,

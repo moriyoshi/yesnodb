@@ -3645,3 +3645,78 @@ header. What is missing is the *MySQL plugin* build with either optional backend
   and the answer was an extraction rather than a design.
 * **A changed file that no build compiles cannot fail.** Ask what builds a file before
   trusting that a green gate says anything about an edit to it.
+
+## 2026-10-08 -- `Backend` widened, fidelity across backends, and a retraction
+
+Three things, and the retraction first because it is the one that matters.
+
+### Retracted: "the flight MySQL backend is compiled by nothing"
+
+Yesterday's entry claimed `YESNO_WITH_FLIGHT` appeared nowhere outside
+`yesno-mysql/CMakeLists.txt`, that `backend_flight.cc` was built by no gate, and drew a
+lesson about changed files that nothing compiles. **It is `"ON"` in
+`third_party/mysql/mysql.BUILD`.** `scripts/gate-mysql.sh` compiles it, and
+`e2e/mysql/mysql.py` runs a whole `run_backend( "flight", ... )` leg against a live Flight
+server.
+
+The claim came from `grep --include=*.bazel`, which does not match a file named
+`mysql.BUILD`. **That is the third filename-pattern miss in two days** -- after
+`--include=Dockerfile` hiding three `*.Dockerfile` files at 1.95, and `cargo doc` without
+`RUSTDOCFLAGS` hiding a broken link. The shape is identical each time: a search whose
+*pattern* excluded the evidence, reported as an absence of evidence. A fourth guard is
+needed and it is not "be careful": when concluding that something does **not** exist, the
+search has to be run a second way. `find -iname` and `grep -rn` over the whole tree each
+took one command and each would have answered correctly.
+
+The user then suggested the flight leg had no E2E scenario either. It does -- same file,
+`run_backend( "flight", ... )` -- so the correction runs in both directions, and I said so
+rather than agreeing.
+
+### What was actually missing, and is now fixed
+
+The flight leg passed `run_fixture=False`, so it ran the Python contract exercises and
+**skipped the byte-exact `mysqltest` fixture**. The one check that compares output byte for
+byte covered a single backend. Both legs now run it, and `gate-mysql` passes -- so the two
+backends produce identical output for the same SQL, which is the fidelity property worth
+having and was previously untested.
+
+The channel backend is the genuinely unbuilt one: `YESNO_WITH_CHANNEL` is not among
+`mysql.BUILD`'s cache entries, `yesno-plugin` has no `BUILD.bazel` to export a staticlib
+from, and no `fx_` verb starts a yesnod with `plugin.channel_socket` set, so it has no E2E
+leg either. Recorded as `the-mysql-channel-backend-has-no-bazel-build-and-no-e2e-leg`.
+
+### The extraction broke the MySQL build, and only the gate could say so
+
+`vector_cursor.h` was added to `backend_flight.cc`'s includes, and
+`third_party/mysql/repository.bzl` symlinks **only the files it is given attributes for** --
+so the header was simply not in the tree and the build died with a fatal include error. A
+file that rule does not name does not exist, which makes a missing entry look like anything
+but a build-configuration problem.
+
+Worth stating plainly: I had just written down that nothing compiled that file. Had I
+believed my own finding I would have shipped a broken MySQL build. **The gate I thought was
+redundant is the one that caught it.**
+
+### `Backend` widened
+
+`BackendStatus` replaces `bool` on all eight `Backend` virtuals, so the channel's
+classification -- retryable, stale, expired, wrong-role -- survives the C ABI boundary
+instead of being flattened into a string. `ha_yesno.cc` gained `bridge_status`, the single
+place a status becomes a MySQL error.
+
+Two decisions recorded in the code rather than left implicit. **`Cursor` stays `bool`**: every
+remote backend materializes before handing one back, so by then there is no transport left
+to fail, and widening it would add a status its implementations could never return. And
+**every status still maps to `HA_ERR_INTERNAL_ERROR`** -- only six `HA_ERR_*` constants are
+known available here and none is a clean match, so choosing a retryable code means verifying
+it against the pinned MySQL headers. What the widening buys today is an accurate
+operator-visible message and one function to change later instead of nine call sites.
+
+The conversion was compiler-driven: change the signatures, then let `g++ -fsyntax-only` name
+every bad return and fix exactly those. All three backends compile locally under
+`-Wall -Wextra -Werror`, which is possible because none of them includes a MySQL header --
+only `ha_yesno.cc` does, and `gate-mysql` covers it.
+
+The payoff is at the snapshot-open sites. Three of them read
+`if (!snapshot.Open(...)) return kError`, which would have discarded the classification at
+the exact step most likely to produce a retryable one. They forward it now.

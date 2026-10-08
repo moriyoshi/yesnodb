@@ -9,6 +9,35 @@
 
 namespace yesno_mysql {
 
+/// How a backend call ended.
+///
+/// Wider than a bool because the plugin channel distinguishes failures that a
+/// host must handle differently, and a bool plus a message forces every one of
+/// them to be treated as fatal. The channel's own C header carries the same
+/// five, and this is where they stop being a string an operator reads and start
+/// being something `ha_yesno.cc` can branch on.
+///
+/// The embedded and Flight backends only ever report `kOk` and `kError`. That
+/// is not a gap: an embedded database has no peer to be stale against, and the
+/// Flight surface exposes no equivalent classification. A backend returning
+/// only the two is conforming.
+enum class BackendStatus {
+  kOk = 0,
+  /// An unclassified failure. The message is all there is.
+  kError = 1,
+  /// Transient: the server has no database open while a follower rebootstraps.
+  /// **The only status worth retrying.** The handle is still good.
+  kRetry = 2,
+  /// The database was replaced. Every handle this backend holds is dead and it
+  /// must reconnect; retrying the call cannot help.
+  kStale = 3,
+  /// The pinned read version is gone. A fresh read may succeed, so this is
+  /// distinct from `kStale`: the connection is fine and only the snapshot died.
+  kExpired = 4,
+  /// The request needed a leader and reached a read-only replica.
+  kWrongRole = 5,
+};
+
 enum class SeekMode {
   kExact = 0,
   kOrNext = 1,
@@ -17,6 +46,15 @@ enum class SeekMode {
   kBefore = 4,
 };
 
+/// A positioned scan over one key's ordinals.
+///
+/// **Deliberately still `bool`.** Every remote backend materializes the key
+/// before handing a cursor back -- it has to, because neither Flight nor the
+/// channel offers a backward continuation and MySQL needs `Prev` -- so by the
+/// time a cursor exists there is no transport left to fail, and the embedded
+/// cursor's failures are plain errors with no peer to be stale against. Giving
+/// it a [`BackendStatus`] would widen an interface whose implementations could
+/// never return anything but the two ends of it.
 class Cursor {
  public:
   virtual ~Cursor() = default;
@@ -57,19 +95,19 @@ class Backend {
   /// batch but the pair is not one transaction -- a failure between them leaves
   /// the removals applied. Removals go first, so that partial state is a
   /// smaller set rather than a larger one.
-  virtual bool Apply(const std::vector<KeyWrites> &writes,
+  virtual BackendStatus Apply(const std::vector<KeyWrites> &writes,
                      std::string *error) = 0;
-  virtual bool Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  virtual BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
                       std::string *error) = 0;
-  virtual bool Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
+  virtual BackendStatus Remove(std::uint64_t key, std::uint64_t ordinal, bool *changed,
                       std::string *error) = 0;
-  virtual bool Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
+  virtual BackendStatus Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
                         std::string *error) = 0;
-  virtual bool Cardinality(std::uint64_t key, std::uint64_t *cardinality,
+  virtual BackendStatus Cardinality(std::uint64_t key, std::uint64_t *cardinality,
                            std::string *error) = 0;
-  virtual bool Clear(std::uint64_t key, std::string *error) = 0;
-  virtual bool Checkpoint(std::string *error) = 0;
-  virtual bool OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
+  virtual BackendStatus Clear(std::uint64_t key, std::string *error) = 0;
+  virtual BackendStatus Checkpoint(std::string *error) = 0;
+  virtual BackendStatus OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
                           std::string *error) = 0;
 };
 
