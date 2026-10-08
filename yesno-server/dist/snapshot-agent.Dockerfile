@@ -7,7 +7,7 @@
 # devices and bidirectional mount propagation for the configured source and
 # snapshot mount roots. Do not grant those privileges to the yesnod container.
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.98
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY . .

@@ -20,7 +20,7 @@
 # Both are one metadata layer over `runner`, so they add a build of nothing and
 # a push of nothing: every layer they need is already in the registry.
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.98
 ARG KUBECTL_VERSION=v1.36.1
 ARG KUBECTL_SHA256_AMD64=629d3f410e09bf49b64ae7079f7f0bda1191efed311f7d37fdbab0ad5b0ec2b7
 ARG KUBECTL_SHA256_ARM64=59f7ee8e477fae658447607dc3c8790ac17a1b016c01c622c12070e969e2d4e7

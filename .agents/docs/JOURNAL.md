@@ -3460,3 +3460,57 @@ sites.
 * **Check the senders before reporting a consequence.** Three for three now.
 * A shared helper that both sides are told to use, and that neither side used, is a finding
   even when both hand-rolled it correctly.
+
+## 2026-10-08 -- The floor checker reported success while three images sat at 1.95
+
+The release pipeline failed on `d0c021d` -- CI run 37715290622, both cross-compile legs,
+`rustc 1.95.0 is not supported by the following packages ... requires rustc 1.98`. All
+eleven gate jobs were green, including `msrv`, so nothing shipped and nothing was wrong with
+the code. **What was wrong was the checker I added that morning to prevent exactly this.**
+
+### Three sites, and one glob
+
+`scripts/check-msrv-consistency.py` discovers build images with `ROOT.rglob( "Dockerfile" )`,
+which matches only files named *exactly* that. The tree has eight dockerfile-shaped files
+and three of them are not:
+
+    dist/build.Dockerfile                        1.95   the release cross-compile, CI caught it
+    yesno-server/dist/snapshot-agent.Dockerfile  1.95   would have failed later
+    yesno-operator/e2e/aws.Dockerfile            1.95   would have failed in the AWS gate
+
+So the 1.95 -> 1.98 bump left three images behind, and the checker **reported all sixteen
+sites in agreement** while they sat there. The real count is nineteen.
+
+**A discovery glob narrower than the convention it models does not under-report a little, it
+reports success.** That is the whole finding, and it is worse than having no checker: a
+missing check leaves you looking, and a blind one tells you to stop.
+
+### Why the five positive controls did not catch it
+
+They were drawn from the same blind spot as the checker. Every one mutated a file the glob
+already found -- a satellite manifest, `MODULE.bazel`, a CI line, `Dockerfile` -- so all five
+passed against a checker that could not see a third of its own subject. **A control that
+only exercises what discovery already finds cannot detect a gap in discovery.** The nine
+controls now include one per previously-invisible file, and those three are the only ones
+that would have failed the old version.
+
+I also reproduced the bug while hunting it: my first sweep for remaining `1.95` ran
+`grep --include=Dockerfile`, which is the identical mistake in a different tool, and came
+back clean. The second sweep used `find -iname "*dockerfile*"` and found all three in one
+command.
+
+### What this says about the morning's entry
+
+That entry's carry-away was "mechanizing a count usually revises it", on the evidence that a
+hand count of fourteen became sixteen. It revised again, to nineteen, and in the direction
+that mattered -- the count was not merely imprecise, the thing doing the counting was blind.
+The sharper statement: **mechanizing a count tells you what the mechanism can see, which is
+a different quantity from what exists.** Check the discovery before trusting the tally.
+
+### Also worth keeping
+
+The gate jobs were green and the release workflow was red, which is the correct outcome and
+a useful separation: the pin question for a consumer rests on the gate jobs, not on the run's
+overall conclusion. A red release pipeline on a revision whose code passes every gate is a
+packaging defect, not a code defect, and conflating them would have blocked a consumer's pin
+for no reason.

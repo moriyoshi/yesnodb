@@ -5,9 +5,17 @@ Why this exists
 ---------------
 
 On 2026-10-07 the floor moved from 1.95 to 1.98 for the AArch64 `dotprod`
-intrinsics. It is written in **fourteen** places and nothing checked that they
-agree, so the bump was a hand search: five manifests, four Dockerfiles, four
+intrinsics. It is written in **nineteen** places and nothing checked that they
+agree, so the bump was a hand search: five manifests, seven build images, four
 lines of the `msrv` CI job, and `MODULE.bazel`.
+
+The count was first recorded as fourteen, then sixteen once this script counted
+what it actually read, and is nineteen now -- because the first version of this
+script globbed `Dockerfile` and could not see `build.Dockerfile`,
+`snapshot-agent.Dockerfile` or `aws.Dockerfile`. All three were left at 1.95, and
+the release pipeline's cross-compile failed on 2026-10-08 *while this checker
+reported every site in agreement*. **A discovery glob narrower than the convention
+it models does not under-report, it reports success.**
 
 `MODULE.bazel` is the dangerous one, and is why this is a script rather than a
 convention. Bazel compiles `yesno-core` and `yesno-wire` and **does not read
@@ -112,10 +120,21 @@ def main():
             bad.append((rel, f"{floor}, or rust-version.workspace = true", "no floor declared"))
 
     # 2. The release and E2E images.
+    #
+    #    **Any file whose name contains "dockerfile", not just files named exactly
+    #    that.** An earlier version globbed `Dockerfile` and so was blind to
+    #    `dist/build.Dockerfile`, `yesno-server/dist/snapshot-agent.Dockerfile` and
+    #    `yesno-operator/e2e/aws.Dockerfile` -- three images left at 1.95 by the
+    #    1.95 -> 1.98 bump, one of which reddened the release pipeline's
+    #    cross-compile on 2026-10-08 while this checker reported all sites in
+    #    agreement. A file-discovery glob that is narrower than the convention it
+    #    models does not under-report a little; it reports success.
     for rel in sorted(
         str(p.relative_to(ROOT))
-        for p in ROOT.rglob("Dockerfile")
-        if not any(part in SKIP_DIRS for part in p.relative_to(ROOT).parts)
+        for p in ROOT.rglob("*")
+        if "dockerfile" in p.name.lower()
+        and p.is_file()
+        and not any(part in SKIP_DIRS for part in p.relative_to(ROOT).parts)
     ):
         found = re.search(r"^ARG RUST_VERSION=([\d.]+)", read(rel), re.M)
         if found:
