@@ -4,7 +4,18 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
-description = "Host side of the yesnod plugin channel: an out-of-process peer over a live Db."
+description = "The yesnod plugin channel: host, client, and a C ABI over the client."
+
+[lib]
+# `staticlib` and `cdylib` alongside `rlib` because `cabi.rs` is consumed from C
+# through `include/yesno_channel.h`. The cost is real and accepted: every
+# workspace build links two extra artifacts for this crate. The alternative was a
+# separate crate -- which is how `yesno-c` does it -- and that was rejected
+# because `crate-type` cannot be feature-gated, so the choice is between paying
+# this on every build or splitting the client away from the protocol it speaks.
+# Keeping one crate keeps one implementation, which is the whole argument for
+# having written the client here at all.
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 yesno-core = { path = "../yesno-core" }

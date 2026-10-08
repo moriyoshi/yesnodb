@@ -3514,3 +3514,67 @@ a useful separation: the pin question for a consumer rests on the gate jobs, not
 overall conclusion. A red release pipeline on a revision whose code passes every gate is a
 packaging defect, not a code defect, and conflating them would have blocked a consumer's pin
 for no reason.
+
+## 2026-10-08 -- The channel C ABI belongs in `yesno-plugin`, and my pre-checks were weaker than the gate three times
+
+The C half of the peer-socket work landed as its own crate, `yesno-channel-c`, and the
+maintainer moved it into `yesno-plugin`. The correction is right and my reasoning for a
+separate crate was a conflation worth naming.
+
+### "Not in `yesno-c`" does not imply "its own crate"
+
+The argument against `yesno-c` holds: that crate embeds a database, takes the directory's
+exclusive lock, and its cursor **deliberately materializes** an owned snapshot so no
+borrowed lifetime reaches a foreign caller -- while a lane payload *is* a borrow into memory
+shared with the server. Those contracts genuinely cannot coexist in one library.
+
+But that was an argument about `yesno-c`, and I turned it into an argument for a third
+workspace without noticing the step. The client lives in `yesno-plugin`; its C projection
+belongs beside it. The only real cost is that `crate-type` cannot be feature-gated, so the
+crate now links a `staticlib` and a `cdylib` on every workspace build. That is the price of
+one implementation instead of two, which is the entire reason the client was written here.
+
+### Reading the history changed two decisions
+
+`abi.rs` records that `yesno-plugin` **already published a C ABI** -- an in-process `cdylib`
+host table under `include/yesno_plugin.h`, removed 2026-09-29, with 351 lines preserved in
+`LTM/removed-cdylib-plugin-abi.md`. I had not looked before adding a new one, which is
+precisely the `stats.rs` failure mode in reverse: not re-adding a deleted instrument, but
+adding a near-namesake without reading why the first went.
+
+It is a different thing, and the removal reasoning argues *for* this one: that ABI loaded
+foreign code **into** yesnod and went because it shared the heap, because a panic escaping a
+callback aborted the daemon, and because its leases were invisible to the shutdown proof.
+The channel is what replaced it and runs the other way. Two concrete consequences, both of
+which I would have got wrong:
+
+* **The header must not be `yesno_plugin.h`.** That names a withdrawn *published* contract a
+  consumer may still hold. Reusing it for different semantics is worse than a new name, so
+  the header is `yesno_channel.h` and the symbols are `yesno_channel_*` where the old ones
+  were `yesno_plugin_*`.
+* Both facts now sit in the module header, so the next reader inherits them.
+
+### Three times in one day, my verification command was weaker than the gate's
+
+This is the finding worth keeping, because the three instances look unrelated and are not:
+
+1. I ran clippy, **then** added `tests/client_roundtrip.rs`, then reported clean. The gate
+   found `needless_borrows_for_generic_args` in the file clippy had never seen.
+2. I swept for stale `1.95` with `grep --include=Dockerfile` and got nothing, while three
+   `*.Dockerfile` files sat at 1.95. `find -iname "*dockerfile*"` found all three at once.
+3. I ran `cargo doc --workspace --no-deps`, exit 0, and reported the docs clean. The gate
+   runs `env RUSTDOCFLAGS="-D warnings" cargo doc`, where a broken intra-doc link is an
+   error rather than a warning -- and there was one.
+
+Each time I ran **a** check and reported what **the** check would say. The fix is not more
+care; it is to run the gate's own command, copied rather than approximated, and for a script
+that means reading the line out of `gate.sh` instead of remembering it. The doc step's own
+comment even says to iterate to a fixed point, which only makes sense if you are running the
+command that can fail.
+
+### Verified rather than asserted
+
+`gate.sh --deep` passed, which is the **first deep run on this tree** -- so Valgrind, the
+sanitizers and the fuzz targets are green, and `EXPECT_STEPS_DEEP`, which I raised 25 -> 27
+yesterday and again 27 -> 28 today, is now checked rather than declared. `gate-pg` passed
+too. Both on the restructured tree.

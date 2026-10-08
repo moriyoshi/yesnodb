@@ -540,15 +540,12 @@ jobs:
       - name: C ABI gate
         run: ./yesno-c/gate.sh
 
-      # The channel C ABI is a second, separate workspace for a reason stated in
-      # its own crate docs: `yesno-c` embeds a database and materializes its
-      # cursor to avoid handing a borrowed lifetime to C, while this one
-      # connects to a running server and a lane payload *is* a borrow into
-      # shared memory. One library cannot keep both contracts. It rides in this
-      # job rather than its own because the toolchain and the C compiler are
-      # already installed here.
-      - name: Channel C ABI gate
-        run: ./yesno-channel-c/gate.sh
+      # The channel C ABI lives in `yesno-plugin` itself rather than a crate of
+      # its own, so its Rust side is already covered by the workspace tests.
+      # What is left is the C side, and it rides in this job because the
+      # toolchain and the C compiler are already installed here.
+      - name: Channel C ABI fixture
+        run: ./scripts/check-channel-cabi.sh
 
   deep:
     name: deep (sanitizers, Valgrind)

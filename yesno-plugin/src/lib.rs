@@ -36,6 +36,7 @@ use std::sync::{Arc, RwLock};
 use yesno_core::Db;
 
 pub mod abi;
+pub mod cabi;
 pub mod channel;
 pub mod client;
 pub mod ipc;

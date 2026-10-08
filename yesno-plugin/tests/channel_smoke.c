@@ -93,6 +93,6 @@ int main(int argc, char **argv) {
   assert(YESNO_CHANNEL_INSERT == 0);
   assert(YESNO_CHANNEL_DELETE_KEY == 4);
 
-  printf("yesno-channel-c smoke passed\n");
+  printf("yesno-plugin channel C ABI smoke passed\n");
   return 0;
 }

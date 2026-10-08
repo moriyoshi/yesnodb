@@ -89,7 +89,13 @@ client_skips=()
 # unconditional `check` calls next to the other policy checks, so they count in both
 # modes. **The guard did its job**: both checkers ran and passed, and the only thing
 # wrong was that the person who added them did not come here.
-EXPECT_STEPS=21
+# **Raised 21 -> 22 and 27 -> 28 on 2026-10-08** for "the channel C ABI links
+# and its header parses as C11". Diagnosed before raising as the paragraph above
+# demands, and in the easy direction this time: the step is a single new
+# unconditional `check` added deliberately in this commit, not a mismatch found
+# after the fact, so the delta is an addition by construction and it counts in
+# both modes.
+EXPECT_STEPS=22
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -136,7 +142,7 @@ EXPECT_STEPS=21
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=27
+EXPECT_STEPS_DEEP=28
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -309,7 +315,6 @@ client_gate uv yesno-flight-python/gate.sh "python client"
 client_gate go yesno-flight-go/gate.sh "go client"
 client_gate javac yesno-flight-java/gate.sh "java client"
 client_gate cc yesno-c/gate.sh "c abi"
-client_gate cc yesno-channel-c/gate.sh "channel c abi"
 
 step "ARCHITECTURE.md layout matches the tree"
 # Cheap, and it catches a class review cannot: a diagram that is 90% right reads
@@ -513,6 +518,16 @@ step "storage-format.md's size-class ladder follows from CLASS_SIZES"
 # at the wrong row, and a prose mention of "class-0" that survived until a human
 # asked. A ladder that is eleven-twelfths right reads as right.
 check python3 scripts/check-storage-ladder.py
+
+step "the channel C ABI links and its header parses as C11"
+# `cabi.rs` is reached from C through `yesno-plugin/include/yesno_channel.h`,
+# and this is the only check that can fail the way a C header fails: the header
+# not parsing under `-Wall -Wextra -Werror`, a declared symbol not actually
+# exported by the staticlib, or a signature disagreeing with the Rust side. The
+# Rust test beside it ( `tests/cabi.rs` ) drives the same entry points against a
+# live server and cannot fail at any of those, so neither one substitutes for
+# the other.
+check ./scripts/check-channel-cabi.sh
 
 step "rustfmt"
 # Whole-tree, because the baseline is gone ( `fmt-baseline`, closed 2026-08-27 ).

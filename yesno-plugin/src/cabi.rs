@@ -1,35 +1,51 @@
-//! A C ABI over the yesno plugin channel client.
+//! A C ABI over this crate's channel [`crate::client`].
 //!
-//! Consumed through `include/yesno_channel.h`, which is the normative document
-//! for the contract; this file implements it. One Rust implementation of the
-//! protocol serves every language, which is the point: the channel is a socket
-//! **and** a `memfd` arena handed over with `SCM_RIGHTS`, so a hand-written
-//! client in another language has to reproduce the framing, the descriptor
-//! receive, the mapping and the lane arithmetic. This repository already paid
-//! for that lesson once, when the Flight ticket header widened from 40 to 48
-//! bytes and three independently written clients were not widened with it.
+//! `include/yesno_channel.h` is the normative document for the contract; this
+//! module implements it. One Rust implementation of the protocol serves every
+//! language, which is the point: the channel is a socket **and** a `memfd` arena
+//! handed over with `SCM_RIGHTS`, so a hand-written client in another language
+//! has to reproduce the framing, the descriptor receive, the mapping and the
+//! lane arithmetic. This repository already paid for that once, when the Flight
+//! ticket header widened from 40 to 48 bytes and three independently written
+//! clients were not widened with it.
 //!
-//! # Why this is not in `yesno-c`
+//! # Not the ABI that was removed
+//!
+//! `yesno-plugin` published a different C ABI until 2026-09-29 -- an in-process
+//! `cdylib` host table under `include/yesno_plugin.h`, preserved in
+//! `LTM/removed-cdylib-plugin-abi.md`. That one loaded foreign code **into**
+//! yesnod, which is why it went: it shared the heap, a panic escaping a callback
+//! aborted the daemon, and its leases were invisible to the shutdown proof.
+//!
+//! This runs the other way. A separate process talks to yesnod over a socket, so
+//! none of those three properties exists here, and the channel is precisely what
+//! replaced that ABI. The header is deliberately **not** called
+//! `yesno_plugin.h`: that name belongs to a withdrawn contract a consumer may
+//! still hold a copy of, and reusing it for different semantics would be worse
+//! than choosing a new name. The symbol namespace is `yesno_channel_*` for the
+//! same reason -- the old one was `yesno_plugin_*`.
+//!
+//! # Why not in `yesno-c`
 //!
 //! `yesno-c` embeds a database in the calling process and takes the directory's
 //! exclusive lock, and its cursor **deliberately materializes** an owned
-//! snapshot so that no borrowed lifetime is handed to a foreign caller. This
-//! ABI is the opposite on both counts: it connects to a server that already
-//! holds the lock, and a lane payload is *borrowed* -- a pointer into memory
-//! shared with that server, valid until the next advance. Those two contracts
-//! cannot both be kept by one library, so there are two.
+//! snapshot so that no borrowed lifetime is handed to a foreign caller. This ABI
+//! is the opposite on both counts: it connects to a server that already holds the
+//! lock, and a lane payload is *borrowed* -- a pointer into memory shared with
+//! that server, valid until the next advance. Those two contracts cannot both be
+//! kept by one library.
 //!
 //! # Safety
 //!
 //! Every non-null handle must be one returned by the matching open function;
-//! close consumes it once and must not race another call on it. Output and
-//! error pointers must reference the writable sizes the header declares. These
-//! rules are stated here and in the header rather than on every symbol.
+//! close consumes it once and must not race another call on it. Output and error
+//! pointers must reference the writable sizes the header declares. These rules
+//! are stated here and in the header rather than on every symbol.
 //!
 //! One hazard the header warns about is structurally absent rather than merely
 //! documented: a snapshot and a lane cursor hold their own references to the
-//! connection, so closing the channel handle while either is open cannot
-//! dangle. It is still wrong order and still reported, but it is not undefined.
+//! connection, so closing the channel handle while either is open cannot dangle.
+//! It is still wrong order and still reported, but it is not undefined.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(non_camel_case_types)]
 #![allow(
@@ -42,8 +58,8 @@ use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use yesno_plugin::client::{Client, Error, LaneCursor, Snapshot};
-use yesno_plugin::ipc::{Write, WriteOp};
+use crate::client::{Client, Error, LaneCursor, Snapshot};
+use crate::ipc::{Write, WriteOp};
 
 const YESNO_CHANNEL_OK: c_int = 0;
 const YESNO_CHANNEL_ERROR: c_int = 1;

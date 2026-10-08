@@ -14,7 +14,7 @@ use yesno_plugin::abi::Role;
 use yesno_plugin::channel::{serve_blocking, Limits, Session};
 use yesno_plugin::Host;
 
-use yesno_channel_c::*;
+use yesno_plugin::cabi::*;
 
 struct Clean(std::path::PathBuf);
 impl Drop for Clean {

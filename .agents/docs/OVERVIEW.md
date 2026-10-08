@@ -22,12 +22,11 @@ which is why the server mirrors the struct instead of deriving on it.
 | `yesno-flight-c++` | the synchronous native Arrow C++ Flight client used by remote hosts |
 | `yesno-tantivy` | generation-bound Tantivy filters from embedded or Flight results |
 | `yesno-server` | `yesnod` + `yesno`: daemon, data CLI, TLS, auth, lifecycle, failover, and gRPC WAL replication |
-| `yesno-plugin` | read-only Unix-socket protocol and session engine for separately running plugin peers |
+| `yesno-plugin` | the Unix-socket channel for separately running peers: the protocol, the host session engine, the Rust client, and a C ABI over that client ( `include/yesno_channel.h` ). Not the in-process `cdylib` ABI removed on 2026-09-29, which loaded foreign code into yesnod; this one is spoken from another process |
 | `yesno-server-utils` | `yesnoctl` + `yesno-archive`: checkpoint, hot backup, restore, and continuous object archive |
 | `yesno-operator` | Kubernetes controller for retained-storage clusters, failover, and same-Pod plugin peers |
 | `yesno-e2e` | the scenario harness; Python driven by `monty` |
 | `yesno-c` | the host-independent C ABI. A separate cargo workspace at the Rust 1.98 floor |
-| `yesno-channel-c` | the C ABI for the **plugin channel client**, a separate cargo workspace. Distinct from `yesno-c` because that one embeds a database and takes its exclusive lock, while this connects to a running `yesnod` and hands C a *borrowed* pointer into the shared arena -- one library cannot keep both contracts |
 | `yesno-mysql` | the embedded or remote MySQL 8.4 storage engine. Built and tested with pinned MySQL and Arrow source by Bazel |
 | `yesno-pg` | the PostgreSQL extension. Outside the cargo workspace, built by Bazel |
 | `yesno-flight-python/` | the pure-Python `yesnodb` Arrow Flight client |
