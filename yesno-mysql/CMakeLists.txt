@@ -10,6 +10,11 @@ SET(YESNO_C_PREBUILT_LIBRARY "" CACHE FILEPATH
 SET(YESNO_C_HEADER "" CACHE FILEPATH
     "yesno.h paired with YESNO_C_PREBUILT_LIBRARY")
 OPTION(YESNO_WITH_FLIGHT "Build the remote Arrow Flight backend" OFF)
+OPTION(YESNO_WITH_CHANNEL "Build the plugin-channel backend" OFF)
+SET(YESNO_PLUGIN_PREBUILT_LIBRARY "" CACHE FILEPATH
+    "Prebuilt libyesno_plugin.a supplied by an outer build system")
+SET(YESNO_PLUGIN_CHANNEL_HEADER "" CACHE FILEPATH
+    "yesno_channel.h paired with YESNO_PLUGIN_PREBUILT_LIBRARY")
 SET(YESNO_FLIGHT_CPP_PREBUILT_LIBRARY "" CACHE FILEPATH
     "Prebuilt libyesno_flight_cpp.a supplied by an outer build system")
 SET(YESNO_FLIGHT_CPP_HEADER "" CACHE FILEPATH
@@ -107,6 +112,53 @@ IF(YESNO_WITH_FLIGHT)
   LIST(APPEND YESNO_PLUGIN_LIBRARIES yesno_flight_cpp)
 ENDIF()
 
+# The plugin-channel backend. Its library is Rust, like `yesno_c`, so it follows
+# that shape rather than Flight's: either an outer build system hands over a
+# prebuilt staticlib and header, or cargo builds one here.
+IF(YESNO_WITH_CHANNEL)
+  IF(YESNO_PLUGIN_PREBUILT_LIBRARY)
+    IF(NOT YESNO_PLUGIN_CHANNEL_HEADER)
+      MESSAGE(FATAL_ERROR
+        "YESNO_PLUGIN_CHANNEL_HEADER is required with "
+        "YESNO_PLUGIN_PREBUILT_LIBRARY")
+    ENDIF()
+    SET(YESNO_PLUGIN_LIBRARY "${YESNO_PLUGIN_PREBUILT_LIBRARY}")
+    GET_FILENAME_COMPONENT(YESNO_PLUGIN_INCLUDE_DIR
+                           "${YESNO_PLUGIN_CHANNEL_HEADER}" DIRECTORY)
+  ELSE()
+    FIND_PROGRAM(CARGO_EXECUTABLE cargo REQUIRED)
+    SET(YESNO_PLUGIN_SOURCE_DIR_RS
+        "${YESNO_PLUGIN_SOURCE_DIR}/../yesno-plugin")
+    SET(YESNO_PLUGIN_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/plugin-target")
+    SET(YESNO_PLUGIN_LIBRARY
+        "${YESNO_PLUGIN_TARGET_DIR}/release/libyesno_plugin.a")
+    SET(YESNO_PLUGIN_INCLUDE_DIR "${YESNO_PLUGIN_SOURCE_DIR_RS}/include")
+
+    FILE(GLOB_RECURSE YESNO_PLUGIN_RUST_SOURCES CONFIGURE_DEPENDS
+         "${YESNO_PLUGIN_SOURCE_DIR_RS}/src/*.rs"
+         "${YESNO_PLUGIN_SOURCE_DIR_RS}/../yesno-core/src/*.rs")
+
+    ADD_CUSTOM_COMMAND(
+      OUTPUT "${YESNO_PLUGIN_LIBRARY}"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "CARGO_TARGET_DIR=${YESNO_PLUGIN_TARGET_DIR}"
+              "${CARGO_EXECUTABLE}" build --release -p yesno-plugin
+      DEPENDS ${YESNO_PLUGIN_RUST_SOURCES}
+      WORKING_DIRECTORY "${YESNO_PLUGIN_SOURCE_DIR_RS}"
+      COMMENT "Building the yesno plugin channel library"
+      VERBATIM)
+
+    ADD_CUSTOM_TARGET(yesno_plugin_build DEPENDS "${YESNO_PLUGIN_LIBRARY}")
+  ENDIF()
+
+  ADD_LIBRARY(yesno_plugin STATIC IMPORTED GLOBAL)
+  SET_TARGET_PROPERTIES(yesno_plugin PROPERTIES
+                        IMPORTED_LOCATION "${YESNO_PLUGIN_LIBRARY}")
+
+  LIST(APPEND YESNO_PLUGIN_SOURCES backend_channel.cc)
+  LIST(APPEND YESNO_PLUGIN_LIBRARIES yesno_plugin)
+ENDIF()
+
 IF(WITH_YESNO_STORAGE_ENGINE AND NOT WITHOUT_YESNO_STORAGE_ENGINE)
   MYSQL_ADD_PLUGIN(yesno ${YESNO_PLUGIN_SOURCES}
     STORAGE_ENGINE
@@ -129,6 +181,16 @@ IF(TARGET yesno)
     yesno PRIVATE "$<$<PLATFORM_ID:Linux>:LINKER:--exclude-libs,libyesno_c.a>")
   TARGET_INCLUDE_DIRECTORIES(
     yesno PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${YESNO_C_INCLUDE_DIR}")
+  IF(YESNO_WITH_CHANNEL)
+    TARGET_COMPILE_DEFINITIONS(yesno PRIVATE YESNO_WITH_CHANNEL=1)
+    TARGET_INCLUDE_DIRECTORIES(yesno PRIVATE "${YESNO_PLUGIN_INCLUDE_DIR}")
+    IF(TARGET yesno_plugin_build)
+      ADD_DEPENDENCIES(yesno yesno_plugin_build)
+    ENDIF()
+    TARGET_LINK_OPTIONS(
+      yesno PRIVATE
+      "$<$<PLATFORM_ID:Linux>:LINKER:--exclude-libs,libyesno_plugin.a>")
+  ENDIF()
   IF(YESNO_WITH_FLIGHT)
     TARGET_COMPILE_DEFINITIONS(yesno PRIVATE YESNO_WITH_FLIGHT=1)
     IF(TARGET Arrow::arrow_shared AND TARGET ArrowFlight::arrow_flight_shared)

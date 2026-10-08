@@ -5,8 +5,10 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "CMakeLists.txt",
     "backend.h",
+    "backend_channel.cc",
     "backend_embedded.cc",
     "backend_flight.cc",
     "ha_yesno.cc",
     "ha_yesno.h",
+    "vector_cursor.h",
 ])

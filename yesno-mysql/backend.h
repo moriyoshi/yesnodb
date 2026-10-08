@@ -78,6 +78,15 @@ std::unique_ptr<Backend> OpenEmbeddedBackend(const std::string& path,
 std::unique_ptr<Backend> OpenFlightBackend(const std::string& endpoint,
                                            std::string *error);
 
+/// The plugin-channel backend: a Unix socket to a yesnod that already holds the
+/// database's exclusive lock.
+///
+/// Unlike `OpenFlightBackend`, its `Apply` is **one commit** across every key,
+/// because a single channel `Apply` frame carries them all -- so its atomicity
+/// matches the embedded backend's rather than Flight's.
+std::unique_ptr<Backend> OpenChannelBackend(const std::string &socket_path,
+                                            std::string *error);
+
 }  // namespace yesno_mysql
 
 #endif

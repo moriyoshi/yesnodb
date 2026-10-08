@@ -33,6 +33,7 @@ handlerton *yesno_hton = nullptr;
 char *yesno_data_dir = nullptr;
 char *yesno_backend_mode = nullptr;
 char *yesno_flight_endpoint = nullptr;
+char *yesno_channel_socket = nullptr;
 std::string resolved_data_dir;
 std::unique_ptr<yesno_mysql::Backend> yesno_backend;
 
@@ -629,9 +630,20 @@ int yesno_init_func(void *plugin) {
     }
     yesno_backend =
         yesno_mysql::OpenFlightBackend(yesno_flight_endpoint, &error);
+  } else if (mode == "channel") {
+    if (yesno_channel_socket == nullptr || yesno_channel_socket[0] == '\0') {
+      my_printf_error(
+          ER_UNKNOWN_ERROR,
+          "YESNO: yesno_channel_socket is required for backend=channel",
+          MYF(0));
+      return 1;
+    }
+    yesno_backend =
+        yesno_mysql::OpenChannelBackend(yesno_channel_socket, &error);
   } else {
-    my_printf_error(ER_UNKNOWN_ERROR,
-                    "YESNO: backend must be 'embedded' or 'flight'", MYF(0));
+    my_printf_error(
+        ER_UNKNOWN_ERROR,
+        "YESNO: backend must be 'embedded', 'flight' or 'channel'", MYF(0));
     return 1;
   }
   if (yesno_backend == nullptr) {
@@ -665,8 +677,8 @@ static MYSQL_SYSVAR_STR(
 static MYSQL_SYSVAR_STR(
     backend, yesno_backend_mode,
     PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY | PLUGIN_VAR_MEMALLOC,
-    "Backend implementation: 'embedded' or 'flight'.", nullptr, nullptr,
-    "embedded");
+    "Backend implementation: 'embedded', 'flight' or 'channel'.", nullptr,
+    nullptr, "embedded");
 
 static MYSQL_SYSVAR_STR(
     flight_endpoint, yesno_flight_endpoint,
@@ -675,9 +687,18 @@ static MYSQL_SYSVAR_STR(
     "'grpc://127.0.0.1:50051'.",
     nullptr, nullptr, nullptr);
 
+static MYSQL_SYSVAR_STR(
+    channel_socket, yesno_channel_socket,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY | PLUGIN_VAR_MEMALLOC,
+    "Unix socket of a running yesnod's plugin channel, used when "
+    "backend=channel, for example '/run/yesno/plugin.sock'. The socket's "
+    "filesystem permissions are the whole admission boundary, so this is an "
+    "operator decision of the same weight as naming the data directory.",
+    nullptr, nullptr, nullptr);
+
 static SYS_VAR *yesno_system_variables[] = {
     MYSQL_SYSVAR(data_dir), MYSQL_SYSVAR(backend),
-    MYSQL_SYSVAR(flight_endpoint), nullptr};
+    MYSQL_SYSVAR(flight_endpoint), MYSQL_SYSVAR(channel_socket), nullptr};
 
 struct st_mysql_storage_engine yesno_storage_engine = {
     MYSQL_HANDLERTON_INTERFACE_VERSION};

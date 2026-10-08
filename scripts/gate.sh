@@ -519,7 +519,7 @@ step "storage-format.md's size-class ladder follows from CLASS_SIZES"
 # asked. A ladder that is eleven-twelfths right reads as right.
 check python3 scripts/check-storage-ladder.py
 
-step "the channel C ABI links and its header parses as C11"
+step "the channel C ABI links from C and C++, and the shared cursor behaves"
 # `cabi.rs` is reached from C through `yesno-plugin/include/yesno_channel.h`,
 # and this is the only check that can fail the way a C header fails: the header
 # not parsing under `-Wall -Wextra -Werror`, a declared symbol not actually

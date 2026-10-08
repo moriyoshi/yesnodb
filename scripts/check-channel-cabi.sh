@@ -34,3 +34,28 @@ cc -std=c11 -Wall -Wextra -Werror \
   -o "$scratch/smoke"
 
 "$scratch/smoke" "$scratch/absent.sock"
+
+# And the C++ consumer, which is a different check from the C one above.
+#
+# `yesno-mysql/vector_cursor.h` holds the ordinal cursor that the Flight and
+# channel backends share. It was file-local to `backend_flight.cc` and had no
+# test of its own -- only whatever the MySQL fixtures reached through Flight --
+# so extracting it put logic a shipping backend depends on behind no direct
+# coverage. Its `kBefore` / `kAfter` sentinels are the subtlety: a cursor has to
+# sit outside the set at either end and come back, which is what a descending
+# scan needs after a failed seek.
+#
+# Compiling it here also links `backend_channel.cc` against the staticlib, which
+# proves the C++ side of the boundary -- the header usable from C++ as well as
+# C, and every symbol the backend calls actually exported. It needs no MySQL
+# headers, which is why it can run in this gate at all rather than only behind
+# the full MySQL build.
+c++ -std=c++17 -Wall -Wextra -Werror \
+  -Iyesno-mysql -Iyesno-plugin/include \
+  yesno-mysql/vector_cursor_test.cc \
+  yesno-mysql/backend_channel.cc \
+  target/debug/libyesno_plugin.a \
+  -lpthread -ldl -lm \
+  -o "$scratch/cursor"
+
+"$scratch/cursor"

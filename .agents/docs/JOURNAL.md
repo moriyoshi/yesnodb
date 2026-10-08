@@ -3578,3 +3578,70 @@ command that can fail.
 sanitizers and the fuzz targets are green, and `EXPECT_STEPS_DEEP`, which I raised 25 -> 27
 yesterday and again 27 -> 28 today, is now checked rather than declared. `gate-pg` passed
 too. Both on the restructured tree.
+
+## 2026-10-08 -- The MySQL channel backend, and a backend nothing compiles
+
+`yesno-mysql/backend_channel.cc`: a third `Backend` beside embedded and flight, over
+`yesno-plugin`'s C ABI. The two things that looked like design problems were both answered
+by precedent already in the file I was extending, and the real finding was elsewhere.
+
+### Both hard parts had answers in `backend_flight.cc`
+
+**`Checkpoint` has no frame**, and it is called at plugin shutdown where a failure raises a
+MySQL error -- so it cannot report one. The Flight backend already answers this by returning
+`true` with the reasoning written down: the remote server owns its checkpoint policy. The
+channel's version is stronger, because `Apply` has already committed server-side by the time
+it returns, so there is nothing buffered on this side that a checkpoint could flush.
+
+**The protocol has no backward continuation.** `SnapshotLoad` resumes *strictly above* a
+value the caller already holds and there is no downward equivalent, while MySQL needs `Prev`
+and a backward `Seek` for `ORDER BY ... DESC`. I had recorded this as "the real cost in the
+handler". It is not: `backend_flight.cc` already materialized the key's ordinals into a
+`VectorCursor` for exactly this reason, and `yesno-c`'s cursor makes the same `O( cardinality )`
+trade deliberately. So the answer was to reuse the shape, not invent one.
+
+`VectorCursor` was file-local in an anonymous namespace, and it is seventy lines of
+`kBefore` / `kAfter` sentinel arithmetic -- a second copy would be a second set of
+off-by-ones. Extracted to `yesno-mysql/vector_cursor.h` and shared.
+
+### One place this backend is better than Flight's
+
+A single channel `Apply` frame carries every key's writes and the server commits them
+together, so `Apply` here is **one transaction** across all keys -- matching the embedded
+backend rather than Flight, which sends a removal batch and an insertion batch and says in
+its own header that the pair is not atomic. Exceeding the server's advertised `max_writes`
+is therefore an **error rather than a split**: splitting would silently give up the
+atomicity the type otherwise promises, and a half-applied transaction is worse than a
+refused one.
+
+What is genuinely lost is the status classification. `yesno_channel.h` distinguishes
+retryable `RETRY` from `STALE`, `EXPIRED` and `WRONG_ROLE`; `Backend` returns a bool and a
+string, so none of it reaches MySQL as something it can branch on. The code goes into the
+message so an operator sees it, and widening `Backend` is what acting on it would take.
+
+### The finding: `backend_flight.cc` is compiled by nothing
+
+`YESNO_WITH_FLIGHT` appears **nowhere outside `yesno-mysql/CMakeLists.txt`** -- no gate
+script, no Bazel file, no Dockerfile -- and defaults to `OFF`. So that backend is built by
+no gate and no CI job, and the `OpenFlightBackend` symbol `ha_yesno.cc` calls is satisfied
+in every gated build by the stub in `backend_embedded.cc`. **It is not untested, it is
+unbuilt**, which is the shape that kept the Java client green and broken for a week.
+
+I noticed because my extraction *modified that file*, so I had changed something no gate
+could fail on. Verified by hand instead: `g++ -fsyntax-only` with `yesno-flight-c++/include`
+and pyarrow's bundled Arrow headers compiles it cleanly. That is a usable local check and
+deliberately not gate material, because it depends on a uv cache path. Recorded as
+`the-flight-mysql-backend-is-compiled-by-nothing`.
+
+The channel backend does not share that hole for its own logic:
+`scripts/check-channel-cabi.sh` compiles `backend_channel.cc` and the shared cursor against
+the real staticlib and runs them, which works precisely because neither needs a MySQL
+header. What is missing is the *MySQL plugin* build with either optional backend enabled.
+
+### Carry away
+
+* **Read the sibling implementation before calling something the hard part.** I had twice
+  written down that `Prev` would be the real cost; the file next door had solved it already,
+  and the answer was an extraction rather than a design.
+* **A changed file that no build compiles cannot fail.** Ask what builds a file before
+  trusting that a green gate says anything about an edit to it.

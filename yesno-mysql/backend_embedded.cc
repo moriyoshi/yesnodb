@@ -228,4 +228,13 @@ std::unique_ptr<Backend> OpenFlightBackend(const std::string&,
 }
 #endif
 
+#ifndef YESNO_WITH_CHANNEL
+std::unique_ptr<Backend> OpenChannelBackend(const std::string &,
+                                            std::string *error) {
+  *error =
+      "this yesno-mysql module was built without the plugin-channel backend";
+  return nullptr;
+}
+#endif
+
 }  // namespace yesno_mysql
