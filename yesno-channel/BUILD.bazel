@@ -1,0 +1,30 @@
+"""`yesno-channel` as a Bazel target: the peer half of the plugin channel.
+
+Exists so `yesno-pg` can link a channel client **without** `yesno-core`. That
+constraint is the whole reason this crate is separate from `yesno-plugin`: a
+PostgreSQL backend must not contain a storage engine, which `yesno-pg`'s own
+manifest states, and the host half of the channel reads a live `Db` on nearly
+every line.
+
+Cargo stays the authority for this crate's tests, clippy, fmt and MSRV. Do not
+add `rust_test` targets here; `scripts/gate.sh` is the one `QUALITY_GATE.md`
+documents.
+"""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+])
+
+rust_library(
+    name = "yesno_channel",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "yesno_channel",
+    edition = "2021",
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True),
+)

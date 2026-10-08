@@ -342,11 +342,20 @@ pub const CHUNK_WRITE_FIXED: usize = 8 + 8 + 1 + 4 + 4;
 
 /// Largest payload one chunk can carry.
 ///
-/// A bitmap is the dense ceiling and is always [`yesno_core::BITMAP_WORDS`] words, so an
+/// A bitmap is the dense ceiling and is always [`BITMAP_WORDS`] words, so an
 /// array of `ARRAY_MAX` `u16`s and a run of `RUN_MAX_INTERVALS` pairs both land at or
 /// under it. Taken from the core constant rather than written as 8192, because the two
 /// disagreeing is the bug this derivation exists to make impossible.
-pub const CHUNK_PAYLOAD_MAX: usize = yesno_core::BITMAP_WORDS * 8;
+pub const CHUNK_PAYLOAD_MAX: usize = BITMAP_WORDS * 8;
+
+/// Words in a dense bitmap container.
+///
+/// **A deliberate copy of the storage engine's `BITMAP_WORDS`**, because this
+/// crate must not depend on it -- see the crate docs. It is a format constant
+/// rather than a tunable, so copying it is safe in the way copying a threshold
+/// would not be, and `yesno-plugin` carries a test asserting the two are equal:
+/// that crate can see both and this one cannot.
+pub const BITMAP_WORDS: usize = 1024;
 
 /// Chunks one [`Frame::ChunkPut`] may carry.
 ///
@@ -410,7 +419,7 @@ impl LaneKind {
 /// reason that method gives: a length field could contradict the kind and the count, and
 /// the peer would have to trust one of the three.
 ///
-/// `card` is the chunk's cardinality, which [`yesno_core::container::codec::decode`]
+/// `card` is the chunk's cardinality, which the storage engine's container decoder
 /// needs and which is not derivable from a bitmap's fixed word count. It is checked
 /// against `count` where the two must agree rather than trusted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -452,7 +461,7 @@ impl ChunkWrite {
             // number and a disagreement is a malformed record rather than a judgement.
             LaneKind::Array => self.count == self.card,
             // A bitmap is always the full word count whatever it holds.
-            LaneKind::Bitmap => self.count as usize == yesno_core::BITMAP_WORDS,
+            LaneKind::Bitmap => self.count as usize == BITMAP_WORDS,
             // A run's cardinality is the sum of its intervals, which `codec::decode`
             // derives from the payload; nothing is claimed about it here.
             LaneKind::Run => true,
@@ -1645,10 +1654,10 @@ mod tests {
                         key: 7,
                         prefix: 0,
                         kind: LaneKind::Bitmap,
-                        count: yesno_core::BITMAP_WORDS as u32,
+                        count: BITMAP_WORDS as u32,
                         card: 64,
                         payload: {
-                            let mut v = vec![0u8; yesno_core::BITMAP_WORDS * 8];
+                            let mut v = vec![0u8; BITMAP_WORDS * 8];
                             v[0] = 0xff;
                             v[1] = 0xff;
                             v[2] = 0xff;
@@ -1948,9 +1957,9 @@ mod tests {
                 key: 1,
                 prefix: 0,
                 kind: LaneKind::Bitmap,
-                count: yesno_core::BITMAP_WORDS as u32,
+                count: BITMAP_WORDS as u32,
                 card: ordinals as u32,
-                payload: vec![0u8; yesno_core::BITMAP_WORDS * 8],
+                payload: vec![0u8; BITMAP_WORDS * 8],
             }],
         };
         let point_bytes = points

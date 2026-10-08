@@ -3772,3 +3772,63 @@ none of that changed a single byte of output.
   data; reaching past it broke a build that cargo could not see.
 * Serving a protocol in a fixture, rather than importing the server that serves it, kept the
   dependency narrow *and* made the fixture exercise the harder path.
+
+## 2026-10-08 -- Splitting the channel's peer half out of `yesno-plugin`
+
+Groundwork for a PostgreSQL channel transport, and the reason is a constraint
+`yesno-pg` states about itself rather than a preference: its Flight client is compiled
+without the server feature **so that a PostgreSQL backend does not link `yesno-core` or a
+second storage engine**. A channel transport needs the client, and the client lived in
+`yesno-plugin`, which depends on the engine. So the transport was blocked on structure, not
+on code.
+
+### The coupling was one constant
+
+Measured before deciding, because the answer determined whether a split was cheap or a
+rewrite:
+
+    client.rs     0 references to yesno_core
+    cabi.rs       0
+    ipc.rs        1, `BITMAP_WORDS`
+    abi.rs        1 method, `Status::from_core`
+    channel.rs    13 -- it reads a live `Db` on nearly every line
+
+So the division is by **who needs a database**, and that line was already there. `ipc`,
+`client` and `abi` moved to a new `yesno-channel`; the host session engine stayed. The one
+method that needed both -- mapping a `CodecError` onto a `Status` -- became a private helper
+in `channel.rs`, where all eight of its callers already were.
+
+### No consumer changed, which was the point
+
+`yesno-plugin` re-exports the three modules, so `yesno_plugin::ipc`,
+`yesno_plugin::client` and `yesno_plugin::abi` all still resolve and the MySQL backend, the
+C ABI, the server and the e2e fixture needed no edits at all. `cargo check --workspace
+--all-targets` passes, and so does `gate-mysql`, which exercises the whole Bazel chain:
+`yesno-channel` to `yesno-plugin`'s staticlib to `backend_channel.cc`.
+
+That the re-export absorbed the move entirely is worth noting as a property of the split
+rather than luck -- the boundary fell between modules that were already only using each
+other through their public surfaces.
+
+### The copied constant gets a test, in the only crate that can hold it
+
+`yesno-channel` carries its own `BITMAP_WORDS = 1024` because it must not link the engine,
+so the value now exists twice. `yesno-plugin` is the only crate that can see both, which
+makes it the only place the copy can be checked, and it now asserts they are equal. **An
+unchecked copy of a format constant is how two sides of a wire quietly stop agreeing** --
+and unlike a tuning threshold, a format constant is safe to copy *provided* something pins
+it.
+
+`read_frame` moved too, since the client needs it; `yesno_plugin::channel::read_frame` is a
+re-export. Its one use of a private `InvalidData` conversion trait was inlined rather than
+exporting the trait so a peer could decode a frame.
+
+### Still to do
+
+The transport itself. `yesno-pg` can now depend on `//yesno-channel:yesno_channel` without
+the engine, and the `Transport` trait it would implement is already there with a doc saying
+a second implementation was planned. Two constraints found while reading it, both recorded
+before writing any of it: `cmd` may be an encoded `yesno-wire` expression and the channel
+has no expression evaluation, so the planner must not lower quals for a channel server; and
+the index and table AMs are configured by a `yesno_pg.endpoint` GUC rather than by server
+options, so they are a separate change.

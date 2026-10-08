@@ -35,11 +35,17 @@ use std::sync::{Arc, RwLock};
 
 use yesno_core::Db;
 
-pub mod abi;
 pub mod cabi;
 pub mod channel;
-pub mod client;
-pub mod ipc;
+
+/// The peer half of the channel, re-exported from `yesno-channel`.
+///
+/// Those three modules moved out on 2026-10-08 so that a peer -- `yesno-pg`
+/// above all -- can link the client without the storage engine coming with it.
+/// They are re-exported rather than relocated in the public API, so every
+/// existing `yesno_plugin::ipc`, `yesno_plugin::client` and
+/// `yesno_plugin::abi` path still resolves and no consumer had to change.
+pub use yesno_channel::{abi, client, ipc};
 
 /// The slot a server keeps its database in. `None` during a rebootstrap.
 ///

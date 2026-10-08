@@ -29,7 +29,10 @@ rust_library(
     crate_name = "yesno_plugin",
     edition = "2021",
     version = "0.1.0",
-    deps = all_crate_deps(normal = True) + ["//yesno-core:yesno_core"],
+    deps = all_crate_deps(normal = True) + [
+        "//yesno-core:yesno_core",
+        "//yesno-channel:yesno_channel",
+    ],
 )
 
 # For C consumers: `yesno-mysql`'s channel backend links this.
@@ -42,7 +45,10 @@ rust_static_library(
     # position-independent. `yesno-c` carries the same flag for the same reason.
     rustc_flags = ["-Crelocation-model=pic"],
     version = "0.1.0",
-    deps = all_crate_deps(normal = True) + ["//yesno-core:yesno_core"],
+    deps = all_crate_deps(normal = True) + [
+        "//yesno-core:yesno_core",
+        "//yesno-channel:yesno_channel",
+    ],
 )
 
 filegroup(

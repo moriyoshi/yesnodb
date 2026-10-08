@@ -1,6 +1,6 @@
 //! Client side of the yesnod plugin channel.
 //!
-//! [`crate::channel`] is the server and [`ipc`] is the wire format; until now nothing in
+//! [`crate::frame`] is the server and [`ipc`] is the wire format; until now nothing in
 //! this workspace spoke the protocol as a *client*, so the one existing consumer
 //! wrote its own. That is the shape that let the Flight ticket header widen from 40
 //! to 48 bytes with three independently written clients left behind, and the reason
@@ -41,10 +41,10 @@
 //! `cargo check` would both contend for its cache -- its pinned set spans both L3
 //! clusters, so no core on this host is outside its footprint -- and write `target/`
 //! under its disk gate. Treat every signature here as unverified until the gate has
-//! run. The protocol facts are not guesses: they are read from [`crate::channel`] and from
+//! run. The protocol facts are not guesses: they are read from [`crate::frame`] and from
 //! the existing consumer's client, cited in
 //! `.agents/docs/peer-sockets-for-the-db-plugins.md`.
-use crate::channel::read_frame;
+use crate::frame::read_frame;
 use crate::ipc::{self, Block, Frame, Lane, Role, Write};
 use std::io::{self, Write as _};
 use std::os::fd::OwnedFd;
@@ -302,7 +302,7 @@ fn under_version<T>(version: u64, result: Result<T>) -> Result<T> {
 ///
 /// A one-byte `iovec`, so nothing beyond the byte is consumed from the socket.
 /// Tolerating an absent descriptor is the whole reason this is not
-/// [`crate::channel::recv_fd`], which requires one and is right to for its own
+/// `yesno-plugin`'s `recv_fd`, which requires one and is right to for its own
 /// caller: here, no descriptor is how inline mode announces itself.
 fn greet(socket: &UnixStream) -> io::Result<(Option<OwnedFd>, u8)> {
     use std::os::fd::{AsRawFd, FromRawFd};

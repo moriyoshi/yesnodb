@@ -1,0 +1,21 @@
+[package]
+name = "yesno-channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The yesnod plugin channel: wire format and client, with no storage engine."
+
+[dependencies]
+# **Deliberately not `yesno-core`.** This crate is the half of the channel that
+# a *peer* needs, and a peer must be linkable into a process that must not
+# contain a storage engine -- `yesno-pg` states that constraint outright, so
+# that a PostgreSQL backend does not grow one. The host half, which does read a
+# live `Db`, stays in `yesno-plugin`.
+#
+# memmap2 maps the arena a peer is handed; libc is the `recvmsg` that receives
+# its descriptor, neither of which has a dependency-free spelling.
+memmap2 = "0.9"
+libc = "0.2"
+bytemuck.workspace = true

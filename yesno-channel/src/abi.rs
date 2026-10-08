@@ -50,18 +50,6 @@ impl Status {
             Status::BlockState => "BLOCK_STATE",
         }
     }
-
-    /// Map a core error onto a code a plugin can branch on.
-    ///
-    /// `SnapshotTooOld` is the one that must not be flattened: it means the
-    /// lease is dead and a new one will work, which is completely different
-    /// advice from `Internal`.
-    pub fn from_core(e: &yesno_core::CodecError) -> Status {
-        match e {
-            yesno_core::CodecError::SnapshotTooOld { .. } => Status::SnapshotTooOld,
-            _ => Status::Internal,
-        }
-    }
 }
 
 /// Which end of a replication pair this server is.

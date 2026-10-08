@@ -31,6 +31,8 @@
 
 use std::collections::HashMap;
 
+pub use yesno_channel::read_frame;
+
 use crate::ipc::{
     Block as WireBlock, Frame, Kind, Lane, LaneKind, Role as WireRole, LANE_BYTES,
     MAX_INLINE_PAYLOAD, MAX_LANES, MAX_PAGE,
@@ -568,7 +570,7 @@ impl Session {
                 version: c.version,
                 changed: c.changed,
             },
-            Err(e) => Self::fault(Status::from_core(&e), "the write failed"),
+            Err(e) => Self::fault(status_from_core(&e), "the write failed"),
         }
     }
 
@@ -657,7 +659,7 @@ impl Session {
                 Ok(c) => decoded.push((w.key, w.prefix, c)),
                 Err(e) => {
                     return Self::fault(
-                        Status::from_core(&e),
+                        status_from_core(&e),
                         &format!("chunk {i}: the payload is not a {kind:?} container"),
                     );
                 }
@@ -678,7 +680,7 @@ impl Session {
                 version: c.version,
                 changed: c.changed,
             },
-            Err(e) => Self::fault(Status::from_core(&e), "the chunk write failed"),
+            Err(e) => Self::fault(status_from_core(&e), "the chunk write failed"),
         }
     }
 
@@ -697,7 +699,7 @@ impl Session {
         };
         match f(snap) {
             Ok(frame) => frame,
-            Err(e) => Self::fault(Status::from_core(&e), "the read failed"),
+            Err(e) => Self::fault(status_from_core(&e), "the read failed"),
         }
     }
 
@@ -716,7 +718,7 @@ impl Session {
         };
         let snap = match db.snapshot() {
             Ok(s) => s,
-            Err(e) => return Self::fault(Status::from_core(&e), "cannot take a snapshot"),
+            Err(e) => return Self::fault(status_from_core(&e), "cannot take a snapshot"),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -757,7 +759,7 @@ impl Session {
         };
         let lanes = match KeyLanes::new(snap, keys) {
             Ok(l) => l,
-            Err(e) => return Self::fault(Status::from_core(&e), "cannot open the lanes"),
+            Err(e) => return Self::fault(status_from_core(&e), "cannot open the lanes"),
         };
         self.slots[index] = true;
         let id = self.next_id;
@@ -801,7 +803,7 @@ impl Session {
         }
         let advanced = match h.lanes.advance() {
             Ok(a) => a,
-            Err(e) => return Self::fault(Status::from_core(&e), "cannot advance"),
+            Err(e) => return Self::fault(status_from_core(&e), "cannot advance"),
         };
         let Some(prefix) = advanced else {
             return Frame::BlockDone;
@@ -899,7 +901,7 @@ impl Session {
         for j in 0..cap {
             let advanced = match h.lanes.advance() {
                 Ok(a) => a,
-                Err(e) => return Self::fault(Status::from_core(&e), "cannot advance"),
+                Err(e) => return Self::fault(status_from_core(&e), "cannot advance"),
             };
             let Some(prefix) = advanced else { break };
             let mut lanes = Vec::with_capacity(arity);
@@ -1077,37 +1079,6 @@ pub fn requires_greeting(kind: Kind) -> bool {
     !matches!(kind, Kind::ClientHello)
 }
 
-/// Read one frame from `r`, growing `buf` until a whole frame is present.
-///
-/// `Ok( None )` on a clean end of stream, which is the peer having gone away -- the
-/// signal that the session may be dropped and its snapshots released.
-pub fn read_frame<R: std::io::Read>(
-    r: &mut R,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<Option<Frame>> {
-    loop {
-        match Frame::decode(buf) {
-            Ok((f, used)) => {
-                buf.drain(..used);
-                return Ok(Some(f));
-            }
-            Err(crate::ipc::IpcError::Truncated) => {}
-            Err(e) => {
-                return Err(<std::io::Error as InvalidData>::new_invalid(e));
-            }
-        }
-        let mut chunk = [0u8; 4096];
-        let n = r.read(&mut chunk)?;
-        if n == 0 {
-            // A clean close with nothing buffered is the peer leaving. A clean close
-            // mid-frame is a peer that died between writes, which is the same
-            // outcome for us and not worth a different error.
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
 /// Serve one connection to completion, blocking.
 ///
 /// Returns when the peer closes. The caller drops the session afterwards, which is
@@ -1118,6 +1089,19 @@ pub fn read_frame<R: std::io::Read>(
 /// which faults mmap pages and may read from disk, so this belongs on a blocking
 /// pool exactly as `do_get` does. An async signature would invite it onto a
 /// reactor thread.
+/// Map a core codec error onto a channel [`Status`].
+///
+/// Lived on `Status` as `from_core` until the status vocabulary moved to
+/// `yesno-channel`, which must not depend on the storage engine. The mapping
+/// needs both, so it belongs here -- the host half -- and every caller was
+/// already in this file.
+fn status_from_core(e: &yesno_core::CodecError) -> Status {
+    match e {
+        yesno_core::CodecError::SnapshotTooOld { .. } => Status::SnapshotTooOld,
+        _ => Status::Internal,
+    }
+}
+
 pub fn serve_blocking<S>(session: &mut Session, mut stream: S) -> std::io::Result<()>
 where
     S: std::io::Read + std::io::Write,
@@ -1375,6 +1359,22 @@ fn load_page(
 
 #[cfg(test)]
 mod tests {
+    /// The copied format constant still equals the engine's.
+    ///
+    /// `yesno-channel` carries its own `BITMAP_WORDS` because a peer must not
+    /// link the storage engine, so the value exists twice. This crate is the
+    /// only one that can see both, which makes it the only place the copy can
+    /// be checked -- and an unchecked copy of a format constant is how two
+    /// sides of a wire quietly stop agreeing.
+    #[test]
+    fn the_copied_bitmap_word_count_matches_the_engine() {
+        assert_eq!(
+            crate::ipc::BITMAP_WORDS,
+            yesno_core::BITMAP_WORDS,
+            "yesno-channel's copy of BITMAP_WORDS has drifted from yesno-core's"
+        );
+    }
+
     use super::*;
 
     /// A lane encodes to the same bytes whether or not its destination is aligned.

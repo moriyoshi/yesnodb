@@ -19,6 +19,9 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 yesno-core = { path = "../yesno-core" }
+# The peer half: wire format, client and status codes. Split out so a peer can
+# link it without the engine; this crate is the host half and needs both.
+yesno-channel = { path = "../yesno-channel", version = "0.1.0" }
 # The IPC channel. memmap2 maps the arena; libc is memfd_create, fcntl sealing and
 # sendmsg, none of which has a dependency-free spelling. The protocol itself is
 # `ipc.rs` in this crate and pulls in neither.
