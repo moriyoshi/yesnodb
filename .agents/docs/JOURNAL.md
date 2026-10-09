@@ -4336,3 +4336,97 @@ the version into `Transport::ticket_for` so a ticket is minted at it rather than
 * **Look at the key, not the name.** `PINNED` reads like a per-transaction pin and is keyed
   per target. Nothing was wrong with the code that used it; the bug is in what the shape of
   the key promises.
+
+## 2026-10-09 -- One version per transaction, not one per key
+
+`a-repeatable-read-transaction-can-see-two-versions-across-keys`, recorded earlier today
+from reading a map's key, and **demonstrated before it was fixed**.
+
+### The demonstration
+
+`tam_repeatable_read_two_keys.spec`: A opens `REPEATABLE READ` and counts `k1`, B inserts
+into `k2`, A counts `k2`. A's view was fixed before B's insert, so `k2` must read 2.
+
+```
+ c2_under_pin / k2_under_pin
+-            2      <- what REPEATABLE READ promises
++            3      <- what it answered
+```
+
+Everything else in the spec matched: `k1_again` was 3, so the single-table property the older
+spec checks was never broken, and `k2_after` was 3 in a fresh transaction. Only the
+cross-key case was wrong, which is exactly why `tam_repeatable_read.spec` could not see it --
+it reads one table.
+
+Writing the spec first and watching it fail cost one gate run and bought the thing I have
+twice gone without this week: evidence that the bug is the one I think it is.
+
+### The shape of the bug was the shape of the key
+
+`PINNED` was `HashMap<( endpoint, key ), ticket>`. A scope's second key had no entry, so it
+was minted when first touched -- at whatever had been committed by then. Nothing in the code
+using that map was wrong; **what was wrong was what the key promised**. A map keyed per
+target can only remember a pin per target, and a transaction has one view.
+
+So `Pins` now holds both: a `version` per endpoint, which is what the scope actually fixes,
+and the ticket cache per target, which is only a cache. They are one struct so that clearing
+cannot clear one and not the other -- a ticket surviving its version would read at a version
+the scope no longer claims, and a version surviving its tickets would mint the next target
+against a view nothing else shares.
+
+`Transport::ticket_for` grew `at: Option<u64>` and now returns `( ticket, version )`. The
+version has to come back because the caller cannot derive it: a Flight ticket is the server's
+opaque bytes and a channel ticket names a pin the transport holds.
+
+### Two transports, two mechanisms, one promise
+
+**Flight** mints at a version by asking as a `QueryRequest`, which is the only descriptor
+form with somewhere to put one -- `QueryRequest::at` already existed in `yesno-wire` and the
+server already answered it from `db.snapshot_at( version )`. Nothing in the protocol needed
+adding. It also verifies the answer: a ticket naming a version other than the one asked for
+is reported, because that would silently put one transaction on two versions again.
+
+**The channel** cannot reopen a version at all, so there is nothing to ask for: minting at a
+fixed version means finding the pin the scope's first target published in the thread-local
+registry and reading through it, taking **no new pin**. That the registry was keyed by
+`( socket, version )` rather than by target -- a choice made this morning for a different
+reason -- is what made this a lookup rather than a redesign.
+
+Both are covered, because they share no code: `tam_repeatable_read_two_keys.spec` and
+`..._channel.spec`, the latter also asserting `length( current_setting(
+'yesno_pg.endpoint' ) ) = 0` so it cannot quietly be testing Flight twice.
+
+### A second wrong answer, fixed by the same change
+
+`has_pinned` was `( endpoint, key )` too, and `count_rows` asks it to decide whether a cheap
+count at `now` is still right. For a key the scope had not yet read the answer was `false`,
+so the count was taken at `now` while a **scan** of that same key would read at the pinned
+version. Two numbers for one key in one transaction, and nobody had asked about it. It is
+endpoint-scoped now.
+
+### `the-fdw-scan-path-pins-no-version-at-all`
+
+Found by grepping for the caller: `pinned_ticket` is called from `tam/exec.rs` **and nowhere
+else**. `fdw/scan.rs` calls `open_scan( &cmd )` at three sites and pins nothing, so a
+`REPEATABLE READ` transaction over a yesno *foreign table* has no snapshot stability at all
+-- for one key or many. `tam-mvcc`'s note that tickets "now provide the isolation each
+PostgreSQL level promises" is true of the table access method only.
+
+Recorded rather than fixed, because it is not a copy of the TAM's three lines. The TAM's
+descriptor is always `key_cmd( key )`, one per relation; an FDW scan's carries the
+**pushed-down expression**, so a ticket cache keyed by `( endpoint, key )` would hand a
+second statement a ticket minted for a different qual. It wants keying by `( endpoint, cmd )`
+and a spec that builds a `SERVER` from `current_setting` through a `DO` block, since the
+isolation harness passes GUCs rather than psql variables.
+
+### Carry away
+
+* **Demonstrate, then fix.** The diff that shows 3 where 2 belongs is worth more than any
+  amount of reasoning about the map, and it is the artifact a later reader needs to believe
+  the fixture is guarding something real.
+* **A map's key is a claim about scope.** Nothing using `PINNED` was wrong; the key said
+  "per target" and the promise was "per transaction", and no amount of correct code at the
+  call sites could reconcile those.
+* **A choice made for one reason can pay for another.** Keying the channel's pin registry by
+  version was this morning's decision about ticket replay. It is what made "mint at a fixed
+  version" a map lookup today.

@@ -67,13 +67,33 @@ pub trait Transport {
     /// [`Transport::next_batch`].
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError>;
 
-    /// Mint a ticket for `cmd` without reading it.
+    /// Mint a ticket for `cmd` without reading it, and say which version it
+    /// reads at.
     ///
     /// A ticket records **the version it was minted at**, and the server
     /// answers at that version rather than at whatever is current. That is what
     /// makes a stable snapshot expressible: hold one ticket for the length of a
     /// transaction and every scan through it sees the same state.
-    fn ticket_for(&mut self, cmd: &[u8]) -> Result<Vec<u8>, TransportError>;
+    ///
+    /// # `at` is what makes one transaction one version rather than one per key
+    ///
+    /// `None` means "whatever is current", which is what a scope's **first**
+    /// target wants. `Some( v )` means *this exact version*, which is what
+    /// every later target in the same scope wants.
+    ///
+    /// Without it, a `REPEATABLE READ` transaction reading two keys minted a
+    /// ticket per key, each at whatever was current when that key was first
+    /// touched -- so a commit between two statements put one transaction on two
+    /// versions. Demonstrated by
+    /// `e2e/postgresql/isolation/tam_repeatable_read_two_keys.spec`, whose
+    /// second key read 3 where the transaction's own view held 2.
+    ///
+    /// The version comes back because the caller cannot derive it: a Flight
+    /// ticket is the server's opaque bytes and a channel ticket names a pin
+    /// this transport holds. `fdw::modify::pinned_ticket` records it for the
+    /// scope and passes it to every later mint.
+    fn ticket_for(&mut self, cmd: &[u8], at: Option<u64>)
+        -> Result<(Vec<u8>, u64), TransportError>;
 
     /// Begin streaming from a ticket obtained earlier, possibly by an earlier
     /// statement in the same transaction.

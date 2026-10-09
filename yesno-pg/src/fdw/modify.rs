@@ -204,15 +204,14 @@ impl Pending {
 
 thread_local! {
     static PENDING: RefCell<Pending> = RefCell::new(Pending::new());
-    /// `( endpoint, key ) -> the Flight ticket this transaction pinned`.
+    /// What this transaction has pinned.
     ///
     /// Only populated under `REPEATABLE READ` and above — see
     /// [`pinned_ticket`]. Cleared by the same transaction callback that clears
     /// `PENDING`, which is why pinning must register that callback too: a
     /// read-only transaction never buffers a write, so nothing else would.
-    static PINNED: RefCell<HashMap<(String, u64), Vec<u8>>> =
-        RefCell::new(HashMap::new());
-    /// `( endpoint, key ) -> the Flight ticket this statement pinned`.
+    static PINNED: RefCell<Pins> = RefCell::new(Pins::new());
+    /// What this statement has pinned.
     ///
     /// `READ COMMITTED` needs exactly this lifetime: repeated scans inside one
     /// executor invocation share a version, while the next statement starts
@@ -224,16 +223,49 @@ thread_local! {
     static REGISTERED: RefCell<bool> = const { RefCell::new(false) };
 }
 
+/// One scope's pins: a version per endpoint, and a ticket per target.
+///
+/// # The version is the pin; the tickets are a cache
+///
+/// This used to be the ticket map alone, keyed by `( endpoint, key )`, and that
+/// shape was the bug: a scope's second key was minted when it was first
+/// touched, so a `REPEATABLE READ` transaction reading two keys held **one
+/// version per key** rather than one version. `version` is what the scope
+/// actually fixes, and every later target is minted at it.
+///
+/// They live in one struct so that clearing cannot clear one and not the other.
+/// A ticket surviving its version would read at a version the scope no longer
+/// claims; a version surviving its tickets would mint the next target against a
+/// view nothing else in the scope shares.
+struct Pins {
+    version: HashMap<String, u64>,
+    ticket: HashMap<(String, u64), Vec<u8>>,
+}
+
+impl Pins {
+    fn new() -> Self {
+        Self {
+            version: HashMap::new(),
+            ticket: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.version.clear();
+        self.ticket.clear();
+    }
+}
+
 struct StatementPins {
     depth: usize,
-    by_target: HashMap<(String, u64), Vec<u8>>,
+    pins: Pins,
 }
 
 impl StatementPins {
     fn new() -> Self {
         Self {
             depth: 0,
-            by_target: HashMap::new(),
+            pins: Pins::new(),
         }
     }
 
@@ -243,7 +275,7 @@ impl StatementPins {
         // the usual cleanup path, but clearing here is the final guard against
         // carrying one statement's snapshot into another.
         if self.depth == 0 {
-            self.by_target.clear();
+            self.pins.clear();
         }
         self.depth += 1;
     }
@@ -253,18 +285,18 @@ impl StatementPins {
         // is already running, so its matching start hook was never called.
         // Treat that first unmatched end as cleanup rather than underflow.
         if self.depth == 0 {
-            self.by_target.clear();
+            self.pins.clear();
             return;
         }
         self.depth -= 1;
         if self.depth == 0 {
-            self.by_target.clear();
+            self.pins.clear();
         }
     }
 
     fn reset(&mut self) {
         self.depth = 0;
-        self.by_target.clear();
+        self.pins.clear();
     }
 }
 
@@ -697,28 +729,49 @@ unsafe extern "C-unwind" fn xact_callback(
 ///   Repeated scans agree, and the next statement can mint a newer ticket.
 /// - `REPEATABLE READ` and `SERIALIZABLE` — pin on first access and reuse, so
 ///   every scan in the transaction reads the same version.
+///
+/// # One version per scope, not one per target
+///
+/// `mint` is handed the version the scope has already fixed, or `None` if this
+/// is the scope's first target, and reports the version it landed on. The first
+/// call fixes it and every later one is minted at it.
+///
+/// This is the fix for a transaction holding **one version per key**: the
+/// ticket map alone was keyed by `( endpoint, key )`, so a second key was
+/// minted when it was first touched -- at whatever had been committed by then.
+/// `tam_repeatable_read_two_keys.spec` demonstrated it, reading 3 of a key
+/// whose transaction had already fixed a view containing 2.
 pub fn pinned_ticket<F>(endpoint: &str, key: u64, mint: F) -> Result<Option<Vec<u8>>, String>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce(Option<u64>) -> Result<(Vec<u8>, u64), String>,
 {
     // `XactIsoLevel` is the level of the transaction in progress. Values are
     // ordered, so `>=` covers SERIALIZABLE without naming it.
     let k = (endpoint.to_string(), key);
     let transaction_pin = unsafe { pg_sys::XactIsoLevel } >= pg_sys::XACT_REPEATABLE_READ as i32;
     if transaction_pin {
-        if let Some(t) = PINNED.with(|p| p.borrow().get(&k).cloned()) {
+        if let Some(t) = PINNED.with(|p| p.borrow().ticket.get(&k).cloned()) {
             return Ok(Some(t));
         }
         // Registered here as well as on the write path. A read-only
         // REPEATABLE READ transaction buffers nothing, so without this the pin
         // would outlive the transaction and the *next* one would read stale.
         ensure_xact_callbacks();
-        let ticket = mint()?;
-        PINNED.with(|p| p.borrow_mut().insert(k, ticket.clone()));
+        let at = PINNED.with(|p| p.borrow().version.get(endpoint).copied());
+        let (ticket, version) = mint(at)?;
+        PINNED.with(|p| {
+            let mut p = p.borrow_mut();
+            // `or_insert`, not `insert`: when `at` was `Some` the mint read at
+            // the version already recorded, so there is nothing to move, and
+            // overwriting would make the record follow the last target instead
+            // of the first.
+            p.version.entry(endpoint.to_string()).or_insert(version);
+            p.ticket.insert(k, ticket.clone());
+        });
         return Ok(Some(ticket));
     }
 
-    if let Some(t) = STATEMENT.with(|s| s.borrow().by_target.get(&k).cloned()) {
+    if let Some(t) = STATEMENT.with(|s| s.borrow().pins.ticket.get(&k).cloned()) {
         return Ok(Some(t));
     }
     let in_statement = STATEMENT.with(|s| s.borrow().depth != 0);
@@ -729,16 +782,33 @@ where
     // then resets both the nesting depth and this map, so a failed read-only
     // statement cannot leak its ticket into the next transaction.
     ensure_xact_callbacks();
-    let ticket = mint()?;
-    STATEMENT.with(|s| s.borrow_mut().by_target.insert(k, ticket.clone()));
+    // The same one-version rule within a statement. `READ COMMITTED` promises a
+    // fresh view per *statement*, not per scan, so two keys read by one
+    // statement must still agree with each other.
+    let at = STATEMENT.with(|s| s.borrow().pins.version.get(endpoint).copied());
+    let (ticket, version) = mint(at)?;
+    STATEMENT.with(|s| {
+        let mut s = s.borrow_mut();
+        s.pins
+            .version
+            .entry(endpoint.to_string())
+            .or_insert(version);
+        s.pins.ticket.insert(k, ticket.clone());
+    });
     Ok(Some(ticket))
 }
 
-/// Whether this transaction has already pinned a version for a target.
-pub fn has_pinned(endpoint: &str, key: u64) -> bool {
-    let target = (endpoint.to_string(), key);
-    PINNED.with(|p| p.borrow().contains_key(&target))
-        || STATEMENT.with(|s| s.borrow().by_target.contains_key(&target))
+/// Whether this transaction or statement has fixed a version for `endpoint`.
+///
+/// **Endpoint-scoped rather than per target, and that is a fix rather than a
+/// simplification.** A caller asks this to decide whether a count taken at
+/// `now` is still the right answer. For a key the scope has not read yet the
+/// answer was `false`, so the count was taken at `now` while a *scan* of that
+/// key would read at the pinned version -- two numbers for one key in one
+/// transaction.
+pub fn has_pinned(endpoint: &str) -> bool {
+    PINNED.with(|p| p.borrow().version.contains_key(endpoint))
+        || STATEMENT.with(|s| s.borrow().pins.version.contains_key(endpoint))
 }
 
 /// Send everything buffered, then clear.

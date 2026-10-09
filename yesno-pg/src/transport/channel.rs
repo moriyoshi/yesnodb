@@ -332,7 +332,11 @@ impl Transport for ChannelTransport {
     /// `cmd` means a ticket replays the same scan whether it is a key or a
     /// pushed-down expression, and it is what `open_scan` already classifies, so
     /// the two paths cannot disagree about what a ticket meant.
-    fn ticket_for(&mut self, cmd: &[u8]) -> Result<Vec<u8>, TransportError> {
+    fn ticket_for(
+        &mut self,
+        cmd: &[u8],
+        at: Option<u64>,
+    ) -> Result<(Vec<u8>, u64), TransportError> {
         // Classified before minting, so a descriptor this transport cannot serve
         // fails here rather than at the first page of a replay -- including the
         // server-evaluates-nothing case, which a ticket would otherwise carry
@@ -340,22 +344,42 @@ impl Transport for ChannelTransport {
         if matches!(cmd_of(cmd)?, Cmd::Expr(_)) {
             self.refuse_if_not_evaluated()?;
         }
-        let snapshot = self.pin()?;
-        let version = snapshot.version();
-        // **Published, which is the whole of what makes a ticket replayable.**
-        // This transport is gone by the next statement; the pin has to be
-        // somewhere that is not. Keyed by version so that two targets pinned at
-        // the same version share one snapshot rather than one evicting the
-        // other -- the common case, since nothing need have committed between
-        // them.
-        PINS.with(|pins| {
-            pins.borrow_mut()
-                .insert((self.socket.clone(), version), snapshot);
-        });
+        let version = match at {
+            // A later target in a scope that has already fixed its version.
+            // **No new pin is taken**: the one the first target published is the
+            // version, and this descriptor simply reads at it. That is why the
+            // registry is keyed by version rather than by target.
+            Some(want) => {
+                let held =
+                    PINS.with(|pins| pins.borrow().get(&(self.socket.clone(), want)).cloned());
+                let Some(snapshot) = held else {
+                    return Err(TransportError::Rpc(format!(
+                        "this scope fixed version {want} and nothing in this session \
+                         still pins it; the channel cannot reopen a version, so the \
+                         transaction must restart. The socket is {}",
+                        self.socket
+                    )));
+                };
+                self.pinned = Some(snapshot);
+                want
+            }
+            None => {
+                let snapshot = self.pin()?;
+                let version = snapshot.version();
+                // **Published, which is the whole of what makes a ticket
+                // replayable.** This transport is gone by the next statement;
+                // the pin has to be somewhere that is not.
+                PINS.with(|pins| {
+                    pins.borrow_mut()
+                        .insert((self.socket.clone(), version), snapshot);
+                });
+                version
+            }
+        };
         let mut ticket = Vec::with_capacity(8 + cmd.len());
         ticket.extend_from_slice(&version.to_le_bytes());
         ticket.extend_from_slice(cmd);
-        Ok(ticket)
+        Ok((ticket, version))
     }
 
     fn open_scan_with_ticket(&mut self, ticket: &[u8]) -> Result<(), TransportError> {

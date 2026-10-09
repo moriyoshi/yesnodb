@@ -820,8 +820,8 @@ unsafe fn fetch_all(rel: pg_sys::Relation) -> Vec<u64> {
     // its first access. Under READ COMMITTED it reuses a ticket only within the
     // current executor statement, so repeated scans agree without hiding a
     // commit from the next statement. See `fdw::modify::pinned_ticket`.
-    let pinned = crate::fdw::modify::pinned_ticket(&_endpoint, key, || {
-        transport.ticket_for(&cmd).map_err(|e| e.to_string())
+    let pinned = crate::fdw::modify::pinned_ticket(&_endpoint, key, |at| {
+        transport.ticket_for(&cmd, at).map_err(|e| e.to_string())
     });
     let opened = match pinned {
         Err(e) => error!("yesno_tam: {e}"),
@@ -861,7 +861,7 @@ unsafe fn count_rows(rel: pg_sys::Relation) -> u64 {
     // a pinned scan must not use. A count that disagrees with the rows the
     // same transaction can see is worse than a slow one.
     if crate::fdw::modify::has_pending(&_endpoint, key)
-        || crate::fdw::modify::has_pinned(&_endpoint, key)
+        || crate::fdw::modify::has_pinned(&_endpoint)
     {
         return unsafe { fetch_all(rel) }.len() as u64;
     }

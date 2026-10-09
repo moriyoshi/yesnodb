@@ -20,6 +20,11 @@
 //! Do not "optimize" by constructing a ticket locally from the key. The
 //! server's ticket carries the snapshot version the count was taken at; a
 //! locally minted one would silently discard it.
+//!
+//! `ticket_for` does *read* the version the server's ticket declares, which is
+//! the opposite of constructing one: it is how `fdw::modify` learns the version
+//! a scope has fixed so that every later target in that scope can be minted at
+//! it. The bytes are still handed back to `fetch_ticket` unaltered.
 
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use futures::StreamExt;
@@ -32,6 +37,30 @@ use crate::ordinal::ordinal_to_i64;
 
 /// The column `yesno-flight`'s S1 schema carries.
 const ORDINAL_COLUMN: &str = "ordinal";
+
+/// A descriptor as a set expression, so it can be wrapped in a `QueryRequest`.
+///
+/// The two forms this trait defines, and the same classification the server
+/// uses -- `SetExpr::looks_like_expr` tests the length first, because a bare key
+/// is eight arbitrary bytes and keys are commonly hashes, so one can begin with
+/// the `YSNX` magic by coincidence.
+fn expr_of(cmd: &[u8]) -> Result<yesno_flight::SetExpr, TransportError> {
+    if yesno_flight::SetExpr::looks_like_expr(cmd) {
+        return yesno_flight::SetExpr::decode(cmd).map_err(|e| {
+            TransportError::Schema(format!("this descriptor is not a set expression: {e}"))
+        });
+    }
+    if cmd.len() != 8 {
+        return Err(TransportError::Schema(format!(
+            "a descriptor is a bare 8-byte key or an encoded expression, and this is \
+             {} bytes of neither",
+            cmd.len()
+        )));
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(cmd);
+    Ok(yesno_flight::SetExpr::Key(u64::from_le_bytes(bytes)))
+}
 
 /// Rows per staging request inside one write transaction.
 ///
@@ -122,7 +151,25 @@ impl Transport for FlightTransport {
         Ok(info.total_records())
     }
 
-    fn ticket_for(&mut self, cmd: &[u8]) -> Result<Vec<u8>, TransportError> {
+    fn ticket_for(
+        &mut self,
+        cmd: &[u8],
+        at: Option<u64>,
+    ) -> Result<(Vec<u8>, u64), TransportError> {
+        // Asking for a specific version means asking as a `QueryRequest`, which
+        // is the only descriptor form with somewhere to put one. The server's
+        // `request_of` checks for it before anything else and answers from
+        // `snapshot_at( version )`.
+        let owned;
+        let cmd = match at {
+            None => cmd,
+            Some(version) => {
+                let expr = expr_of(cmd)?;
+                owned = yesno_flight::QueryRequest::at(yesno_flight::AnyExpr::Set(expr), version)
+                    .encode();
+                &owned
+            }
+        };
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
         let info = self
@@ -132,7 +179,26 @@ impl Transport for FlightTransport {
 
         // The ticket is taken from the server response and handed back unread.
         // QueryInfo validates its shape but this adapter never constructs one.
-        Ok(info.ticket_bytes().to_vec())
+        let bytes = info.ticket_bytes().to_vec();
+        // Its declared version, which is the one thing read out of it. A ticket
+        // the client cannot parse is a version skew worth reporting here rather
+        // than discovering as a wrong answer later.
+        let version = yesno_flight::Ticket::decode(&bytes)
+            .ok_or_else(|| {
+                TransportError::Schema("yesnod returned a ticket this client cannot parse".into())
+            })?
+            .version;
+        if let Some(wanted) = at {
+            // The server was asked for one version and answered with another,
+            // which no amount of retrying fixes and which would silently put
+            // this transaction on two versions.
+            if version != wanted {
+                return Err(TransportError::Schema(format!(
+                    "asked yesnod for version {wanted} and its ticket names {version}"
+                )));
+            }
+        }
+        Ok((bytes, version))
     }
 
     fn open_scan_with_ticket(&mut self, ticket: &[u8]) -> Result<(), TransportError> {
@@ -148,7 +214,7 @@ impl Transport for FlightTransport {
     }
 
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError> {
-        let ticket = self.ticket_for(cmd)?;
+        let (ticket, _) = self.ticket_for(cmd, None)?;
         self.open_scan_with_ticket(&ticket)
     }
 
