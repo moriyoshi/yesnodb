@@ -134,8 +134,15 @@ for sql_file in sql_files:
     assert fx_alive(server), f"PostgreSQL died during {name}: {out['stderr']}"
 
 
-def session(label):
-    session_env = env + ["PGOPTIONS=-c yesno_pg.endpoint=" + endpoint]
+def session(label, channel):
+    # The index and table access methods read their server from a GUC, and a
+    # GUC is a session setting -- so which transport a spec exercises has to be
+    # decided when its sessions are started, not inside the spec.
+    if channel:
+        guc = "yesno_pg.channel_socket=" + channel_socket
+    else:
+        guc = "yesno_pg.endpoint=" + endpoint
+    session_env = env + ["PGOPTIONS=-c " + guc]
     return fx_start_tty(psql, ["-X", "-a", "-q"], session_env)
 
 
@@ -155,8 +162,14 @@ specs = fx_list(isolation_dir, ".spec")
 for spec in specs:
     filename = spec.rsplit("/", 1)[-1]
     name = filename[:-5]
-    a = session("a")
-    b = session("b")
+    # A spec named `*_channel` runs over the plugin channel, everything else
+    # over Flight. Two specs can then carry the same SQL and exercise entirely
+    # different machinery, which is the point of the channel one: a ticket is
+    # self-describing over Flight and is a handle to a live pin over the
+    # channel.
+    channel = name[len(name) - 8 :] == "_channel"
+    a = session("a", channel)
+    b = session("b", channel)
     seq_a = 0
     seq_b = 0
     pending_a = None

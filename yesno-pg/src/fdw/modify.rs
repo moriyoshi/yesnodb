@@ -662,6 +662,13 @@ unsafe extern "C-unwind" fn xact_callback(
         pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT => {
             flush();
             PINNED.with(|p| p.borrow_mut().clear());
+            // Beside the line above and never apart from it. A channel ticket
+            // names a snapshot the session is still holding, so the two have to
+            // end at one moment: a ticket outliving its pin is a recoverable
+            // error, and a pin outliving its ticket holds one of the database's
+            // 4096 reader slots and pins the reclamation floor, which nothing in
+            // this backend would ever report.
+            crate::transport::channel::release_transaction_pins();
             STATEMENT.with(|s| s.borrow_mut().reset());
         }
         // Both abort events, and both must clear. A buffer surviving an abort
@@ -670,6 +677,7 @@ unsafe extern "C-unwind" fn xact_callback(
         pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
             PENDING.with(|p| p.borrow_mut().clear());
             PINNED.with(|p| p.borrow_mut().clear());
+            crate::transport::channel::release_transaction_pins();
             STATEMENT.with(|s| s.borrow_mut().reset());
         }
         _ => {}

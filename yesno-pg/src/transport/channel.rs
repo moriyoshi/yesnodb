@@ -29,6 +29,20 @@
 //! correctness difference, and the only way to be sure they agree is for there
 //! to be one implementation rather than two.
 //!
+//! # A ticket outlives the transport that minted it
+//!
+//! A Flight ticket is self-describing -- it carries the version, so a later
+//! statement replays it against a connection opened fresh. This channel has no
+//! frame for "open a snapshot at version V", so **the pin is the snapshot
+//! handle** and the version lasts exactly as long as something holds it.
+//!
+//! PostgreSQL builds a transport per statement, so until 2026-10-09 a ticket was
+//! good for the statement that minted it and no longer: the second read of a
+//! `REPEATABLE READ` transaction failed with "the transaction must restart".
+//! `PINS` holds the pin for the session instead, and
+//! [`release_transaction_pins`] drops it on the same transaction callback that
+//! clears the tickets.
+//!
 //! # A server may still decline, and the operator declares that
 //!
 //! `max_expr_bytes` is advertised in the greeting and zero means this `yesnod`
@@ -46,6 +60,10 @@
 //! client refuses it as well, before spending a round trip; this layer repeats
 //! the check because it is the one that knows the message is read from a SQL
 //! prompt and that the remedy is spelled `ALTER SERVER`.
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use yesno_channel::client::{Client, Error as ClientError, Snapshot};
 use yesno_channel::ipc::{Write, WriteOp};
 
@@ -54,6 +72,50 @@ use crate::ordinal::ordinal_to_i64;
 
 /// What the server logs this peer as.
 const PEER_NAME: &str = "yesno-pg";
+
+thread_local! {
+    /// Snapshots this transaction has pinned, by socket and version.
+    ///
+    /// # A ticket is a promise that its version is still pinned somewhere
+    ///
+    /// A Flight ticket is self-describing: it carries the version, so any later
+    /// statement can replay it against a connection opened fresh. The channel
+    /// has no frame for "open a snapshot at version V" -- **the pin is the
+    /// snapshot handle**, and the version lives exactly as long as something
+    /// holds it.
+    ///
+    /// Until 2026-10-09 the only holder was the `ChannelTransport` that minted
+    /// the ticket, and PostgreSQL builds one of those per statement. So a ticket
+    /// was good for the statement that minted it and no longer: the second read
+    /// of a `REPEATABLE READ` transaction failed with "no snapshot is pinned;
+    /// the transaction must restart". Holding the pin here instead makes it
+    /// last as long as the ticket does.
+    ///
+    /// A thread-local is the right scope and not a convenience: a PostgreSQL
+    /// backend is one process serving one session, so "this thread" and "this
+    /// session" are the same thing, which is the same reasoning
+    /// `fdw::modify`'s buffer already rests on.
+    ///
+    /// **Cleared by [`release_transaction_pins`] on the transaction callback
+    /// that clears the tickets**, and the two must be one moment. A ticket
+    /// outliving its pin is a recoverable error; a pin outliving its ticket
+    /// holds a reader slot out of the database's 4096 and pins the reclamation
+    /// floor, which nothing in this backend would ever notice.
+    static PINS: RefCell<HashMap<(String, u64), Rc<Snapshot>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Drop every snapshot this transaction pinned.
+///
+/// Called from `fdw::modify`'s transaction callback, beside the line that clears
+/// the ticket map, because a ticket and its pin have to end together. Dropping a
+/// [`Snapshot`] sends `SnapshotClose`, so this is where the server learns the
+/// version may be collapsed; a failure to deliver that is ignored, exactly as
+/// `Snapshot::drop` ignores it, because there is nothing a committing
+/// transaction could do about it.
+pub fn release_transaction_pins() {
+    PINS.with(|pins| pins.borrow_mut().clear());
+}
 
 /// An open scan's position.
 ///
@@ -72,9 +134,13 @@ pub struct ChannelTransport {
     socket: String,
     batch_rows: usize,
     client: Option<Client>,
-    /// The pinned read view. Held across statements so a ticket stays valid for
-    /// the length of a transaction, which is the property `ticket_for` promises.
-    pinned: Option<Snapshot>,
+    /// The read view this transport is using.
+    ///
+    /// `Rc` because a pin minted by [`Transport::ticket_for`] is **also** held
+    /// in `PINS`, which is what lets a later statement reach it. This field is
+    /// then a cache: the statement that minted the pin need not go through the
+    /// map to use it.
+    pinned: Option<Rc<Snapshot>>,
     scan: Option<Scan>,
 }
 
@@ -161,11 +227,15 @@ impl ChannelTransport {
         Ok(self.client.as_mut().expect("just assigned"))
     }
 
-    /// Pin a fresh read view, replacing any held one.
-    fn pin(&mut self) -> Result<&Snapshot, TransportError> {
-        let snapshot = self.client()?.snapshot().map_err(rpc)?;
-        self.pinned = Some(snapshot);
-        Ok(self.pinned.as_ref().expect("just assigned"))
+    /// Pin a fresh read view, replacing any this transport was using.
+    ///
+    /// Not published to `PINS`: a pin only has to outlive its statement when a
+    /// *ticket* names it, and publishing every read's snapshot would hold a
+    /// reader slot per scan until the transaction ended.
+    fn pin(&mut self) -> Result<Rc<Snapshot>, TransportError> {
+        let snapshot = Rc::new(self.client()?.snapshot().map_err(rpc)?);
+        self.pinned = Some(Rc::clone(&snapshot));
+        Ok(snapshot)
     }
 
     /// Refuse an expression this server will not evaluate, naming the remedy.
@@ -270,7 +340,18 @@ impl Transport for ChannelTransport {
         if matches!(cmd_of(cmd)?, Cmd::Expr(_)) {
             self.refuse_if_not_evaluated()?;
         }
-        let version = self.pin()?.version();
+        let snapshot = self.pin()?;
+        let version = snapshot.version();
+        // **Published, which is the whole of what makes a ticket replayable.**
+        // This transport is gone by the next statement; the pin has to be
+        // somewhere that is not. Keyed by version so that two targets pinned at
+        // the same version share one snapshot rather than one evicting the
+        // other -- the common case, since nothing need have committed between
+        // them.
+        PINS.with(|pins| {
+            pins.borrow_mut()
+                .insert((self.socket.clone(), version), snapshot);
+        });
         let mut ticket = Vec::with_capacity(8 + cmd.len());
         ticket.extend_from_slice(&version.to_le_bytes());
         ticket.extend_from_slice(cmd);
@@ -290,25 +371,25 @@ impl Transport for ChannelTransport {
         let cmd = cmd_of(&ticket[8..])?;
         let want = u64::from_le_bytes(version);
 
-        // The pin is this transport's, so a ticket from a different connection
-        // cannot be honoured. Reported rather than served at whatever version
-        // happens to be current, because reading a different version than the
-        // ticket names is the one failure a snapshot is supposed to prevent.
-        match self.pinned.as_ref().map(Snapshot::version) {
-            Some(have) if have == want => {}
-            Some(have) => {
-                return Err(TransportError::Rpc(format!(
-                    "this ticket names version {want} and the pinned snapshot is {have}; \
-                     the channel cannot reopen a version, so the transaction must restart"
-                )))
-            }
-            None => {
-                return Err(TransportError::Rpc(format!(
-                    "this ticket names version {want} and no snapshot is pinned; the \
-                     channel cannot reopen a version, so the transaction must restart"
-                )))
-            }
-        }
+        // This transport's own pin first -- the statement that minted the ticket
+        // is holding it -- then the transaction's registry, which is where a
+        // *later* statement finds it. Served at the named version or not at all:
+        // reading a different version than the ticket names is the one failure a
+        // snapshot exists to prevent, so a missing pin is reported rather than
+        // answered from whatever is current.
+        let found = match self.pinned.as_ref() {
+            Some(held) if held.version() == want => Some(Rc::clone(held)),
+            _ => PINS.with(|pins| pins.borrow().get(&(self.socket.clone(), want)).cloned()),
+        };
+        let Some(snapshot) = found else {
+            return Err(TransportError::Rpc(format!(
+                "this ticket names version {want} and nothing in this session still pins \
+                 it; the channel cannot reopen a version, so the transaction must \
+                 restart. The socket is {}",
+                self.socket
+            )));
+        };
+        self.pinned = Some(snapshot);
         self.scan = Some(Scan {
             cmd,
             after: None,
@@ -326,9 +407,12 @@ impl Transport for ChannelTransport {
         }
         let (cmd, after) = (scan.cmd.clone(), scan.after);
         let limit = self.batch_rows as u32;
+        // Cloned rather than borrowed: the handle is counted, so this costs an
+        // increment and leaves `self` free for the cursor update below.
         let snapshot = self
             .pinned
             .as_ref()
+            .map(Rc::clone)
             .ok_or_else(|| TransportError::Rpc("the scan has no pinned snapshot".into()))?;
         let (ordinals, more) = match &cmd {
             Cmd::Key(key) => snapshot.load(*key, after, limit),

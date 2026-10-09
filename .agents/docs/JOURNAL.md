@@ -4250,3 +4250,89 @@ the two.
   not "what shape is it" but "does this shape cost more than it has to".
 * **A cost regression passes every correctness gate.** Both of these returned exactly the
   right rows. Nothing in the suite was going to notice, and nothing will next time either.
+
+## 2026-10-09 -- A channel ticket that outlives the statement that minted it
+
+The second of `Transport::Channel`'s stated limits, and the last one that was a functional
+hole rather than a deliberate refusal: a ticket could not outlive its transport instance, so
+the **second read of a `REPEATABLE READ` transaction failed outright** with "the transaction
+must restart".
+
+### Why the channel is different from Flight here
+
+A Flight ticket is self-describing. It carries the version, so a later statement replays it
+against a connection opened fresh and the server reconstructs the read. The channel has no
+frame for "open a snapshot at version V" -- **the pin is the snapshot handle** -- so the
+version lives exactly as long as something holds that handle.
+
+The only holder was the `ChannelTransport` that minted the ticket, and PostgreSQL builds one
+of those per statement: `begin_foreign_scan` calls `connect`, and the table access method's
+`fetch_all` calls `open_transport_for_table`. So a ticket was good for the statement that
+minted it and no longer.
+
+The fix is a thread-local keyed by `( socket, version )`. A thread-local is the right scope
+and not a convenience -- a PostgreSQL backend is one process serving one session, which is
+the reasoning `fdw::modify`'s write buffer already rests on -- and keying by version means
+two targets pinned at the same version share one snapshot rather than evicting each other,
+which is the common case because nothing need have committed between them.
+
+`release_transaction_pins` drops them from the transaction callback **beside the line that
+clears the tickets**, and the two have to be one moment. A ticket outliving its pin is a
+recoverable error. A pin outliving its ticket holds one of the database's 4096 reader slots
+and pins the reclamation floor, and nothing in the backend would ever report it.
+
+### The client is deliberately still not cached
+
+The TODO entry said the fix was "a thread-local client per socket". Only the *pin* needed to
+be thread-local, and caching the client as well was rejected rather than skipped:
+`channel_max_peers` defaults to **8**, so a connection per backend held for the backend's
+life would turn a working deployment into a refused one the moment a ninth backend touched
+the server. Today's peak is the backends concurrently scanning, which caching would convert
+into the backends that have ever scanned.
+
+It would save a connect-and-handshake per statement, which is real. It wants that default
+revisited first, and that is recorded rather than decided here.
+
+### The spec asserts which transport it is on
+
+`tam_repeatable_read_channel.spec` carries the same SQL as the Flight spec and exercises
+entirely different machinery, so the harness had to learn to start a session against the
+channel GUC -- chosen from the file name, because a GUC is a session setting and cannot be
+set from inside the spec.
+
+**A spec that silently ran over Flight would have passed every assertion while testing
+nothing**, which is the false pass a `Tid Scan` fixture produced two days ago by planning a
+Seq Scan. So the spec proves its own transport:
+`SELECT length( current_setting( 'yesno_pg.endpoint' ) )` must be **0**. That is the one
+machine-independent way to say "not Flight" -- the endpoint's port and the socket's path are
+both temporary-directory specific and cannot appear in a byte-exact oracle -- and zero there
+beside a read that answered is a complete proof: the access method found a server and it was
+not the Flight one. It is read after the first query so the extension is loaded and both
+GUCs are registered.
+
+### `a-repeatable-read-transaction-can-see-two-versions-across-keys`
+
+Found by reading `PINNED`'s key while deciding how to key the pin registry, and it affects
+**both** transports. `fdw::modify::PINNED` is keyed by `( endpoint, key )`, so a
+`REPEATABLE READ` transaction reading two different yesno keys mints a ticket per key, each
+at whatever version was current when that key was first touched. A commit between the two
+statements means one transaction reads two versions.
+
+`tam_repeatable_read.spec` cannot see it, because it reads one table. Recorded in `TODO.md`
+with the shape of the fix: pin per transaction and endpoint rather than per target, and mint
+later tickets at the recorded version. Cheap for the channel, where the ticket is
+`version || cmd` and the registry is already keyed by version; for Flight it means threading
+the version into `Transport::ticket_for` so a ticket is minted at it rather than at `now`.
+
+### Carry away
+
+* **A fixture must prove which arm it took.** Twice this week a passing fixture would have
+  been exercising the wrong path -- a Seq Scan instead of a Tid Scan, Flight instead of the
+  channel. Both were caught by making the fixture assert the mechanism, not just the answer,
+  and in both cases the assertion was one cheap line.
+* **The recorded fix is not always the right fix.** The entry said "a thread-local client
+  per socket"; the client half would have broken deployments against a default of 8 peers.
+  Reading what the fix was *for* got a smaller change that closes the same hole.
+* **Look at the key, not the name.** `PINNED` reads like a per-transaction pin and is keyed
+  per target. Nothing was wrong with the code that used it; the bug is in what the shape of
+  the key promises.
