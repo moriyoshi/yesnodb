@@ -5348,3 +5348,74 @@ leave half-landed across three ABIs.
 * **Two entries in two days under-priced themselves** -- this one by 3x, and the ladder's
   un-shift by proposing ten classes where one is right. A recorded estimate is a guess made
   before the reading was done, and re-pricing is part of picking the item up.
+
+## 2026-10-10 -- The MySQL range estimate is not the constraint, and my demonstration showed correlation
+
+Three hours after recording a demonstration that "justified" the fix, the discriminating test
+says the fix would buy nothing. The correction is worth more than the original entry.
+
+### What the first demonstration actually showed
+
+```text
+1  SIMPLE  est_*  NULL  ALL  PRIMARY  NULL  NULL  NULL  1000  11.11  Using where
+```
+
+I read this as "the optimizer rejected the index **because** `rows` is the whole key". It
+shows the index rejected **beside** a whole-key `rows`. Those are different claims, and the
+one I wrote down is the one I did not test.
+
+### The test
+
+Force `records_in_range` to return **1** for every range and look again. The plan is
+byte-identical -- `type=ALL`, `key=NULL`, `rows=1000` -- and identical for `SELECT ordinal`
+as well as `SELECT COUNT(*)`, so it is not a `COUNT` artifact.
+
+**`records_in_range` is not consulted.** The `rows` the optimizer prints comes from
+`records()` / `stats.records`. An exact range count, at the price of three C/C++ ABIs priced
+earlier today, would change nothing at all.
+
+### The leading suspect, and why not to touch it yet
+
+`HA_ONLY_WHOLE_INDEX` in `ha_yesno::index_flags`. Its documented meaning is that the engine
+can read the index only in its entirety, so the range optimizer never builds a range plan and
+never asks for an estimate -- which is exactly `possible_keys = PRIMARY` with `key = NULL`. It
+is easy to miss because `max_supported_key_parts()` is 1, so "the whole index" and "its one
+part" coincide and the flag reads as harmless.
+
+Not dropped, because it advertises a **capability**: removing it makes MySQL issue index reads
+in shapes the handler may not serve, and the failure mode is wrong rows rather than a
+different plan. That wants a read of `index_read_map`, `index_next` and `index_prev` against
+what MySQL would then call -- a correctness review, not a flag edit, and not something to
+start on the back of a probe.
+
+### A correct improvement, written and then removed
+
+`min( records(), hi - lo + 1 )` -- the range's own width bounds its cardinality -- needs no new
+surface, is tightest exactly where an estimate matters, and returns the *exact* 10 for the
+demonstrated case. I wrote it, gated it, and removed it: **no test can distinguish it from the
+whole-key answer**, because nothing consults the function. An improvement nothing can see is
+the thing this session has flagged three times in other people's work, and leaving it in
+because it is "obviously better" would have been the same mistake with my name on it.
+
+Recorded as eight lines to restore once the real blocker is lifted -- at which point it may
+make the three-ABI exact count unnecessary.
+
+### What survives
+
+The characterisation fixture in `e2e/mysql/mysql.py`. It pins the plan on all three backends
+and its comment now carries the right reason: when this changes, the cause is whatever
+unblocks the range optimizer, and the estimate is downstream of that.
+
+### Carry away
+
+* **"Consistent with" is not "caused by", and the difference is one experiment.** The plan I
+  recorded was consistent with the entry's premise, which is exactly why it read as
+  confirmation. Perturbing the suspected cause takes one gate run and is the only thing that
+  separates them.
+* **Force the input to an absurd value.** Returning 1 where the truth is 1000 is a stronger
+  probe than making the estimate correct, because a correct estimate that changes nothing is
+  ambiguous -- it could mean the plan was already right -- while an absurd one that changes
+  nothing can only mean the input is unread.
+* **Delete the improvement nothing can observe, even when it is yours and correct.** The
+  width bound is better arithmetic than what is there. It is also invisible, and eight lines
+  of invisible correctness is how a file stops being readable.
