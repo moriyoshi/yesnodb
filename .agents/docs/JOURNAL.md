@@ -5293,3 +5293,58 @@ been the thing the entry was written to prevent.
 * **A characterisation test needs its obsolescence written into it.** An assertion pinning a
   defect is indistinguishable from an assertion pinning a contract unless the comment says
   which it is and what will falsify it.
+
+## 2026-10-10 -- Pricing the MySQL range estimate, and finding the entry's estimate wrong
+
+With the plan demonstrated, the next question is what the fix costs. The entry said "one new
+`Backend` method plus a C ABI entry point". **It is three C/C++ boundaries**, and that was
+only visible by reading all three backends rather than the interface they share.
+
+| leg | reaches yesno via | needs |
+|---|---|---|
+| embedded | `yesno_db_cardinality` in `yesno-c` | `yesno_db_cardinality_in_range` |
+| Flight | `client_->Cardinality( key )` in `yesno-flight-c++` | a new action |
+| channel | `yesno_channel_cardinality` in `yesno-plugin` | `yesno_channel_cardinality_in_range` |
+
+`Backend` is one interface over three transports that each cross into Rust through a
+*different* ABI, so "add a Backend method" is three entry points and three sets of fixtures.
+The entry's own sentence -- "the ceiling is the `Backend` interface, not the C ABI" -- is true
+about where the limitation lives and misleading about what changing it costs.
+
+### The Flight leg looked blocked, and the way through is an action
+
+`yesno-flight-c++` has no `yesno-wire` encoder: `grep -r 'YSNX\|SetExpr' yesno-flight-c++/`
+is empty. So the obvious route -- send `And( Key, Range )` as a descriptor, as `yesno-pg`
+does -- means **a second implementation of the wire format in C++**, which `yesno-wire`'s own
+header forbids in as many words: "two copies of the code are harmless and two
+*implementations* are not."
+
+A **Flight action** avoids it entirely. The surface already carries `ACTION_CLEAR`,
+`ACTION_CONTAINS` and five more, and the C++ client already has a `U64Action( name, ... )`
+helper -- so `cardinality_in_range` is an action name, 24 bytes of payload, and a server
+handler calling `Snapshot::len_in_range`. No expression, no second encoder, and the plumbing
+on both sides exists.
+
+That is the one real design question in this fix, and it is now answered rather than
+discovered halfway through.
+
+### Stopped at the price, deliberately
+
+The ingredient is exact and free, the entry's bar is cleared, and the hazard is resolved. What
+is left is five crates and three C/C++ boundaries for a **cost** defect, in code that only
+compiles under Bazel -- so every C++ slip costs a ten-minute gate run. That is a decision to
+take deliberately with a fresh session, not something to start at the end of a long one and
+leave half-landed across three ABIs.
+
+### Carry away
+
+* **Price a change by reading every implementation, not the interface.** One trait over three
+  transports hid a factor of three, and the hiding was structural: `Backend` is exactly the
+  abstraction that makes the ABIs invisible from above.
+* **A forbidden route can have a cheap neighbour.** "Encode the expression in C++" is
+  prohibited by the format's own rule; "add an action that takes three integers" reuses
+  plumbing both sides already have. Finding the second took one grep for the first's
+  prohibition and one for the client's helpers.
+* **Two entries in two days under-priced themselves** -- this one by 3x, and the ladder's
+  un-shift by proposing ten classes where one is right. A recorded estimate is a guess made
+  before the reading was done, and re-pricing is part of picking the item up.
