@@ -5032,3 +5032,65 @@ download. I did not fetch it.
 * **A long list of eliminated causes is the deliverable when the bug will not come out.**
   Nothing here fixes anything. What it leaves is a single named difference and a download,
   instead of two open questions and five untested hypotheses.
+
+## 2026-10-10 -- Real SimHash correlation, and the constraint that was worth more
+
+The last difference the previous entry could name was that my codes' bits were independent of
+one another while SimHash bits are projections of one vector. That needs no GloVe either:
+`sign( r_i . x )` over random hyperplanes and random vectors **is** SimHash, and what GloVe
+supplies is a particular density spread, which is one knob.
+
+`.agents-workspace/tmp/simhash/`: 1024 hyperplanes over 25-dimensional vectors with a shared
+mean direction. The mean's magnitude sets the spread -- a hyperplane aligned with it sees
+mostly-positive projections and a dense posting list, one anti-aligned a sparse one -- and the
+sweep found it in three tries:
+
+| mu | min | median | max |
+|---|---|---|---|
+| 1.0 | 0.261 | 0.496 | 0.749 |
+| 1.8 | 0.127 | 0.494 | 0.884 |
+| **2.1** | **0.094** | **0.493** | **0.917** |
+| 2.5 | 0.058 | 0.492 | 0.949 |
+
+The report measured **0.091 / 0.496 / 0.925**. At `mu = 2.1`, both sides of the boundary --
+950 000 and 1 000 000 documents, 486 M and 511 M postings, 1034 keys and 1034 concurrent lane
+streams, per-key reads and the lane walk -- **zero failures**.
+
+The harness prints the measured spread beside the reported one before it ingests anything, so
+the corpus is checked against the report rather than asserted to match it. That is what made
+the sweep three runs instead of a guess.
+
+### The constraint that is worth more than the corpus
+
+`ARRAY_MAX` is **4096**. The *sparsest* dimension the report measured, at density 0.091,
+holds about **5 963 ordinals in a 65 536-wide chunk**. So **every full chunk in their corpus
+is a bitmap**, at every density from 0.091 to 0.925, and every full-chunk extent is class 11
+at 8192 bytes.
+
+Three things follow, and the third is the useful one:
+
+1. **"Skew is load-bearing" cannot mean container-kind variety among full chunks** -- there is
+   none available in that density range. It must be about each key's *partial tail chunk*,
+   which migrates up the size classes as documents arrive, or about dimensions sparser than
+   the reported minimum.
+2. The size-class ladder is nearly irrelevant to their corpus: class 11 for chunks, class 5
+   for the index.
+3. **That makes the second of the two named causes unlikely.** A class disagreement needs two
+   classes confusable for one cell, and there is essentially one class in play for chunk
+   payloads -- so a mis-pointed reference lands on another *correctly aligned* class-11 slot,
+   which is exactly what the trailer tag catches and what the alignment refusal cannot.
+
+Both named causes are now improbable for different reasons: the first eliminated empirically
+across 81 096 reuses and 2 317 relocations, the second by arithmetic on `ARRAY_MAX`.
+
+### Carry away
+
+* **A knob with a printed measurement beats a model.** I did not need to model GloVe, only to
+  match one statistic and show that I had. The spread is printed beside the reported one on
+  every run, so the corpus either matches or says it does not.
+* **Deduce from the constants before building another corpus.** `ARRAY_MAX = 4096` against a
+  density of 0.091 is a two-line calculation that constrains the bug more than four harnesses
+  did, and it was available on day one.
+* **Two causes, both now improbable, is a report -- not a failure.** The entry framed this as
+  "which of two causes is it". The answer this side can give is "neither looks like it, and
+  here is why for each", which is what the next person needs before they spend the download.
