@@ -5174,3 +5174,59 @@ done that.
   came back contradicting the premise of four journal entries, and checking it took four
   greps. The instinct to verify before accepting was right; the instinct to verify *before
   starting* was the one missing.
+
+## 2026-10-10 -- Sweeping the rest of the TODO list for the same staleness, and finding none
+
+Having spent a day on an entry that had been fixed for three weeks, the obvious question is
+whether the list holds more of them. It does not, and the check was cheap enough to be worth
+recording for the next time the question comes up.
+
+### Two mechanical passes over 53 open entries
+
+**Citations that no longer exist.** For each open entry, extract backticked identifiers that
+look like Rust paths or functions and check the last path segment against every tracked
+source file. An open entry naming code that is gone is the shape of drift that bit me.
+
+Four hits, all explained and none stale:
+
+| entry | absent symbol | why |
+|---|---|---|
+| `sdot-arm-is-scan-bound-not-kernel-bound` | `vdotq_s32` | in a prototype under `.agents-workspace/tmp/`, which `git ls-files` does not see -- the entry says so |
+| `read-concurrency-is-bounded-by-shard-count` | `yesno_tiled_width_does_not_allocate_a_mask_per_lane` | a **haiiie** test name, not ours |
+| `release-image-filesystem-userland` | `lvmtools` | a package name |
+| `rerun-the-unwired-sweep` | `Db::open_reader_with_events` | the entry **records its removal** -- absent because it says so |
+
+**Subjects an LTM document already calls done.** Cross-reference every open slug against the
+LTM corpus and flag any mention within 300 characters of DONE, FIXED, closed, resolved or
+superseded. Three hits, all false positives: the resolution words belong to neighbouring
+prose -- a deleted `docs/split-merge-algebra.md`, a superseded section, a "superseded
+leader".
+
+### Not made into a gate, deliberately
+
+The first pass is the kind of thing this repo usually turns into `scripts/check-*`. It should
+not be. Three of its four hits are structurally unfixable -- a gitignored prototype, a foreign
+repository's test name, an apt package -- so the checker would ship with a permanent baseline
+of three, and `AGENTS.md` is explicit that a baseline may only shrink and that entries must
+not be added to make a change pass. A gate whose standing state is "three known exceptions"
+teaches a reader to skip it.
+
+The construction is recorded here instead, which is the same bargain the research rule makes:
+the finding is the deliverable and the instrument is rebuildable in ten minutes.
+
+### What this says about the stale entry
+
+It was an outlier. The list's hygiene is not the problem, which means the lesson from
+`mis-pointed-extent-at-1024-bit-codes` is entirely about **my** process -- check the tree and
+the subsystem's LTM document before trying to reproduce a reported defect -- and not about a
+systematic rot that needs tooling. Worth knowing, because the tempting response to being
+burned once is to build a checker, and here that would have been the wrong artifact.
+
+### Carry away
+
+* **Two passes, 53 entries, four minutes, nothing found.** That is a good outcome and it is
+  worth writing down: the next person to wonder whether the list is trustworthy has an
+  answer with a date on it instead of having to re-derive one.
+* **Do not build a gate whose baseline starts non-empty.** The three permanent exceptions
+  here are not defects to be fixed; they are the checker being the wrong shape for the
+  question, and a baseline would have disguised that as progress.
