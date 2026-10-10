@@ -5230,3 +5230,66 @@ burned once is to build a checker, and here that would have been the wrong artif
 * **Do not build a gate whose baseline starts non-empty.** The three permanent exceptions
   here are not defects to be fixed; they are the checker being the wrong shape for the
   question, and a baseline would have disguised that as progress.
+
+## 2026-10-10 -- The MySQL range estimate, demonstrated on a real plan
+
+`mysql-records-in-range-is-whole-key` set its own bar: "**demonstrate the improvement on a
+real plan before adding it**, rather than on the grounds that the estimate is imprecise."
+That bar is now cleared, and clearing it was cheaper than the fix would have been.
+
+This time the LTM check came first -- the lesson from the stale entry an hour earlier.
+`grep records_in_range .agents/docs/LTM/*.md` finds nothing, and the handler reads exactly as
+the entry describes, so the entry is live.
+
+### The plan
+
+A key of 1000 contiguous ordinals, `BETWEEN 100 AND 109` -- 1% of the key:
+
+```text
+1  SIMPLE  est_*  NULL  ALL  PRIMARY  NULL  NULL  NULL  1000  11.11  Using where
+```
+
+`possible_keys` is PRIMARY and `key` is **NULL**. The optimizer considered the index and
+**rejected it**, because `rows` is 1000 -- the whole-key cardinality -- for a range whose
+true answer is 10. The `11.11` is MySQL's default selectivity guess for a condition it
+cannot price, so it weighs 1000 x 11.11% against a 1000-row range scan and takes the scan.
+
+Identical on **all three backends**, which confirms what the entry said about the ceiling: it
+is `records_in_range`, not `backend_flight.cc` or `backend_channel.cc`. And `COUNT(*)` still
+answers 10, so this is a **cost** defect, not a correctness one.
+
+### Probing by deliberate failure
+
+I did not know whether MySQL would pick `range` or `ALL`, and guessing would have produced an
+expected value I then "confirmed". So the first run asserted `False` with the plan in its
+message, read the real plan out of the gate's failure, and the assertion was written from it.
+One red gate run, no invented expectation.
+
+The result is a **characterisation** assertion: it pins the defect, not the fix. The comment
+says what must change when `records_in_range` learns to answer a range -- `key` to PRIMARY,
+`type` to range, `rows` to about 10 -- so that editing the line then is correct and editing it
+for any other reason is not.
+
+### Not implemented, and why that is the right stopping point
+
+The entry priced the fix before asking for the demonstration: a `Backend` method, three
+implementations, a `yesno_channel.h` entry point with the C and C++ fixtures
+`check-channel-cabi.sh` runs, and the handler change. The ingredient already exists --
+`len_in_range` answers complete chunks from index cardinalities without reading a payload --
+so the work is surface, not algorithm.
+
+What the demonstration changes is that the surface is now justified by a plan rather than by
+an adjective. Leaving it there is deliberate: a fix landing without this evidence would have
+been the thing the entry was written to prevent.
+
+### Carry away
+
+* **An entry that states its own precondition is telling you what to do first.** The bar
+  here was one fixture and one red gate run; the fix is four files and a public ABI. Reading
+  the entry as an instruction rather than a description saved doing them in the wrong order.
+* **`assert False` with the value in the message is a legitimate one-shot probe.** It costs
+  one gate run and it is the difference between a measured expectation and a guess that
+  survives because it was written down first.
+* **A characterisation test needs its obsolescence written into it.** An assertion pinning a
+  defect is indistinguishable from an assertion pinning a contract unless the comment says
+  which it is and what will falsify it.

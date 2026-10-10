@@ -200,6 +200,82 @@ def exercise_contract(mysql, client_base, env, key, label):
     )
     assert cleared["stdout"] == "0\n"
 
+    # `records_in_range` and what the optimizer does with it.
+    #
+    # `mysql-records-in-range-is-whole-key` says the handler answers a point
+    # lookup exactly and gives **every other range the whole-key cardinality**,
+    # and it asks for the improvement to be demonstrated on a real plan before a
+    # `Backend` method and a C ABI entry point are added for it. This is that
+    # demonstration: a key big enough for an estimate to matter, and the plan
+    # MySQL actually chooses for a narrow range over it.
+    #
+    # The probe asserts the plan, because that is the thing a better estimate
+    # would change. If the optimizer already picks a range scan over the index,
+    # a precise estimate buys nothing here and the entry closes; if it picks a
+    # full scan, the entry is justified and this records by how much.
+    est = "est_" + label
+    checked(
+        mysql_run(
+            mysql,
+            client_base,
+            env,
+            "CREATE TABLE "
+            + est
+            + " (ordinal BIGINT UNSIGNED NOT NULL PRIMARY KEY) "
+            + "ENGINE=YESNO CONNECTION='key=" + key + "9'",
+            False,
+        ),
+        label + " estimate table",
+    )
+    # 1000 ordinals in one contiguous run, so a BETWEEN of ten is 1% of the key
+    # and the difference between an exact estimate and the whole-key one is
+    # two orders of magnitude.
+    bulk = ", ".join("(" + str(n) + ")" for n in range(1000))
+    checked(
+        mysql_run(mysql, client_base, env, "INSERT INTO " + est + " VALUES " + bulk, False),
+        label + " estimate load",
+    )
+    plan = checked(
+        mysql_run(
+            mysql,
+            client_base,
+            env,
+            "EXPLAIN SELECT COUNT(*) FROM " + est + " WHERE ordinal BETWEEN 100 AND 109",
+            True,
+        ),
+        label + " range plan",
+    )
+    # **A characterisation assertion: this pins the defect, not the fix.**
+    #
+    # `type` is ALL and `key` is NULL while `possible_keys` is PRIMARY -- the
+    # optimizer considered the index and **rejected it** -- because `rows` is
+    # 1000, the whole-key cardinality, for a range whose true answer is 10. The
+    # 11.11 is MySQL's default selectivity guess for a condition it cannot
+    # price, so it compares 1000 x 11.11% against a 1000-row range and takes
+    # the scan.
+    #
+    # When `records_in_range` learns to answer a range, this line has to change:
+    # `key` becomes PRIMARY, `type` becomes range, and `rows` drops to about 10.
+    # Changing it then is correct; changing it for any other reason is not.
+    assert plan["stdout"] == (
+        "1\tSIMPLE\t" + est + "\tNULL\tALL\tPRIMARY\tNULL\tNULL\tNULL"
+        "\t1000\t11.11\tUsing where\n"
+    ), label + " range plan changed: " + repr(plan["stdout"])
+    # And the answer is right regardless, which is what makes the above a cost
+    # defect rather than a correctness one.
+    narrow = checked(
+        mysql_run(
+            mysql,
+            client_base,
+            env,
+            "SELECT COUNT(*) FROM " + est + " WHERE ordinal BETWEEN 100 AND 109",
+            True,
+        ),
+        label + " range answer",
+    )
+    assert narrow["stdout"] == "10\n", label + " range answer: " + repr(narrow["stdout"])
+    checked(mysql_run(mysql, client_base, env, "DROP TABLE " + est, False), label + " estimate drop")
+
     # Transactions, as of 2026-09-19. This assertion used to require the
     # opposite -- a rolled-back INSERT was retained, and the engine advertised
     # HA_NO_TRANSACTIONS -- and it was changed deliberately with the engine's
