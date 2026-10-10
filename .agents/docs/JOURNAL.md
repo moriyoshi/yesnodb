@@ -4805,3 +4805,83 @@ be.
 * **A step function's cost is at its steps.** The saving from dropping a class is bounded by
   64 bytes; the loss is bounded by the gap to the next class, which here is up to 1 984. Any
   future ladder change should be argued at the cliffs rather than at the averages.
+
+## 2026-10-10 -- Failing to reproduce `mis-pointed-extent-at-1024-bit-codes`, usefully
+
+The oldest open correctness item: a consumer's real corpus makes `read_container_for` raise
+`MisPointedExtent`, at 1024-bit SimHash codes, passing at 950 000 documents and failing at
+1 000 000. Under diagnosis since 2026-09-15, "awaiting the re-run".
+
+The entry says what matters about the data -- **skew is load-bearing, because uniform
+densities give bitmaps and nothing else** -- which means the corpus does not need GloVe. A
+bit position is a yesno key and a document is an ordinal, so it needs codes whose
+per-dimension densities have the reported shape, and that is a distribution a harness can
+draw directly.
+
+### The construction
+
+`.agents-workspace/tmp/mispoint/`, a standalone crate with a path dependency on `yesno-core`;
+nothing added to `src/`. splitmix64 over `( seed, bit, doc )`, so a failing run replays from
+three numbers and no data is stored. Per-dimension densities by cubic easing of a mixed
+uniform, giving **0.090 min, 0.514 median, 0.930 max** against the reported 0.091 / 0.496 /
+0.925. Ingest with `WriteBatch`, committing every 25 000 documents and checkpointing every
+200 000. Then read every key through `key_expr( ).collect_set( )` -- not `cardinality( )`,
+which is answered from index popcounts and never decodes a payload, which is exactly the read
+this bug does not happen on -- and check each against a count the engine did not produce.
+
+### Five runs, all clean
+
+| corpus | postings | extents | slabs by class | result |
+|---|---|---|---|---|
+| independent, 4 shards | 518 668 186 | 206 MB | 5, 8, 9, 10, **11 x70** | clean |
+| independent, 1 shard | 518 668 186 | 166 MB | 5, 8, 9, 10, **11 x68** | clean |
+| clumped 8192 | 273 549 764 | 191 MB | 1, 5, 7, 8, 9, 10, 11 x63 | clean |
+| clumped 65536 | 274 264 187 | 166 MB | 1, 5, 7, 8, 9, 10 x8, 11 x47 | clean |
+
+Read back per key **and in the inverted path's shape** -- a union of all 1024 keys, and
+intersections at widths 2, 8, 32, 128 and 16 scattered -- since the entry notes `Gather` and
+`DenseScan` answer correctly on the same index, so the read surface is implicated.
+
+### The clumping was the interesting part, and it is why the first corpus was not enough
+
+The first two rows are **68 and 70 of about 80 slabs in class 11**: almost every container a
+bitmap. That is the defect the entry rules out when it says uniform codes give bitmaps and
+nothing else -- and **per-dimension skew does not fix it**, because the skew is *between* keys
+while a container's kind is decided *within* one. Independent Bernoulli at density 0.5 over a
+65 536-wide chunk is a bitmap every time, whatever the key's own density.
+
+So the corpus needed density varying along the *ordinal* axis as well, which is what a real
+embedding gives: SimHash bits are projections of one vector, so they correlate, and a key has
+sparse stretches and dense ones. Clumping produced the full mix -- packed pages and classes 7
+through 11 -- and still read back exactly.
+
+### What a negative result is worth here
+
+It rules out "1024 keys x 1M ordinals with skewed densities and a realistic container mix",
+across two shard counts and two read shapes, which was the whole of the hypothesis the entry
+could state without the consumer. What is left are three things this harness structurally
+cannot produce, and the first two are **questions, not experiments**:
+
+1. **Which API does the inverted path call?** A union or intersection of `Snapshot::key_expr`
+   does not reproduce it, so their path reaches something else -- lanes, `key_stream` with
+   seeks, or a `yesno-wire` expression through Flight.
+2. **Does the corpus delete or re-ingest?** This harness only appends, so the only superseded
+   extents are each key's tail chunk at each flush and **no cell is ever reclaimed and
+   reused** -- which is the first of the two causes the entry names. It cannot exercise it.
+3. True bit correlation, which needs their pipeline: these bits are independent of one another
+   even when clumped along the ordinal axis.
+
+Asking those two is a better next move than a sixth synthetic corpus.
+
+### Carry away
+
+* **A negative reproduction is a result when it is bounded.** "Did not reproduce" is worth
+  nothing; "did not reproduce at 518M postings across two shard counts and two read shapes
+  with this container mix" removes a hypothesis space and names what is left.
+* **Skew between keys is not skew within one.** Container kind is chosen per chunk, so a
+  corpus generator that varies only per-key density produces the uniform case the entry
+  already excluded. The histogram of `slabs_by_class` is what showed it -- 68 of 80 bitmaps,
+  from a corpus I had described to myself as skewed.
+* **Stop at the question.** Two facts from the consumer -- which read API, and whether
+  anything is deleted -- would cut more of the space than any corpus I can invent, and
+  inventing a sixth would mostly be guessing at what their pipeline does.
