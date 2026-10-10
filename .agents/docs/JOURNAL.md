@@ -4521,3 +4521,36 @@ single RPC the fast path used to make.
 * **Write down the regression you chose.** The second round trip is real, deliberate, and
   bought correctness; naming it with the shape of its fix is the difference between a
   recorded trade and a thing someone measures in six months and calls a bug.
+
+## 2026-10-10 -- Two open limits were hiding inside a closed entry
+
+Asked whether the recorded items had been addressed, I went to check rather than answer from
+memory, and found a bookkeeping defect of my own making.
+
+`the-pg-channel-transport-has-four-stated-limits` is one long bullet naming four things. Over
+two days I closed the first two by editing sentences *inside* it, and twice I recorded a new
+finding by replacing a sentence near its end with a sentence plus a new `- [ ]` bullet. Each
+time, the prose after the insertion point became the **new bullet's** text. So the Third and
+Fourth limits migrated down the file and ended up as the tail of
+`the-fdw-scan-path-pins-no-version-at-all` -- which I then marked `[x]`.
+
+Two genuinely open limits were therefore filed inside a closed entry, where nobody looks.
+`scripts/check-todo-refs.py` passed throughout: every cited slug still resolved, because
+nothing about the citation was wrong. What was wrong was which bullet the words sat under,
+and no checker has an opinion about that.
+
+Moved back, verified by counting which of `First`/`Second`/`Third`/`Fourth` appear on which
+line. The four-limits entry names all four again.
+
+### Carry away
+
+* **Appending a list item by replacing prose inside a list item moves the rest of it.** The
+  TODO's entries are single enormous lines, so "insert after this sentence" and "start a new
+  bullet here" are the same edit. Add a new entry at a boundary -- after the whole bullet --
+  or re-read the bullet afterwards.
+* **A green checker is not a read.** `check-todo-refs.py` verifies that cited slugs exist. It
+  cannot see an entry whose content belongs to its neighbour, and I took its pass as
+  confirmation that the file was in order three times.
+* **"Did we address those?" deserves a grep, not a recollection.** I had told the user twice
+  which items were open; the file disagreed with both summaries in a way I would not have
+  found by rereading my own messages.
