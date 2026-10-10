@@ -48,6 +48,25 @@ pub mod flight;
 /// at the transport boundary so the executor path never sees a `u64`.
 pub type OrdinalBatch = Vec<i64>;
 
+/// What preparing a descriptor yielded.
+///
+/// # `rows` is `Some` only when the transport got it for free
+///
+/// Flight's `get_flight_info` computes `total_records` whether or not anyone
+/// looks, so preparing a Flight descriptor answers "how many" at no cost beyond
+/// the ticket. The channel's ticket is derived from a pin it already holds and
+/// its count is a **separate frame**, so filling this in would charge every row
+/// scan for a number only `count(*)` wants.
+///
+/// So a caller that needs the count asks here first and falls back to
+/// [`Transport::cardinality`], which is one round trip either way and one fewer
+/// on Flight.
+pub struct Prepared {
+    pub ticket: Vec<u8>,
+    pub version: u64,
+    pub rows: Option<u64>,
+}
+
 /// A source of ordinals for one key.
 pub trait Transport {
     /// Exact row count, without fetching rows.
@@ -63,7 +82,7 @@ pub trait Transport {
     /// touch this layer.
     ///
     /// `at` is the version to count at, with the meaning it has on
-    /// [`Transport::ticket_for`]: `None` is "whatever is current" and
+    /// [`Transport::prepare`]: `None` is "whatever is current" and
     /// `Some( v )` is that exact version. A scope that has fixed a version must
     /// pass it, or its count describes a different database than its scans do --
     /// which is **not** merely a stale estimate when the count is the answer, as
@@ -74,8 +93,16 @@ pub trait Transport {
     /// [`Transport::next_batch`].
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError>;
 
-    /// Mint a ticket for `cmd` without reading it, and say which version it
-    /// reads at.
+    /// Mint a ticket for `cmd` without reading it, and report what came with
+    /// it.
+    ///
+    /// Called `ticket_for` until 2026-10-10, when it grew [`Prepared::rows`].
+    /// Pinning the foreign data wrapper's scans had made a pushed-down
+    /// `count(*)` cost **two** `get_flight_info`s where its whole point was one:
+    /// a mint to fix the scope's version, then a count at that version. Flight's
+    /// mint response already carried the count, so the second call was asking
+    /// for something it had been handed. See
+    /// `pinning-costs-the-fast-count-a-second-round-trip`.
     ///
     /// A ticket records **the version it was minted at**, and the server
     /// answers at that version rather than at whatever is current. That is what
@@ -99,8 +126,7 @@ pub trait Transport {
     /// ticket is the server's opaque bytes and a channel ticket names a pin
     /// this transport holds. `fdw::modify::pinned_ticket` records it for the
     /// scope and passes it to every later mint.
-    fn ticket_for(&mut self, cmd: &[u8], at: Option<u64>)
-        -> Result<(Vec<u8>, u64), TransportError>;
+    fn prepare(&mut self, cmd: &[u8], at: Option<u64>) -> Result<Prepared, TransportError>;
 
     /// Begin streaming from a ticket obtained earlier, possibly by an earlier
     /// statement in the same transaction.

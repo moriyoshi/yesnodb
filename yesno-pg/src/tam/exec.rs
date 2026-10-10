@@ -821,11 +821,13 @@ unsafe fn fetch_all(rel: pg_sys::Relation) -> Vec<u64> {
     // current executor statement, so repeated scans agree without hiding a
     // commit from the next statement. See `fdw::modify::pinned_ticket`.
     let pinned = crate::fdw::modify::pinned_ticket(&_endpoint, &cmd, |at| {
-        transport.ticket_for(&cmd, at).map_err(|e| e.to_string())
+        transport.prepare(&cmd, at).map_err(|e| e.to_string())
     });
     let opened = match pinned {
         Err(e) => error!("yesno_tam: {e}"),
-        Ok(Some(ticket)) => transport.open_scan_with_ticket(&ticket),
+        // Any row count the mint came with is ignored: this walk wants the
+        // ordinals, not how many of them there are.
+        Ok(Some((ticket, _))) => transport.open_scan_with_ticket(&ticket),
         Ok(None) => transport.open_scan(&cmd),
     };
     if let Err(e) = opened {

@@ -21,7 +21,7 @@
 //! server's ticket carries the snapshot version the count was taken at; a
 //! locally minted one would silently discard it.
 //!
-//! `ticket_for` does *read* the version the server's ticket declares, which is
+//! `prepare` does *read* the version the server's ticket declares, which is
 //! the opposite of constructing one: it is how `fdw::modify` learns the version
 //! a scope has fixed so that every later target in that scope can be minted at
 //! it. The bytes are still handed back to `fetch_ticket` unaltered.
@@ -32,7 +32,7 @@ use tonic::transport::Channel;
 use yesno_flight::client::Mutation;
 use yesno_flight::YesnoClient;
 
-use super::{OrdinalBatch, Transport, TransportError};
+use super::{OrdinalBatch, Prepared, Transport, TransportError};
 use crate::ordinal::ordinal_to_i64;
 
 /// The column `yesno-flight`'s S1 schema carries.
@@ -42,7 +42,7 @@ const ORDINAL_COLUMN: &str = "ordinal";
 /// it is.
 ///
 /// One function because **two call sites asking for a version differently is how
-/// they drift**: `cardinality` and `ticket_for` must agree exactly about what
+/// they drift**: `cardinality` and `prepare` must agree exactly about what
 /// "at version v" means on the wire, or a count and a scan in one transaction
 /// would disagree for a reason no fixture would name.
 fn at_version(cmd: &[u8], at: Option<u64>) -> Result<Option<Vec<u8>>, TransportError> {
@@ -172,11 +172,7 @@ impl Transport for FlightTransport {
         Ok(info.total_records())
     }
 
-    fn ticket_for(
-        &mut self,
-        cmd: &[u8],
-        at: Option<u64>,
-    ) -> Result<(Vec<u8>, u64), TransportError> {
+    fn prepare(&mut self, cmd: &[u8], at: Option<u64>) -> Result<Prepared, TransportError> {
         let wrapped = at_version(cmd, at)?;
         let cmd = wrapped.as_deref().unwrap_or(cmd);
         self.client()?;
@@ -189,6 +185,10 @@ impl Transport for FlightTransport {
         // The ticket is taken from the server response and handed back unread.
         // QueryInfo validates its shape but this adapter never constructs one.
         let bytes = info.ticket_bytes().to_vec();
+        // **Free**: the server computed it to fill `total_records` whether or
+        // not this call wanted it, so reading it here is what lets a pushed-down
+        // `count(*)` be one round trip again rather than two.
+        let rows = Some(info.total_records());
         // Its declared version, which is the one thing read out of it. A ticket
         // the client cannot parse is a version skew worth reporting here rather
         // than discovering as a wrong answer later.
@@ -207,7 +207,11 @@ impl Transport for FlightTransport {
                 )));
             }
         }
-        Ok((bytes, version))
+        Ok(Prepared {
+            ticket: bytes,
+            version,
+            rows,
+        })
     }
 
     fn open_scan_with_ticket(&mut self, ticket: &[u8]) -> Result<(), TransportError> {
@@ -223,8 +227,8 @@ impl Transport for FlightTransport {
     }
 
     fn open_scan(&mut self, cmd: &[u8]) -> Result<(), TransportError> {
-        let (ticket, _) = self.ticket_for(cmd, None)?;
-        self.open_scan_with_ticket(&ticket)
+        let prepared = self.prepare(cmd, None)?;
+        self.open_scan_with_ticket(&prepared.ticket)
     }
 
     fn next_batch(&mut self) -> Result<Option<OrdinalBatch>, TransportError> {

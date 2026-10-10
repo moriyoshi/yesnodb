@@ -67,7 +67,7 @@ use std::rc::Rc;
 use yesno_channel::client::{Client, Error as ClientError, Snapshot};
 use yesno_channel::ipc::{Write, WriteOp};
 
-use super::{OrdinalBatch, Transport, TransportError};
+use super::{OrdinalBatch, Prepared, Transport, TransportError};
 use crate::ordinal::ordinal_to_i64;
 
 /// What the server logs this peer as.
@@ -136,7 +136,7 @@ pub struct ChannelTransport {
     client: Option<Client>,
     /// The read view this transport is using.
     ///
-    /// `Rc` because a pin minted by [`Transport::ticket_for`] is **also** held
+    /// `Rc` because a pin minted by [`Transport::prepare`] is **also** held
     /// in `PINS`, which is what lets a later statement reach it. This field is
     /// then a cache: the statement that minted the pin need not go through the
     /// map to use it.
@@ -358,11 +358,7 @@ impl Transport for ChannelTransport {
     /// `cmd` means a ticket replays the same scan whether it is a key or a
     /// pushed-down expression, and it is what `open_scan` already classifies, so
     /// the two paths cannot disagree about what a ticket meant.
-    fn ticket_for(
-        &mut self,
-        cmd: &[u8],
-        at: Option<u64>,
-    ) -> Result<(Vec<u8>, u64), TransportError> {
+    fn prepare(&mut self, cmd: &[u8], at: Option<u64>) -> Result<Prepared, TransportError> {
         // Classified before minting, so a descriptor this transport cannot serve
         // fails here rather than at the first page of a replay -- including the
         // server-evaluates-nothing case, which a ticket would otherwise carry
@@ -395,7 +391,16 @@ impl Transport for ChannelTransport {
         let mut ticket = Vec::with_capacity(8 + cmd.len());
         ticket.extend_from_slice(&version.to_le_bytes());
         ticket.extend_from_slice(cmd);
-        Ok((ticket, version))
+        Ok(Prepared {
+            ticket,
+            version,
+            // **`None`, deliberately.** A count here is `SnapshotCardinality`,
+            // a frame of its own, so answering it would charge every row scan
+            // for a number only `count(*)` wants. A caller that wants it asks
+            // `cardinality` and pays one frame -- the same one it would have
+            // paid anyway.
+            rows: None,
+        })
     }
 
     fn open_scan_with_ticket(&mut self, ticket: &[u8]) -> Result<(), TransportError> {

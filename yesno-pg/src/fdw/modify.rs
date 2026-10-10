@@ -245,7 +245,11 @@ struct Pins {
     /// a cache keyed by the table's key would hand the second a ticket minted
     /// for the first's filter. The table access method's descriptor is always
     /// `key_cmd( key )`, so for it this is the same thing.
-    ticket: HashMap<(String, Vec<u8>), Vec<u8>>,
+    /// The row count is cached beside the ticket, and that is sound rather than
+    /// convenient: the ticket names a version, so the count of this descriptor
+    /// at that version cannot change while the entry lives. `None` when the
+    /// transport did not get it for free -- see [`crate::transport::Prepared`].
+    ticket: HashMap<(String, Vec<u8>), PinnedScan>,
 }
 
 impl Pins {
@@ -747,9 +751,9 @@ unsafe extern "C-unwind" fn xact_callback(
 /// minted when it was first touched -- at whatever had been committed by then.
 /// `tam_repeatable_read_two_keys.spec` demonstrated it, reading 3 of a key
 /// whose transaction had already fixed a view containing 2.
-pub fn pinned_ticket<F>(endpoint: &str, cmd: &[u8], mint: F) -> Result<Option<Vec<u8>>, String>
+pub fn pinned_ticket<F>(endpoint: &str, cmd: &[u8], mint: F) -> Result<Option<PinnedScan>, String>
 where
-    F: FnOnce(Option<u64>) -> Result<(Vec<u8>, u64), String>,
+    F: FnOnce(Option<u64>) -> Result<crate::transport::Prepared, String>,
 {
     // `XactIsoLevel` is the level of the transaction in progress. Values are
     // ordered, so `>=` covers SERIALIZABLE without naming it.
@@ -764,17 +768,20 @@ where
         // would outlive the transaction and the *next* one would read stale.
         ensure_xact_callbacks();
         let at = PINNED.with(|p| p.borrow().version.get(endpoint).copied());
-        let (ticket, version) = mint(at)?;
+        let prepared = mint(at)?;
+        let entry = (prepared.ticket, prepared.rows);
         PINNED.with(|p| {
             let mut p = p.borrow_mut();
             // `or_insert`, not `insert`: when `at` was `Some` the mint read at
             // the version already recorded, so there is nothing to move, and
             // overwriting would make the record follow the last target instead
             // of the first.
-            p.version.entry(endpoint.to_string()).or_insert(version);
-            p.ticket.insert(k, ticket.clone());
+            p.version
+                .entry(endpoint.to_string())
+                .or_insert(prepared.version);
+            p.ticket.insert(k, entry.clone());
         });
-        return Ok(Some(ticket));
+        return Ok(Some(entry));
     }
 
     if let Some(t) = STATEMENT.with(|s| s.borrow().pins.ticket.get(&k).cloned()) {
@@ -792,17 +799,25 @@ where
     // fresh view per *statement*, not per scan, so two keys read by one
     // statement must still agree with each other.
     let at = STATEMENT.with(|s| s.borrow().pins.version.get(endpoint).copied());
-    let (ticket, version) = mint(at)?;
+    let prepared = mint(at)?;
+    let entry = (prepared.ticket, prepared.rows);
     STATEMENT.with(|s| {
         let mut s = s.borrow_mut();
         s.pins
             .version
             .entry(endpoint.to_string())
-            .or_insert(version);
-        s.pins.ticket.insert(k, ticket.clone());
+            .or_insert(prepared.version);
+        s.pins.ticket.insert(k, entry.clone());
     });
-    Ok(Some(ticket))
+    Ok(Some(entry))
 }
+
+/// A pinned scan: the ticket, and the row count that came with minting it.
+///
+/// `None` rows is not "no rows" but "this transport charges for counting" --
+/// the channel's count is a frame of its own, so a row scan is not made to pay
+/// for a number only `count(*)` wants. See [`crate::transport::Prepared`].
+pub type PinnedScan = (Vec<u8>, Option<u64>);
 
 /// Whether this transaction or statement has fixed a version for `endpoint`.
 ///

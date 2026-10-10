@@ -4554,3 +4554,64 @@ line. The four-limits entry names all four again.
 * **"Did we address those?" deserves a grep, not a recollection.** I had told the user twice
   which items were open; the file disagreed with both summaries in a way I would not have
   found by rereading my own messages.
+
+## 2026-10-10 -- Paying back the round trip, and failing to prove it
+
+Yesterday's FDW pinning turned a pushed-down `count(*)` from one `get_flight_info` into two:
+a mint to fix the scope's version, then a count at that version. The entry recording it
+already named the fix, because the shape was obvious once written down -- **Flight's mint
+response had been carrying the count all along**, in the `total_records` that
+`get_flight_info` computes whether or not anyone looks.
+
+So `ticket_for` became `prepare`, returning `Prepared { ticket, version, rows }`. The fast
+count consumes `rows` and makes no second call.
+
+### `rows` is `Option`, and that is the honest shape
+
+Filling it unconditionally would have been wrong for the channel, whose ticket is derived
+from a pin it already holds and whose count is `SnapshotCardinality` -- **a frame of its
+own**. A `Prepared` that always carried a count would charge every channel row scan for a
+number only `count(*)` wants.
+
+`None` therefore means "this transport charges for counting", not "no rows", and the caller
+falls back to `cardinality`. One round trip on Flight, one frame on the channel, and row
+scans unchanged on both.
+
+A later scan of the same descriptor now gets the count **for nothing**, from the pin cache.
+That is sound rather than opportunistic: the ticket names a version, so the count of that
+descriptor at that version cannot move while the cache entry lives.
+
+### `nothing-in-the-suite-counts-round-trips`
+
+Here is what I cannot claim. `gate-pg` passes, which proves every number is right. It says
+nothing about how many requests produced them, and **no fixture in the suite does**.
+`ServerStats` carries `allocated_bytes`, `deferred_bytes`, `wal_bytes`, `live_readers`,
+`shards` and `features` -- space and readers, no request counter.
+
+So the regression went in undetected yesterday and came out unverified today, both times on
+the property the phase exists for: "one `get_flight_info` and **no** `do_get`. That is the
+entire point." The fix is readable in one function and I am confident in it; confidence is
+not a gate.
+
+Recorded with the shape of the remedy: a `requests` counter on the `stats` action, asserted
+around a `count(*)` in `fdw_count.sql`. The counter is a `yesno-flight` change and is the
+smaller half of that work.
+
+### And the bookkeeping, done right this time
+
+The new entry went in **before** the whole bullet rather than by replacing a sentence inside
+one, and I checked afterwards which of `First`/`Second`/`Third`/`Fourth` sat on which line.
+All four are still on the four-limits entry. That check took one command and is now the
+thing I do after touching that file.
+
+### Carry away
+
+* **The cheapest fix for a doubled call is usually one call, not one fewer.** Both RPCs were
+  asking the same server the same question about the same version; only one of them had been
+  told it was allowed to answer both halves.
+* **An `Option` in a return type can be a statement about cost.** `rows: None` says "I would
+  charge you for this", which is a thing a trait can usefully express and a thing a caller
+  can usefully branch on -- better than two methods or a lie.
+* **"Verified by reading" is a result worth writing down as such.** The alternative is a
+  sentence that sounds measured, in a repo whose whole discipline is that measurements have
+  constructions attached.

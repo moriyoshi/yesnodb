@@ -813,17 +813,25 @@ pub unsafe extern "C-unwind" fn begin_foreign_scan(
     // buffer and the overlay are already keyed by, so a channel server and a
     // Flight server cannot be confused for one another.
     let identity = server.transport.buffer_key();
-    let ticket = match &identity {
+    let pinned = match &identity {
         None => None,
         Some(identity) => {
             match crate::fdw::modify::pinned_ticket(identity, &cmd, |at| {
-                transport.ticket_for(&cmd, at).map_err(|e| e.to_string())
+                transport.prepare(&cmd, at).map_err(|e| e.to_string())
             }) {
                 Ok(t) => t,
                 Err(e) => error!("yesno_fdw: {e}"),
             }
         }
     };
+    let ticket = pinned.as_ref().map(|(t, _)| t.clone());
+    // The count the mint came with, when it came with one. **This is what makes
+    // a pushed-down `count(*)` one round trip again**: pinning made it two -- a
+    // mint to fix the version, then a count at that version -- and Flight's
+    // mint response had been carrying the count all along. A later scan of the
+    // same descriptor gets it from the pin cache for nothing, because the ticket
+    // names a version and the count at that version cannot move.
+    let prepared_rows = pinned.as_ref().and_then(|(_, rows)| *rows);
     let at = identity
         .as_ref()
         .and_then(|identity| crate::fdw::modify::pinned_version(identity));
@@ -839,9 +847,15 @@ pub unsafe extern "C-unwind" fn begin_foreign_scan(
         // number rather than a stale estimate. The alternative -- declining the
         // fast path whenever a version is pinned -- would make `count(*)` cost
         // a full scan for every such transaction.
-        match transport.cardinality(&cmd, at) {
-            Ok(n) => batch.push(n as i64),
-            Err(e) => error!("yesno_fdw: {e}"),
+        match prepared_rows {
+            Some(n) => batch.push(n as i64),
+            // The channel comes here: its ticket is derived from a pin it
+            // already holds and its count is a separate frame, so this is the
+            // one round trip it would have paid anyway.
+            None => match transport.cardinality(&cmd, at) {
+                Ok(n) => batch.push(n as i64),
+                Err(e) => error!("yesno_fdw: {e}"),
+            },
         }
     } else if mode == PUSHDOWN_COUNT_STAR {
         // The fast count is a count **on the server**, which has not seen this
