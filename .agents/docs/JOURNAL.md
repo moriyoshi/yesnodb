@@ -4968,3 +4968,67 @@ inverted path call?** Neither per-key collection, nor unions and intersections o
   them, so the compactor's own trigger is unreachable from it -- which is the same observation
   `COMPACT_LIVE_FRACTION`'s comment makes about why the threshold was once consulted twice in
   a whole run.
+
+## 2026-10-10 -- The inverted path reads lanes, and that did not reproduce it either
+
+Two entries ago I stopped at a question for the consumer: **which API does the inverted path
+call?** The consumer's repository is on this machine, so I read it instead of asking --
+read-only, `~/src/haiiie`, nothing modified.
+
+### The answer, with citations
+
+`haiiie-core/src/yesno_store.rs:328` opens `YesnoLanes::new( &snap, keys, None )`, and at
+lines 433-434 and 463-464 that opens **one `Snapshot::key_stream` -- or
+`key_stream_prefix_range` -- per key**, holds every one of them open at once, walks them in
+lockstep by chunk prefix with `next_chunk` and forward seeks, and retains a borrowed
+`yesno_core::Container` per lane.
+
+Three things no `collect_set` does: **many concurrent streams** against one store, **seeking
+rather than draining**, and **a container held across other lanes' reads**. Both earlier
+harnesses read one key at a time and kept nothing, so neither was ever going to find a bug in
+this shape.
+
+Two more facts the same read supplied, and both mattered to the corpus:
+
+* The lane set is `dims + z_planes` wide, not `dims`. `meta.rs:97` derives
+  `z_planes = u32::BITS - dims.leading_zeros()`, so **11 lanes at 1024 dims**, carrying the
+  bit planes of the complement weight `z = D - |x|` -- a density profile nothing in the
+  dimension keys resembles.
+* The keys are `( namespace << 56 ) | ( kind << 20 ) | index` ( `keyspace.rs:106` ), with
+  `Kind::Dim = 0x10` and `Kind::ZPlane = 0x11`. My first harness used 0..1024, which has the
+  same contiguity and a thousandth of the magnitude -- and an index leaf stores a **truncated
+  big-endian suffix** of `( key << 48 ) | prefix48`, so where a key's discriminating bits sit
+  relative to the truncation width is a property of its absolute value.
+
+### Reproduced, and clean
+
+1034 concurrent key streams -- 1024 dimension keys plus 11 z-planes -- at **both sides of the
+reported boundary**, 950 000 and 1 000 000 documents, with the real key layout and the
+z-planes populated from `z = D - |x|` and verified against an independent count. Read two
+ways: unbounded, seeking each stream forward per block as `YesnoLanes` does; and **bounded**,
+a fresh `key_stream_prefix_range` per key per block, which is what `supports_bounded_lanes`
+and `open_lanes_prefix_range` offer -- about **17 600 bounded plan constructions**, a path
+built by `open_planned` rather than the same stream sought forward.
+
+16 544 chunks through the lane walk. **Zero failures, every configuration.**
+
+### What is left is the data
+
+The read API, the key layout, the lane width, the scale on both sides of the boundary, the
+container mix, reclamation and relocation are now all covered. What remains is the corpus
+itself: these bits are independent of one another, while SimHash bits are projections of one
+vector and are not. Their `bench/suites/glove-100.json` names `glove-100-angular` from
+ann-benchmarks and `bench/data` holds only `miracl`, so running their own repro needs that
+download. I did not fetch it.
+
+### Carry away
+
+* **The consumer's source was on disk the whole time.** Two harnesses and six corpora were
+  built against a guess at their read path when the answer was four greps away in a sibling
+  checkout. "Ask the consumer" was the wrong instinct when their code is readable.
+* **Reading the caller changed the corpus, not just the read.** The z-planes and the key
+  magnitude came from the same file as the API, and neither would have occurred to me from
+  the yesno side -- the lane *width* is a fact about their metadata, not about this crate.
+* **A long list of eliminated causes is the deliverable when the bug will not come out.**
+  Nothing here fixes anything. What it leaves is a single named difference and a download,
+  instead of two open questions and five untested hypotheses.
