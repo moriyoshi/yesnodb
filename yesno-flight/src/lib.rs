@@ -576,6 +576,10 @@ pub struct YesnoFlightService {
     visibility_wait: std::time::Duration,
     /// Open write transactions and the outcomes of recently committed ones.
     writes: Arc<std::sync::Mutex<WriteTransactions>>,
+    /// Calls this service has answered, by kind.
+    ///
+    /// Shared and cheap to read; see [`RequestCounts`].
+    requests: Arc<RequestCounts>,
     /// How long an untouched write transaction survives.
     ///
     /// Staged work is memory the client is holding on the server, so an
@@ -584,6 +588,46 @@ pub struct YesnoFlightService {
     /// streaming still expires, which bounds the worst case at one deadline's
     /// worth of memory per open transaction rather than an unbounded one.
     write_ttl: std::time::Duration,
+}
+
+/// Calls a service has answered, by kind.
+///
+/// # Why a counter exists at all
+///
+/// The aggregate pushdown's whole claim is that a `count(*)` is **one
+/// `get_flight_info` and no `do_get`** -- the count comes from container
+/// popcounts in the index, so no ordinal is read, transferred or decoded. That
+/// is a statement about *how many requests a query makes*, and until 2026-10-10
+/// nothing anywhere could see it: `yesno-pg`'s fixtures assert the numbers a
+/// query returns and `ServerStats` reports space and readers. A regression that
+/// doubled the requests went in undetected and its repair came out unverified,
+/// both on that same property.
+///
+/// Counted here rather than reported through the `stats` action, because the
+/// consumer is a test harness holding the service in-process. Putting it on the
+/// wire is a separate want with a separate audience, and this needs no protobuf
+/// field to be useful to the gate.
+///
+/// `Relaxed` throughout: these are diagnostics, nothing branches on them, and a
+/// reader that observes one increment late has still observed a count it can
+/// compare against another reading taken the same way.
+#[derive(Default, Debug)]
+pub struct RequestCounts {
+    pub flight_infos: std::sync::atomic::AtomicU64,
+    pub do_gets: std::sync::atomic::AtomicU64,
+    pub do_puts: std::sync::atomic::AtomicU64,
+}
+
+impl RequestCounts {
+    /// `( flight_infos, do_gets, do_puts )` as of now.
+    pub fn read(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.flight_infos.load(Relaxed),
+            self.do_gets.load(Relaxed),
+            self.do_puts.load(Relaxed),
+        )
+    }
 }
 
 #[cfg(feature = "server")]
@@ -1191,8 +1235,17 @@ impl YesnoFlightService {
             lease_ttl,
             visibility_wait: Self::DEFAULT_VISIBILITY_WAIT,
             writes: Arc::new(std::sync::Mutex::new(WriteTransactions::default())),
+            requests: Arc::new(RequestCounts::default()),
             write_ttl: Self::DEFAULT_WRITE_TTL,
         }
+    }
+
+    /// The counters this service increments, shared with it.
+    ///
+    /// Taken **before** the service is moved into a server task, which is the
+    /// only time a caller can: `tonic` owns it afterwards.
+    pub fn request_counts(&self) -> Arc<RequestCounts> {
+        Arc::clone(&self.requests)
     }
 
     /// Park a clone of `snap` so the version it names survives to `DoGet`.
@@ -1360,6 +1413,9 @@ impl FlightService for YesnoFlightService {
         &self,
         r: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        self.requests
+            .flight_infos
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = r.into_inner();
         let request = Self::request_of(&d)?;
         let query_kind = match &request {
@@ -1480,6 +1536,9 @@ impl FlightService for YesnoFlightService {
         &self,
         r: Request<FlightTicket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        self.requests
+            .do_gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let raw = r.into_inner().ticket;
         let t = Ticket::decode(&raw).ok_or_else(|| Status::invalid_argument("malformed ticket"))?;
         let db = self.db.clone();
@@ -1931,6 +1990,9 @@ impl FlightService for YesnoFlightService {
         &self,
         r: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        self.requests
+            .do_puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The mode rides on the **first message's** descriptor, and reading it
         // means peeking the stream before handing it to the decoder — a
         // `FlightRecordBatchStream` consumes the descriptor without exposing it.

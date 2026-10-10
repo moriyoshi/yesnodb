@@ -97,6 +97,61 @@ version = checked(psql_run(["-At", "-c", "SELECT yesno_pg_version()"]), "version
 assert version["stdout"] == "0.1.0\n"
 checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop extension")
 
+# How many requests a pushed-down count makes, which no expected file can see.
+#
+# The aggregate pushdown's whole claim is that `count(*)` reads no ordinals: the
+# count comes from container popcounts in the index, so there is no stream to
+# open. Every `.out` file asserts the number a query *returns* and none of them
+# can tell one request from three -- which is how a regression that doubled them
+# went in on 2026-10-09 and how its repair went out unverified on 2026-10-10.
+#
+# **Two `get_flight_info`s, and the derivation matters more than the number.**
+# One is the planner's: `GetForeignRelSize` asks for the key's cardinality to
+# give PostgreSQL a true row count. The second is the executor's, and it serves
+# two purposes at once -- it mints the ticket that fixes this scope's version and
+# its response carries the count, which is what `Transport::prepare` exists to
+# exploit. Three would mean the count and the mint had gone back to being
+# separate calls.
+#
+# **Zero `do_get`s is the load-bearing half.** A stream here would mean ordinals
+# were read to count them, which is the thing the phase exists to avoid.
+checked(psql_run(["-q", "-c", "CREATE EXTENSION yesno_pg"]), "create extension for counts")
+checked(
+    psql_run(
+        [
+            "-q",
+            "-c",
+            "CREATE SERVER cnt FOREIGN DATA WRAPPER yesno_fdw OPTIONS ( endpoint '"
+            + endpoint
+            + "' )",
+        ]
+    ),
+    "create counting server",
+)
+checked(
+    psql_run(
+        [
+            "-q",
+            "-c",
+            "CREATE FOREIGN TABLE cnt42 ( ordinal bigint ) SERVER cnt OPTIONS ( key '42' )",
+        ]
+    ),
+    "create counting table",
+)
+before = fx_flight_requests()
+counted = checked(psql_run(["-At", "-c", "SELECT count(*) FROM cnt42"]), "pushed-down count")
+after = fx_flight_requests()
+assert counted["stdout"] == "10\n", counted["stdout"]
+infos = after["flight_infos"] - before["flight_infos"]
+gets = after["do_gets"] - before["do_gets"]
+assert gets == 0, f"a pushed-down count opened {gets} stream(s); it must open none"
+assert infos == 2, (
+    f"a pushed-down count made {infos} get_flight_info call(s), expected 2: "
+    "one for the planner's row estimate and one that mints the ticket and "
+    "carries the count"
+)
+checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop counting extension")
+
 sql_files = fx_list(sql_dir, ".sql")
 expected_files = fx_list(expected_dir, ".out")
 assert len(sql_files) > 0

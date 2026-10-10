@@ -26,6 +26,7 @@ use crate::world::{HandleKind, World};
 pub const OWNS: &[&str] = &[
     "fx_flight_start",
     "fx_flight_stop",
+    "fx_flight_requests",
     "fx_channel_start",
     "fx_channel_stop",
     "fx_resource",
@@ -140,6 +141,19 @@ impl World {
                 })?;
                 drop(channel);
                 Ok(MontyObject::None)
+            }
+            "fx_flight_requests" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                let flight = self.fixture.flight.as_ref().ok_or_else(|| {
+                    value_err(format!("{verb}(): fixture Flight server is not running"))
+                })?;
+                let (infos, gets, puts) = flight.requests.read();
+                Ok(dict(vec![
+                    ("flight_infos", crate::convert::int_obj(infos)),
+                    ("do_gets", crate::convert::int_obj(gets)),
+                    ("do_puts", crate::convert::int_obj(puts)),
+                ]))
             }
             "fx_flight_stop" => {
                 a.exact(0)?;
@@ -720,6 +734,10 @@ fn fixture_err(verb: &str, message: impl Into<String>) -> MontyException {
 struct FlightFixture {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<Result<(), String>>>,
+    /// Shared with the service, so a scenario can assert **how many requests** a
+    /// query made rather than only what it returned. Taken before the service
+    /// moves into the server task, which is the only moment it can be.
+    requests: Arc<yesno_flight::RequestCounts>,
 }
 
 /// A real plugin channel over a real socket, for a scenario that drives a peer.
@@ -864,6 +882,7 @@ impl FlightFixture {
                         .map_err(|error| format!("cannot seed key {key}: {error}"))?;
                 }
                 let service = YesnoFlightService::new(Arc::new(db));
+                let requests = service.request_counts();
                 let runtime = tokio::runtime::Runtime::new()
                     .map_err(|error| format!("cannot create Flight runtime: {error}"))?;
                 runtime.block_on(async move {
@@ -874,7 +893,7 @@ impl FlightFixture {
                         .local_addr()
                         .map_err(|error| format!("cannot read Flight address: {error}"))?;
                     ready
-                        .send(Ok(address))
+                        .send(Ok((address, requests)))
                         .map_err(|_| "scenario stopped before Flight startup".to_owned())?;
                     tonic::transport::Server::builder()
                         .add_service(FlightServiceServer::new(service))
@@ -889,12 +908,20 @@ impl FlightFixture {
                 })
             })
             .map_err(|error| format!("cannot spawn Flight fixture: {error}"))?;
-        let fixture = Self {
+        let mut fixture = Self {
             shutdown: Some(shutdown),
             thread: Some(thread),
+            requests: Arc::new(yesno_flight::RequestCounts::default()),
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(address)) => Ok((fixture, format!("http://{address}"))),
+            Ok(Ok((address, requests))) => {
+                // Replaces the placeholder above with the service's own, which
+                // is the one it increments. A scenario reading the placeholder
+                // would see zeroes forever and every assertion about request
+                // counts would pass vacuously.
+                fixture.requests = requests;
+                Ok((fixture, format!("http://{address}")))
+            }
             Ok(Err(error)) => {
                 drop(fixture);
                 Err(error)

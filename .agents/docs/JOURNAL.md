@@ -4615,3 +4615,59 @@ thing I do after touching that file.
 * **"Verified by reading" is a result worth writing down as such.** The alternative is a
   sentence that sounds measured, in a repo whose whole discipline is that measurements have
   constructions attached.
+
+## 2026-10-10 -- Counting the requests, and correcting what I said about them
+
+`nothing-in-the-suite-counts-round-trips`, opened an hour earlier because I had just closed a
+performance entry **by reading the code** and said so.
+
+### The counter, and where it is not
+
+`YesnoFlightService` now increments a shared `RequestCounts` -- `get_flight_info`, `do_get`,
+`do_put` -- and hands it out through `request_counts()`, which a caller must take **before**
+the service moves into a `tonic` task because that is the only moment it can. `FlightFixture`
+takes it, passes it back over the ready channel beside the bound address, and
+`fx_flight_requests()` reads it as a dict.
+
+Counted **in-process rather than through the `stats` action**. The consumer is a harness
+holding the service; putting it on the wire is a separate want with a separate audience, and
+this needed no protobuf field to be useful to the gate. `Relaxed` throughout, since nothing
+branches on them.
+
+### What it measured, and the claim it corrected
+
+```
+two get_flight_info, zero do_get
+```
+
+One is the planner's: `GetForeignRelSize` asks for the key's cardinality to hand PostgreSQL a
+true row count. The second is the executor's mint, whose response carries the count --
+which is exactly what `prepare` was built to exploit.
+
+**So `prepare` restored the statement to two requests, not one.** This morning I wrote "one
+round trip again", which was true of the execution path and not of the statement, and I had
+no way to know the difference because nothing counted. The entry and the journal now say
+two. The counter did its first job before it had a second reading to compare against.
+
+### The assertion is not vacuous, and the shape is why
+
+`assert infos == 2` rather than `<= 2`. A counter that never incremented reports a delta of
+**zero**, so an equality fails where an inequality would have passed quietly -- which is the
+failure mode of a freshly added instrument and the one most likely to go unnoticed. The
+`do_gets == 0` beside it is the load-bearing half: a stream there would mean ordinals were
+read in order to count them, which is the thing the aggregate pushdown exists to avoid.
+
+Both numbers came back exactly as derived on the first run, and against the code before
+`prepare` the `infos` assertion would have read 3.
+
+### Carry away
+
+* **An instrument's first duty is to contradict you.** I built this to guard a fix and it
+  immediately corrected the sentence announcing that fix. A performance claim with no
+  counter behind it is a reading of control flow, and control flow is not where requests are
+  counted.
+* **Assert the number, not a bound.** `<= 2` would have passed on a broken counter. For a
+  new instrument the equality is the self-test.
+* **The gate already knew where to look.** `every_verb_has_a_caller_in_some_scenario` reads
+  the PostgreSQL scenario directory, so one verb and one assertion were the whole wiring --
+  no new target, no new step, no `EXPECT_STEPS` to bump.
