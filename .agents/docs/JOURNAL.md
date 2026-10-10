@@ -4885,3 +4885,86 @@ Asking those two is a better next move than a sixth synthetic corpus.
 * **Stop at the question.** Two facts from the consumer -- which read API, and whether
   anything is deleted -- would cut more of the space than any corpus I can invent, and
   inventing a sixth would mostly be guessing at what their pipeline does.
+
+## 2026-10-10 -- Eliminating the reclaim-and-reuse cause, and finding evacuation off
+
+The previous entry stopped at two questions for the consumer. One of them -- "does the corpus
+delete or re-ingest?" -- has an engine-side half I could answer without them, because the
+cause it points at is named in the entry: **a reclaimed-and-reused cell**. The append-only
+harness structurally could not produce one.
+
+### The harness, and what confirmed it was not vacuous
+
+`.agents-workspace/tmp/churn/`: seed every key at its own density, then churn -- each round
+removes a deterministic slice of a key's live set and inserts the same number of fresh
+ordinals in the same span, so cardinality holds steady while chunks are rewritten, their old
+extents superseded and their cells freed. An independent `BTreeSet` per key is the oracle.
+
+**The vacuity check earned its keep four times.** The harness prints `freed_extents` and
+`evacuated_chunks` per round and says so when either stays at zero, and the first four
+configurations evacuated nothing at all:
+
+| configuration | freed | evacuated |
+|---|---|---|
+| churn only, 128 keys | 850 | 0 |
+| churn + uniform shrink | 3 315 | 0 |
+| ditto with `--evacuate 64` | 3 321 | 0 |
+| churn only, 1024 keys x 1M | 80 660 | 0 |
+
+Without that line I would have reported "evacuation does not reproduce it" four times over
+while never evacuating anything.
+
+### Why evacuation would not trigger, which is a finding in itself
+
+**`EVACUATE_PER_CHECKPOINT` is 0.** Evacuation is off in a stock database, so a consumer on
+defaults never relocates an extent -- which removes relocation from their possible causes
+outright, before any corpus is built.
+
+With the budget raised it still would not fire, for two further reasons.
+`evacuation_candidates` excludes the **active** slab of each class, so a corpus with few
+slabs per class offers none; and deleting from *every* key uniformly shrinks every chunk
+together, which empties each class's slabs completely -- a wholly free slab is released, not
+evacuated. What produces a partly-live slab is deleting hard from a **subset** of keys and
+leaving the rest alone.
+
+### The run that did reach it
+
+1024 keys over a 1 000 000 ordinal span, three churn rounds at 20%, then five shrink rounds
+deleting 70% from 90% of keys, with the budget at 64:
+
+```
+  shrink 0: -177772631 | slabs 241, freed extents 45829, evacuated 65
+  shrink 4:   -1438166 | slabs 241, freed extents 81096, evacuated 2317
+  slabs by class [(1,4), (5,4), (7,3), (8,4), (9,4), (10,4), (11,10)]
+  verified 1024 keys against the oracle; 0 failure(s)
+```
+
+**81 096 cells freed and reused, 2 317 live extents relocated**, across seven size classes,
+and every key read back equal to the oracle. Both halves of the named cause, at the reported
+shape, clean.
+
+### Where that leaves the bug
+
+Of the two causes the entry distinguishes, the first -- a mis-pointed reference from a
+reclaimed-and-reused cell -- is now eliminated for everything a default-configured database
+can do, and for relocation besides. The second -- a class disagreement producing a trailer
+read at the wrong offset -- was already changed by the trailer moving out of the slot, and the
+2026-09-30 amendment says it now announces itself as "extent cell is not slot-aligned" rather
+than reading another live byte range.
+
+So the remaining question is the one the previous entry asked first: **which API does the
+inverted path call?** Neither per-key collection, nor unions and intersections of
+`Snapshot::key_expr`, nor 81 096 reuses and 2 317 relocations reproduces it.
+
+### Carry away
+
+* **A vacuity check on an instrument is worth as much as the instrument.** Four of five
+  configurations here measured nothing, and said so. The temptation each time was to read a
+  clean verification as evidence.
+* **Find the default before building the corpus.** `EVACUATE_PER_CHECKPOINT = 0` eliminates
+  relocation for every consumer on defaults, and it is one grep. I built three corpora before
+  looking.
+* **Uniform deletion is the wrong shape for sparsity.** It empties slabs rather than thinning
+  them, so the compactor's own trigger is unreachable from it -- which is the same observation
+  `COMPACT_LIVE_FRACTION`'s comment makes about why the threshold was once consulted twice in
+  a whole run.
