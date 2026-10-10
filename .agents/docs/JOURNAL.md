@@ -4739,3 +4739,69 @@ each item says where it is.
   were a cosmetic defect; the paragraph justifying the ladder's shape had been inverted by
   the same change and nothing had noticed, because it reads as a design rationale rather
   than as a claim about the current code.
+
+## 2026-10-10 -- Measuring the ladder shift, which narrowed the fix from ten classes to one
+
+`the-ladder-is-still-shifted-for-a-trailer-that-moved` was opened this morning with the
+shape of a conclusion -- the ladder sits 64 bytes above the obvious powers of two for a
+trailer that moved, so un-shift it -- and the discipline of asking for the payload
+distribution first. Getting it **inverted most of the proposal**.
+
+### The construction
+
+A standalone crate under `.agents-workspace/tmp/ladder/` with a path dependency on
+`yesno-core`; nothing added to `src/`. For four corpora -- sparse ( one ordinal every 10 007,
+64 keys ), clustered ( runs of 3 000 at a wide stride ), dense ( whole chunks, every container
+a bitmap ) and one built to straddle `PACK_MAX` -- it encodes every container with
+`container::codec::encode`, applies the admission rule as `checkpoint.rs:312` writes it
+( packed when `len <= PACK_MAX` and not a bitmap ), and classifies the rest under both
+ladders. Then it opens a real `Db`, commits, checkpoints, and reads `Db::slabs_by_class()`,
+so which classes are reached is **observed rather than derived**. Reproduce by rebuilding it
+from this entry; it is deleted with the scratch tree.
+
+### What it found
+
+**Un-shift class 5 only. Leave classes 2-4 and 6-10 where they are.**
+
+`INDEX_NODE` is **1024 exactly**, and class 5 is 1088 -- a 64-byte overshoot of the one
+fixed-size object the engine allocates a slot for. Un-shifting it fits **2024 nodes in a
+slab against 1905, +6.25%**, in the regime `extent.rs` says the index dominates.
+
+**No chunk payload can reach any class below 2112.** `checkpoint.rs:312` packs every
+non-bitmap payload at or below `PACK_MAX` ( 2028 ), and the smallest class above that is
+2112. The sparse corpus produced 3 904 chunks of 12 and 14 bytes and **every one was
+packed**: its only ladder consumer was the index. Across all four corpora a real checkpoint
+touched classes 1, 5, and -- for the straddling corpus alone -- 7 through 10. So un-shifting
+class 5 creates no cliff, because nothing ever asks it for 1025..1088.
+
+**And un-shifting the upper classes is actively harmful.** A ladder change is a cliff, not a
+gradient: dropping a class by 64 pushes the 64 payloads above it into the *next* class. Over
+every payload the ladder can be asked for, the worst case is a **4097-byte payload -- 4160
+today, 6144 un-shifted, +1984 bytes, +47.7%**. The clustered corpus, whose payloads are 6000
+bytes, saves 1.03%; a payload of 6145 would lose 1984. The dense corpus is unaffected
+because class 11 was already un-shifted.
+
+So the entry's reasoning was right about the cause and wrong about the remedy, and the thing
+that distinguished them was the admission rule -- which is why "which classes are reached"
+had to be observed rather than assumed from the array.
+
+### A slip caught by the instrument's own output
+
+The first run printed `+0.06% more index nodes in a slab`. The ratio is 2024/1905, which is
+6.25%, and I had appended a `%` to a fraction without scaling it. It was obvious only because
+6.25% is also exactly 64/1024 and the two had to agree. **A derived number that cannot be
+cross-checked against an independent one is a number worth distrusting**, and this one could
+be.
+
+### Carry away
+
+* **"Measure first" changed the answer, not just the confidence.** The proposal went from ten
+  classes to one, and two of the classes it would have moved turn out to cost 47.7% on a
+  realistic payload. Opening the entry with the measurement as a prerequisite rather than a
+  formality is what caught it.
+* **An admission rule upstream can make half a ladder unreachable.** Reading `CLASS_SIZES`
+  tells you nothing about which of its entries anything asks for; `PACK_MAX` decides that,
+  from another file.
+* **A step function's cost is at its steps.** The saving from dropping a class is bounded by
+  64 bytes; the loss is bounded by the gap to the next class, which here is up to 1 984. Any
+  future ladder change should be argued at the cliffs rather than at the averages.
