@@ -227,6 +227,32 @@ impl ChannelTransport {
         Ok(self.client.as_mut().expect("just assigned"))
     }
 
+    /// The read view for `at`: the scope's pinned one, or a fresh pin.
+    ///
+    /// `Some( v )` must find the pin the scope's first target published rather
+    /// than take a new one. Taking one would read at `now` and silently answer a
+    /// different version than the scope's scans do -- and for a pushed-down
+    /// `count(*)` that is the answer, not an estimate.
+    fn snapshot_at(&mut self, at: Option<u64>) -> Result<Rc<Snapshot>, TransportError> {
+        let Some(want) = at else {
+            return self.pin();
+        };
+        if let Some(held) = self.pinned.as_ref().filter(|s| s.version() == want) {
+            return Ok(Rc::clone(held));
+        }
+        let found = PINS.with(|pins| pins.borrow().get(&(self.socket.clone(), want)).cloned());
+        let Some(snapshot) = found else {
+            return Err(TransportError::Rpc(format!(
+                "this scope fixed version {want} and nothing in this session still pins \
+                 it; the channel cannot reopen a version, so the transaction must \
+                 restart. The socket is {}",
+                self.socket
+            )));
+        };
+        self.pinned = Some(Rc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
     /// Pin a fresh read view, replacing any this transport was using.
     ///
     /// Not published to `PINS`: a pin only has to outlive its statement when a
@@ -289,12 +315,12 @@ fn rpc(error: ClientError) -> TransportError {
 }
 
 impl Transport for ChannelTransport {
-    fn cardinality(&mut self, cmd: &[u8]) -> Result<u64, TransportError> {
+    fn cardinality(&mut self, cmd: &[u8], at: Option<u64>) -> Result<u64, TransportError> {
         let cmd = cmd_of(cmd)?;
         if matches!(cmd, Cmd::Expr(_)) {
             self.refuse_if_not_evaluated()?;
         }
-        let snapshot = self.pin()?;
+        let snapshot = self.snapshot_at(at)?;
         match &cmd {
             Cmd::Key(key) => snapshot.cardinality(*key),
             // Exact, not estimated, for the same reason the key form is: the
@@ -350,17 +376,7 @@ impl Transport for ChannelTransport {
             // version, and this descriptor simply reads at it. That is why the
             // registry is keyed by version rather than by target.
             Some(want) => {
-                let held =
-                    PINS.with(|pins| pins.borrow().get(&(self.socket.clone(), want)).cloned());
-                let Some(snapshot) = held else {
-                    return Err(TransportError::Rpc(format!(
-                        "this scope fixed version {want} and nothing in this session \
-                         still pins it; the channel cannot reopen a version, so the \
-                         transaction must restart. The socket is {}",
-                        self.socket
-                    )));
-                };
-                self.pinned = Some(snapshot);
+                self.snapshot_at(Some(want))?;
                 want
             }
             None => {

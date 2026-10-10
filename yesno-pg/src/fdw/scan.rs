@@ -24,7 +24,7 @@ use crate::fdw::relation_options;
 use crate::fdw::walk::walk;
 use crate::options::{ServerOptions, TableOptions};
 use crate::transport::flight::FlightTransport;
-use crate::transport::{OrdinalBatch, Transport};
+use crate::transport::{OrdinalBatch, Transport, TransportError};
 
 /// What a `ForeignScan` should produce.
 ///
@@ -112,8 +112,18 @@ pub unsafe extern "C-unwind" fn get_foreign_rel_size(
         // before `GetForeignPlan`, so no pushdown exists yet; the estimate is
         // the key's full cardinality and PostgreSQL applies its own selectivity
         // on top. Counting the filtered set here would double-count it.
+        //
+        // At the version this scope fixed, when it has fixed one. An estimate
+        // taken at `now` inside a `REPEATABLE READ` transaction would describe
+        // a database the scan will not read, and reaching for a version the
+        // server has collapsed is reported rather than silently retried --
+        // which the fallback below turns into a warning and a default estimate.
+        let at = server
+            .transport
+            .buffer_key()
+            .and_then(|identity| crate::fdw::modify::pinned_version(&identity));
         let n = transport
-            .cardinality(&FlightTransport::key_cmd(table.key))
+            .cardinality(&FlightTransport::key_cmd(table.key), at)
             .map_err(|e| e.to_string())?;
         Ok(n as f64)
     })();
@@ -679,6 +689,14 @@ struct ScanState {
     transport: Box<dyn Transport>,
     /// The Flight descriptor payload: a bare key, or the pushed-down expression.
     cmd: Vec<u8>,
+    /// The ticket this scope pinned for `cmd`, if it pinned one.
+    ///
+    /// Held so a **rescan** reopens at the same version. A nested-loop join
+    /// rescans its inner side, and reopening from `cmd` alone would restart it
+    /// at whatever is current -- so one join could read two versions of its
+    /// inner relation, which is the same bug as reading two keys at two
+    /// versions and harder to see.
+    ticket: Option<Vec<u8>>,
     batch: OrdinalBatch,
     /// Index into `batch` of the next ordinal to emit.
     at: usize,
@@ -695,6 +713,23 @@ struct ScanState {
     /// past, so nothing is emitted twice.
     add: std::collections::BTreeSet<u64>,
     remove: std::collections::BTreeSet<u64>,
+}
+
+/// Open a scan through `ticket` when the scope pinned one, else from `cmd`.
+///
+/// One function because three call sites open a scan -- the count's overlaid
+/// path, the row scan, and `rescan_foreign_scan` -- and a scan opened from the
+/// descriptor while its siblings went through the ticket would read a different
+/// version for no reason visible at the call site.
+fn open_pinned(
+    transport: &mut dyn Transport,
+    cmd: &[u8],
+    ticket: Option<&[u8]>,
+) -> Result<(), TransportError> {
+    match ticket {
+        Some(ticket) => transport.open_scan_with_ticket(ticket),
+        None => transport.open_scan(cmd),
+    }
 }
 
 /// Drop a `ScanState` when the executor's memory context is reset.
@@ -766,12 +801,45 @@ pub unsafe extern "C-unwind" fn begin_foreign_scan(
     };
 
     let (add, remove) = pending_overlay(&server, &cmd, mode);
+
+    // **The scan's version, fixed for the scope.** Until 2026-10-10 this path
+    // pinned nothing at all: every scan opened at whatever was current, so a
+    // `REPEATABLE READ` transaction over a foreign table saw a fresh database
+    // per statement. `fdw_repeatable_read.spec` demonstrated it on both paths
+    // at once -- the pushed-down count and the row scan each read 4 where the
+    // transaction's own view held 3.
+    //
+    // `identity` rather than the raw endpoint, because it is what the write
+    // buffer and the overlay are already keyed by, so a channel server and a
+    // Flight server cannot be confused for one another.
+    let identity = server.transport.buffer_key();
+    let ticket = match &identity {
+        None => None,
+        Some(identity) => {
+            match crate::fdw::modify::pinned_ticket(identity, &cmd, |at| {
+                transport.ticket_for(&cmd, at).map_err(|e| e.to_string())
+            }) {
+                Ok(t) => t,
+                Err(e) => error!("yesno_fdw: {e}"),
+            }
+        }
+    };
+    let at = identity
+        .as_ref()
+        .and_then(|identity| crate::fdw::modify::pinned_version(identity));
+
     let mut batch = Vec::new();
     if mode == PUSHDOWN_COUNT_STAR && add.is_empty() && remove.is_empty() {
         // One `get_flight_info` and **no** `do_get`. That is the entire point
         // of the phase: the count comes from container popcounts in the index,
         // so no ordinal is read, transferred, or decoded.
-        match transport.cardinality(&cmd) {
+        //
+        // `at` keeps that true *and* consistent: a pushed-down count is the
+        // query's answer, so taking it at `now` under a pin would be a wrong
+        // number rather than a stale estimate. The alternative -- declining the
+        // fast path whenever a version is pinned -- would make `count(*)` cost
+        // a full scan for every such transaction.
+        match transport.cardinality(&cmd, at) {
             Ok(n) => batch.push(n as i64),
             Err(e) => error!("yesno_fdw: {e}"),
         }
@@ -781,7 +849,7 @@ pub unsafe extern "C-unwind" fn begin_foreign_scan(
         // wrong answer, not merely a stale one. Counting the overlaid stream
         // costs a scan and is correct; the fast path above still covers every
         // read-only statement, which is nearly all of them.
-        if let Err(e) = transport.open_scan(&cmd) {
+        if let Err(e) = open_pinned(transport.as_mut(), &cmd, ticket.as_deref()) {
             error!("yesno_fdw: {e}");
         }
         let mut n: i64 = 0;
@@ -803,12 +871,13 @@ pub unsafe extern "C-unwind" fn begin_foreign_scan(
         }
         transport.close_scan();
         batch.push(n + pending.len() as i64);
-    } else if let Err(e) = transport.open_scan(&cmd) {
+    } else if let Err(e) = open_pinned(transport.as_mut(), &cmd, ticket.as_deref()) {
         error!("yesno_fdw: {e}");
     }
     let state = Box::new(ScanState {
         transport,
         cmd,
+        ticket,
         batch,
         at: 0,
         // A count has its single row already; there is no stream to drain.
@@ -943,7 +1012,8 @@ pub unsafe extern "C-unwind" fn rescan_foreign_scan(node: *mut pg_sys::ForeignSc
         return;
     }
     let cmd = state.cmd.clone();
-    if let Err(e) = state.transport.open_scan(&cmd) {
+    let ticket = state.ticket.clone();
+    if let Err(e) = open_pinned(state.transport.as_mut(), &cmd, ticket.as_deref()) {
         error!("yesno_fdw: {e}");
     }
     state.batch.clear();

@@ -4430,3 +4430,94 @@ isolation harness passes GUCs rather than psql variables.
 * **A choice made for one reason can pay for another.** Keying the channel's pin registry by
   version was this morning's decision about ticket replay. It is what made "mint at a fixed
   version" a map lookup today.
+
+## 2026-10-10 -- The foreign data wrapper had no snapshot stability at all
+
+`the-fdw-scan-path-pins-no-version-at-all`, found yesterday by grepping for a caller:
+`fdw::modify::pinned_ticket` was called from `tam/exec.rs` **and nowhere else**. The
+`tam-mvcc` entry's claim that tickets "now provide the isolation each PostgreSQL level
+promises" was true of the table access method only.
+
+### Demonstrated, and the spec chose the fix
+
+`fdw_repeatable_read.spec` reads twice per statement on purpose, because the two reads take
+different paths and there was no reason to assume they failed together:
+
+```
+ count_second        max_second
+-            3      -          3     <- what REPEATABLE READ promises
++            4      +          4     <- what both answered
+```
+
+Both were wrong, and each for its own reason. `count(*)` is pushed down as an aggregate and
+answered by `Transport::cardinality`, which **took no ticket at all**; `max( ordinal )` is
+not pushed down, so it is a row scan through `open_scan`, which opened at `now`. Writing
+both into one spec is what turned "the FDW does not pin" into a list of the two things to
+change.
+
+The server comes from the GUC through a one-line `DO ... EXECUTE format( ... )` block,
+because the isolation harness passes GUCs and a `SERVER` option must be a literal. Key 500
+is untouched by the fixture's seed, so the spec owns its data.
+
+### The descriptor is the cache key, not the key
+
+`pinned_ticket` keyed its ticket cache by `( endpoint, key )`, which is right for the TAM --
+whose descriptor is always `key_cmd( key )`, one per relation -- and wrong for the FDW, whose
+descriptor **carries the pushed-down expression**. Two statements scanning one foreign table
+with different quals are two descriptors, and a cache keyed by the table's key would have
+handed the second a ticket minted for the first's filter: a wrong answer dressed as a
+snapshot. It is keyed by `( endpoint, cmd )` now, which for the TAM is the same thing.
+
+### A count is not always an estimate
+
+`Transport::cardinality` grew the same `at: Option<u64>` that `ticket_for` has. The
+alternative was the TAM's existing trick -- decline the fast count whenever a version is
+pinned and count through the overlaid scan -- and that would make `count(*)` cost a full
+scan for every `REPEATABLE READ` transaction, which is the opposite of the property the
+pushdown exists for.
+
+Flight answers at a version through `QueryRequest::at`, and `at_version` is now **one
+function used by both `cardinality` and `ticket_for`**: two call sites asking for a version
+differently is how a count and a scan in one transaction come to disagree for a reason no
+fixture would name. The channel's `snapshot_at` is the same shape -- find the pin the scope's
+first target published, take no new one.
+
+### Two things nothing asked about
+
+`ScanState` carries the ticket so a **rescan** reopens at the same version. A nested-loop
+join rescans its inner side, and reopening from the descriptor alone would restart it at
+whatever is current -- one join reading two versions of one relation, which is the cross-key
+bug again and harder to see. No spec covers it yet; it is a correctness fix made because the
+code was in front of me, not because anything failed.
+
+`get_foreign_rel_size` now estimates at the pinned version too. That one *is* only an
+estimate, but an estimate describing a database the scan will not read is worth nothing and
+costs the same.
+
+### The cost, recorded rather than hidden
+
+A pushed-down `count(*)` was "one `get_flight_info` and **no** `do_get`". It is now two: one
+to mint the scope's ticket, which is what fixes the version, and one for the count at that
+version. **The mint cannot be dropped** -- a transaction whose first access is a fast count
+must fix its version then, or its later scans read a newer one and the bug returns on exactly
+the path this spec was written for.
+
+The fix is one call rather than one fewer, and it is recorded as
+`pinning-costs-the-fast-count-a-second-round-trip`: Flight's `prepare_command` response
+already carries `total_records` *and* a ticket naming the version, so a
+`Transport::prepare( cmd, at ) -> ( ticket, version, rows )` would answer all three from the
+single RPC the fast path used to make.
+
+### Carry away
+
+* **Two reads in one spec told me what one could not.** Had the spec asserted only
+  `count(*)`, the row-scan path would have been fixed by accident or not at all; had it
+  asserted only `max()`, the cardinality path would have stayed broken behind a passing
+  fixture.
+* **A cache key is a scope claim, twice in two days.** Yesterday `( endpoint, key )` promised
+  per-transaction and delivered per-target. Today the same tuple was right for one caller and
+  wrong for the other, because what identifies a read is the descriptor and only one caller's
+  descriptor is a function of its key.
+* **Write down the regression you chose.** The second round trip is real, deliberate, and
+  bought correctness; naming it with the shape of its fix is the difference between a
+  recorded trade and a thing someone measures in six months and calls a bug.

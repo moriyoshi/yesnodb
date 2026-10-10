@@ -61,7 +61,14 @@ pub trait Transport {
     /// or an encoded `yesno-wire` expression. Opaque here on purpose — the
     /// transport must not care which, so that adding an expression form does not
     /// touch this layer.
-    fn cardinality(&mut self, cmd: &[u8]) -> Result<u64, TransportError>;
+    ///
+    /// `at` is the version to count at, with the meaning it has on
+    /// [`Transport::ticket_for`]: `None` is "whatever is current" and
+    /// `Some( v )` is that exact version. A scope that has fixed a version must
+    /// pass it, or its count describes a different database than its scans do --
+    /// which is **not** merely a stale estimate when the count is the answer, as
+    /// it is for a pushed-down `count(*)`.
+    fn cardinality(&mut self, cmd: &[u8], at: Option<u64>) -> Result<u64, TransportError>;
 
     /// Begin streaming a key's ordinals. Subsequent batches come from
     /// [`Transport::next_batch`].
@@ -153,7 +160,7 @@ pub trait Transport {
             // empty range it produces is the right answer rather than a wrap.
             yesno_wire::SetExpr::Range(ordinal, ordinal.saturating_add(1)),
         ]);
-        Ok(self.cardinality(&expr.encode())? > 0)
+        Ok(self.cardinality(&expr.encode(), None)? > 0)
     }
 
     /// Every populated key, ascending.

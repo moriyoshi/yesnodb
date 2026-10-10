@@ -38,6 +38,25 @@ use crate::ordinal::ordinal_to_i64;
 /// The column `yesno-flight`'s S1 schema carries.
 const ORDINAL_COLUMN: &str = "ordinal";
 
+/// The descriptor to send in order to read at `at`, or `None` to send `cmd` as
+/// it is.
+///
+/// One function because **two call sites asking for a version differently is how
+/// they drift**: `cardinality` and `ticket_for` must agree exactly about what
+/// "at version v" means on the wire, or a count and a scan in one transaction
+/// would disagree for a reason no fixture would name.
+fn at_version(cmd: &[u8], at: Option<u64>) -> Result<Option<Vec<u8>>, TransportError> {
+    let Some(version) = at else {
+        return Ok(None);
+    };
+    // A `QueryRequest` is the only descriptor form with somewhere to put a
+    // version, and the server's `request_of` checks for it before anything else
+    // and answers from `snapshot_at( version )`.
+    Ok(Some(
+        yesno_flight::QueryRequest::at(yesno_flight::AnyExpr::Set(expr_of(cmd)?), version).encode(),
+    ))
+}
+
 /// A descriptor as a set expression, so it can be wrapped in a `QueryRequest`.
 ///
 /// The two forms this trait defines, and the same classification the server
@@ -141,7 +160,9 @@ impl FlightTransport {
 }
 
 impl Transport for FlightTransport {
-    fn cardinality(&mut self, cmd: &[u8]) -> Result<u64, TransportError> {
+    fn cardinality(&mut self, cmd: &[u8], at: Option<u64>) -> Result<u64, TransportError> {
+        let wrapped = at_version(cmd, at)?;
+        let cmd = wrapped.as_deref().unwrap_or(cmd);
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
         let info = self
@@ -156,20 +177,8 @@ impl Transport for FlightTransport {
         cmd: &[u8],
         at: Option<u64>,
     ) -> Result<(Vec<u8>, u64), TransportError> {
-        // Asking for a specific version means asking as a `QueryRequest`, which
-        // is the only descriptor form with somewhere to put one. The server's
-        // `request_of` checks for it before anything else and answers from
-        // `snapshot_at( version )`.
-        let owned;
-        let cmd = match at {
-            None => cmd,
-            Some(version) => {
-                let expr = expr_of(cmd)?;
-                owned = yesno_flight::QueryRequest::at(yesno_flight::AnyExpr::Set(expr), version)
-                    .encode();
-                &owned
-            }
-        };
+        let wrapped = at_version(cmd, at)?;
+        let cmd = wrapped.as_deref().unwrap_or(cmd);
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
         let info = self

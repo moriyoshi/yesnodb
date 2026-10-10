@@ -68,7 +68,9 @@ unsafe fn exact_rows(path: *mut pg_sys::IndexPath, index: pg_sys::Oid) -> Option
     let out = (|| {
         let mut transport = unsafe { open_transport_for_index(rel) }.ok()?;
         let cmd = crate::transport::flight::FlightTransport::key_cmd(key);
-        transport.cardinality(&cmd).ok()
+        // `None`: this is a planner cost estimate for an index, which has no
+        // transaction-scoped pin of its own to respect.
+        transport.cardinality(&cmd, None).ok()
     })();
     unsafe { pg_sys::RelationClose(rel) };
     out

@@ -239,7 +239,13 @@ thread_local! {
 /// view nothing else in the scope shares.
 struct Pins {
     version: HashMap<String, u64>,
-    ticket: HashMap<(String, u64), Vec<u8>>,
+    /// Keyed by `( endpoint, descriptor )` and **not by key**, because an FDW
+    /// scan's descriptor carries its pushed-down expression: two statements
+    /// scanning one foreign table with different quals are two descriptors, and
+    /// a cache keyed by the table's key would hand the second a ticket minted
+    /// for the first's filter. The table access method's descriptor is always
+    /// `key_cmd( key )`, so for it this is the same thing.
+    ticket: HashMap<(String, Vec<u8>), Vec<u8>>,
 }
 
 impl Pins {
@@ -741,13 +747,13 @@ unsafe extern "C-unwind" fn xact_callback(
 /// minted when it was first touched -- at whatever had been committed by then.
 /// `tam_repeatable_read_two_keys.spec` demonstrated it, reading 3 of a key
 /// whose transaction had already fixed a view containing 2.
-pub fn pinned_ticket<F>(endpoint: &str, key: u64, mint: F) -> Result<Option<Vec<u8>>, String>
+pub fn pinned_ticket<F>(endpoint: &str, cmd: &[u8], mint: F) -> Result<Option<Vec<u8>>, String>
 where
     F: FnOnce(Option<u64>) -> Result<(Vec<u8>, u64), String>,
 {
     // `XactIsoLevel` is the level of the transaction in progress. Values are
     // ordered, so `>=` covers SERIALIZABLE without naming it.
-    let k = (endpoint.to_string(), key);
+    let k = (endpoint.to_string(), cmd.to_vec());
     let transaction_pin = unsafe { pg_sys::XactIsoLevel } >= pg_sys::XACT_REPEATABLE_READ as i32;
     if transaction_pin {
         if let Some(t) = PINNED.with(|p| p.borrow().ticket.get(&k).cloned()) {
@@ -807,8 +813,20 @@ where
 /// key would read at the pinned version -- two numbers for one key in one
 /// transaction.
 pub fn has_pinned(endpoint: &str) -> bool {
-    PINNED.with(|p| p.borrow().version.contains_key(endpoint))
-        || STATEMENT.with(|s| s.borrow().pins.version.contains_key(endpoint))
+    pinned_version(endpoint).is_some()
+}
+
+/// The version this scope has fixed for `endpoint`, if any.
+///
+/// Passed to [`crate::transport::Transport::cardinality`] so that a count
+/// describes the same database the scope's scans read. **A count is not always
+/// an estimate**: a pushed-down `count(*)` is the query's answer, so taking it
+/// at `now` inside a transaction that fixed an older version is a wrong result
+/// rather than a stale hint.
+pub fn pinned_version(endpoint: &str) -> Option<u64> {
+    PINNED
+        .with(|p| p.borrow().version.get(endpoint).copied())
+        .or_else(|| STATEMENT.with(|s| s.borrow().pins.version.get(endpoint).copied()))
 }
 
 /// Send everything buffered, then clear.
