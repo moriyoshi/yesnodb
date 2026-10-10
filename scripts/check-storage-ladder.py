@@ -33,10 +33,19 @@ class is a format decision with a recorded rationale, not arithmetic, and
 `AGENTS.md` requires reading that rationale and journalling before touching it.
 This only enforces that the document says what the code does.
 
-It does **not** read the `//` comments beside each `CLASS_SIZES` row. Those
-describe payload bounds from the superseded trailer-in-slot regime ( each is
-`size - 8` ) and are a source-comment problem, tracked separately; a checker that
-enforced them would be enforcing the stale regime.
+It *does* now read the `//` comments beside each `CLASS_SIZES` row, for one
+thing: that **none of them restates a payload bound**. They used to, from the
+superseded trailer-in-slot regime where the bound was `size - 8`, and nine of
+them went on saying so for a year after the trailer moved to a table at the tail
+of the slab body. With the trailer out of line the bound *is* the slot size, so a
+row restating it says nothing the value does not -- and the version of this
+checker that declined to look explained that enforcing the old bounds would be
+enforcing the stale regime, which was true and is why the fix was to delete them
+rather than to correct them.
+
+So the rule is the absence of the thing, not its agreement. Correcting nine
+comments to `<= slot` would have produced nine tautologies to keep in step with
+the array; forbidding the restatement produces none.
 """
 
 import re
@@ -150,9 +159,28 @@ def main():
         bad.append(f"PACKED_CLASS is {packed}, but the prose does not say "
                    f"'Class {packed} is the packed-page class'")
 
+    # And the source comments, whose only rule is that they do not restate the
+    # payload bound. See this script's docstring.
+    block = re.search(r"pub const CLASS_SIZES: \[u32; \d+\] = \[(.*?)\n\];", SRC.read_text(), re.S)
+    if block is None:
+        bad.append("could not re-find the CLASS_SIZES block to read its comments")
+    else:
+        restated = [
+            line.strip()
+            for line in block.group(1).split("\n")
+            if "<=" in line
+        ]
+        for line in restated:
+            bad.append(
+                f"a CLASS_SIZES row restates a payload bound, which the slot size "
+                f"already gives: {line!r}"
+            )
+
     if bad:
-        print(f"FAIL: {len(bad)} ladder statement(s) in docs/storage-format.md "
-              f"disagree with CLASS_SIZES:\n")
+        # Not "in docs/storage-format.md": the source-comment rule below fails
+        # here too, and a header naming the wrong file sends the reader to the
+        # wrong place. Each item says where it is.
+        print(f"FAIL: {len(bad)} ladder statement(s) disagree with CLASS_SIZES:\n")
         for b in bad:
             print(f"  {b}")
         print("\nCLASS_SIZES is the only source of truth; every figure above is derived "

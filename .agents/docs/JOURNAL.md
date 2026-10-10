@@ -4671,3 +4671,71 @@ Both numbers came back exactly as derived on the first run, and against the code
 * **The gate already knew where to look.** `every_verb_has_a_caller_in_some_scenario` reads
   the PostgreSQL scenario directory, so one verb and one assertion were the whole wiring --
   no new target, no new step, no `EXPECT_STEPS` to bump.
+
+## 2026-10-10 -- Nine tautologies deleted, and the rationale above them inverted
+
+`class-sizes-row-comments-describe-the-old-trailer-regime`: nine of the twelve `//` comments
+beside `CLASS_SIZES` stated a maximum payload of `slot - 8`, from the era when every slot
+carried its own eight-byte extent trailer. The trailer moved to a table at the tail of the
+slab body and `class_for` has set `need = payload_len` with nothing added ever since.
+
+### Deleted rather than corrected
+
+The obvious repair is to change nine `<= slot - 8` to `<= slot`. That is wrong, and the
+previous version of `scripts/check-storage-ladder.py` had already said why in its own
+docstring -- it declined to read these comments because "a checker that enforced them would
+be enforcing the stale regime."
+
+Corrected, they would be **tautologies**: the admissible payload *is* the slot size, which
+the value on the same line already gives. Nine of them would then be nine things to keep in
+step with the array, for no information. So they are gone, the rule is stated once in the
+array's doc comment beside what the bounds used to mean, and the checker now enforces the
+**absence**: a `CLASS_SIZES` row carrying `<=` fails it.
+
+Verified by sabotage -- putting `payload <= 568` back on the 576 row fails with the row
+quoted, and the file was restored in the same command. A new rule that has never been seen
+to fail is not a rule.
+
+The two `exact for N` annotations went with them, and they were wrong twice over: `2112 =
+round_up_64( 2048 + 8 )` was exact only while the trailer sat in the slot, and a 2048-byte
+payload has taken a 2112-byte slot with 64 bytes wasted since the day it moved.
+
+### `the-ladder-is-still-shifted-for-a-trailer-that-moved`
+
+Which is the finding the comments were hiding. The paragraph above the array explained that
+the ladder is shifted up by 64 from the obvious powers of two "so that a power-of-two payload
+plus its 8-byte trailer still fits exactly. Without the shift a 2048-byte payload would round
+to 3072 and waste 33%."
+
+Every clause of that is history. With the trailer out of line the shift is a **cost**: 2048
+takes a 2112 slot and wastes 64, and `slab_capacity` divides by `slot + 8`, so it is per slot
+rather than per payload. **The precedent is in the same array** -- class 11 was un-shifted
+from 8256 to 8192 when the trailer moved, and its comment explains exactly this reasoning.
+Classes 2 through 10 were simply not revisited.
+
+Un-shifting preserves the 64-byte alignment invariant, since 512, 2048 and 4096 are all
+multiples of 64 -- which is the property that made the shift look free in the first place. But
+the ladder is persisted in the superblock and `DbStore::open` rejects a file whose ladder is
+not this array exactly, so a value change breaks every existing file. Recorded with what is
+wanted before touching it: the payload-size distribution a real corpus produces, since the
+shift costs nothing for payloads that are not near a power of two.
+
+### A wording fix that matters more than it looks
+
+The checker's failure header said "N ladder statement(s) in `docs/storage-format.md` disagree
+with `CLASS_SIZES`". The new rule fails on a **source** comment, so that header would have
+sent a reader to the wrong file to find a defect that is not there. It names no file now and
+each item says where it is.
+
+### Carry away
+
+* **A comment that restates its own line is not documentation.** The repair that preserves
+  the most text is not the repair that leaves the least to go wrong; deleting nine lines
+  removed nine future divergences and lost nothing a reader needed.
+* **The previous author of the checker had already reasoned this out** and left it in a
+  docstring, where it sat for three days as an explanation for not acting. Reading why a
+  tool declines to check something is how the right fix was already written down.
+* **Fixing a stale comment is how you find the stale reasoning above it.** The row comments
+  were a cosmetic defect; the paragraph justifying the ladder's shape had been inverted by
+  the same change and nothing had noticed, because it reads as a design rationale rather
+  than as a claim about the current code.

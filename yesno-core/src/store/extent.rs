@@ -444,10 +444,34 @@ pub const PACK_MAX: usize = 2028;
 /// a property of the ladder rather than a per-kind rule an allocator change
 /// could silently break.
 ///
-/// The ladder is shifted up by 64 from the obvious powers of two ( 576 not 512,
-/// 2112 not 2048 ) so that a power-of-two payload plus its 8-byte trailer still
-/// fits exactly. Without the shift a 2048-byte payload would round to 3072 and
-/// waste 33%.
+/// Un-shifting the ladder ( see below ) would preserve this: 512, 2048 and 4096
+/// are multiples of 64 exactly as 576, 2112 and 4160 are.
+///
+/// # The admissible payload is the slot size, and the shift's reason has expired
+///
+/// Every general class sits 64 bytes above the obvious power of two -- 576 not
+/// 512, 2112 not 2048, 4160 not 4096 -- because a slot once had to hold
+/// `payload + EXT_TRAILER_BYTES`. In that regime 2112 was exactly
+/// `round_up_64( 2048 + 8 )`, and the shift was what stopped a 2048-byte payload
+/// rounding to 3072 and wasting 33%.
+///
+/// **The trailer moved to a table at the tail of the slab body, so a slot now
+/// holds only the payload**: [`class_for`] sets `need = payload_len` and adds
+/// nothing. The admissible payload for every general class is therefore the slot
+/// size itself, and that is why no row below restates it -- `payload <= slot` is
+/// arithmetic rather than information, and nine rows went on saying `slot - 8`
+/// after it stopped being true. `scripts/check-storage-ladder.py` now refuses a
+/// row that restates the bound, so that shape of staleness cannot return.
+///
+/// The shift is a **cost** now rather than a saving: a 2048-byte payload takes
+/// the 2112-byte slot and wastes 64, where an unshifted ladder would be exact,
+/// and `slab_capacity` divides by `slot + 8` so the waste is per slot. Class 11
+/// was un-shifted when the trailer moved -- 8192, not 8256; see its own note --
+/// and classes 2 through 10 were not. Un-shifting them is a **format change**,
+/// because the ladder is persisted in the superblock and `DbStore::open` rejects
+/// a file whose ladder differs, so it is recorded as
+/// `the-ladder-is-still-shifted-for-a-trailer-that-moved` rather than done
+/// quietly here.
 /// Is `class` a packed page rather than a slot for one payload?
 ///
 /// A packed class sits **outside** the ascending size ladder and is never chosen by
@@ -467,15 +491,18 @@ pub const fn is_packed_class(class: u8) -> bool {
 pub const CLASS_SIZES: [u32; 12] = [
     0,    // 0  RESERVED -- not a class; `class_size` returns None for it
     4096, // 1  PACKED
-    576,  // 2  payload <=  568
-    704,  // 3           <=  696
-    896,  // 4           <=  888
-    1088, // 5           <= 1080
-    1600, // 6           <= 1592
-    2112, // 7           <= 2104   exact for 2048
-    3136, // 8           <= 3128
-    4160, // 9           <= 4152   exact for 4096
-    6208, // 10          <= 6200
+    // No payload bound beside these: it is the slot size, which the value already
+    // says. See this array's doc comment for what the bounds used to mean and why
+    // 2112 and 4160 were once described as exact.
+    576,  // 2
+    704,  // 3
+    896,  // 4
+    1088, // 5
+    1600, // 6
+    2112, // 7
+    3136, // 8
+    4160, // 9
+    6208, // 10
     // 11. **Exactly a bitmap payload.** It was 8256 -- `round_up_64( 8192 + 8 )` -- while
     // every slot carried its own 8-byte trailer, and that 64 bytes of slack was the sole
     // reason consecutive dense payloads could not be adjacent: `8256 % 4096 == 64` also
