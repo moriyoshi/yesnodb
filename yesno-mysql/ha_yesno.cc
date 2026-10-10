@@ -3,6 +3,7 @@
 #include "storage/yesno/ha_yesno.h"
 
 #include <charconv>
+#include <climits>
 #include <cstring>
 #include <map>
 #include <set>
@@ -793,8 +794,23 @@ int ha_yesno::close() {
 
 ulong ha_yesno::index_flags(uint index, uint part, bool /* all_parts */) const {
   if (index != 0 || part != 0) return 0;
-  return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE |
-         HA_ONLY_WHOLE_INDEX;
+  // `HA_ONLY_WHOLE_INDEX` is **not** here, and its absence is the point.
+  //
+  // It says the engine can read the index only in its entirety -- a guard
+  // against MySQL asking for a prefix of a multi-part key. This key has
+  // **one part**: `max_supported_key_parts()` is 1, and `index_read_map`
+  // accepts `HA_WHOLE_KEY` and `1` as the same request, so there is no partial
+  // shape for the flag to refuse. It was vacuous as a guard and, on the
+  // evidence of the plan recorded in `e2e/mysql/mysql.py`, not vacuous to the
+  // range optimizer.
+  //
+  // What makes removing it safe rather than hopeful is that the handler already
+  // serves every call a range scan makes: `index_read_map` maps
+  // `HA_READ_KEY_OR_NEXT`, `HA_READ_AFTER_KEY`, `HA_READ_KEY_OR_PREV` and
+  // `HA_READ_BEFORE_KEY` onto `SeekMode`, and `index_next` / `index_prev`
+  // continue from there. The capability was there; only the advertisement was
+  // withholding it.
+  return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
 }
 
 ulonglong ha_yesno::read_ordinal(const uchar *buf) const {
@@ -1154,7 +1170,34 @@ ha_rows ha_yesno::records_in_range(uint index, key_range *min_key,
     return present;
   }
   ha_rows count = 0;
-  return records(&count) == 0 ? count : HA_POS_ERROR;
+  if (records(&count) != 0) return HA_POS_ERROR;
+
+  // **The range's own width bounds its cardinality**, from the arguments
+  // already in hand and with no new surface anywhere.
+  //
+  // The exact answer costs three C/C++ ABIs -- `yesno-c`, a `yesno-flight`
+  // action with its C++ client method, and `yesno_channel.h` -- because
+  // `Backend` is one interface over three transports that each cross into Rust
+  // differently. This is not that. `min( whole key, hi - lo + 1 )` is tightest
+  // exactly where an estimate matters, a narrow range over a large key, and
+  // returns the exact count whenever the range is dense.
+  //
+  // Flags are ignored deliberately, and the direction of the error is why. An
+  // over-estimate costs the optimizer a plan it would not otherwise take; an
+  // under-estimate makes it take an index scan worse than a table scan.
+  // `hi - lo + 1` is the inclusive width, so it is the conservative bound
+  // whichever way `HA_READ_AFTER_KEY` and its siblings read -- and this returns
+  // a hint, where a bound in the safe direction is worth more than exactness
+  // about an endpoint.
+  if (max_key == nullptr) return count;
+  const ulonglong hi = uint8korr(max_key->key);
+  const ulonglong lo = min_key != nullptr ? uint8korr(min_key->key) : 0;
+  if (hi < lo) return 0;
+  const ulonglong span = hi - lo;
+  // `span + 1` wraps only for the whole domain, where the bound says nothing.
+  if (span == ULLONG_MAX) return count;
+  const ulonglong width = span + 1;
+  return width < static_cast<ulonglong>(count) ? static_cast<ha_rows>(width) : count;
 }
 
 int ha_yesno::delete_table(const char *, const dd::Table *table_def) {

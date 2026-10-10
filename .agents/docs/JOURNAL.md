@@ -5419,3 +5419,66 @@ unblocks the range optimizer, and the estimate is downstream of that.
 * **Delete the improvement nothing can observe, even when it is yours and correct.** The
   width bound is better arithmetic than what is there. It is also invisible, and eight lines
   of invisible correctness is how a file stops being readable.
+
+## 2026-10-10 -- The MySQL range fix was deleting a flag, not adding three ABIs
+
+`mysql-records-in-range-is-whole-key` is closed, and the fix is **one flag removed and eight
+lines of arithmetic**, against an inventory I had priced at three C/C++ boundaries four hours
+earlier.
+
+```text
+before  1 SIMPLE est_* NULL ALL    PRIMARY NULL    NULL NULL 1000  11.11 Using where
+after   1 SIMPLE est_* NULL range  PRIMARY PRIMARY 8    NULL   10 100.00 Using where
+```
+
+Rows examined 1000 -> 10, the index used rather than rejected, `filtered` 11.11 -> 100.00
+because MySQL is no longer guessing a selectivity it could not compute. All three backends,
+full fixture green.
+
+### Three probes, and the middle one did the work
+
+1. **Demonstrate the plan.** `type=ALL`, `key=NULL`, `rows=1000` -- the index considered and
+   rejected beside a whole-key estimate. I recorded this as justifying the fix. It was
+   consistent with the entry's premise and tested none of it.
+2. **Force `records_in_range` to return 1.** The plan is byte-identical, for `SELECT ordinal`
+   as well as `COUNT(*)`. **The estimate was never read**, so the exact count the entry asked
+   for would have changed nothing. Returning an absurd value is what made this decisive: a
+   *correct* estimate changing nothing would have been ambiguous.
+3. **Read the handler.** `HA_ONLY_WHOLE_INDEX` guards against MySQL asking for a prefix of a
+   multi-part key, and this key has one part -- `max_supported_key_parts()` is 1, and
+   `index_read_map` accepts `HA_WHOLE_KEY` and `1` as the same request. Vacuous as a guard,
+   decisive to the range optimizer, which built no range plan while it was set and so never
+   asked for an estimate.
+
+Removing it was safe on evidence rather than hope: `index_read_map` already maps every
+`ha_rkey_function` a range needs onto `SeekMode`, and `index_next` / `index_prev` continue
+from there. **The capability was there; only the advertisement was withholding it.**
+
+### The code I deleted and then restored
+
+`min( records(), hi - lo + 1 )` was written, gated, and removed earlier the same day because
+no test could distinguish it -- nothing consulted the function. With the flag gone it is
+*visible*: `rows` of 10 can only come from the width bound, as `type` of range can only come
+from the flag, so **one assertion guards both**. The reason to delete it was right at the time
+and stopped being true three hours later, which is a better outcome than keeping it on a hunch
+would have been.
+
+### What the entry asked for and did not need
+
+Three C/C++ ABIs -- `yesno-c`, a `yesno-flight` action with its C++ client method, and
+`yesno_channel.h` -- plus a `Backend` method and three implementations. None of it. The
+inventory is preserved in the entry because `len_in_range` would still beat the width bound on
+a *sparse* range, where the width over-estimates; but nothing demonstrates a plan that needs
+it, which is the bar the entry itself set.
+
+### Carry away
+
+* **Ask what is refusing before asking what is imprecise.** The entry named the estimate, the
+  estimate was genuinely wrong, and it was not the cause. Four hours of pricing an exact
+  count went into a path the optimizer never walked.
+* **A capability flag is an assertion about the handler, and it can be wrong in the
+  conservative direction.** `HA_ONLY_WHOLE_INDEX` cost every range scan on this engine for as
+  long as it was set, and it protected against a shape that cannot occur with one key part.
+* **"Delete the improvement nothing can observe" is a rule about the present.** The width
+  bound was correctly deleted when nothing could see it and correctly restored when something
+  could. Neither decision invalidates the other.

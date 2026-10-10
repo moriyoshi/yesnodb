@@ -245,21 +245,27 @@ def exercise_contract(mysql, client_base, env, key, label):
         ),
         label + " range plan",
     )
-    # **A characterisation assertion: this pins the defect, not the fix.**
+    # **This pins the fix, and it replaced an assertion that pinned the defect.**
     #
-    # `type` is ALL and `key` is NULL while `possible_keys` is PRIMARY -- the
-    # optimizer considered the index and **rejected it** -- because `rows` is
-    # 1000, the whole-key cardinality, for a range whose true answer is 10. The
-    # 11.11 is MySQL's default selectivity guess for a condition it cannot
-    # price, so it compares 1000 x 11.11% against a 1000-row range and takes
-    # the scan.
+    # It read `ALL / PRIMARY / NULL / 1000 / 11.11` until 2026-10-10: the
+    # optimizer considered the index and rejected it, and `records_in_range` --
+    # which returns the whole-key count for every range -- looked like the
+    # reason. It was not. Forced to return 1 it changed nothing, because
+    # `HA_ONLY_WHOLE_INDEX` in `index_flags` meant no range plan was ever built
+    # and so no estimate was ever requested.
     #
-    # When `records_in_range` learns to answer a range, this line has to change:
-    # `key` becomes PRIMARY, `type` becomes range, and `rows` drops to about 10.
-    # Changing it then is correct; changing it for any other reason is not.
+    # Two changes produce the line below, and neither alone was tested:
+    # dropping that flag ( vacuous for a one-part key ) lets a range plan exist,
+    # and bounding the estimate by the range's own width makes it exact. `rows`
+    # of 10 can only come from the width bound, and `type` of range only from
+    # the flag, so **this one line guards both** -- which is what stopped the
+    # width bound from being an improvement nothing could see.
+    #
+    # `filtered` is 100.00, not 11.11: MySQL is no longer guessing a selectivity
+    # for a condition it could not price.
     assert plan["stdout"] == (
-        "1\tSIMPLE\t" + est + "\tNULL\tALL\tPRIMARY\tNULL\tNULL\tNULL"
-        "\t1000\t11.11\tUsing where\n"
+        "1\tSIMPLE\t" + est + "\tNULL\trange\tPRIMARY\tPRIMARY\t8\tNULL"
+        "\t10\t100.00\tUsing where\n"
     ), label + " range plan changed: " + repr(plan["stdout"])
     # And the answer is right regardless, which is what makes the above a cost
     # defect rather than a correctness one.

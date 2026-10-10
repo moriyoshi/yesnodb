@@ -38,7 +38,28 @@ Items extracted from `JOURNAL.md` during `good-sleep` consolidation, plus follow
 
 ### Documentation
 
-- [ ] **mysql-records-in-range-is-whole-key** ( *2026-09-18, found auditing the driver boundaries* ): `ha_yesno::records_in_range` answers a **point** lookup exactly -- `HA_READ_KEY_EXACT` with no upper key resolves through `Backend::Contains` -- and every other range falls through to `records()`, which is `Backend::Cardinality`, the total for the key. So `WHERE ordinal BETWEEN 100 AND 200` tells the optimizer the range costs a full scan. **Re-verified 2026-10-07** by reading the handler rather than re-deriving it: unchanged. `index != 0` returns `HA_POS_ERROR`; a `min_key`-only `HA_READ_KEY_EXACT` resolves through `Backend::Contains` and returns 0 or 1, which is exact; every other shape falls through to `records()`. Still applicable, and the estimate a range gets is still the whole-key cardinality.
+- [x] **mysql-records-in-range-is-whole-key** ( *2026-09-18; **FIXED 2026-10-10 with no new ABI surface at all**, where this entry priced three C/C++ boundaries* ): **Two changes, neither of them a `Backend` method.**
+
+  ( 1 ) **`HA_ONLY_WHOLE_INDEX` removed from `ha_yesno::index_flags`.** It says the engine can read the index only in its entirety -- a guard against MySQL asking for a prefix of a multi-part key -- and this key has **one part**: `max_supported_key_parts()` is 1 and `index_read_map` accepts `HA_WHOLE_KEY` and `1` as the same request, so there was no partial shape for it to refuse. It was vacuous as a guard and decisive to the range optimizer, which built no range plan at all while it was set -- and therefore never asked for an estimate. Removing it is safe on evidence rather than hope: `index_read_map` already maps `HA_READ_KEY_OR_NEXT`, `HA_READ_AFTER_KEY`, `HA_READ_KEY_OR_PREV` and `HA_READ_BEFORE_KEY` onto `SeekMode`, and `index_next` / `index_prev` continue from there, so the handler already served every call a range scan makes.
+
+  ( 2 ) **`records_in_range` bounds a range by its own width**: `min( records(), hi - lo + 1 )`, from the arguments in hand. Flags are ignored deliberately, because the inclusive width is the conservative bound whichever way `HA_READ_AFTER_KEY` and its siblings read, and an over-estimate costs a plan while an under-estimate costs a worse one.
+
+  **The plan, on all three backends**, for 1000 contiguous ordinals and `BETWEEN 100 AND 109`:
+
+  ```text
+  before  1 SIMPLE est_* NULL ALL    PRIMARY NULL    NULL NULL 1000  11.11 Using where
+  after   1 SIMPLE est_* NULL range  PRIMARY PRIMARY 8    NULL   10 100.00 Using where
+  ```
+
+  Rows examined 1000 -> 10, the index used instead of rejected, and `filtered` 11.11 -> 100.00 because MySQL is no longer guessing a selectivity for a condition it could not price. Pinned by the assertion in `e2e/mysql/mysql.py`, which guards **both** changes in one line: `rows` of 10 can only come from the width bound and `type` of range only from the flag. A side effect worth noting: the index path is now actually exercised by a range scan, where MySQL previously always table-scanned.
+
+  **The three-ABI exact count is not needed** and is not done. `len_in_range` would give the exact answer for a *sparse* range where the width bound over-estimates; nothing demonstrates a plan that needs it, which is the bar this entry set. The inventory is preserved below in case something ever does.
+
+  **Three probes got here, and the middle one is the load-bearing one**: demonstrate the plan; force `records_in_range` to return 1 and find the plan *unchanged*, proving the estimate was never read; then read the handler and find the flag vacuous. The first probe alone looked like confirmation of this entry's premise and was not. See JOURNAL 2026-10-10.
+
+  ---
+
+  **ORIGINAL ENTRY AND ITS SUPERSEDED PRICING:** `ha_yesno::records_in_range` answers a **point** lookup exactly -- `HA_READ_KEY_EXACT` with no upper key resolves through `Backend::Contains` -- and every other range falls through to `records()`, which is `Backend::Cardinality`, the total for the key. So `WHERE ordinal BETWEEN 100 AND 200` tells the optimizer the range costs a full scan. **Re-verified 2026-10-07** by reading the handler rather than re-deriving it: unchanged. `index != 0` returns `HA_POS_ERROR`; a `min_key`-only `HA_READ_KEY_EXACT` resolves through `Backend::Contains` and returns 0 or 1, which is exact; every other shape falls through to `records()`. Still applicable, and the estimate a range gets is still the whole-key cardinality.
 
   Not a wrong answer ( estimates are hints ), but yesno computes exactly this cheaply: `len_in_range` and `range_summary` answer complete chunks from index cardinalities without reading a payload, and the PostgreSQL FDW already gets the benefit through Flight pushdown.
 
