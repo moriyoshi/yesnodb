@@ -5094,3 +5094,83 @@ across 81 096 reuses and 2 317 relocations, the second by arithmetic on `ARRAY_M
 * **Two causes, both now improbable, is a report -- not a failure.** The entry framed this as
   "which of two causes is it". The answer this side can give is "neither looks like it, and
   here is why for each", which is what the next person needs before they spend the download.
+
+## 2026-10-10 -- The entry was stale, and I never opened the index that said so
+
+`mis-pointed-extent-at-1024-bit-codes` was **fixed on 2026-09-15, the day it was reported**.
+The haiiie side said so when I handed the investigation over, and the claim checks out in this
+tree, so the four entries I wrote today are correcting rather than progressing.
+
+### The actual cause, verified here
+
+`slab-free-leaves-a-stale-bump-pointer`. A slab emptied by reclamation stayed registered as a
+class's bump slab in `Allocator::active[class]`; `new_slab_for` then re-initialized that same
+slab with a **different** class's geometry and the old class resumed bump-allocating into it.
+Two slot sizes indexed one occupancy bitmap, one chunk's payload landed where another's
+trailer belonged, and `owning_class` resolved the trailer from the slab's single recorded
+class -- reporting "extent reference points at another chunk" about an extent that was
+perfectly healthy. **The corruption was in the addressing.**
+
+Checked rather than believed: `retire_from_active` is in `store/alloc.rs` with both call sites
+( `free_now`, `adopt_live_at_open` ), each has a sabotage-checked test, and the second test's
+comment dates it -- "measured 2026-09-15: 1069 tests, 0 failures".
+
+### It was in this repository the whole time
+
+`JOURNAL.md`'s own consolidation table, line 97, cites
+`2026-09-15 -- slab-free-leaves-a-stale-bump-pointer: two size classes allocating into one
+slab` through `... the fix had two call sites and one guarded test`, consolidated into
+`LTM/allocation-reclamation-and-fsck.md`. That document's first bullet states the rule, and
+its table records the 1024-bit arm going from `95 / 239 / 1 / failed` to `0 / 0 / 0 / ok`.
+
+So the bug, its mechanism, its fix, and the very corpus arm this entry is named after were all
+written down here three weeks before I started. The only thing wrong was that the TODO entry
+had not been closed.
+
+### What that makes of today's work
+
+**The eliminations were unfalsifiable.** Five harnesses, six large runs and about twenty
+minutes of compute were spent trying to reproduce a bug against a tree that contains its fix.
+"Did not reproduce" was guaranteed before the first line was written, and every bound I
+reported -- 518M postings, 81 096 reuses, 2 317 relocations, 1034 concurrent lane streams,
+real SimHash at the reported density spread -- is a measurement of nothing.
+
+**And the one conclusion that was not merely vacuous is wrong.** I argued from `ARRAY_MAX`
+that a class disagreement was unlikely because "there is essentially one class in play for
+chunk payloads". A cross-class slab reuse is precisely the case where that does not hold: one
+*slab* served two slot sizes, so the class in play depended on which cell you asked about. The
+arithmetic was right and the inference from it was not.
+
+Two inputs I also got wrong, both by over-reading: the corpus was GloVe-**25**, not the
+`glove-100-angular` named in `bench/suites/glove-100.json`, which is an unrelated suite I
+assumed was theirs because it was the only one matching "glove"; and the original failure was
+`Invariant( "extent reference points at another chunk" )`, which predates the
+`MisPointedExtent` variant -- so the "awaiting the re-run" the entry had carried for three
+weeks was waiting for a payload that cannot exist.
+
+### The check I did not do
+
+`AGENTS.md` names `.agents/docs/LTM/INDEX.md` as the long-term memory index for durable
+project knowledge. **I did not open it once this session.** I noticed it earlier -- it has
+staged changes from another session -- and used that as a reason to leave it alone rather than
+a reason to read it.
+
+The missing step is one hop and belongs before any attempt to reproduce a reported bug: *read
+the LTM entry for the subsystem the error comes from.* `MisPointedExtent` is raised by the
+allocator's addressing, `LTM/INDEX.md` lists `allocation-reclamation-and-fsck.md`, and its
+first bullet is the fix. Three weeks of "under diagnosis" and a day of work rest on not having
+done that.
+
+### Carry away
+
+* **Before reproducing a reported bug, check whether it is fixed.** A TODO entry is a record
+  of what someone believed on the day they wrote it, not a statement about the current tree.
+  The tree is the authority and the LTM is its index.
+* **An investigation that cannot fail is not evidence.** Nothing in today's harnesses could
+  have come out any other way. The tell was available: every single configuration passed,
+  including ones deliberately built to be hostile, and that uniformity should have prompted
+  "what would make this impossible to reproduce" far earlier than the fifth harness.
+* **Reading a peer's correction is cheaper than defending a day's work.** The handoff message
+  came back contradicting the premise of four journal entries, and checking it took four
+  greps. The instinct to verify before accepting was right; the instinct to verify *before
+  starting* was the one missing.
