@@ -5660,3 +5660,61 @@ already sitting at the bottom of the entry I was editing.
 * **Read the whole entry before acting on its top.** The warning that invalidated my proposal
   was the last paragraph of the item, written on 2026-09-14 about a different tool, and it
   generalized perfectly to mine.
+
+## 2026-10-11 -- The recount was already automated, and "documentation only" is not a gate exemption
+
+A follow-on to the entry above, and a correction to it. Having re-derived
+`miri-cannot-reach-the-mmap-unsafe-sites`'s counts by hand, I then found
+`scripts/check-unsafe-count.py` -- a gate step, `scripts/gate.sh` line 427 -- which re-counts
+`yesno-core/src` on every run and compares the result against that entry's sentence, anchored on
+both the slug and the exact phrasing. **The count cannot rot, and the manual re-derivation was
+redundant.**
+
+The entry never mentions the checker. Its own instruction is "re-derive it rather than trusting
+it", written when that was the only option, and the automation that retired the advice was added
+afterwards without updating the advice. So the entry sent me to do by hand a thing the gate does
+every run. The "trap" I thought I had found -- that a bare `grep -c "unsafe fn"` returns 38
+because `store/segment.rs` names the phrase in a comment -- is the same `//`-skipping the checker
+already encodes.
+
+The entry now leads with the checker instead, and records that its anchor is a *sentence*, so
+prose near it is load-bearing: the check fails unless the claim matches exactly once. That is
+verified rather than asserted -- injecting a second claim in the checker's wording fails it with
+`FAIL: 2 counted claims match` and exit 1.
+
+### The part that was not redundant
+
+The scope finding stands and no checker covers it: 430 `unsafe` blocks live outside
+`yesno-core`, all three deep-gate tools run `-p yesno-core` only, and the plugin channel's memfd
+arena is a second instance of this entry's own file-backed-mapping family. `check-unsafe-count.py`
+reads `SRC = yesno-core/src` and nothing else, so it would never have reported any of that. The
+automation verifies the number; it has nothing to say about whether the number is counting the
+right set.
+
+### The process error
+
+I committed `8da1e3a` with "Documentation only; no code changed" and skipped the gate on that
+reasoning. **`TODO.md` is gate input.** Two gate steps read it -- `check-todo-refs.py`, which I
+did run, and `check-unsafe-count.py`, which I did not -- and my new paragraph restated the
+figures. It passed only because I happened to phrase it "totalling **93 blocks and 37 `unsafe
+fn`**" rather than the checker's "The uncovered surface is ...". Different wording by luck, not
+by design; the same paragraph written a little more naturally would have pushed a red gate.
+
+This is the third time today the same shape has cost something: editing the tree mid-gate
+because a comment "cannot change behaviour", and now skipping the gate because a change is
+"documentation only". Both reason from what the change *means* to what the tooling *does*, and
+the tooling does not read meaning.
+
+### Carry away
+
+* **Before re-deriving a number by hand, grep `scripts/` for the checker that already does it.**
+  One `ls scripts/` would have saved the whole exercise, and the file is named exactly what it
+  does.
+* **A backlog entry can be older than the automation that answers it.** Advice does not expire on
+  its own; "re-derive this" outlived the state where that was the only way, and nothing links an
+  entry to the script written to close it.
+* **"Documentation only" is not "not gate-relevant"** in a repo whose gate checks its own
+  documentation. The question is never what a change means, it is which steps read the files it
+  touched.
+* **Automation pins the arithmetic, not the premise.** The checker guarantees 93 is right and is
+  structurally incapable of noticing that 93 counts one crate out of seven that have `unsafe`.
