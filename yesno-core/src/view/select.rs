@@ -65,6 +65,40 @@ pub enum IntersectionCountStrategy {
     Selective,
 }
 
+impl IntersectionCountStrategy {
+    /// Choose selective traversal only when the query support covers less than
+    /// half the packed logical extent. This is a work ratio, not an arity or a
+    /// machine-specific timing threshold.
+    ///
+    /// `support_upper` bounds the distinct logical ordinals the queries name
+    /// from **above**. `sum( filter.len() )` is the bound a caller can compute
+    /// before [`ViewIntersectionCounter::new`], and it is the reason this is a
+    /// free function rather than a method: the strategy is an *argument* to
+    /// `new`, so nothing can consult a counter to decide how to build one.
+    ///
+    /// # The bound is loose by the batch width, deliberately
+    ///
+    /// A sum over `k` filters overstates their union by up to a factor of `k`,
+    /// while selective traversal costs what the *deduplicated* union costs. So
+    /// on a wide batch of overlapping filters -- which is the normal case for
+    /// sibling planes of one key -- this returns [`FullScan`](Self::FullScan)
+    /// where selective traversal would have won, and the wider the batch the
+    /// more often. That is a safe answer rather than a good one: `FullScan` is
+    /// valid for every layout and both strategies produce identical counts, so
+    /// a loose bound costs time and never correctness. Passing the exact union
+    /// instead would select more often and is a measured performance question,
+    /// not a drop-in improvement.
+    pub fn recommend(layout: ViewLayout, support_upper: u128, logical_end: u64) -> Self {
+        if matches!(layout, ViewLayout::Interleaved)
+            && support_upper.saturating_mul(2) < u128::from(logical_end)
+        {
+            Self::Selective
+        } else {
+            Self::FullScan
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SelectedLogical {
     filter_start: usize,
@@ -203,19 +237,6 @@ impl<'a> ViewIntersectionCounter<'a> {
     /// Coalesced half-open chunk-prefix windows for selective traversal.
     pub fn prefix_windows(&self) -> &[(Prefix48, Prefix48)] {
         &self.windows
-    }
-
-    /// Choose selective traversal only when the query union covers less than
-    /// half the packed logical extent. This is a work ratio, not an arity or
-    /// machine-specific timing threshold.
-    pub fn recommended_strategy(&self, logical_end: u64) -> IntersectionCountStrategy {
-        if matches!(self.view.layout(), ViewLayout::Interleaved)
-            && (self.selected.len() as u128) * 2 < u128::from(logical_end)
-        {
-            IntersectionCountStrategy::Selective
-        } else {
-            IntersectionCountStrategy::FullScan
-        }
     }
 
     /// Consume one non-empty physical chunk.
@@ -1528,5 +1549,76 @@ mod tests {
         let got = packed.view_intersection_cardinalities_batch(&view, &[&odds, &edges]);
         assert_eq!(got[0], vec![STRIDE / 2; 17]);
         assert_eq!(got[1], vec![2; 17]);
+    }
+
+    /// The work ratio, pinned from both sides of the boundary.
+    ///
+    /// Note what this does **not** cover. The method this replaced was broken
+    /// by its *shape* -- it read a field that `new` fills only for a counter
+    /// already built `Selective` -- and no assertion here would catch someone
+    /// reintroducing that shape, because the ratio was never the broken part.
+    /// What is testable is the ratio itself, so that is what this pins.
+    #[test]
+    fn the_strategy_ratio_is_half_the_logical_extent_and_blocked_never_selects() {
+        use IntersectionCountStrategy::{FullScan, Selective};
+        let il = ViewLayout::Interleaved;
+
+        // Every logical position named: selective traversal buys nothing.
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, 1000, 1000),
+            FullScan
+        );
+
+        // Strictly less than half: worth visiting only the named intervals.
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, 499, 1000),
+            Selective
+        );
+
+        // Exactly half is not less than half, and an odd extent rounds the
+        // only way the strict comparison can: 499 of 999 is below half and
+        // selects, 500 of 999 is not and does not.
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, 500, 1000),
+            FullScan
+        );
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, 499, 999),
+            Selective
+        );
+        assert_eq!(IntersectionCountStrategy::recommend(il, 500, 999), FullScan);
+
+        // An empty extent has no selective work to do either.
+        assert_eq!(IntersectionCountStrategy::recommend(il, 0, 0), FullScan);
+
+        // Selective traversal is interleaved-only, whatever the ratio says --
+        // `new` rejects the pair outright, so disagreeing here would turn a
+        // recommendation into an error.
+        let blocked = ViewLayout::Blocked { stride: 1 << 20 };
+        assert_eq!(
+            IntersectionCountStrategy::recommend(blocked, 0, u64::MAX),
+            FullScan
+        );
+        assert_eq!(
+            IntersectionCountStrategy::recommend(blocked, 1, 1000),
+            FullScan
+        );
+
+        // The doubling must not wrap a wide bound into a small one.
+        //
+        // `1 << 127` is the input that pins this by its *answer*: doubling
+        // wraps it to 0, so an unsaturated `*` would read it as no support at
+        // all and return `Selective`. `u128::MAX` does not pin it -- doubling
+        // wraps to `2^128 - 2`, which is still far above any `u64`, so both
+        // answer `FullScan` and the drift is caught only by the debug overflow
+        // check. Asserted here too, so the no-panic case stays covered.
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, 1u128 << 127, u64::MAX),
+            FullScan
+        );
+        assert_eq!(
+            IntersectionCountStrategy::recommend(il, u128::MAX, u64::MAX),
+            FullScan
+        );
     }
 }

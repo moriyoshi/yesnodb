@@ -5799,3 +5799,119 @@ that surface.
 * **Read the whole entry before re-running it.** This one records its construction and both
   controls; I rebuilt a ruler from scratch and arrived, several wrong counts later, at the notes
   already written in it. That is the second time today -- `check-unsafe-count.py` was the first.
+
+## 2026-10-11 -- Lifting the view intersection strategy out of the object it configures
+
+The maintainer took the lift rather than the deletion, so `recommended_strategy` is resolved the
+way `chunks_remaining` was: the expression production was already writing by hand now lives with
+the type it returns, and the broken copy is gone.
+
+`IntersectionCountStrategy::recommend( layout, support_upper, logical_end )` replaces
+`ViewIntersectionCounter::recommended_strategy( &self, logical_end )`. The change is small and
+the reason it is correct is the whole point: the strategy is an **argument to**
+`ViewIntersectionCounter::new`, so the decision has to be makeable from what a caller holds
+*before* there is a counter. `support_upper` -- `sum( filter.len() )`, an upper bound on the
+union because filters may overlap -- is that quantity. The old method used the exact
+`selected.len()`, which only exists after `new` has already been told the answer.
+
+Over-counting is the safe direction and the doc says so: a bound that is too large can only
+choose `FullScan` where selective traversal would also have worked. The exact union would select
+more often, which is a measured performance question and deliberately not what this change
+decides.
+
+`yesno-eval` is wired to it at the site that open-coded the rule. Production behaviour is
+unchanged -- that arm already computed this expression with `layout` known to be `Interleaved`
+-- and the only difference is `saturating_mul`, which cannot wrap an absurd bound into a small
+one. I kept the `match view.layout()` rather than collapsing it into the new function, because
+the `Blocked` arm skips a `snap.max( key )` query it has never needed and folding the dispatch
+inward would have made every blocked view pay for it. A tidier call site was not worth a new
+query on a path that does not want one.
+
+### The test, and an assertion of mine that was wrong
+
+`the_strategy_ratio_is_half_the_logical_extent_and_blocked_never_selects` pins the boundary from
+both sides, the `Blocked` answer, and the saturation. It fails under each of three deliberate
+drifts -- `<` to `<=`, dropping the layout guard, and unsaturated doubling -- with the file
+restored byte-identical after each.
+
+The saturation assertion was wrong on the first attempt, and an adversarial review of this diff
+caught it. I had asserted `recommend( Interleaved, u128::MAX, u64::MAX ) == FullScan` under the
+comment "the doubling must not wrap a wide bound into a small one". `u128::MAX` doubled wraps to
+`2^128 - 2`, which is still far above any `u64`, so saturating and wrapping give the **same**
+answer and the only thing failing under the drift was the debug overflow check. This repo sets no
+`[profile]` section, so `--release` leaves `overflow-checks` off and the drift passed there. The
+input that pins the property by its answer is `1 << 127`: doubling wraps it to **0**, which reads
+as no support at all and returns `Selective`. Re-verified by sabotage under `cargo test --release`
+with `wrapping_mul`, which now fails on `left: Selective, right: FullScan` rather than on a panic.
+**A test that fails for the wrong reason is a test that will pass for the wrong reason** -- and my
+earlier sabotage run had shown a red line and I read it as confirmation without asking which
+assertion produced it.
+
+It failed on its first run, and the code was right: I had asserted that support 499 of extent 999
+is `FullScan`, reasoning loosely that 499 is "about half" of 999. It doubles to 998, which is
+strictly below 999, so `Selective` is correct. The test now pins 499/999 as `Selective` and
+500/999 as `FullScan`, which is the actual boundary rather than where I guessed it was. **A test
+written to confirm a fix can still encode the author's arithmetic error, and the fix is the thing
+that catches it** -- had the implementation been wrong in the same direction I was, both would
+have agreed and the test would have passed.
+
+### Carry away
+
+* **A "recommend" method on the object the recommendation configures cannot work.** The input it
+  needs exists only before construction, so the method is either circular or too late. The lift
+  is not a refactor for tidiness; it is the only shape that can answer.
+* **Keep the dispatch where it skips work.** Collapsing the layout match into the new function
+  would have read better and cost every blocked view a `snap.max` query.
+* **An over-estimate and an exact value are different inputs, not a quality difference.**
+  Swapping the bound for the union would change which strategy is chosen, so the lift
+  deliberately preserved the bound rather than "improving" it.
+
+## 2026-10-11 -- What an adversarial review of my own diff found
+
+Ran a fresh subagent over the uncommitted view-strategy lift, told it the claims to check and
+not my conclusions. No correctness defect in the change; every finding was documentary, and two
+were worth acting on.
+
+**The saturation assertion did not pin saturation.** Recorded with the lift entry above. The
+short version: the input I chose made the drift detectable only by a debug overflow panic, so
+the property held in debug for a reason unrelated to the property, and did not hold in release at
+all. I had *run* the sabotage, seen red, and treated red as confirmation without asking which
+assertion produced it. A sabotage check needs to say which assertion failed and why, or it only
+confirms that something was unhappy.
+
+**"The inverse of its own construction" was a universal built from two examples.** Built
+`FullScan` on a non-empty interleaved view the old method answered `Selective` *always*, because
+`selected` is empty and the ratio is trivially true. Built `Selective` it read the true union and
+answered correctly but too late, so it contradicted its construction only for a *dense* filter --
+a sparse one agrees with itself. Both rows I published were real; the sentence generalising them
+was not, and the causal clause I gave ( "an empty `selected` makes the ratio trivially true" )
+explains only one of the two directions it asserted. The defect stands on narrower ground: one
+branch is unconditionally wrong, the other is unactionable.
+
+**A caveat I had put in the JOURNAL but not in the rustdoc.** `sum( filter.len() )` overstates
+the union by up to a factor of `k` for `k` filters, and the call site is the batch path for
+sibling planes of one key, where the filters overlap heavily. So "it can only choose `FullScan`
+where selective traversal would also have worked" reads as a corner case and is the common case
+there. The honest version was in my journal entry and absent from the doc a future caller
+actually reads. The rustdoc now carries it.
+
+The review also trimmed something I would defend less than I expected: 22 lines of doc on a
+7-line public function, two thirds of it the obituary of a deleted private method, in the public
+rustdoc of a re-exported item, citing a backlog slug no crate consumer can follow. The history
+belongs here, not there. What stayed is the ratio, why the parameter is a bound, and the
+structural reason this is a free function -- the part a caller needs.
+
+### Carry away
+
+* **Ask a sabotage run which assertion failed.** Red is not confirmation. Mine was red for a
+  reason that had nothing to do with the property under test, and in the profile the gate does
+  not use it was green.
+* **An overflow guard on a `u128` parameter is nearly decorative, and that is a signal.** The
+  caller's own fold uses a plain `+` and would panic first, so the careful arithmetic defends a
+  path the caller cannot reach. Worth noticing when a guard's type makes it unreachable.
+* **Two examples do not make a universal, and the giveaway is that the stated cause covers one
+  of them.** The sentence survived because the examples beneath it were true.
+* **Put the caveat where the reader is.** A limitation recorded only in the journal is a
+  limitation the next caller will not see.
+* **Review the diff with something that has not read my reasoning.** A fork would have inherited
+  the conclusions I wanted checked.

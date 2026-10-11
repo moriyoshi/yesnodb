@@ -1253,11 +1253,12 @@ fn count_key_intersections(
             let support_upper = filters
                 .iter()
                 .fold(0u128, |sum, filter| sum + u128::from(filter.len()));
-            let strategy = if support_upper * 2 < u128::from(logical_end) {
-                IntersectionCountStrategy::Selective
-            } else {
-                IntersectionCountStrategy::FullScan
-            };
+            // The ratio lives with the strategy it returns rather than here.
+            // It used to be open-coded at this one site while
+            // `ViewIntersectionCounter::recommended_strategy` carried a second,
+            // broken copy of the same rule.
+            let strategy =
+                IntersectionCountStrategy::recommend(view.layout(), support_upper, logical_end);
             (
                 strategy,
                 ViewIntersectionCounter::new(view, filters.iter().copied(), strategy)?,
