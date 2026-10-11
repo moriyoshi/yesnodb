@@ -5718,3 +5718,84 @@ the tooling does not read meaning.
   touched.
 * **Automation pins the arithmetic, not the premise.** The checker guarantees 93 is right and is
   structurally incapable of noticing that 93 counts one crate out of seven that have `unsafe`.
+
+## 2026-10-11 -- The unwired sweep: a dead-symbol hit that was a wrong answer, not an unused one
+
+Re-ran `rerun-the-unwired-sweep`, both halves, at the maintainer's request.
+
+### Scripts half reproduces exactly, after two ruler corrections
+
+**3 named in prose but never invoked** -- `fmt-scoped.py`, `gate-mount-propagation.sh`,
+`miri.sh` -- all three already explained in the entry, so **no action**, identical to 2026-10-06.
+
+Both ways of getting it wrong report a fully wired tree, which is the dangerous direction:
+
+* Counting bare filename occurrences finds **0 uninvoked**, because `CLAUDE.md` names
+  `fmt-scoped.py` in backticks and a mention is not a call.
+* Excluding only Markdown finds **2**, because every remaining non-Markdown reference to
+  `miri.sh` is a **comment**: `gate.sh` explaining in `#` that it no longer runs it, `ci.yml`
+  saying the same in YAML, `ops/run.rs` citing its tiers in `//`.
+
+So Markdown and comment lines are excluded from the *invocation* search only, with every other
+file type still in -- which is what keeps the entry's recorded false positive false.
+
+### The `pub fn` half, and why its numbers are not the recorded ones
+
+Declarations scoped to `yesno-core/src`: 82 files, **839 bare `pub fn`**, 677 distinct names,
+**2** with no non-comment reference, 53 test-only. Controls run before believing any of it, as
+the entry requires: a planted `pub fn` moved the dead count 2 -> 3 and the file was restored
+byte-identical by md5; five wired symbols appear in neither list.
+
+Not comparable to the recorded 824 / 24 / 99, and not offered as a replacement. The declaration
+scope agrees ( 839 against 824 ) but this implementation matches references **by bare name**, so
+`inner`, `score` and `slot_of` look called because unrelated identifiers share the name. **The
+comparison that does hold is the one that answers the sweep's question**: both hits are already
+on the recorded list of 24, so no new dead symbol appeared in five days.
+
+### The finding: `recommended_strategy` returns the inverse of its own construction
+
+The entry's rule is that a dead-symbol hit is read twice -- once as "should this exist", once as
+"is production doing this already". The second reading found something neither framing predicts.
+
+`ViewIntersectionCounter::recommended_strategy( &self, logical_end )` tests
+`self.selected.len() * 2 < logical_end`. But `new` populates `selected` **only when the strategy
+it was handed is already `Selective`**. The method reads a field whose existence depends on the
+decision it claims to make. Demonstrated with a filter covering 1000 of 1000 logical positions,
+which is maximally unselective:
+
+```text
+  built FullScan,  filter covers 1000/1000  ->  recommended_strategy = Selective   ( wrong )
+  built Selective, same inputs              ->  recommended_strategy = FullScan
+```
+
+It answers the **opposite of whatever it was constructed with**, on identical inputs, because an
+empty `selected` makes the ratio trivially true. And the reason nothing calls it is structural:
+the strategy is an *argument* to `new`, so no caller can hold a counter before it needs the
+decision. `yesno-eval` open-codes the choice pre-construction from `sum( filter.len() )`, an
+upper bound on the union -- correct, and necessarily a different quantity from the exact
+`selected.len()` the method reads.
+
+Deletion or the `chunks_remaining`-style lift ( a function over layout, support bound and
+logical_end that both sites call ) are the two resolutions. Neither taken: both change `view/`'s
+public surface, and two entries are already open as measured-and-awaiting-a-decision on exactly
+that surface.
+
+`into_magnitude`, the other hit, read twice and came back empty: no open-coded equivalent, since
+`neg` and `abs` take `&self` and must clone and the one `magnitude().clone()` is inside
+`#[cfg(test)]`. A plain uncalled consuming accessor, and the semver diff the entry describes.
+
+### Carry away
+
+* **A dead-symbol list is a list of symbols nothing exercises, which is also where a wrong
+  answer hides.** Nothing was slow and nothing failed, and the function had been returning an
+  inverted recommendation for as long as it existed, because having no callers means having no
+  tests. "Unused" and "untested" are the same condition seen from two sides.
+* **An accessor that reads state created by the decision it advises cannot advise.** Worth
+  checking wherever a "recommend" or "should_" method hangs off the object the recommendation
+  configures.
+* **The sweep's two wrong rulers both fail safe-looking.** Prose mentions and comments make a
+  tree look wired, and nothing complains. A sweep that reports fewer hits than the last run is
+  more suspicious than one that reports more.
+* **Read the whole entry before re-running it.** This one records its construction and both
+  controls; I rebuilt a ruler from scratch and arrived, several wrong counts later, at the notes
+  already written in it. That is the second time today -- `check-unsafe-count.py` was the first.
