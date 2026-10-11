@@ -6062,3 +6062,68 @@ operations, same results, same lock hold ) and not by a number, and the entry sa
   the test green, because it reversed collection and write-back together and so changed nothing;
   the bug I meant to model needed the *pairing* broken instead. The first red I did not get was
   more useful than the ones I did.
+
+## 2026-10-12 -- Cutting the descents, and three sabotages that passed before one bit
+
+Continued `numeric-fold-cost-is-the-plan-not-the-arithmetic` from the setup hoisting to the part
+that actually costs: the per-key index descent.
+
+### What landed
+
+`Cursor::reaim( lo, hi )` re-aims a cursor by resuming inside the leaf it already holds, and
+descending from the root only when that leaf does not reach `lo`. `build_plans` drives **one
+cursor per shard** across the shard's distinct keys in ascending order. Consecutive keys are
+adjacent in `ChunkKey` order, so most re-aims resume and cost no descent.
+
+It is threshold-free, which is why it needs no measurement to justify its *shape*: strictly fewer
+descents than a cursor per key, never more, and no page read a cursor per key would not also
+take. The contiguous scan over `[first key, last key]` that the entry originally proposed is not
+what landed and should not be -- it reads every chunk of every key between the requested ones, so
+it wins dense, loses sparse, and the crossover is a tuned constant.
+
+### The leaf-reach test is correctness, and I had documented it as cost
+
+I wrote `reaim`'s doc claiming the alternative -- walk a leaf or two forward instead of descending
+-- was merely untuned, "a tuned constant, and tuning it needs a measurement this could not take".
+Then I sabotaged the leaf-reach test away expecting a slower but correct cursor, and it **failed**:
+key 5's plan began with key 4's chunks 14-23.
+
+`next_leaf` resets `idx` to 0, and `step` compares only against `hi`. **There is no lower bound
+anywhere in the cursor.** So a re-aim that lets an exhausted leaf fall through yields the next
+leaf from its start, below `lo`. Resume-or-descend is not one point on a cost curve with walking
+in between; walking is unsound without teaching `step` a lower bound. The doc now says so, which
+matters because the "optimization" is exactly what a later reader would reach for.
+
+### Three sabotages passed before one bit, and each pass was a fixture defect
+
+This is the part worth carrying.
+
+1. **Identical shapes.** Every key had the same chunk count and per-chunk cardinality, so a chunk
+   attributed to the wrong key was *indistinguishable* from the right one. My `shape()` comparison
+   could not see misattribution at all.
+2. **One leaf.** 72 index entries fitted a single 1 KiB leaf, so `reaim`'s descend arm never ran.
+   I fixed (1) and this still passed.
+3. **No gap keys.** Every written key was also a requested key, so after one key's scan the cursor
+   already sat on the next requested key's first entry -- and skipping *no* entries below `lo` was
+   still correct. Catching that needs a key **in the index and not in the batch**, between two
+   keys that are, on the same shard; and because shard routing goes through a vshard map, the only
+   way to place one is a single-shard database.
+
+The fixture now has distinct per-key shapes, ~250 entries over several leaves, and odd keys
+requested with even keys written-but-not-requested. `no_advance` and `never_descend` both fail
+against it; `always_descend` passes, which is right -- never resuming is slower, not wrong, and a
+control that failed would mean the test was pinning the optimization rather than the answer.
+
+### Carry away
+
+* **A sabotage that passes is a fact about the fixture, three times running.** Each pass named a
+  different thing the data could not express: shape collisions, a tree too small to branch, and
+  an absence of the one row that makes the bug observable. None of them were visible from reading
+  the test.
+* **Distinguish the control from the drift before running either.** `always_descend` must pass and
+  `never_descend` must fail, and knowing which is which in advance is what turns a red line into
+  information. I predicted `never_descend` would pass and was wrong, which is how the soundness
+  issue surfaced.
+* **A cost framing can hide a correctness condition.** I wrote "threshold-free" about a test whose
+  real job was to keep the cursor above its lower bound. The sabotage that was supposed to measure
+  a tradeoff found a bug instead.

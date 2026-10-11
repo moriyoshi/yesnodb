@@ -318,16 +318,27 @@ impl KeyStream {
         for (i, positions) in by_shard {
             let shard = &snap.db.shards[i];
 
+            // Distinct keys in **ascending** order, each with the output
+            // positions it feeds. Ascending because one cursor resumes forward
+            // and never rewinds; distinct because a repeated key must be
+            // planned once and shared, not scanned twice from a cursor that has
+            // already passed it.
+            let mut distinct: std::collections::BTreeMap<u64, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for &at in &positions {
+                distinct.entry(keys[at]).or_default().push(at);
+            }
+            let order: Vec<u64> = distinct.keys().copied().collect();
+
             // One acquisition for every key on this shard. The memtable range
             // is a `BTreeMap` walk with no I/O under it, so collecting several
             // keys' overlays does not widen the hold in the way the store lock
             // would.
             let overlays: Vec<Vec<(Prefix48, Option<Container>)>> = {
                 let mem = shard.mem.read().unwrap();
-                positions
+                order
                     .iter()
-                    .map(|&at| {
-                        let key = keys[at];
+                    .map(|&key| {
                         mem.chunks_in_key_range(
                             ChunkKey::range_start(key),
                             ChunkKey::range_end(key),
@@ -341,22 +352,35 @@ impl KeyStream {
 
             match snap.roots[i].zip(shard.store.as_ref()) {
                 None => {
-                    for (overlay, &at) in overlays.into_iter().zip(positions.iter()) {
-                        let plan = Self::merge_plan::<std::iter::Empty<_>>(overlay, None)?;
-                        out[at] = Some(Arc::new(plan));
+                    for (overlay, &key) in overlays.into_iter().zip(order.iter()) {
+                        let plan =
+                            Arc::new(Self::merge_plan::<std::iter::Empty<_>>(overlay, None)?);
+                        for &at in &distinct[&key] {
+                            out[at] = Some(Arc::clone(&plan));
+                        }
                     }
                 }
                 Some((tree, store)) => {
                     let reader = store.lock().unwrap().published_nodes();
-                    for (overlay, &at) in overlays.into_iter().zip(positions.iter()) {
-                        let key = keys[at];
-                        let scan = tree.range(
-                            &reader,
-                            ChunkKey::range_start(key),
-                            ChunkKey::range_end(key),
-                        );
-                        let plan = Self::merge_plan(overlay, Some(scan))?;
-                        out[at] = Some(Arc::new(plan));
+
+                    // **One cursor for the shard.** Each key's interval is
+                    // `[key, key+1)` and ascending keys are adjacent in
+                    // `ChunkKey` order, so `reaim` usually resumes inside the
+                    // leaf already in hand and descends only when the next key
+                    // is outside it. A cursor per key descends every time.
+                    let mut cursor = tree.range(
+                        &reader,
+                        ChunkKey::range_start(order[0]),
+                        ChunkKey::range_end(order[0]),
+                    );
+                    for (n, (overlay, &key)) in overlays.into_iter().zip(order.iter()).enumerate() {
+                        if n > 0 {
+                            cursor.reaim(ChunkKey::range_start(key), ChunkKey::range_end(key))?;
+                        }
+                        let plan = Arc::new(Self::merge_plan(overlay, Some(cursor.by_ref()))?);
+                        for &at in &distinct[&key] {
+                            out[at] = Some(Arc::clone(&plan));
+                        }
                     }
                 }
             }
@@ -838,76 +862,127 @@ mod tests {
         )
     }
 
-    /// The batched planner must produce exactly the per-key planner's plans.
-    ///
-    /// They share [`KeyStream::merge_plan`], so agreement on the merge is
-    /// structural rather than tested -- what this pins is everything around it:
-    /// that batching preserves the **caller's order** across shard grouping,
-    /// that a key absent from the index yields the same empty plan either way,
-    /// and that the three chunk states still resolve identically when the
-    /// overlay is collected for several keys under one memtable acquisition.
-    ///
-    /// Ordering is the real risk. `build_plans` groups positions by shard and
-    /// writes results back by index, so a reordering bug would hand lane `i`
-    /// the plan for some other key -- a plausible wrong answer, not a crash.
-    #[test]
-    fn batched_plans_equal_the_per_key_plans() {
-        let dir = tmpdir("batched-plans");
-        let _guard = CleanDir(dir.clone());
-
-        // Four shards, so the grouping is exercised and the keys do not arrive
-        // in shard order.
-        let many = DbOptions {
-            shards: 4,
-            ..Default::default()
-        };
-
-        {
-            let db = Db::open_with(&dir, many.clone()).unwrap();
-            for key in [1u64, 2, 3, 7, 11, 40] {
-                let vals: Vec<u64> = (0..12u64).map(|c| (c << 16) | key).collect();
-                db.insert_many(key, &vals).unwrap();
-            }
-            db.checkpoint().unwrap();
-        }
-
-        let db = Db::open_with(&dir, many).unwrap();
-
-        // All three chunk states: on disk from the checkpoint above, a fresh
-        // memtable-only key, an overlay on a disk chunk, and a tombstone that
-        // must suppress a chunk the index still holds.
-        db.insert_many(99, &[(3u64 << 16) | 5]).unwrap();
-        // Chunk 0 of key 1, which the checkpoint above already put on disk: an
-        // overlay the memtable must win. And ordinal 2 is chunk 0 of key 2, so
-        // removing it is a tombstone suppressing a chunk the index still holds.
-        db.insert_many(1, &[12_345]).unwrap();
-        db.remove(2, 2).unwrap();
-
-        let snap = db.snapshot().unwrap();
-
-        // Deliberately not sorted, not shard-grouped, with a repeat and a key
-        // that was never written.
-        let keys = [40u64, 1, 2, 99, 7, 123_456, 3, 11, 1];
-
-        let batched = KeyStream::build_plans(&snap, &keys).unwrap();
+    /// Assert the batched planner agrees with the per-key one for every key.
+    fn plans_agree(snap: &Snapshot, keys: &[u64]) {
+        let batched = KeyStream::build_plans(snap, keys).unwrap();
         assert_eq!(batched.len(), keys.len());
-
         for (at, &key) in keys.iter().enumerate() {
-            let alone = KeyStream::build_plan(&snap, key).unwrap();
+            let alone = KeyStream::build_plan(snap, key).unwrap();
             assert_eq!(
                 shape(&batched[at]),
                 shape(&alone),
                 "key {key} at position {at} planned differently in a batch"
             );
         }
+    }
 
-        // And the plans drive identical streams, which is the property a caller
-        // actually depends on.
+    /// The batched planner must produce exactly the per-key planner's plans.
+    ///
+    /// They share [`KeyStream::merge_plan`], so agreement on the merge is
+    /// structural. What this pins is everything around it: order preservation
+    /// across shard grouping, a repeated key planned once and shared rather
+    /// than re-scanned from a cursor that has already passed it, a key absent
+    /// from the index planning empty, and one cursor resuming with `reaim`
+    /// seeing exactly what a fresh cursor per key sees.
+    ///
+    /// # The fixture is shaped by three sabotages that passed against earlier ones
+    ///
+    /// First version: every key had the same chunk count and cardinality, so a
+    /// chunk attributed to the wrong key was **indistinguishable** from the
+    /// right one. Second: 72 index entries fitted one leaf, so `reaim` never
+    /// took its descend arm. Third, and the one that actually matters: every
+    /// written key was also a requested key, so after one key's scan the cursor
+    /// already sat on the next requested key's first entry -- and a `reaim` that
+    /// skipped **no** entries below `lo` was still correct. Catching that needs
+    /// a key that is **in the index and not in the batch**, between two keys
+    /// that are, on the same shard. Shard routing goes through a vshard map, so
+    /// the only way to place one there is a single-shard database, which is what
+    /// the first half below is for. The second half keeps the multi-shard
+    /// grouping honest.
+    #[test]
+    fn batched_plans_equal_the_per_key_plans() {
+        let dir = tmpdir("batched-plans");
+        let _guard = CleanDir(dir.clone());
+
+        // Distinct per key, so a misattributed chunk changes the shape, and
+        // ~250 entries so the tree is several 1 KiB leaves deep.
+        let chunks_for = |key: u64| 8 + (key % 5) * 4;
+        let card_for = |key: u64, chunk: u64| 1 + ((key + chunk) % 4);
+        let fill = |db: &Db, keys: &[u64]| {
+            for &key in keys {
+                let mut vals = Vec::new();
+                for chunk in 0..chunks_for(key) {
+                    for j in 0..card_for(key, chunk) {
+                        vals.push((chunk << 16) | j);
+                    }
+                }
+                db.insert_many(key, &vals).unwrap();
+            }
+        };
+
+        // --- One shard: index order is exact, so gaps can be placed. ---
+        let one = DbOptions {
+            shards: 1,
+            ..Default::default()
+        };
+        let written: Vec<u64> = (1..=16u64).chain([40, 41, 100, 101, 1000]).collect();
+        {
+            let db = Db::open_with(&dir, one.clone()).unwrap();
+            fill(&db, &written);
+            db.checkpoint().unwrap();
+        }
+        let db = Db::open_with(&dir, one).unwrap();
+
+        // All three chunk states on top of the tree.
+        db.insert_many(99, &[(3u64 << 16) | 5]).unwrap();
+        db.insert_many(1, &[12_345]).unwrap();
+        db.remove(2, 2).unwrap();
+
+        let snap = db.snapshot().unwrap();
+
+        // Every odd key is requested and every even one is not, so between any
+        // two requested keys the index holds one that is not in the batch.
+        // Unsorted, with a repeat, a memtable-only key and a key never written.
+        let keys = [
+            1000u64, 1, 3, 99, 5, 123_456, 7, 9, 11, 13, 15, 41, 101, 1, 3,
+        ];
+        plans_agree(&snap, &keys);
+
+        // The fixture must distinguish keys at all, or every assertion above is
+        // satisfied by any permutation of the plans.
+        let distinct: std::collections::BTreeSet<_> = written
+            .iter()
+            .map(|&k| shape(&KeyStream::build_plan(&snap, k).unwrap()))
+            .collect();
+        assert!(
+            distinct.len() > 1,
+            "every key has the same plan shape, so misattribution would be invisible"
+        );
+
+        // And the plans drive identical streams, which is what a caller depends on.
         for &key in &keys {
             let want = snap.load(key).unwrap();
-            let batched = KeyStream::batch(&snap, &[key]).unwrap().pop().unwrap();
-            assert_eq!(drain(batched), want, "key {key}");
+            let got = KeyStream::batch(&snap, &[key]).unwrap().pop().unwrap();
+            assert_eq!(drain(got), want, "key {key}");
         }
+        drop(snap);
+        drop(db);
+
+        // --- Four shards: grouping must not reorder the output. ---
+        let dir2 = tmpdir("batched-plans-shards");
+        let _guard2 = CleanDir(dir2.clone());
+        let many = DbOptions {
+            shards: 4,
+            ..Default::default()
+        };
+        {
+            let db = Db::open_with(&dir2, many.clone()).unwrap();
+            fill(&db, &written);
+            db.checkpoint().unwrap();
+        }
+        let db = Db::open_with(&dir2, many).unwrap();
+        let snap = db.snapshot().unwrap();
+        plans_agree(&snap, &keys);
     }
 
     /// The equivalence that makes this a *parallel implementation* of `load`

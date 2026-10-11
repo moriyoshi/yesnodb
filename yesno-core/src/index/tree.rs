@@ -938,6 +938,72 @@ impl<R: NodeReader> Cursor<'_, R> {
         Ok(false)
     }
 
+    /// Re-aim at `[lo, hi)`, resuming inside the leaf already in hand when it
+    /// reaches `lo` and descending from the root only when it does not.
+    ///
+    /// # Why this is not just `range` again
+    ///
+    /// Planning a batch of keys scans one `[key, key+1)` interval per key, and
+    /// ascending keys are adjacent in `ChunkKey` order, so consecutive keys
+    /// usually land in the same leaf. A fresh cursor per key pays a root descent
+    /// each time; `seek_to` is no help because it clears the stack and descends
+    /// too. This reuses the cached leaf, the parsed path and the `cached` page
+    /// when it can, and otherwise defers to exactly the descent that would have
+    /// happened anyway.
+    ///
+    /// # The leaf-reach test is a correctness condition, not an optimization
+    ///
+    /// It is tempting to read "resume when the leaf reaches `lo`, else descend"
+    /// as a cost choice, and to improve it by walking a leaf or two forward
+    /// instead of descending. **That is unsound.** [`Self::next_leaf`] resets
+    /// `idx` to 0 and [`Self::step`] has no lower bound -- it compares only
+    /// against `hi` -- so a cursor that falls into the next leaf yields its
+    /// entries from the start, including the ones below `lo`. Dropping the test
+    /// and letting the exhausted leaf fall through gives the *next* key a plan
+    /// that begins with the trailing chunks of the key before it, which
+    /// `batched_plans_equal_the_per_key_plans` catches only because its fixture
+    /// holds a key that is in the index and not in the batch.
+    ///
+    /// So the choice is resume-inside-this-leaf or descend, and nothing in
+    /// between without teaching `step` a lower bound. That also makes it
+    /// **threshold-free**: no tuned constant, strictly fewer descents than a
+    /// cursor per key, and no page read that a cursor per key would not also
+    /// take.
+    ///
+    /// `lo` must not go backwards across calls: the resume advances `idx`
+    /// forward within the leaf and never rewinds, which is sound for a batch
+    /// visited in ascending key order and wrong for any other order. Callers in
+    /// this crate sort first; `batched_plans_equal_the_per_key_plans` is what
+    /// notices if one stops.
+    pub(crate) fn reaim(&mut self, lo: ChunkKey, hi: ChunkKey) -> Result<()> {
+        self.hi = hi;
+        self.done = false;
+        self.seek = None;
+
+        if let Some(id) = self.leaf {
+            let lbuf = self.leaf_bytes(id)?;
+            let leaf = LeafRef::parse(lbuf.as_slice())?;
+            let n = leaf.len();
+            // The last key of this leaf reaching `lo` is exactly the condition
+            // for the first entry `>= lo` to be in it, at or after `idx`. When
+            // it does not reach `lo` we must descend rather than fall through:
+            // see the correctness note above.
+            if n > 0 && leaf.key_at(n - 1).expect("in range") >= lo {
+                let mut i = self.idx;
+                while i < n && leaf.key_at(i).expect("in range") < lo {
+                    i += 1;
+                }
+                self.idx = i;
+                return Ok(());
+            }
+        }
+
+        // Out of this leaf's reach: take the descent the per-key cursor would
+        // have taken. `step` performs it on the next pull.
+        self.seek = Some(lo);
+        Ok(())
+    }
+
     /// The bytes of leaf `id`, reading it only when it is not the cached one.
     fn leaf_bytes(&mut self, id: PageId) -> Result<Page> {
         if let Some((cached_id, buf)) = &self.cached {
