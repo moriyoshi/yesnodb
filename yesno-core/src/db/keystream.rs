@@ -164,6 +164,19 @@ impl KeyStream {
         ))
     }
 
+    /// One stream per key, all planned in one pass per shard.
+    ///
+    /// See [`KeyStream::build_plans`] for what the sharing saves and what it
+    /// deliberately leaves alone.
+    pub(super) fn batch(snap: &Snapshot, keys: &[u64]) -> Result<Vec<KeyStream>> {
+        let plans = Self::build_plans(snap, keys)?;
+        Ok(keys
+            .iter()
+            .zip(plans)
+            .map(|(&key, plan)| KeyStream::over(snap, snap.shard_index(key), plan))
+            .collect())
+    }
+
     /// Construct a stream whose plan is restricted to `[lo, hi)` prefixes.
     pub(super) fn in_prefix_range(
         snap: &Snapshot,
@@ -237,6 +250,136 @@ impl KeyStream {
                 .collect()
         };
 
+        match snap.roots[i].zip(shard.store.as_ref()) {
+            None => Self::merge_plan::<std::iter::Empty<_>>(overlay, None),
+            Some((tree, store)) => {
+                // **The lock is held only long enough to build the reader.** It
+                // used to span the whole `tree.range` walk, so one key's open
+                // serialised every other open on that shard -- and key-only
+                // sharding means a parallel query's workers all want the same
+                // shards at once. Measured at 8 threads: sharing shards cost 1.80x
+                // the same work on disjoint shards, 44% of it above the
+                // no-sharing floor.
+                //
+                // Sound because `tree` is a **snapshot** root, hence a superblock
+                // root, and `pending_nodes` holds only pages not yet reachable
+                // from any superblock. See `PublishedNodes`.
+                let reader = store.lock().unwrap().published_nodes();
+                Self::merge_plan(overlay, Some(tree.range(&reader, start, end)))
+            }
+        }
+    }
+
+    /// Plans for several keys, sharing one node reader per shard.
+    ///
+    /// # What this saves, and what it deliberately does not
+    ///
+    /// Per-key planning takes the memtable read lock, takes the store lock to
+    /// build a [`PublishedNodes`](crate::store::PublishedNodes) reader, and then
+    /// descends the index from the root. This hoists the first two out of the
+    /// loop: **one** memtable acquisition and **one** reader for every key on a
+    /// shard, with the descents unchanged. That is strictly less work for any
+    /// key distribution, which is why it needs no density heuristic.
+    ///
+    /// **Do not mistake this for the fix to
+    /// `numeric-fold-cost-is-the-plan-not-the-arithmetic`.** That entry measured
+    /// planning at ~545 ns of a 953 ns element, and what this removes is the
+    /// per-key *setup*: one uncontended mutex, one rwlock read and two `Arc`
+    /// clones, since `published_nodes` allocates nothing. Tens of nanoseconds,
+    /// not hundreds. The **descents** are the bulk and this leaves every one of
+    /// them in place.
+    ///
+    /// Cutting the descents is a separate, measured decision. Collapsing them
+    /// into one scan over `[first key, last key]` reads every chunk of every key
+    /// *between* the requested ones, so it wins on a batch dense in the index
+    /// and loses on a sparse one -- which needs a density threshold, hence a
+    /// measurement. The threshold-free alternative is to resume within the leaf
+    /// a cursor already holds and re-descend only when the next key is outside
+    /// it, and that needs a forward seek `Cursor` does not have: `seek_to`
+    /// clears the stack and descends from the root, so re-seeking costs what a
+    /// new descent costs.
+    ///
+    /// # The lock discipline is the one already established here
+    ///
+    /// The store lock is held only long enough to build the reader, exactly as
+    /// in [`Self::build_plan_range`], and for the same measured reason: it once
+    /// spanned the `tree.range` walk and cost 1.80x at 8 threads sharing a
+    /// shard. Batching must not re-widen it, so the reader is built once under
+    /// a lock held no longer than before and every descent runs outside it.
+    fn build_plans(snap: &Snapshot, keys: &[u64]) -> Result<Vec<Arc<Plan>>> {
+        snap.check_live()?;
+        let mut out: Vec<Option<Arc<Plan>>> = vec![None; keys.len()];
+        let mut by_shard: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (at, &key) in keys.iter().enumerate() {
+            by_shard.entry(snap.shard_index(key)).or_default().push(at);
+        }
+
+        for (i, positions) in by_shard {
+            let shard = &snap.db.shards[i];
+
+            // One acquisition for every key on this shard. The memtable range
+            // is a `BTreeMap` walk with no I/O under it, so collecting several
+            // keys' overlays does not widen the hold in the way the store lock
+            // would.
+            let overlays: Vec<Vec<(Prefix48, Option<Container>)>> = {
+                let mem = shard.mem.read().unwrap();
+                positions
+                    .iter()
+                    .map(|&at| {
+                        let key = keys[at];
+                        mem.chunks_in_key_range(
+                            ChunkKey::range_start(key),
+                            ChunkKey::range_end(key),
+                            snap.version,
+                        )
+                        .map(|(p, c)| (p, c.cloned()))
+                        .collect()
+                    })
+                    .collect()
+            };
+
+            match snap.roots[i].zip(shard.store.as_ref()) {
+                None => {
+                    for (overlay, &at) in overlays.into_iter().zip(positions.iter()) {
+                        let plan = Self::merge_plan::<std::iter::Empty<_>>(overlay, None)?;
+                        out[at] = Some(Arc::new(plan));
+                    }
+                }
+                Some((tree, store)) => {
+                    let reader = store.lock().unwrap().published_nodes();
+                    for (overlay, &at) in overlays.into_iter().zip(positions.iter()) {
+                        let key = keys[at];
+                        let scan = tree.range(
+                            &reader,
+                            ChunkKey::range_start(key),
+                            ChunkKey::range_end(key),
+                        );
+                        let plan = Self::merge_plan(overlay, Some(scan))?;
+                        out[at] = Some(Arc::new(plan));
+                    }
+                }
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|p| p.expect("every position belongs to exactly one shard"))
+            .collect())
+    }
+
+    /// Merge one key's memtable overlay with its index scan into a [`Plan`].
+    ///
+    /// Extracted so that [`Self::build_plan_range`] and [`Self::build_plans`]
+    /// run the **same** merge rather than two copies of it. A batched planner
+    /// that reimplemented this could diverge from the single-key one on a
+    /// tombstone or an empty container and no test of either alone would see it;
+    /// `batched_plans_equal_the_per_key_plans` compares them, and it compares
+    /// them through this.
+    fn merge_plan<I>(overlay: Vec<(Prefix48, Option<Container>)>, scan: Option<I>) -> Result<Plan>
+    where
+        I: Iterator<Item = Result<(ChunkKey, ChunkRef)>>,
+    {
         let mut plan: Vec<Step> = Vec::new();
 
         // An empty container carries no ordinals, and the stream contract
@@ -252,28 +395,14 @@ impl KeyStream {
             }
         };
 
-        match snap.roots[i].zip(shard.store.as_ref()) {
+        match scan {
             None => {
                 for (p, c) in overlay {
                     push_mem(&mut plan, p, c);
                 }
             }
-            Some((tree, store)) => {
-                // **The lock is held only long enough to build the reader.** It
-                // used to span the whole `tree.range` walk, so one key's open
-                // serialised every other open on that shard -- and key-only
-                // sharding means a parallel query's workers all want the same
-                // shards at once. Measured at 8 threads: sharing shards cost 1.80x
-                // the same work on disjoint shards, 44% of it above the
-                // no-sharing floor.
-                //
-                // Sound because `tree` is a **snapshot** root, hence a superblock
-                // root, and `pending_nodes` holds only pages not yet reachable
-                // from any superblock. See `PublishedNodes`.
-                let reader = store.lock().unwrap().published_nodes();
+            Some(scan) => {
                 let mut overlay = overlay.into_iter().peekable();
-
-                let scan = tree.range(&reader, start, end);
                 for item in scan {
                     let (ck, cref) = item?;
                     let prefix = ck.prefix();
@@ -696,6 +825,89 @@ mod tests {
             out.push((p, c));
         }
         OrdSet::from_chunks(out)
+    }
+
+    /// The shape of a plan, for comparing two planners without `PartialEq`.
+    fn shape(p: &Plan) -> (usize, Vec<(Prefix48, u32, bool)>) {
+        (
+            p.disk,
+            p.steps
+                .iter()
+                .map(|st| (st.prefix, st.card, matches!(st.src, Source::Disk(..))))
+                .collect(),
+        )
+    }
+
+    /// The batched planner must produce exactly the per-key planner's plans.
+    ///
+    /// They share [`KeyStream::merge_plan`], so agreement on the merge is
+    /// structural rather than tested -- what this pins is everything around it:
+    /// that batching preserves the **caller's order** across shard grouping,
+    /// that a key absent from the index yields the same empty plan either way,
+    /// and that the three chunk states still resolve identically when the
+    /// overlay is collected for several keys under one memtable acquisition.
+    ///
+    /// Ordering is the real risk. `build_plans` groups positions by shard and
+    /// writes results back by index, so a reordering bug would hand lane `i`
+    /// the plan for some other key -- a plausible wrong answer, not a crash.
+    #[test]
+    fn batched_plans_equal_the_per_key_plans() {
+        let dir = tmpdir("batched-plans");
+        let _guard = CleanDir(dir.clone());
+
+        // Four shards, so the grouping is exercised and the keys do not arrive
+        // in shard order.
+        let many = DbOptions {
+            shards: 4,
+            ..Default::default()
+        };
+
+        {
+            let db = Db::open_with(&dir, many.clone()).unwrap();
+            for key in [1u64, 2, 3, 7, 11, 40] {
+                let vals: Vec<u64> = (0..12u64).map(|c| (c << 16) | key).collect();
+                db.insert_many(key, &vals).unwrap();
+            }
+            db.checkpoint().unwrap();
+        }
+
+        let db = Db::open_with(&dir, many).unwrap();
+
+        // All three chunk states: on disk from the checkpoint above, a fresh
+        // memtable-only key, an overlay on a disk chunk, and a tombstone that
+        // must suppress a chunk the index still holds.
+        db.insert_many(99, &[(3u64 << 16) | 5]).unwrap();
+        // Chunk 0 of key 1, which the checkpoint above already put on disk: an
+        // overlay the memtable must win. And ordinal 2 is chunk 0 of key 2, so
+        // removing it is a tombstone suppressing a chunk the index still holds.
+        db.insert_many(1, &[12_345]).unwrap();
+        db.remove(2, 2).unwrap();
+
+        let snap = db.snapshot().unwrap();
+
+        // Deliberately not sorted, not shard-grouped, with a repeat and a key
+        // that was never written.
+        let keys = [40u64, 1, 2, 99, 7, 123_456, 3, 11, 1];
+
+        let batched = KeyStream::build_plans(&snap, &keys).unwrap();
+        assert_eq!(batched.len(), keys.len());
+
+        for (at, &key) in keys.iter().enumerate() {
+            let alone = KeyStream::build_plan(&snap, key).unwrap();
+            assert_eq!(
+                shape(&batched[at]),
+                shape(&alone),
+                "key {key} at position {at} planned differently in a batch"
+            );
+        }
+
+        // And the plans drive identical streams, which is the property a caller
+        // actually depends on.
+        for &key in &keys {
+            let want = snap.load(key).unwrap();
+            let batched = KeyStream::batch(&snap, &[key]).unwrap().pop().unwrap();
+            assert_eq!(drain(batched), want, "key {key}");
+        }
     }
 
     /// The equivalence that makes this a *parallel implementation* of `load`

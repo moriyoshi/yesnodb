@@ -82,10 +82,10 @@ impl KeyLanes {
     /// a caller cannot tell a lane that failed to open from one that is merely
     /// empty.
     pub fn new(snap: &Snapshot, keys: &[u64]) -> Result<KeyLanes> {
-        let mut streams = Vec::with_capacity(keys.len());
-        for &key in keys {
-            streams.push(snap.key_stream(key)?);
-        }
+        // Planned as a batch rather than a key at a time: the index descents
+        // are unchanged, but the memtable acquisition and the node reader are
+        // shared per shard. See `KeyStream::build_plans`.
+        let mut streams = super::keystream::KeyStream::batch(snap, keys)?;
         let mut heads = Vec::with_capacity(streams.len());
         for s in &mut streams {
             heads.push(s.peek_prefix()?);

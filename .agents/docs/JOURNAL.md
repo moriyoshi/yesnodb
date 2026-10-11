@@ -5985,3 +5985,80 @@ Both controls run, each with the touched file restored byte-identical and md5-ve
 * **A fix proposed in the same breath as the warning against it is still worth writing down** --
   filing the entry is what made the error cheap to find, two hours later, with the code in front
   of me instead of the symptom.
+
+## 2026-10-11 -- The numeric fold's planning cost: the blocker was imaginary, and so was my fix
+
+Approved to take `numeric-fold-cost-is-the-plan-not-the-arithmetic`. Two things turned out to be
+wrong, one in the entry and one in what I built for it.
+
+### The stated blocker does not apply
+
+The entry defers because batching "touches the planner, which `yesno-flight/src/expr.rs`
+describes as carrying an audited termination proof". The proof is **Theorem 7 of
+`docs/formal-model.md`**, audited by `scripts/check-plan-measure.py` against the rewrite arms in
+`stream/plan.rs`'s `pass_b`, under `mu( e ) = ||e||` -- a weighted node count on the `Expr` tree,
+with the obligation that every arm strictly decreases it. The arms are `and`/`or`/`xor`/`diff`
+collapsing to `empty`/`a`/`b`.
+
+**Batching leaf plan construction adds no arm and changes no node count.** The entry conflated
+the `Expr` rewriter with `KeyStream::build_plan`'s index range scan, and the 0.545 us lives in
+the second. `stream/plan.rs` names neither `build_plan` nor `KeySource` outside one comment. The
+work was never gated on the proof, and it has been deferred since 2026-10-07 on that basis. The
+citation had also gone stale within the day: that file is `yesno-eval/src/lib.rs` since this
+morning's crate split.
+
+### What I built is not the fix, and `published_nodes` is why
+
+Per-key planning takes the memtable read lock, takes the store lock to build a node reader, and
+descends from the root. I hoisted the first two: one acquisition and one reader per shard,
+descents untouched -- strictly less work for any key distribution, so no density heuristic, and
+the store lock is held no longer than before, which matters because widening it was measured at
+1.80x on 8 threads sharing a shard and deliberately narrowed.
+
+Then I went looking for a load-immune witness, since the host cannot support a timing, and found
+the answer by reading `Store::published_nodes`: **three `Arc` clones and no allocation.** So an
+allocation counter would show nothing, and what the hoisting actually removes per key is one
+uncontended mutex, one rwlock read and two refcount bumps -- tens of nanoseconds against a
+measured 545. **The descents are the bulk and I left every one of them.**
+
+That is worth stating plainly because I had been about to wire a new public
+`Snapshot::key_exprs` through `yesno-eval` on the strength of it. I removed that API instead: it
+had no caller, and a public fn with no caller is precisely what the sweep I ran this morning
+flags.
+
+### What the remainder actually needs
+
+Cutting the descents has two shapes and neither is free. A single contiguous scan over
+`[first key, last key]` -- the entry's own proposal -- reads every chunk of every key *between*
+the requested ones, so it wins dense and loses sparse, and the crossover is a density threshold,
+which is a measurement. Resuming within the leaf a cursor already holds, and re-descending only
+when the next key falls outside it, is threshold-free and strictly fewer descents, but `Cursor`
+has no forward seek: `seek_to` clears the stack and descends from the root, so re-seeking costs
+what a new descent costs. The second is the better shape and is index-layer work.
+
+### Why there is no before/after
+
+QG section 4 wants three runs compared as ranges against a per-core quiet check counting only
+foreign work, and ARCHITECTURE is blunter: anything added to the planner needs measuring against
+the query it plans. The host held load average 29-32 on 20 cores with another tenant on a core
+throughout -- the contamination QG records as having passed a host-wide 89% idle gate on
+2026-10-07 while every pinned core was busy. The entry's numbers are quiet-host numbers and the
+comparison has to be too. So the landed change is justified by *structure* ( strictly fewer
+operations, same results, same lock hold ) and not by a number, and the entry says so.
+
+### Carry away
+
+* **"It touches X, which has a proof" deserves one read of the proof.** Theorem 7's measure is a
+  node count on the expression tree; nothing about leaf planning can move it. Four days of
+  deferral rested on a conflation of two things both called "the planner".
+* **Before optimising a step, find out what the step costs.** `published_nodes` not allocating is
+  a two-line read that reframed the whole change from "the fix" to "tens of nanoseconds". I found
+  it only because I went looking for a counter to witness the win, which is an argument for
+  needing a witness even when you cannot time anything.
+* **A public API added for a caller you have not written yet is dead API.** I had
+  `Snapshot::key_exprs` compiling before noticing that nothing called it and that the fix it
+  existed for had not landed.
+* **A sabotage that passes is information about the sabotage.** Reversing the position list left
+  the test green, because it reversed collection and write-back together and so changed nothing;
+  the bug I meant to model needed the *pairing* broken instead. The first red I did not get was
+  more useful than the ones I did.
