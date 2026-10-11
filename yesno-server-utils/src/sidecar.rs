@@ -13,6 +13,7 @@ use crate::archive::{
     cursor, cursor_fingerprint, inspect_base, new_state, set_cursor_history,
     validate_base_manifest, ArchiveError, ArchiveStore, SCHEMA_VERSION,
 };
+use crate::ctx;
 use clap::{Parser, ValueEnum};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
@@ -226,17 +227,6 @@ pub struct ArchiveOptions {
 ///
 /// A bare number is refused. "Retention 7" is seven of something, and every
 /// wrong guess about which deletes recoverable history.
-/// Attach the path to an `io::Error` before it is boxed into [`ArchiveError`].
-///
-/// The sidecar is a detached task: its error surfaces through a metric wait,
-/// seconds later and in another process, so the `Display` string is the whole
-/// report. `std::io::Error` carries no path and `ArchiveError` is a boxed
-/// `dyn Error`, so the `?` that boxes it is exactly where the only identifying
-/// information is lost. Mirrors `archive::ctx`.
-fn ctx(doing: &str, path: &std::path::Path, error: std::io::Error) -> ArchiveError {
-    format!("cannot {doing} '{}': {error}", path.display()).into()
-}
-
 pub(crate) fn parse_duration_micros(text: &str) -> Result<u64, ArchiveError> {
     let text = text.trim();
     let (digits, unit) = text.split_at(text.len().saturating_sub(1));
@@ -565,7 +555,9 @@ async fn capture_network_base(
     archive_generation: u64,
     establish_cursors: bool,
 ) -> Result<(), ArchiveError> {
-    tokio::fs::create_dir_all(&runtime.work_dir).await?;
+    tokio::fs::create_dir_all(&runtime.work_dir)
+        .await
+        .map_err(|e| ctx("create the archive work directory", &runtime.work_dir, e))?;
     let target = capture_target(runtime, archive_generation)?;
     let mut client = ReplicationClient::new(runtime.channel.clone());
     let report = replication_base_backup(
@@ -647,7 +639,9 @@ async fn capture_server_snapshot(
         Ok(BaseSnapshotSource::Portable) => SnapshotSource::Network,
         _ => return Err("server returned an unknown snapshot source".into()),
     };
-    tokio::fs::create_dir_all(&runtime.work_dir).await?;
+    tokio::fs::create_dir_all(&runtime.work_dir)
+        .await
+        .map_err(|e| ctx("create the archive work directory", &runtime.work_dir, e))?;
     let target = capture_target(runtime, archive_generation)?;
     let capture = async {
         let (path, cleanup_path) = materialize_snapshot(runtime, lease, &target).await?;
@@ -791,7 +785,9 @@ async fn materialize_snapshot(
                         )
                         .into());
                     }
-                    file.write_all(&data).await?;
+                    file.write_all(&data)
+                        .await
+                        .map_err(|e| ctx("write the snapshot file", &path, e))?;
                     offset = offset.saturating_add(data.len() as u64);
                     if chunk.last {
                         if offset != expected.size {
@@ -815,7 +811,9 @@ async fn materialize_snapshot(
                         _ => return Err("snapshot byte stream changed access mode".into()),
                     };
                 }
-                file.sync_all().await?;
+                file.sync_all()
+                    .await
+                    .map_err(|e| ctx("sync the snapshot file", &path, e))?;
             }
             None => return Err("snapshot file chunk has no payload".into()),
         }
@@ -905,8 +903,22 @@ async fn publish_captured_base(
 async fn remove_staged_base(path: &Path) -> Result<(), ArchiveError> {
     // This path was constructed by this process for this capture and did not
     // exist beforehand. It contains no user-authored files.
-    tokio::fs::remove_dir_all(path).await?;
-    Ok(())
+    //
+    // `NotFound` is success, not failure: this function's post-condition is
+    // that the staging directory is gone, and an absent directory satisfies it.
+    // Reporting it would be actively harmful, because the callers run this as
+    // janitorial cleanup after a base has already been published and combine
+    // the two with `Result::and` -- so a cleanup error becomes the sidecar's
+    // terminal error on a capture that otherwise succeeded. `seed.rs` already
+    // argues exactly this for its own stage removal -- "a cleanup failure must
+    // not turn a committed seed into a startup failure" -- and the server's
+    // portable snapshot provider maps `NotFound` to success in both `cleanup`
+    // and `reconcile`. This was the remover on the capture path that did not.
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ctx("remove the staged base", path, error)),
+    }
 }
 
 async fn wal_loop(runtime: Runtime, shard: u32) -> Result<(), ArchiveError> {
@@ -1313,7 +1325,9 @@ where
     let lease_ttl = cli.writer_lease_ttl_secs;
     let retention = cli.retention()?;
     let retention_interval = cli.retention_interval_secs;
-    tokio::fs::create_dir_all(&cli.work_dir).await?;
+    tokio::fs::create_dir_all(&cli.work_dir)
+        .await
+        .map_err(|e| ctx("create the archive work directory", &cli.work_dir, e))?;
     let channel = connect(&cli).await?;
     let store = ArchiveStore::connect(&cli.store)?;
     let writer_lease = Arc::new(store.acquire_writer(new_writer_id()?, lease_ttl).await?);
@@ -1520,6 +1534,39 @@ mod tests {
     }
 
     use super::*;
+
+    /// A staging directory that is already gone satisfies the post-condition.
+    ///
+    /// The callers run this as janitorial cleanup *after* a base has been
+    /// published and join the two with `Result::and`, so before this was fixed
+    /// an absent directory became the sidecar's terminal error on a capture
+    /// that had already succeeded -- reported through a metric wait in another
+    /// process as a bare "No such file or directory ( os error 2 )".
+    #[tokio::test]
+    async fn a_staged_base_that_is_already_gone_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("base-never-created");
+        assert!(!absent.exists());
+        remove_staged_base(&absent)
+            .await
+            .expect("an absent staging directory is the post-condition, not a failure");
+    }
+
+    /// A removal that fails for any other reason still names the path.
+    #[tokio::test]
+    async fn a_staging_removal_failure_names_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_directory = tmp.path().join("regular-file");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+        let error = remove_staged_base(&not_a_directory)
+            .await
+            .expect_err("removing a regular file as a directory must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(not_a_directory.to_str().unwrap()),
+            "a removal failure must name the path, got {message:?}"
+        );
+    }
 
     #[test]
     fn only_an_established_or_new_term_archive_rebases_without_a_checkpoint() {

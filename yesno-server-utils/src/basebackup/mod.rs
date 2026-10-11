@@ -73,6 +73,29 @@ pub struct BaseBackupReport {
     pub attempts: u32,
 }
 
+/// Attach the path to an `std::io::Error`, preserving its `ErrorKind`.
+///
+/// `std::io::Error` carries no path, so `File::open( p )` failing yields
+/// exactly "No such file or directory ( os error 2 )". Both error types here
+/// hold an `Io( std::io::Error )` whose `Display` adds a prefix but no path,
+/// so a base backup that failed on a missing file could say that a file was
+/// missing and never which one. See
+/// `the-archive-sidecar-fails-with-enoent-under-load`.
+///
+/// This returns an `std::io::Error` rather than a new variant so that every
+/// existing `?` conversion keeps working and `kind()` keeps answering what it
+/// did. `BaseBackupError::Io` is public and `sync_tree` returns a bare
+/// `std::io::Error`, so the kind is the only machine-readable part a caller
+/// has; flattening it to `Other` would be a silent semantic change. Note that
+/// `create_staging`'s `AlreadyExists` retry dispatches on the raw error before
+/// the wrap, so that loop is unaffected either way.
+fn io_ctx(doing: &str, path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("cannot {doing} '{}': {error}", path.display()),
+    )
+}
+
 /// A failure inside one disposable staging directory.
 #[derive(Debug)]
 pub enum BaseBackupAttemptError {
@@ -202,7 +225,8 @@ fn target_parts(target: &Path) -> Result<(&Path, &std::ffi::OsStr), BaseBackupEr
 
 fn create_staging(target: &Path) -> Result<StagingDir, BaseBackupError> {
     let (parent, name) = target_parts(target)?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| io_ctx("create the backup target's parent", parent, e))?;
     for _ in 0..100 {
         let id = STAGING_ID.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
@@ -219,7 +243,9 @@ fn create_staging(target: &Path) -> Result<StagingDir, BaseBackupError> {
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(io_ctx("create the staging directory", &path, error).into());
+            }
         }
     }
     Err(std::io::Error::new(
@@ -232,9 +258,11 @@ fn create_staging(target: &Path) -> Result<StagingDir, BaseBackupError> {
 fn image_state(path: &Path) -> Result<(u64, u64), BaseBackupAttemptError> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path)?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| io_ctx("open the shard image", path, e))?;
     let mut head = vec![0u8; 2 * yesno_core::store::PAGE];
-    file.read_exact(&mut head)?;
+    file.read_exact(&mut head)
+        .map_err(|e| io_ctx("read the shard image's superblocks", path, e))?;
     let page = yesno_core::store::PAGE;
     let superblock = yesno_core::store::superblock::pick(&head[..page], &head[page..])?
         .ok_or_else(|| {
@@ -248,15 +276,29 @@ fn image_state(path: &Path) -> Result<(u64, u64), BaseBackupAttemptError> {
 
 fn sync_tree(dir: &Path) -> Result<u64, std::io::Error> {
     let mut bytes = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let file = std::fs::File::open(entry.path())?;
-            bytes = bytes.saturating_add(file.metadata()?.len());
-            file.sync_all()?;
+    for entry in std::fs::read_dir(dir).map_err(|e| io_ctx("list the staged backup", dir, e))? {
+        let entry = entry.map_err(|e| io_ctx("read an entry of the staged backup", dir, e))?;
+        let path = entry.path();
+        if entry
+            .file_type()
+            .map_err(|e| io_ctx("stat a staged file", &path, e))?
+            .is_file()
+        {
+            let file =
+                std::fs::File::open(&path).map_err(|e| io_ctx("open a staged file", &path, e))?;
+            bytes = bytes.saturating_add(
+                file.metadata()
+                    .map_err(|e| io_ctx("size a staged file", &path, e))?
+                    .len(),
+            );
+            file.sync_all()
+                .map_err(|e| io_ctx("sync a staged file", &path, e))?;
         }
     }
-    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)
+        .map_err(|e| io_ctx("open the staged backup to sync it", dir, e))?
+        .sync_all()
+        .map_err(|e| io_ctx("sync the staged backup", dir, e))?;
     Ok(bytes)
 }
 
@@ -361,7 +403,8 @@ pub(crate) async fn replication_base_backup(
         return Err(BaseBackupError::TargetExists(target.to_path_buf()));
     }
     let (parent, _) = target_parts(target)?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| io_ctx("create the backup target's parent", parent, e))?;
 
     let max_attempts = options.max_attempts.max(1);
     let mut last = None;
@@ -372,8 +415,12 @@ pub(crate) async fn replication_base_backup(
                 if target.exists() {
                     return Err(BaseBackupError::TargetExists(target.to_path_buf()));
                 }
-                std::fs::rename(&staging.path, target)?;
-                std::fs::File::open(parent)?.sync_all()?;
+                std::fs::rename(&staging.path, target)
+                    .map_err(|e| io_ctx("publish the staged backup", &staging.path, e))?;
+                std::fs::File::open(parent)
+                    .map_err(|e| io_ctx("open the target's parent to sync it", parent, e))?
+                    .sync_all()
+                    .map_err(|e| io_ctx("sync the target's parent", parent, e))?;
                 staging.published = true;
                 report.target = target.to_path_buf();
                 report.attempts = attempt;
@@ -424,7 +471,9 @@ async fn stream_snapshot_file(
         .await?
         .into_inner();
     let path = target.join(&file.name);
-    let mut output = tokio::fs::File::create(path).await?;
+    let mut output = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| io_ctx("create the snapshot file", &path, e))?;
     let mut offset = 0u64;
     loop {
         let mut chunk = stream
@@ -445,7 +494,10 @@ async fn stream_snapshot_file(
             }
             None => return Err("snapshot file chunk has no payload".into()),
         };
-        output.write_all(&data).await?;
+        output
+            .write_all(&data)
+            .await
+            .map_err(|e| io_ctx("write the snapshot file", &path, e))?;
         offset = offset.saturating_add(data.len() as u64);
         if chunk.last {
             if offset != file.size {
@@ -461,7 +513,10 @@ async fn stream_snapshot_file(
             break;
         }
     }
-    output.sync_all().await?;
+    output
+        .sync_all()
+        .await
+        .map_err(|e| io_ctx("sync the snapshot file", &path, e))?;
     Ok(())
 }
 
@@ -473,7 +528,12 @@ async fn stream_snapshot(
     for file in &lease.files {
         stream_snapshot_file(channel.clone(), lease, file, target).await?;
     }
-    tokio::fs::File::open(target).await?.sync_all().await?;
+    tokio::fs::File::open(target)
+        .await
+        .map_err(|e| io_ctx("open the snapshot target to sync it", target, e))?
+        .sync_all()
+        .await
+        .map_err(|e| io_ctx("sync the snapshot target", target, e))?;
     Ok(())
 }
 
@@ -522,7 +582,8 @@ pub async fn base_backup(
         return Err(BaseBackupError::TargetExists(target.to_path_buf()).into());
     }
     let (parent, _) = target_parts(target)?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| io_ctx("create the backup target's parent", parent, e))?;
     let mut staging = create_staging(target)?;
 
     let lease = ControlPlaneClient::new(channel.clone())
@@ -568,8 +629,12 @@ pub async fn base_backup(
     if target.exists() {
         return Err(BaseBackupError::TargetExists(target.to_path_buf()).into());
     }
-    std::fs::rename(&staging.path, target)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    std::fs::rename(&staging.path, target)
+        .map_err(|e| io_ctx("publish the staged backup", &staging.path, e))?;
+    std::fs::File::open(parent)
+        .map_err(|e| io_ctx("open the target's parent to sync it", parent, e))?
+        .sync_all()
+        .map_err(|e| io_ctx("sync the target's parent", parent, e))?;
     staging.published = true;
     Ok(BaseBackupReport {
         target: target.to_path_buf(),
@@ -581,4 +646,49 @@ pub async fn base_backup(
         bytes,
         attempts: 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A missing shard image names itself.
+    ///
+    /// `std::io::Error` carries no path, so before `io_ctx` this read as
+    /// "staging I/O failed: No such file or directory ( os error 2 )" -- which
+    /// says a file was missing and never which one. The archiver runs detached
+    /// and its error surfaces through a metric wait in another process, so the
+    /// string is the entire report. See
+    /// `the-archive-sidecar-fails-with-enoent-under-load`.
+    #[test]
+    fn a_missing_shard_image_names_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("shard-0000.yno");
+        let error = image_state(&image).expect_err("a missing image cannot yield a superblock");
+        let message = error.to_string();
+        assert!(
+            message.contains(image.to_str().unwrap()),
+            "a missing shard image must name itself, got {message:?}"
+        );
+    }
+
+    /// A missing staged backup names itself, and keeps its `ErrorKind`.
+    ///
+    /// The kind assertion is the point of returning an `std::io::Error` rather
+    /// than a new variant. `sync_tree` returns a bare `std::io::Error`, so its
+    /// kind is the only machine-readable part a caller has, and a helper that
+    /// flattened it to `Other` would be a silent semantic change that no other
+    /// assertion here would notice.
+    #[test]
+    fn a_missing_staged_backup_names_itself_and_keeps_its_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("absent-staging");
+        let error = sync_tree(&staged).expect_err("a missing directory cannot be synced");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(
+            message.contains(staged.to_str().unwrap()),
+            "a missing staged backup must name itself, got {message:?}"
+        );
+    }
 }

@@ -5482,3 +5482,120 @@ it, which is the bar the entry itself set.
 * **"Delete the improvement nothing can observe" is a rule about the present.** The width
   bound was correctly deleted when nothing could see it and correctly restored when something
   could. Neither decision invalidates the other.
+
+## 2026-10-11 -- The archiver's bare ENOENT: a false "every site" claim, and one remover that called success a failure
+
+Picked up `the-archive-sidecar-fails-with-enoent-under-load`, whose standing ask was narrow and
+testable: the sidecar died twice with a bare `No such file or directory ( os error 2 )` and
+neither occurrence could say which file was missing, so "the next occurrence should capture which
+path was missing".
+
+### The entry already claimed that ask was done, and it was not
+
+A prior session added `ctx( doing, path, error )` to `archive.rs` and to `sidecar.rs`, and wrote
+that the two now "attach the path at **every** filesystem site in those two files". It was wrong
+in both halves. `sidecar.rs` still had six bare sites -- both `create_dir_all( work_dir )` calls
+in the capture paths, the startup one, the streamed snapshot file's `write_all` and `sync_all`,
+and `remove_staged_base`. And `archive.rs`, the file the mechanism was built in, had two of its
+own: an entry `file_type` in `database_files`, and a `write_all` inside `write_local_state` whose
+six neighbouring io calls **every one** got `ctx`. A careful pass through a function missed one
+line in the middle of it.
+
+Three more files on the sidecar's task tree were outside the claim's scope entirely:
+`basebackup/mod.rs`, `lease.rs`, and `transport.rs` -- whose TLS reads are the most
+operator-visible `ENOENT` in the crate, being what a mistyped `--ca` produces. A recurrence at
+any of them would still have been bare, under a sentence saying the next occurrence would name
+the file.
+
+The lesson is not that the prior work was wasted; `ctx` is the right mechanism and the direct-path
+stat it covers is still the entry's strongest suspect. It is that **"every" is a claim a grep can
+check, and nobody checked it.** A quantifier in a findings document is an assertion about the
+tree, and it decays exactly like a path does.
+
+### The message shape localizes the two failures without reproducing them
+
+Both occurrences reported an *unprefixed* `os error 2`. That is evidence, not noise:
+`BaseBackupAttemptError::Io` renders as "staging I/O failed: ..." and `BaseBackupError::Io` as
+"cannot prepare backup target: ...", so neither base-backup type can produce a bare message. An
+unprefixed one means an `std::io::Error` boxed straight into `ArchiveError`, which is a boxed
+`dyn Error` -- so the failure was at one of the handful of bare sites in `sidecar.rs`, not in
+`basebackup`, and not at any site `ctx` already covered. **The Display prefix is a free witness
+to which error type a string passed through**, and worth keeping distinct for that reason alone.
+
+### One defect of exactly the shape the entry predicted
+
+The entry guessed: "If the archiver assumes a file it is about to read cannot have been rotated or
+removed underneath it, load only makes that visible rather than causing it." `remove_staged_base`
+is that assumption written down. Its comment asserted the path "was constructed by this process
+for this capture and did not exist beforehand" -- true -- and drew the wrong conclusion from it,
+treating `NotFound` from `remove_dir_all` as a failure to report.
+
+Three things make it fit the symptom:
+
+* Its post-condition is that the staging directory is gone. **An absent directory already
+  satisfies it**, so reporting it is not conservatism, it is a wrong answer.
+* Its callers join it with `Result::and` **after** a base has been published and
+  `base_generation` advanced. A cleanup error therefore becomes the sidecar's terminal error on a
+  capture that otherwise succeeded -- which is precisely a wait on `base_generation` reporting a
+  task death rather than a timeout.
+* The tree already argues both halves of this. `seed.rs` declines to fail a committed seed on a
+  cleanup error in so many words -- "a cleanup failure must not turn a committed seed into a
+  startup failure" -- and the server's portable snapshot provider maps `NotFound` to success in
+  both `cleanup` and `reconcile`. **This was the remover on the capture path that did not**, and
+  the asymmetry is the defect regardless of whether it caused these two failures. I first wrote
+  "the one remover in the tree", which is wrong: `seed.rs` has two bare `remove_dir_all( &stage )?`
+  calls, guarded by `stage_is_owned` and discarding an interrupted stage rather than cleaning up
+  after a success. Different situation, so the fix stands -- but the quantifier did not, in a
+  change whose whole finding was an unchecked quantifier.
+
+### What I did not do
+
+I did not close the entry. The fix is right on its own terms, but nothing demonstrates
+`remove_staged_base` reaching `NotFound` in the live flow: `capture_server_snapshot` guards it
+with `exists()`, `capture_network_base` runs it on a target a rename just published, and nothing
+else in the tree removes the work directory. I also did not invent a race fix for
+`sync_tree`'s readdir-then-open, which is the right *shape* but operates on a staging directory no
+other process writes. Both would have been the MySQL mistake again -- pricing a path nothing
+walks.
+
+`ctx` now lives in `lib.rs` rather than in `archive`, because four modules need it and none owns
+it: `transport` is used *by* `archive`, so importing it from there would invert the dependency.
+`sidecar`'s duplicate copy, which carried a comment saying it mirrored `archive::ctx`, is gone --
+the mirror was the reason one of the two files could drift from the other in the first place.
+
+`basebackup`'s context goes through an `io_ctx` that returns an `std::io::Error` carrying the
+original `kind()` rather than a new enum variant. That keeps every existing `?` conversion working
+and keeps the kind readable: `BaseBackupError::Io` is public and `sync_tree` returns a bare
+`std::io::Error`, so the kind is the only machine-readable part a caller has, and flattening it to
+`Other` would be a silent semantic change. I first justified this by `create_staging`'s
+`AlreadyExists` retry loop and that was wrong on inspection -- that arm dispatches on the raw
+error *before* the wrap, so it is unaffected either way. The guarantee is worth keeping on the
+public-type argument alone, and a test asserts the kind survives.
+
+Five tests, each sabotage-verified to fail with the fix reverted: an absent staging directory is
+not an error, a removal failure names its path, a missing shard image names itself, a missing
+staged backup names itself *and* keeps its `ErrorKind`, and an unreadable TLS authority names the
+path -- that last one standing in for the whole `ctx` mechanism, and chosen because a mistyped
+`--ca` is the one site here an operator will actually hit.
+
+### Carry away
+
+* **A quantifier is checkable, so check it, and write it so the next reader can.** "Every
+  filesystem site in those two files" was wrong in both halves and named a scope ( "those two
+  files" ) that was not the right scope either. The replacement states the set -- every io site
+  reachable from the sidecar's task tree -- names the nine modules in it, names `seed.rs` and
+  `restore.rs` as deliberately outside it, and gives the grep vocabulary that checks it. My own
+  first grep was too narrow and missed `OpenOptions::open`, `set_len` and `rewind`, which is why
+  the vocabulary is written down rather than left to the next person's wrist.
+* **An error's prefix is forensic evidence.** Distinct `Display` prefixes per error type let a
+  bare string, recorded weeks earlier in a scenario log, rule out two whole modules.
+* **"The path did not exist beforehand" does not imply "the path exists now."** A cleanup
+  function's contract is its post-condition, and an operation that finds the post-condition
+  already met has succeeded.
+* **Janitorial work joined with `Result::and` inherits the severity of the real work.** A
+  staging directory that could not be removed should not be able to fail a base backup that was
+  published, and the next such pairing deserves the same look.
+* **Two sessions in a row widened this entry's scope on contact, and that is the signal.** The
+  first found one file's worth; this one found four more plus a miss inside the file the mechanism
+  was built in. A diagnostic gap is rarely local, because the thing that produced it -- `?` on an
+  `io::Error` being the path of least resistance -- is uniform across a crate.

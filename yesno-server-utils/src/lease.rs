@@ -14,6 +14,7 @@ use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersio
 use prost::Message;
 
 use crate::archive::{pb, ArchiveError, ArchiveStore, SCHEMA_VERSION, WRITER_OBJECT};
+use crate::ctx;
 
 /// Holds local kernel ownership for the lifetime of one sidecar run.
 #[derive(Debug)]
@@ -67,7 +68,11 @@ fn lease_message(owner_id: Vec<u8>, ttl_secs: u64) -> Result<pb::ArchiveWriterLe
 /// Generate an opaque writer identity from the operating system RNG.
 pub fn new_writer_id() -> Result<Vec<u8>, ArchiveError> {
     let mut id = vec![0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut id)?;
+    let source = std::path::Path::new("/dev/urandom");
+    File::open(source)
+        .map_err(|e| ctx("open the system RNG", source, e))?
+        .read_exact(&mut id)
+        .map_err(|e| ctx("read the system RNG", source, e))?;
     Ok(id)
 }
 
@@ -85,22 +90,28 @@ impl ArchiveStore {
             );
         }
         if let Some(root) = &self.local_prefix {
-            std::fs::create_dir_all(root)?;
+            std::fs::create_dir_all(root)
+                .map_err(|e| ctx("create the local archive prefix", root, e))?;
             let path = root.join(WRITER_OBJECT);
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(path)?;
+                .open(&path)
+                .map_err(|e| ctx("open the local writer lease", &path, e))?;
             file.try_lock().map_err(|error| {
                 std::io::Error::other(format!("archive prefix already has a live writer: {error}"))
             })?;
             let lease = lease_message(owner_id.clone(), ttl_secs)?.encode_to_vec();
-            file.set_len(0)?;
-            file.rewind()?;
-            file.write_all(&lease)?;
-            file.sync_all()?;
+            file.set_len(0)
+                .map_err(|e| ctx("truncate the local writer lease", &path, e))?;
+            file.rewind()
+                .map_err(|e| ctx("rewind the local writer lease", &path, e))?;
+            file.write_all(&lease)
+                .map_err(|e| ctx("write the local writer lease", &path, e))?;
+            file.sync_all()
+                .map_err(|e| ctx("sync the local writer lease", &path, e))?;
             *self.owner_id.lock().unwrap() = owner_id;
             *self.lease_ttl_secs.lock().unwrap() = ttl_secs;
             return Ok(WriterLease {

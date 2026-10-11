@@ -6,6 +6,8 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tower::service_fn;
 
+use crate::ctx;
+
 /// One administrative client transport failure.
 pub type ConnectError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -69,12 +71,13 @@ pub async fn connect(value: &str, tls: ClientTls<'_>) -> Result<Channel, Connect
         yesno_server::tls::install_crypto_provider();
         let mut config = ClientTlsConfig::new();
         if let Some(ca) = tls.ca {
-            config = config.ca_certificate(Certificate::from_pem(std::fs::read(ca)?));
+            let pem = std::fs::read(ca).map_err(|e| ctx("read the TLS authorities", ca, e))?;
+            config = config.ca_certificate(Certificate::from_pem(pem));
         }
         if let (Some(cert), Some(key)) = (tls.cert, tls.key) {
             config = config.identity(Identity::from_pem(
-                std::fs::read(cert)?,
-                std::fs::read(key)?,
+                std::fs::read(cert).map_err(|e| ctx("read the client certificate", cert, e))?,
+                std::fs::read(key).map_err(|e| ctx("read the client private key", key, e))?,
             ));
         }
         if let Some(name) = tls.server_name {
@@ -93,6 +96,32 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    /// A mistyped `--ca` names the file it could not read.
+    ///
+    /// This is the most operator-visible `ENOENT` in the crate and it used to
+    /// be a bare "No such file or directory ( os error 2 )", which says nothing
+    /// an operator can act on. See
+    /// `the-archive-sidecar-fails-with-enoent-under-load`.
+    #[tokio::test]
+    async fn an_unreadable_tls_authority_names_the_path() {
+        let dir = tempdir().unwrap();
+        let ca = dir.path().join("typo-in-the-ca-path.pem");
+        let error = connect(
+            "https://localhost:1",
+            ClientTls {
+                ca: Some(&ca),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a missing CA bundle cannot configure TLS");
+        let message = error.to_string();
+        assert!(
+            message.contains(ca.to_str().unwrap()),
+            "an unreadable CA must name the path, got {message:?}"
+        );
+    }
 
     #[tokio::test]
     async fn connects_to_an_absolute_unix_socket() {

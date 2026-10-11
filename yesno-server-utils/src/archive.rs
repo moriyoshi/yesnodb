@@ -26,22 +26,7 @@ pub mod pb {
 /// One sidecar failure, safe to move across its asynchronous worker tasks.
 pub type ArchiveError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Attach the path to an `io::Error` before it is boxed into [`ArchiveError`].
-///
-/// **`std::io::Error` carries no path.** `File::open( p )` failing yields
-/// exactly "No such file or directory ( os error 2 )", and `ArchiveError` is a
-/// boxed `dyn Error`, so the `?` that boxes it is where the only identifying
-/// information is lost. The archiver runs as a detached task whose error
-/// surfaces through a metric wait many seconds later and in another process, so
-/// that string is the entire report.
-///
-/// This is not hypothetical. The sidecar died with a bare `os error 2` twice --
-/// `pitr_retention.py` on 2026-09-28 and `archive.py` on 2026-09-29 -- and
-/// neither occurrence could say **which** file was missing, so neither could be
-/// diagnosed. See `the-archive-sidecar-fails-with-enoent-under-load`.
-fn ctx(doing: &str, path: &std::path::Path, error: std::io::Error) -> ArchiveError {
-    format!("cannot {doing} '{}': {error}", path.display()).into()
-}
+use crate::ctx;
 
 /// Archive metadata schema emitted by this version of the sidecar.
 pub const SCHEMA_VERSION: u32 = 2;
@@ -785,7 +770,11 @@ fn database_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, ArchiveError> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| ctx("list the image directory", dir, e))? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        if !entry
+            .file_type()
+            .map_err(|e| ctx("stat an image-directory entry", &entry.path(), e))?
+            .is_file()
+        {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -816,7 +805,8 @@ async fn write_local_state(path: &Path, bytes: Vec<u8>) -> Result<(), ArchiveErr
         let mut file = std::fs::File::create(&temporary)
             .map_err(|e| ctx("create the state temporary", &temporary, e))?;
         use std::io::Write as _;
-        file.write_all(&bytes)?;
+        file.write_all(&bytes)
+            .map_err(|e| ctx("write the state temporary", &temporary, e))?;
         file.sync_all()
             .map_err(|e| ctx("sync the state temporary", &temporary, e))?;
         std::fs::rename(&temporary, &path)
