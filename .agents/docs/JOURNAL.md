@@ -5599,3 +5599,64 @@ path -- that last one standing in for the whole `ctx` mechanism, and chosen beca
   first found one file's worth; this one found four more plus a miss inside the file the mechanism
   was built in. A diagnostic gap is rarely local, because the thing that produced it -- `?` on an
   `io::Error` being the path of least resistance -- is uniform across a crate.
+
+## 2026-10-11 -- Re-deriving the unsafe counts, and being told in advance not to fix what I found
+
+Picked up `miri-cannot-reach-the-mmap-unsafe-sites` because its own text says what to do with
+it: "a count is the part of a claim most likely to go stale and the least likely to be
+re-derived, so state it with the date it was taken and re-derive it rather than trusting it."
+The last recount was 2026-09-29, twelve days earlier, and the plugin channel had landed since.
+
+### The counts had not moved, and the control mattered
+
+Same nine files, same per-file figures, **93 blocks and 37 `unsafe fn`**. The entry is accurate
+as of today. Two things about the method are worth keeping:
+
+* The entry's instruction to recount *with a control* earned its keep in a smaller way than
+  expected. The sentinel pattern matched nothing, as intended, which is what distinguishes
+  "agreement" from "my grep was broken".
+* A bare `grep -c "unsafe fn"` returns **38**, not 37, because `store/segment.rs` mentions the
+  phrase in a comment. An unexplained off-by-one in a count that is supposed to be stable reads
+  exactly like drift, and would have sent the next session looking for a new `unsafe fn` that
+  does not exist. Recorded in the entry so it does not.
+
+### The scope was the stale part, not the count
+
+The entry counts `yesno-core` and says "the uncovered surface is 93 blocks". Outside that crate
+the workspace holds **430 more**, and all three tools in the deep gate -- ASan, ThreadSanitizer
+and `scripts/valgrind.sh` -- run `-p yesno-core` only. So those 430 have no UB tool at all,
+heap-resident paths included: a weaker position than the one this entry carefully documents for
+`yesno-core`, and written down nowhere.
+
+Most of it is a different family and should not be filed as the same gap. `yesno-pg` is 295
+blocks of pgrx FFI, and `yesno-c` with `yesno-plugin/src/cabi.rs` is 95 more of C ABI contract,
+where the hazard is caller misuse a sanitizer on the Rust side would not see. But **the plugin
+channel's arena is this entry's family exactly**: `channel.rs` maps a `memfd` with
+`MmapOptions::map_mut`, and a memfd mapping is file-backed. The construction measured on
+2026-09-14 as silent under both ASan and Valgrind grew a second instance, in a crate no tool
+runs on, after the entry's file list was written.
+
+### The fix was available, cheap, and wrong
+
+Extending ASan to those crates works: 31 tests, under a second, clean. I was ready to propose it
+as a gate step. It would not have covered the arena for two independent reasons -- ASan cannot
+see file-backed mappings, which this entry had already measured, and `yesno-plugin`'s lib has
+**two** tests, neither of which faults the mapping. The result would have been a green sanitizer
+line over code that never touches the thing it claims to check.
+
+The entry's closing paragraph says precisely this, about MIRI: "reporting the gate as met by
+running MIRI over code that never touches a mapping is precisely what this item warns against."
+I arrived at the same mistake from the other end, with a different tool, and the warning was
+already sitting at the bottom of the entry I was editing.
+
+### Carry away
+
+* **Re-derive the count, but check the scope first.** The count was right and the scope was
+  three crates out of date. I nearly reported "unchanged" and stopped, which would have been
+  true and useless.
+* **A feasible fix is not a fix.** "It builds, it runs, it is fast, it is green" says nothing
+  about whether the green means anything. The question is which tests fault the construction
+  under test, and here the answer was none.
+* **Read the whole entry before acting on its top.** The warning that invalidated my proposal
+  was the last paragraph of the item, written on 2026-09-14 about a different tool, and it
+  generalized perfectly to mine.
