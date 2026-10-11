@@ -5915,3 +5915,73 @@ structural reason this is a free function -- the part a caller needs.
   limitation the next caller will not see.
 * **Review the diff with something that has not read my reasoning.** A fork would have inherited
   the conclusions I wanted checked.
+
+## 2026-10-11 -- Fixing the checkpointer flake, and the control I did not write down
+
+Filed `checkpointer-idle-test-guards-race-its-own-ticker` this morning with a preferred fix, then
+implemented it and found the fix was wrong. The reason is the useful part.
+
+### The flake
+
+`an_idle_database_still_checkpoints` failed under gate load at
+`assert!( db.dirty_bytes() > 0 )`, immediately after a 5 000-ordinal write. `Ticker` has been
+running since `start` with `interval_secs = 1`, so a tick can land between `insert_many`
+returning and the guard reading `dirty_bytes()`, flush the memtable and reclaim the log. **The
+test failed because its subject succeeded early**: had the tick come a moment later, the
+assertion the test exists for would have passed.
+
+### The fix I proposed would have made the test vacuous
+
+I wrote: read `counters.checkpoints` before and after, drop both guards. `Ticker` calls
+`db.checkpoint()` **unconditionally** each tick and increments the counter on every success, and
+`maintenance.rs`'s own module header says `checkpoint()` "early-outs on a quiescent database". So
+the counter rises from zero on a database that never wrote -- and the two assertions the test
+actually exists for, `dirty_bytes() == 0` and `wal_len() == 0`, are trivially true of a database
+that never wrote. The whole test would have passed with the write deleted.
+
+I had written the warning against this in the same entry: "the guards are load-bearing against a
+vacuous test". Then proposed removing them.
+
+### The control I named, and the one I did not
+
+The entry demanded one control -- the test must still fail when `maintenance::Ticker` is removed
+-- and **the bad proposal passes it**. No ticker means no ticks means no increments. The control
+it fails is the one I never wrote down: *the test must still fail when the write is removed.*
+
+That is the transferable part. A guard exists against vacuity, so the control that matters is a
+vacuity control, and I specified the other one. A fix that satisfies the stated control and
+breaks the unstated property is exactly what gets merged.
+
+### What landed
+
+The precondition is `assert!( db.visible() > before )`, taken around the write. It asserts the
+data **arrived** rather than that the memtable is still holding it -- the same guarantee without
+the race, because `checkpoint()` reads the oracle's watermark and never moves it, so no tick can
+falsify it. Both racing guards are gone and the final assertions are untouched, since they were
+always the substance.
+
+Both controls run, each with the touched file restored byte-identical and md5-verified:
+
+```text
+  ticker neutralised ( interval_secs = u64::MAX )
+    -> fails on "no background checkpoint ran in 20 s"          ( the real assertion )
+  write deleted
+    -> fails on "the write did not land, so a checkpoint ..."   ( the new precondition )
+```
+
+### Carry away
+
+* **Write the vacuity control, not just the regression control.** When a guard's job is to stop
+  an assertion being trivially true, "would this still fail if the subject were removed" and
+  "would this still fail if the *setup* were removed" are different questions, and only the
+  second one tests the guard.
+* **A counter that increments unconditionally is not evidence of work.** `counters.checkpoints`
+  counts ticks that succeeded, including the ones that early-outed with nothing to do, and the
+  module header says so plainly. I reached for it as a work witness without reading the thing
+  that increments it.
+* **State a precondition about the data, not about the transient state that holds it.** Dirty
+  bytes and log length are both things the system under test is allowed to clear. The visible
+  version is not.
+* **A fix proposed in the same breath as the warning against it is still worth writing down** --
+  filing the entry is what made the error cheap to find, two hours later, with the code in front
+  of me instead of the symptom.

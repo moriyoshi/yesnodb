@@ -48,15 +48,26 @@ async fn an_idle_database_still_checkpoints() {
 
     // One write, through the engine directly — this is about the *timer*, not
     // about the network.
+    let before = db.visible();
     db.insert_many(1, &(0..5_000u64).map(|i| i * 3).collect::<Vec<_>>())
         .unwrap();
+
+    // The write must land, or the two assertions after the wait are vacuous:
+    // `dirty_bytes() == 0` and `wal_len() == 0` are both trivially true of a
+    // database that never wrote.
+    //
+    // State that as a fact about the **data**, not about the memtable or the
+    // log. `Ticker` has been running since `start` with `interval_secs = 1`, so
+    // by the time this line executes it may already have flushed the memtable
+    // and reclaimed the log — which is the behaviour under test, and must not
+    // read as a failed precondition. `assert!( db.dirty_bytes() > 0 )` here did
+    // exactly that under gate load on 2026-10-11: the test failed because its
+    // subject succeeded early. `visible()` is the witness that cannot race,
+    // because `checkpoint()` reads the oracle's watermark and never moves it.
+    // See `checkpointer-idle-test-guards-race-its-own-ticker`.
     assert!(
-        db.dirty_bytes() > 0,
-        "nothing is dirty, so there would be nothing for a checkpoint to do"
-    );
-    assert!(
-        wal_len(dir.path(), 0) > 0,
-        "the log is empty, so reclaiming it at checkpoint would prove nothing"
+        db.visible() > before,
+        "the write did not land, so a checkpoint would have nothing to do"
     );
     // And nothing else writes from here on. That is the whole design of the
     // test: the write path must not be what triggers the checkpoint.
