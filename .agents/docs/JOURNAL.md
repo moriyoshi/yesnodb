@@ -6127,3 +6127,44 @@ control that failed would mean the test was pinning the optimization rather than
 * **A cost framing can hide a correctness condition.** I wrote "threshold-free" about a test whose
   real job was to keep the cursor above its lower bound. The sabotage that was supposed to measure
   a tradeoff found a bug instead.
+
+## 2026-10-12 -- `reaim`'s other two callers, and a bound no local test can hold
+
+`Cursor::reaim` was built for batched planning, and two more sites had the same shape:
+`Snapshot::shard_keys` and `shard_keys_limited` both enumerated distinct keys by building a
+**fresh cursor per key**, pulling one entry and dropping it -- one root descent per key.
+
+Their comment already weighed two options and warned off the wrong one: the seek-past step is
+what makes enumeration `O( distinct keys )` rather than `O( chunks )`, and replacing it with
+`cursor.next()` in a loop "returns the identical answer, so no correctness test would notice".
+`reaim` is the third option they did not have -- one cursor, re-aimed per key, worst case the
+same descents and usually none, because the next key's first chunk sits immediately after this
+key's last and is normally in the leaf already held.
+
+### The warning applies to my change too, which took a sabotage to see
+
+I nearly left it at that. But the sentence that forbids the chunk-by-chunk walk says *why* it is
+dangerous, and the same reasoning covers a broken `reaim` here: it would re-report this key's
+later chunks, `candidates` is sorted and deduped, so **the answer is identical** and the only
+symptom is the `O( chunks )` degeneration the comment exists to prevent.
+
+Sabotaging `reaim`'s advance confirmed it. The failure came from
+`batched_plans_equal_the_per_key_plans` and from **no test of key enumeration at all** -- and I
+briefly misread it as the opposite, because a `cargo test --lib keys` filter matches
+`db::keystream::` on the substring and the planning test ran under it. The guard I thought I had
+found at the enumeration site was the planning test wearing a filter.
+
+So the bound these two functions advertise is pinned at a different site and borrowed here. The
+comment now says so by name, including that weakening the planning test takes this bound with it
+and silently. That is a worse property than an untested invariant, because it reads as covered.
+
+### Carry away
+
+* **A filter match is not a test identity.** `--lib keys` caught `db::keystream::...` and I read
+  the pass as coverage of key enumeration. Check which test actually failed before concluding
+  which property is held.
+* **When a comment explains why an alternative is undetectable, check whether it indicts your
+  version too.** This one named the exact mechanism -- identical output, worse complexity -- and
+  I was two lines away from relying on it for a change with the same failure mode.
+* **A borrowed invariant should be documented at both ends.** The planning test now carries a
+  bound for code in another module that cannot observe it, and nothing but a comment links them.

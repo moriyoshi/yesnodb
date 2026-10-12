@@ -4816,8 +4816,11 @@ impl Snapshot {
                     (self.roots[shard_ix].as_ref(), shard.store.as_ref())
                 {
                     let store = store.lock().unwrap();
+                    // One cursor for the batch, re-aimed per key; see
+                    // `shard_keys` for why the seek-past step stays and what
+                    // `reaim` saves on it.
+                    let mut cursor = tree.range(&*store, at, end);
                     while batch.len() < limit {
-                        let mut cursor = tree.range(&*store, at, end);
                         let Some(item) = cursor.next() else {
                             index_done = true;
                             break;
@@ -4829,9 +4832,8 @@ impl Snapshot {
                             index_done = true;
                             break;
                         }
-                        // The seek-past step, as in `shard_keys`: walking chunk by
-                        // chunk returns the same answer at one descent per chunk.
                         at = ChunkKey::range_end(key);
+                        cursor.reaim(at, end)?;
                     }
                 }
             }
@@ -4917,20 +4919,36 @@ impl Snapshot {
                 Some((lo, _)) => ChunkKey::range_start(lo),
                 None => ChunkKey(0),
             };
-            loop {
-                let mut cursor = tree.range(&*store, at, hi);
-                let Some(item) = cursor.next() else { break };
+            // **One cursor, re-aimed per key.** The seek-past step is what makes
+            // this O( distinct keys ) rather than O( chunks ) -- do not replace
+            // it with `cursor.next()` in a loop, which walks every chunk of
+            // every key and returns the identical answer, so no correctness
+            // test would notice. `reaim` keeps that bound and drops most of its
+            // cost: the next key's first chunk sits immediately after this
+            // key's last, so it is usually in the leaf already in hand and
+            // costs no descent at all. A fresh cursor per key descended every
+            // time.
+            //
+            // **Nothing here can guard that, and the warning above is why.** A
+            // `reaim` that advanced past nothing would re-report this key's
+            // later chunks; `candidates` is sorted and deduped below, so the
+            // answer would be identical and the loop would merely degenerate to
+            // the O( chunks ) walk this comment forbids. Verified by sabotage:
+            // breaking `reaim`'s advance fails
+            // `batched_plans_equal_the_per_key_plans` in `db::keystream` and
+            // **no test of key enumeration at all**. So `reaim`'s advance is
+            // pinned at the planning site and borrowed here -- if that test is
+            // ever weakened, this bound goes with it and silently.
+            let mut cursor = tree.range(&*store, at, hi);
+            while let Some(item) = cursor.next() {
                 let (ck, _) = item?;
                 let key = ck.key();
                 candidates.push(key);
-                // The seek-past step, and the whole reason this is
-                // O( distinct keys ). Do not replace it with `cursor.next()`
-                // in a loop: that walks every chunk of every key and returns the
-                // identical answer, so no correctness test would notice.
                 if key == u64::MAX {
                     break;
                 }
                 at = ChunkKey::range_end(key);
+                cursor.reaim(at, hi)?;
             }
         }
 
