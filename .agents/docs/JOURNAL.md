@@ -6338,3 +6338,109 @@ run and could widen a pre-existing window without causing it.
   one of them is a bug a user can hit.
 * **Say what would make the finding wrong.** The added daemon launches are the confound; leaving
   it out would have made the attribution look stronger than it is.
+
+## 2026-10-12 -- The fencing half was already done, and my own commit left a comment contradicting it
+
+Having closed ownership, I went to take the other half of the CDC handoff's acceptance item 5 --
+fencing a transaction against a leader that has been superseded -- which I had just written up as
+"a smaller piece of work now that the identity plumbing exists".
+
+It needed no work at all, and the check I was about to add could never have fired.
+
+### Three links, none of them mine
+
+`Db::term` reads `inner.route.term`: a plain field, assigned once at construction, never
+reassigned, no interior mutability. So a term change requires a **new `Db` instance**.
+`guard::current` caches one `YesnoFlightService` per database instance, keyed on
+`Arc::ptr_eq` -- so a new database gives a **new service**. `WriteTransactions` lives in the
+service -- so a new service gives an **empty table**, and a handle minted under the old term
+resolves to nothing.
+
+Recording the term on `PendingWrite` and comparing it to `db.term()` at commit would compare a
+constant with itself. That is the third vacuous check I have talked myself out of today, and the
+pattern in all three was the same: the thing looked missing because nobody had written down why it
+was not needed.
+
+Better still, the chain is already **pinned**, not merely argued:
+`a_handle_from_a_previous_service_is_not_reissued` asserts that a handle from a previous service
+commits nothing against a new one and that the first service's staged work died with it.
+
+### The part that was mine
+
+`write_transactions.rs` opened with a paragraph naming ownership as deliberately uncovered
+"because the surface does not exist. The Flight service authenticates nobody today, so a handle is
+bound to whoever holds its eight bytes." My ownership commit made that false and I did not touch
+it -- a module header contradicting the code one commit later, which is exactly what CLAUDE.md
+means by a load-bearing comment and exactly the failure it warns about.
+
+It now says where the ownership tests live and **why they are not in that crate**: this crate
+authenticates nobody, so a test there would have to insert the identity extension itself and would
+be asserting against its own fixture. The honest home is the host's test and the scenario.
+
+### Carry away
+
+* **"What is deliberately not covered" is the first thing to re-read after covering something.**
+  A header listing known gaps is a header that goes stale the moment one closes, and it reads
+  with full authority while wrong.
+* **Three vacuous checks avoided in one day, all found the same way**: ask what the value can
+  actually be before writing the comparison. The term, `published_nodes`'s allocations, and the
+  anonymous-principal limit were each one read away from a change that did nothing or a caveat
+  about nothing.
+* **A structural guarantee is worth more when something asserts its consequence.** Fencing rests
+  on three facts no test names, but the observable consequence -- an old handle resolving to
+  nothing -- was already pinned, which is what makes it safe to claim rather than hope.
+
+## 2026-10-12 -- The error that made its own diagnosis impossible
+
+The `AlreadyOpen` gate failure came back a second time, so I diagnosed instead of re-running --
+and the diagnosis ended somewhere other than where it started.
+
+### Three wrong binaries before the right one
+
+I had filed the entry saying to reproduce with `cargo test --workspace`. That was wrong. The gate
+log holds **two** `yesno-core` lib binaries: the workspace step runs 1004 tests and passes, and the
+failure is in the later off-by-default step, `cargo test -p yesno-core --features jit`, at 1000.
+
+The counts are not monotonic -- 1000 is *fewer* than 1004, because some tests are gated off by a
+feature -- so the build cannot be inferred from the feature list, only read out of the log. Before
+working that out I had cleanly reproduced nothing across `--lib` ( 991 ), `--lib --features
+tracing` ( 1004 ) and `--workspace` ( 1004 ), which is twenty attempts against three binaries that
+were never the one that failed. The right one is clean 6 for 6 as well.
+
+**Twice today the test count caught me doing this, and the second time I had written the wrong
+command into a backlog entry**, where it would have sent the next person down the same three dead
+ends.
+
+### The finding was in the error, not the test
+
+`Db::open` did `file.try_lock().map_err( |_| AlreadyOpen )`. `File::try_lock` returns
+`Result< (), TryLockError >`, and the two arms mean opposite things: `WouldBlock` is a genuine
+second holder; `Error( io )` is the lock call failing -- `EINTR`, `ENOLCK` -- with possibly no
+holder at all. Both became "database at X is already open by another process", and
+`EventError::from_codec` classified both as `Contention`.
+
+So an operator hitting a transient lock failure is told to go find the other process, and there
+need not be one. And **the two sightings of this flake cannot be attributed**, because the message
+that named them cannot distinguish the cases. I spent the hour before this looking for something
+retaining an `Arc< DbInner >` past a drop, on the strength of a string that does not mean what it
+says.
+
+Split: `WouldBlock` keeps `AlreadyOpen`; anything else is `CodecError::LockUnavailable { dir,
+reason }`, carrying the errno and classified `Io`. The test pins the **class**, not the message,
+because the class is what consumers branch on, and it fails under a sabotage that reclassifies it
+back to `Contention`.
+
+I also cleared `checkpoint_staggered` as the holder while I was there: synchronous, local guards
+only, spawns nothing, clones no `Arc`.
+
+### Carry away
+
+* **Read the failing binary out of the log; do not infer it.** Feature unification is not
+  monotonic in the test count, so "more features, more tests" is not a reliable way to identify a
+  build, and a clean run of the wrong one reads as exoneration.
+* **An error that collapses two causes makes its own recurrence useless.** Two sightings bought
+  nothing here because the message could not distinguish them. The repair is not more sampling, it
+  is making the next sighting informative -- the same conclusion as the archiver's bare `ENOENT`
+  this morning, reached from the opposite direction.
+* **A wrong reproduce command in a backlog entry is worse than none.** It transfers the author's
+  dead end to the next reader with the authority of a recorded fact.

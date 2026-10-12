@@ -61,6 +61,28 @@ pub enum CodecError {
     #[error("database at {0} is already open by another process")]
     AlreadyOpen(String),
 
+    /// The lock could not be taken, for a reason that is **not** contention.
+    ///
+    /// Separate from [`Self::AlreadyOpen`] because the two have opposite
+    /// remedies and were once the same error. `File::try_lock` reports
+    /// contention as `TryLockError::WouldBlock` and anything else as
+    /// `TryLockError::Error`, and the open path used to map *both* to
+    /// `AlreadyOpen` -- so a transient `EINTR` or `ENOLCK` told the caller
+    /// another process held the database, and the event-error classifier mapped
+    /// it to `Contention` rather than `Io`. An operator reading that would go
+    /// looking for the other holder, and there is none.
+    ///
+    /// ( That classifier is named in text rather than linked: it is private,
+    /// and a public doc comment that links to a private item fails the gate's
+    /// `doc links resolve` step. )
+    ///
+    /// Found on 2026-10-12 while diagnosing a twice-seen gate failure that
+    /// reported `AlreadyOpen` where no second holder was possible; the two
+    /// observations could not distinguish the cases, which is what this
+    /// variant exists to stop. See `a-dropped-db-may-not-have-released-its-flock`.
+    #[error("cannot lock the database at {dir}: {reason}")]
+    LockUnavailable { dir: String, reason: String },
+
     /// The snapshot was invalidated to bound space amplification.
     ///
     /// Carries the version it held and the last key it is known to have read,

@@ -66,6 +66,8 @@ impl EventError {
         use crate::CodecError;
         let class = match error {
             CodecError::AlreadyOpen(_) => ErrorClass::Contention,
+            // Not `Contention`: there may be no other holder at all.
+            CodecError::LockUnavailable { .. } => ErrorClass::Io,
             CodecError::UnsupportedEndianness | CodecError::UnsupportedEncoding => {
                 ErrorClass::Unsupported
             }
@@ -339,4 +341,40 @@ pub(crate) fn noop_sink() -> Events {
 /// Publish without allowing an observer panic to affect database correctness.
 pub(crate) fn emit(sink: &Events, event: CoreEvent) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.publish(event)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lock failure that is not contention must not be classed as contention.
+    ///
+    /// The two have opposite remedies -- find the other holder, or look at why
+    /// the lock call failed -- and they were one error until 2026-10-12, when a
+    /// gate failure twice reported `AlreadyOpen` for a database no second
+    /// process could have held. This pins the **class**, because that is what a
+    /// consumer branches on; the message is asserted only for the detail the
+    /// class cannot carry.
+    #[test]
+    fn a_lock_failure_that_is_not_contention_is_io_and_not_contention() {
+        let busy = crate::CodecError::AlreadyOpen("/d".into());
+        let broken = crate::CodecError::LockUnavailable {
+            dir: "/d".into(),
+            reason: "Interrupted system call (os error 4)".into(),
+        };
+        assert_eq!(
+            EventError::from_codec(&busy).class,
+            ErrorClass::Contention,
+            "a genuine second holder is contention"
+        );
+        assert_eq!(
+            EventError::from_codec(&broken).class,
+            ErrorClass::Io,
+            "a failed lock call is not contention: there may be no holder"
+        );
+        assert!(
+            broken.to_string().contains("os error 4"),
+            "the reason the lock failed must reach the message, got {broken}"
+        );
+    }
 }

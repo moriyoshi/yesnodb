@@ -635,8 +635,17 @@ pub(crate) fn acquire_lock(dir: &std::path::Path) -> Result<(std::fs::File, u64)
 
     // Non-blocking: an already-open database is an error to report, not a
     // queue to join. Blocking here would hang a caller with no way to know why.
-    file.try_lock()
-        .map_err(|_| CodecError::AlreadyOpen(dir.display().to_string()))?;
+    // Split, because the two arms have opposite remedies: `WouldBlock` means
+    // find the other holder, anything else means the lock call itself failed
+    // and there may be no holder at all. Collapsing them reported a transient
+    // `EINTR` or `ENOLCK` as "already open by another process".
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => CodecError::AlreadyOpen(dir.display().to_string()),
+        std::fs::TryLockError::Error(error) => CodecError::LockUnavailable {
+            dir: dir.display().to_string(),
+            reason: error.to_string(),
+        },
+    })?;
 
     use std::io::{Read, Seek, Write};
     let mut buf = Vec::new();
