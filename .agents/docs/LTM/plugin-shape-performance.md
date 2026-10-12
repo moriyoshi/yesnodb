@@ -210,3 +210,30 @@ A consumer patch measured encoding container payloads directly into mapped arena
 The integration uses one `encode_into( dst, container ) -> Lane` for arena and inline destinations and for single and batched advances. Keeping a separate direct encoder would duplicate the run `( start, len_minus_1 )` to inclusive-end conversion that had already produced a silent wrong answer. A byte scratch destination may be unaligned even when arena slots are word-aligned, so the bitmap writer has an aligned word path and a byte fallback; `a_lane_is_the_same_bytes_at_any_alignment` forces both and was sabotage-checked by reversing endianness in the fallback. The previous comment claiming disjoint `handles` and `arena` fields could not be borrowed together was false.
 
 The final integration passed 55 plugin tests, `gate.sh`, and `gate-operator.sh`. A matched local latency re-measurement on a quiet host remains open; the source patch's wall-clock readings did not meet that condition.
+
+## The direct-versus-staged latency comparison is not runnable, by design
+
+An open item asked for the integrated direct-arena encoder to be remeasured against the previous
+staged one on a quiet host, because the consumer's wall-clock cells had failed their quiet-host
+gate while the CPU and memory cells passed. The host is no longer the obstacle; the tree is.
+
+**There is one encoder.** `encode_into( dst, container ) -> Lane` serves the arena and inline
+destinations and both single and batched advances. The staged form -- allocate a per-lane `Vec`,
+copy it into the arena slot -- was not kept, and the reason is recorded above: keeping a separate
+direct encoder would duplicate the run `( start, len_minus_1 )` to inclusive-end conversion that
+had already produced a silent wrong answer.
+
+So the A/B needs an arm that was deleted **to prevent a defect**, and reconstructing it would
+measure the reconstruction while re-creating the duplicated conversion. The CPU and memory finding
+stands as scoped; the latency claim is not obtainable by that route, which is a closure rather
+than a deferral.
+
+**The available substitute answers a different question.** Arena against inline is a live axis --
+the server can serve payloads inside the frames instead of through the shared arena -- and that is
+"is the arena worth it", not "was the patch worth it". It also needs the full separate-process
+harness rather than a microbenchmark, because the original result is a 265-lane, 600-search,
+A-B-B-A measurement against matched query traffic.
+
+**The general form, which this tree has now hit four times in two days: an entry's method can
+expire even when its question is still interesting.** Check that the comparison arm still exists
+before scheduling the comparison.
