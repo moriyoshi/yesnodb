@@ -657,6 +657,8 @@ cargo +nightly fuzz run roaring_import   -- -max_total_time=300
 - Public items get a doc comment. Constants with non-obvious values get the reasoning, not just the value — `BITMAP_DEMOTE` is the model.
 - Repo-authored docs use half-width parentheses and half-width colons, with a space before/after a parenthesis adjacent to non-whitespace.
 - Work summaries go into an existing document under `.agents/docs/`, not `/tmp` and not a new stray file.
+- **`.agents/docs/` is gate input, so a documentation-only change is not gate-exempt.** Six steps of `scripts/gate.sh` read it -- the cited-slug check, the backlog-count check, the layout diagram, the self-containment check, R1, and the model-constant self-test -- and one of them parses a *specific sentence* out of `TODO.md`. A doc-only commit pushed on the reasoning that it could not break anything passed only because its wording happened not to collide with that anchor; the same paragraph phrased more naturally would have reddened the gate. **The question is never what a change means, it is which steps read the files it touched.**
+- **An anchored checker makes the prose around it load-bearing.** `scripts/check-unsafe-count.py` verifies exactly one sentence matching a fixed phrasing and fails when a second matches, so restating its figures nearby in the same words breaks the gate. Before re-deriving a documented number by hand, look for the checker that already does it: one backlog entry still instructs a manual recount that the gate performs on every run, because the advice outlived the automation that retired it.
 
 ---
 

@@ -583,6 +583,41 @@ terminal's answer.
 
 **A Bloom-style bitset was tried first and is wrong.** Equal prefixes hash equal, so a zero AND does imply disjointness — but by the birthday bound 500 prefixes in a 4096-bit filter collide on ~61 bits, so the AND is essentially never zero and nothing is ever proved. Sizing it properly needs bits proportional to `n²`. Do not re-add it; the unit test that killed it is `disjointness_is_claimed_only_from_a_complete_sketch`.
 
+#### Leaf planning is a different subsystem, and the termination proof does not reach it
+
+Two things in this tree are called "the planner" and conflating them has cost real time.
+
+- **The rewrite planner** is `stream/plan.rs`. Theorem 7's termination measure `mu( e ) = ||e||`
+  is a weighted node count over the `Expr` tree, and `scripts/check-plan-measure.py` audits every
+  rewrite arm in `pass_b` against it.
+- **Leaf planning** is `KeyStream::build_plan` in `db/keystream.rs`: an index range scan that
+  resolves one key's visible chunks to references, merging the memtable overlay with the index.
+  `KeySource` defers it to a `OnceLock`, so it happens inside the first `open` rather than at
+  construction.
+
+`stream/plan.rs` names neither `build_plan` nor `KeySource` outside one comment. **A change to
+leaf planning adds no rewrite arm and alters no node count, so it cannot affect Theorem 7** --
+which matters because the proof's existence was read as a reason not to touch leaf planning at
+all, and the cost it was blocking is real: planning dominates a sorted query over many distinct
+keys, at roughly 545 ns of a 953 ns element over 1024 keys.
+
+Leaf plans may be built in a batch, sharing one memtable acquisition and one node reader per
+shard, and `Cursor::reaim` lets a single cursor serve a shard's keys in ascending order -- worth
+1.43x to 2.27x, falling as chunks per key rises.
+
+#### The index cursor has no lower bound
+
+`index/tree.rs`'s `Cursor` compares only against its upper bound. `next_leaf` resets the entry
+index to zero, and `step` never tests the lower end of the range, so **a cursor that falls into
+the next leaf yields that leaf from its start** -- including entries below the key the caller
+asked for.
+
+This is why `Cursor::reaim` resumes only inside the leaf it already holds and descends from the
+root otherwise. The leaf-reach test reads like a cost choice and is a **soundness condition**:
+dropping it gives the next key a plan that begins with the previous key's trailing chunks.
+Walking a leaf or two forward instead of re-descending is therefore unsound rather than untuned,
+and nothing in between is available without teaching `step` a lower bound.
+
 ### Split and concatenate — simplifying interleaved operands
 
 A union of operands whose chunk ranges only partly overlap was charged for a full merge across the **whole** domain, even where a region has one contributor. `Or` peeks both sides once per prefix, so `Or( small_set, huge_range )` costs a step per chunk of the range and does not finish — to produce a result that is, over most of its extent, simply one stream after the other.
