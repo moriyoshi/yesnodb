@@ -68,6 +68,13 @@ Items extracted from `JOURNAL.md` during `good-sleep` consolidation, plus follow
 
 ### Documentation
 
+- [ ] **architecture-describes-a-removed-plugin-facility** ( *extracted 2026-10-12 from the deep-sleep synthesis entry of 2026-10-03, which was consolidated and removed; filed because the follow-up it carried had never reached this file* ): `ARCHITECTURE.md` says `yesno-server/src/plugin.rs` owns **both** plugin shapes and describes the **in-process facility that was removed**, so a reader is directed at a design the tree no longer has. It also says the local gate misses the server crate, which stopped being true when the Clippy gate became workspace-wide -- the same stale-remedy shape recorded in `quality-gates-and-project-tooling`.
+
+  **Also to check against canonical guidance**, which that entry raised and nothing has since: the current same-Pod socket ownership and the peer-UID rule are documented in LTM but were never reconciled with `ARCHITECTURE.md` or `QUALITY_GATE.md`. No canonical document was edited in that pass, deliberately.
+
+  **This is a `distill-memories` candidate rather than a code item.** The knowledge exists and is correct in `LTM/plugin-hosting-and-isolation-synthesis.md` and `LTM/out-of-process-plugin-via-foreign-reader.md`; what is wrong is the canonical document that outranks them for a reader who starts at the top.
+
+
 - [x] **mysql-records-in-range-is-whole-key** ( *2026-09-18; **FIXED 2026-10-10 with no new ABI surface at all**, where this entry priced three C/C++ boundaries* ): **Two changes, neither of them a `Backend` method.**
 
   ( 1 ) **`HA_ONLY_WHOLE_INDEX` removed from `ha_yesno::index_flags`.** It says the engine can read the index only in its entirety -- a guard against MySQL asking for a prefix of a multi-part key -- and this key has **one part**: `max_supported_key_parts()` is 1 and `index_read_map` accepts `HA_WHOLE_KEY` and `1` as the same request, so there was no partial shape for it to refuse. It was vacuous as a guard and decisive to the range optimizer, which built no range plan at all while it was set -- and therefore never asked for an estimate. Removing it is safe on evidence rather than hope: `index_read_map` already maps `HA_READ_KEY_OR_NEXT`, `HA_READ_AFTER_KEY`, `HA_READ_KEY_OR_PREV` and `HA_READ_BEFORE_KEY` onto `SeekMode`, and `index_next` / `index_prev` continue from there, so the handler already served every call a range scan makes.
