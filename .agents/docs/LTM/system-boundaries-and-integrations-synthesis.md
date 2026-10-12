@@ -32,6 +32,11 @@
 - Flight can return a commit version and wait briefly before preparing an exact-version read. This makes explicit read-your-writes expressible, but it is not a minimum-version API, an idempotency key, a conditional write, or a session guarantee. The legacy 8-byte acknowledgement and the 16-byte row-count-plus-version form must remain distinguishable.
 - The initial commercial envelope is vendor-supported BYOC over rebuildable derived membership data. Multitenant DBaaS remains deferred until workload limits, isolation, recovery, and release evidence exist.
 - Licensing, MSRV, wheel/JAR compatibility, and PostgreSQL major-version support are product boundaries. A test harness or client dependency must not silently raise the core crate's compatibility promise.
+- A setting that can be supplied two ways needs **one defined answer for being supplied both**. The PostgreSQL transport returns three outcomes rather than two and raises on ambiguity, because a misconfiguration answered as an empty table is indistinguishable from an empty table.
+- **Capability probing was rejected deliberately**: the planner would connect once per planned scan for a fact that cannot change between statements, and planning would start failing when the server was merely unreachable. Two settings disagreeing is a query that fails naming the option, not a wrong answer.
+- Two latent defects surfaced when a second transport was added, both of the same shape -- **a wrong answer where an error belonged**: an identity dialed as the wrong protocol, and a correct rejection read as "absent". Adding a second implementation of an interface is an effective way to find the first one's unstated assumptions.
+- **Ask what is refusing before asking what is imprecise.** A storage engine's range estimate was recorded as the reason the index went unused; the estimate was genuinely wrong and was never read, because a capability flag had already refused the plan.
+- A transaction belongs to the principal that opened it, and the host already authenticates -- the identity existed one crate away and only had to be made reachable. **Refuse with `NotFound` rather than `PermissionDenied`**, or the refusal confirms the handle is real and becomes an enumeration oracle.
 
 ## Operational Guidance
 

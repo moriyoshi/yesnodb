@@ -25,6 +25,10 @@
 - The default peer UID is 10001. A different UID is valid when `channel.allowUids` includes it and the socket mode permits access. The operator source note's later test bullet still says any non-10001 UID is rejected; its earlier correction and the current `plugin_spec_error` implementation establish the narrower rule.
 - A sparse default arena reserves 512 MiB of address space per connection (`4 * 16 * 1024 * 8192`), while touched pages consume memory. A 256 MiB two-container experiment showed the same 128 MiB half charged in full to both cgroups after the peer read it. Size both containers for touched arena pages; the later phase-C accounting anomaly remains unexplained.
 - The in-process `cdylib` ABI was removed. Its shared address space, process-aborting escaped panics, and leases that a host call could not revoke outweighed its no-copy advantage. The older shared-directory `Db::open_reader` exploration is also separate from the served plugin path: it sees checkpoint state, needs a writable `READERS` mount, and now uses per-slot `flock` alongside the legacy pid check for PID-namespace-safe liveness.
+- The dense write wire is **64.8x** on the wire and reuses the read side's schema, so each row is an existing operation rather than a new one. The correctness claim is therefore one differential test against the wire that already worked, not a round trip proving the new encoding agrees with itself.
+- **A bound stated in one unit must not be fed a quantity in another.** A row cap meant to limit memory was fed an ordinal count, so it refused precisely the dense page the wire existed to make possible, while the smaller fixture passed every time.
+- **The convenient fixture is often the one that cannot fail.** A working feature, a passing differential test and a headline ratio all existed before anyone measured at the size the backlog named, which is where the case returned an error.
+- **Agreement between two implementations of one protocol is not evidence**, because both can encode the same misreading. A protocol's error table belongs beside its interpreter rather than duplicated in each client.
 
 ## Operational Guidance
 

@@ -26,6 +26,12 @@ Set evaluation spans representation-specific eager kernels, conforming lazy stre
 - `BigUint` is normalized little-endian limbs; a set *is* an integer and width is a reader's argument ( `IntLayout` was removed 2026-09-25 ). Karatsuba is measured; Toom-3 and Burnikel-Ziegler were declined until real operands exceed roughly 256 and 512 limbs.
 - View folds are not restrictions. `Any`, `All`, and `Parity` are exact for union, intersection, and symmetric difference respectively; inverse-image expansion preserves the whole Boolean signature.
 - Flight view transforms deliberately materialize at an eager boundary and re-enter the Boolean tree as set leaves. Lazy view expression nodes require a workload plus planner bounds, statistics, streaming cardinality, and a renewed termination audit.
+- **Two different things are called the planner.** The rewrite planner carries Theorem 7's termination measure, a weighted node count on the `Expr` tree audited arm by arm; **leaf planning** is the index range scan that resolves one key's chunks. Batching the second adds no rewrite arm and cannot touch the proof, and conflating them deferred a fix for days.
+- Leaf planning, not arithmetic or decoding, dominates a sorted query over many distinct keys -- roughly 545 ns of a 953 ns element over 1024 keys -- and a `OnceLock` hides it from any measurement that times the expression construction.
+- **The cursor has no lower bound anywhere**: advancing to the next leaf resets the position and the step compares only against the upper bound. So resuming a cursor across a leaf boundary without re-seeking yields entries below the requested bound, which makes a leaf-reach test a **soundness condition** rather than a cost choice.
+- A batched leaf planner is worth **1.43x to 2.27x**, with the win falling as chunks per key rises because a longer key exhausts the cursor's leaf and forces a re-descend. The gradient matching the mechanism is the evidence; the ratio alone is not.
+- The machine-integer evaluator is a **parallel implementation** of the numeric evaluator, worth 4x on arithmetic-dominated expressions and nothing on read-dominated ones: the win is in interpretation, not arithmetic. Any unsupported node falls back to evaluating the **whole** expression in arbitrary precision, never a mixture.
+- **"Unused" and "untested" are the same condition seen from two sides.** A public method with no callers had returned the inverse of its own construction for its entire existence, because having no callers means having no tests.
 
 ## Operational Guidance
 

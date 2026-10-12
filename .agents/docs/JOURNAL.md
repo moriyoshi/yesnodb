@@ -335,3 +335,52 @@ These source topics are deliberately not folded into any synthesis:
 Open follow-ups remain in [`.agents/docs/TODO.md`](TODO.md). See
 [`.agents/docs/LTM/INDEX.md`](LTM/INDEX.md) for the complete topic index and the current synthesis
 map.
+
+---
+
+## Deep Sleep Consolidation, 2026-10-12
+
+**No new synthesis documents.** All 16 source documents that grew in the preceding `good-sleep`
+pass ( 834 lines ) were already sources of one of the eight existing syntheses, or deliberately
+standalone. There was no new cluster, and inventing one to balance file counts is the forced
+consolidation the skill warns against. What existed instead was **drift**: five syntheses
+summarised sources that had materially changed underneath them.
+
+Refreshed, in descending order of drift:
+
+| Synthesis | Sources that grew | Lines |
+|---|---|---:|
+| [Testing, Gates, and Measurement](LTM/testing-gates-and-measurement-synthesis.md) | methodology, quality gates, e2e harness | 193 |
+| [System Boundaries, Services, and Integrations](LTM/system-boundaries-and-integrations-synthesis.md) | PostgreSQL extension, client libraries | 140 |
+| [Set Evaluation, Planning, and Packed Lenses](LTM/set-evaluation-and-planning-synthesis.md) | expression planning, packed lenses | 132 |
+| [Query Acceleration Admission](LTM/query-acceleration-admission-synthesis.md) | SIMD arms, expression planning | 131 |
+| [Plugin Hosting and Isolation](LTM/plugin-hosting-and-isolation-synthesis.md) | plugin channel protocol | 80 |
+
+**Refreshed as facts and guidance, not prose.** These syntheses are 55 to 87 lines against sources
+of several hundred each, and they work because `Stable Knowledge` carries one line per durable
+fact with the detail left in the source. Restating today's material at source length would destroy
+the property that makes a synthesis worth reading, so each gained lines rather than sections.
+
+**Left standalone, deliberately.** `checkpoint-and-commit-lock-contention` ( +65 ) and
+`flight-write-transactions` ( +60 ) both grew and both were previously judged standalone.
+Contention now overlaps the durability synthesis and write transactions overlap system boundaries;
+folding either in would bury a self-contained narrative, so the overlap is named here rather than
+acted on.
+
+**No source document was modified or deleted, and `LTM/INDEX.md` needed no edit**: no synthesis
+gained a *source*, only facts, and the index's 47 rows still match the 47 documents on disk. A
+cosmetic edit to show activity would have been the wrong move.
+
+### Candidates for `distill-memories`
+
+Flagged, not written -- promotion into the canonical documents is that skill's job, and keeping
+them separate is what stops a consolidation pass from quietly rewriting them.
+
+- **`ARCHITECTURE.md`**: that leaf planning and the rewrite planner are distinct subsystems, with
+  Theorem 7's termination measure binding only the latter's rewrite arms -- the conflation deferred
+  a fix for days. And that `Cursor` carries no lower bound anywhere, which is what makes a
+  leaf-reach test a soundness condition rather than an optimization.
+- **`QUALITY_GATE.md`**: that `.agents/docs` is gate input, so a documentation-only change is not
+  exempt, and that a checker anchored on a sentence makes nearby prose load-bearing.
+- Already filed as a backlog item rather than a candidate:
+  `architecture-describes-a-removed-plugin-facility`.

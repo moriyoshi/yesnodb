@@ -32,6 +32,14 @@ The project relies on deliberately independent test layers. Properties, external
 - Local and remote lint toolchains must be named explicitly. The repository default can pass while CI's newer `stable` emits a lint that does not exist locally; `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings` is the faithful reproduction of that CI surface.
 - AddressSanitizer runs library and integration-test targets with `--lib --tests`. Sanitizer-instrumented doctests cannot link reliably against dependency rlibs built without the sanitizer runtime, and deleting doctests is not a repair.
 - Reusable workflow composition is itself a remote test surface. A called workflow must own a literal concurrency namespace because `github.workflow` resolves to the caller's name and can otherwise make the callee cancel the run waiting for it.
+- **Load average is not a contention measure.** It counts uninterruptible processes, so a host with something permanently stuck carries a floor that never falls and says nothing about current load. Per-core idle and the disk half are the readings that move.
+- A quiet-host check must be **per-core over the cores the measurement uses**, count only foreign work, and be sampled at both edges. A host-wide mean has resolution `1/ncores`, so one busy co-tenant costs a few points of idle and passes a threshold while a pinned worker has been lost.
+- **Feature unification is not monotonic in the test count**, so a failing binary cannot be inferred from the feature list -- one crate ran 991 tests at default, 1004 with `tracing`, 1000 under `jit`. Read the binary out of the log; a clean run of the wrong one reads as exoneration.
+- **An error that collapses two causes cannot be diagnosed by recurrence.** Repeated sightings buy nothing when the message cannot distinguish the cases; the repair is to make the next sighting informative rather than to sample more.
+- A **vacuity control** and a **regression control** answer different questions -- would this still fail if the *setup* were removed, versus if the *subject* were removed. A guard against vacuity needs the first, and specifying only the second is how a fix that guts a test passes review.
+- **A sabotage that runs and passes is a fact about the fixture**, not about the code. Shape collisions, a structure too small to reach the second code path, and the absence of the one row that makes a defect observable each let a real defect through.
+- `.agents/docs` is **gate input**: several gate steps read it and one parses a specific sentence out of `TODO.md`, so a documentation-only change is not exempt and an anchored checker makes nearby prose load-bearing.
+- A **resource failure and an assertion failure deserve opposite responses.** A failing assertion may be reporting a real defect and is diagnosed before any retry; a toolchain killed by the kernel produced no verdict, so there is nothing to bury.
 
 ## Operational Guidance
 

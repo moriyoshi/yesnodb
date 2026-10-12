@@ -23,6 +23,10 @@ SIMD, fused-DAG JIT, and GPU offload accelerate different shapes of set work. Ad
 - The planner's exact facts can justify sound rewrites; approximate sketches cannot justify dropping rows. Its statistics and segmentation setup cost real work, with the paged-source segmentation gate at 128 chunks per operand after a crossover near 88. `cardinality_cost` prices visited chunks but omits materialized cardinality, so equally priced forms have differed by 214x in execution.
 - The observer keys container recurrence by wire posting-list key plus container index and planned-shape recurrence by a leaf-collapsed postfix fingerprint. A `KeySource` pointer is not stable across queries; JIT shape reuse must retain OS thread identity because its 64-entry cache is thread-local. Captured container reuse is an upper bound because an index substitutes for the actual prefix.
 - A contiguous `yesno::hotspot` TRACE window of at most 250,000 queries preserves reuse distances inside that window. Sampling would change the distances. The synthetic 16 MiB cache case achieved 78.2% hits and 25 fill bytes per operation with five-observation admission and a 20,000-access half-life, versus 72.0% and 2,295 bytes for fill-on-miss. Those figures do not establish a real traffic hit rate or justify changing `AUTO_MIN_CHUNKS`.
+- In the packed-integer arm, **one of four optimizations worked**: an MSRV bump for the `dotprod` intrinsics bought 5.47x, row blocking was worth 1% against a model predicting 1.44x, and a fourth arm was broken and discarded rather than caveated.
+- The kernel sits at **89% of its instruction-level ceiling**, and the remaining 56% of the gap is **scan and contention, not the kernel** -- so further kernel work is mis-aimed, which is why the open item is named for the scan.
+- **Check a decomposition by multiplying it back.** A split of total time into parts is a claim, and the parts must sum.
+- Exact top-k offloading **wins on traffic rather than scan speed**, and the distinction matters: a scan-speed framing invites kernel work the traffic framing shows is beside the point.
 
 ## Operational Guidance
 
