@@ -5,11 +5,30 @@
 //! that, and several of them would pass against a *wrong* implementation that
 //! merely looked atomic -- the order fixture in particular.
 //!
-//! What is deliberately **not** covered, because the surface does not exist:
-//! staging or committing from another principal or leadership term. The Flight
-//! service authenticates nobody today, so a handle is bound to whoever holds
-//! its eight bytes. That is a real gap and it is named here rather than
-//! papered over with a test that would assert nothing.
+//! # Ownership and fencing, which this file still does not cover and no longer needs to
+//!
+//! This paragraph used to say staging or committing from another principal was
+//! uncovered "because the surface does not exist". It exists as of 2026-10-12:
+//! a transaction belongs to the principal that opened it, and staging, commit
+//! and abort all refuse anyone else.
+//!
+//! The tests for it are **not here**, and that is not an omission. This crate
+//! authenticates nobody -- the identity comes from the host, which puts a name
+//! in `CallerIdentity` -- so a test in this file would have to insert that
+//! extension itself and would be asserting against its own fixture. The real
+//! coverage is `yesno-server/tests/auth.rs`, which drives two Admin principals
+//! over a socket, and `e2e/scenarios/server_auth.py`, which additionally
+//! exercises the deployment where every caller is `anonymous` and ownership
+//! therefore separates nobody.
+//!
+//! **Leadership-term fencing is structural rather than checked**, and belongs
+//! here because this file already pins it. `Db::term` reads an immutable field,
+//! so a term change means a *new* `Db`; the host builds one service per
+//! database instance, so a new database means a new `WriteTransactions`; and an
+//! empty table resolves an old handle to nothing. That chain is what
+//! `a_handle_from_a_previous_service_is_not_reissued` asserts. A term field on
+//! `PendingWrite` compared at commit would therefore compare a constant with
+//! itself and could never fire.
 
 use std::sync::Arc;
 
