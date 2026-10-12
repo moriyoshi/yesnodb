@@ -59,6 +59,86 @@ The stored Roaring run pair is `( start, len_minus_1 )`; the published plugin pa
 
 The first tests of the inline capacity used sparse lanes and never approached the frame bound. The admission test connected sequentially and could not expose simultaneous overflow. A test of blocked-writer hang-up never made a serving thread hold the writer lock. Each was replaced by a fixture that makes the failed mechanism observable. A real daemon smoke test also found that the adopted metrics surface retained an `Arc<Db>` across clean `SIGTERM`, causing exit status 1; `Shared::release()` returns it to `Starting` before teardown.
 
+### The dense write wire
+
+The read side gained a dense wire on 2026-09-30; the write side still carried **one row per set
+bit** until 2026-10-03. Measured on a 64-chunk half-dense page -- 2 097 152 ordinals over 512 KiB
+of actual bitmap:
+
+| wire | bytes | per set bit | vs. the data |
+|---|---:|---:|---:|
+| pair `{ key, ordinal }` | 34 126 004 | 16.3 | 65x |
+| container payloads | 526 948 | 0.251 | 1.005x |
+
+**64.8x on the wire, and no new encoder or schema.** `apply` and a write transaction accept a
+batch carrying the *same* `containers_schema` the read side already ships, payloads byte-identical
+to the page store and to a `.roaring` file, and each row becomes
+`patch_chunk( key, prefix, empty, c )` -- which is `( old \ {} ) union c`, exactly what `insert`
+means. Because it is an encoding change to an existing operation, the correctness claim is one
+differential test against the wire that already worked rather than a round trip proving the new
+encoding agrees with itself.
+
+End to end, both wires landing an identical set, verified ordinal by ordinal:
+
+| page | pairs | containers |
+|---|---:|---:|
+| 64 chunks, 512 KiB | 1058-1212 ms | 41.0-42.1 ms |
+| 1024 chunks, 8 MiB | 16.6-17.1 s | 29.2-48.5 ms |
+
+**The container arm is flat across a 16x size range**, which is the real shape of the result: it
+is no longer wire-bound. The larger page measuring slightly faster than the smaller one is
+unexplained and was left so, because both are orders of magnitude under the pair arm and an
+unverified cause is worth less than saying it is unverified.
+
+### A bound that refused the case the feature existed for
+
+A container row reports the **ordinals** it carries, so the same logical write reports the same
+figure on either wire and the acknowledgement check compares encoded against decoded cardinality.
+That is right for reporting, and wrong as an input to `MAX_TRANSACTION_ROWS`, which exists to
+limit **memory** in rows because a mutation row costs a few dozen bytes. The 8 MiB page was
+therefore refused with `apply exceeded 16777216 staged rows` -- the bound rejecting precisely the
+case the dense wire exists to make possible -- while the 64-chunk fixture passed every time.
+
+The repair separates three quantities that had been two: ordinals written ( reported ), operations
+staged ( bounded by `MAX_TRANSACTION_ROWS` ), and container payload bytes behind them ( bounded by
+`MAX_TRANSACTION_CONTAINER_BYTES`, 256 MiB ). **Any one standing in for another lets a bound
+refuse work it was not meant to refuse, or admit memory it was meant to refuse.**
+
+`a_dense_page_past_the_row_bound_in_ordinals_is_still_accepted` pins it at 257 full chunks, one
+past the bound, which is affordable only because `Container::full()` expresses a whole chunk as
+one run interval -- 16 777 217 ordinals in a few hundred bytes rather than a 134 MB vector.
+
+**The fixture that was convenient to build was also the one that could not fail.** A working
+feature, a passing differential test and a 64.8x wire figure all existed before anyone measured at
+the size the backlog actually named, which is where the headline case returned an error.
+
+### The advertised cap was not the protocol ceiling
+
+A write cap was published as a protocol limit and was **6.25x** smaller than what the protocol
+actually permits -- the advertised figure, not the ceiling. The same file already recorded this
+exact failure once before. Raising it is worth 5.6x on writer time with checkpoint unchanged, but
+the absolute numbers belong to a particular setup and the ratio is setup-dependent; **no claim is
+made that the cap alone is a speedup.**
+
+### Reviewing two implementations of one protocol
+
+A differential review of the two channel clients found four defects in one and one in the other,
+and the method matters more than the count: **agreement between two implementations is not
+evidence**, because both can encode the same misreading. Two findings generalize --
+
+- A client must **read on through a database replacement** rather than treating it as the end of
+  the stream.
+- **A protocol's error table belongs beside its interpreter.** The architectural finding was
+  where that knowledge was living: duplicated in each client rather than owned by the protocol.
+
+### Where the C ABI lives, and what the header may not be called
+
+The channel's C ABI belongs in `yesno-plugin`, which already publishes one; the header **must
+not** be named `yesno_plugin.h`, because the two would collide for any consumer linking both. The
+peer half was later split out so a host embedding only the peer does not drag the host half's
+dependencies in. Local pre-checks were weaker than the gate three times over that work, which is
+the recurring argument for running the gate rather than reasoning about it.
+
 ## Files
 
 - `yesno-plugin/src/ipc.rs`: frame codec and structural bounds.

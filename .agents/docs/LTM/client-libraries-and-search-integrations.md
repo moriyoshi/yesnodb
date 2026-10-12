@@ -94,6 +94,65 @@ The textual query language spells literals `{a, b, ...}` and accepts `{}`. Java 
 
 Flight no longer advertises or accepts `compact`; all Rust, Python, Go, Java, and C++ methods were removed, and E2E surface assertions reject its return. Administrative checkpointing belongs to the authenticated control service. `ServerStats` is a Protobuf message with canonical field bytes rather than language-specific JSON mirrors.
 
+### MySQL storage engine: three backends behind one `Backend`
+
+`yesno-mysql` reaches a database three ways -- embedded, Flight, and the plugin channel -- behind
+one `Backend` trait, and each leg is held to the same cases rather than to a subset. Two process
+lessons from building the channel leg:
+
+- **A backend nothing compiles is not a backend.** One arm existed in source, type-checked under
+  no configuration the gate built, and was therefore unverified in both directions.
+- Widening `Backend` for the channel forced a **retraction** of an earlier claim about fidelity
+  across backends; the differential fixture that compares the legs is what produced it.
+
+### `records_in_range` was never consulted, and the flag was why
+
+The engine's range estimate was recorded as the reason MySQL would not use the index. It was
+genuinely wrong, and it was **not the cause**. The arc took four entries and the middle probe did
+the work:
+
+1. Demonstrate the plan -- which looked like confirmation and tested nothing.
+2. **Force `records_in_range` to return 1.** The plan was byte-identical, so the estimate was
+   never read. An *absurd* value made this decisive; a merely correct one changing nothing would
+   have been ambiguous.
+3. Read the handler, and find `HA_ONLY_WHOLE_INDEX` vacuous.
+
+`HA_ONLY_WHOLE_INDEX` guards against MySQL asking for a **prefix** of a multi-part key. This key
+has one part -- `max_supported_key_parts()` is 1 and `index_read_map` accepts `HA_WHOLE_KEY` and
+`1` as the same request -- so there was no partial shape for it to refuse, and it was decisive to
+the range optimizer, which built no range plan while it was set and therefore never asked for an
+estimate.
+
+Removing it is safe on evidence rather than hope: `index_read_map` already maps every
+`ha_rkey_function` a range needs onto a seek mode, and `index_next` / `index_prev` continue from
+there. **The capability was present; only the advertisement withheld it.**
+
+The estimate is now bounded by the range's own inclusive width, `min( records(), hi - lo + 1 )`,
+from the arguments in hand, ignoring flags deliberately -- the inclusive width is conservative
+whichever way `HA_READ_AFTER_KEY` and its siblings read, and an over-estimate costs a plan while an
+under-estimate costs a worse one. The plan, on all three backends, for 1000 contiguous ordinals
+and `BETWEEN 100 AND 109`:
+
+```text
+before  1 SIMPLE est_* NULL ALL    PRIMARY NULL    NULL NULL 1000  11.11 Using where
+after   1 SIMPLE est_* NULL range  PRIMARY PRIMARY 8    NULL    10 100.00 Using where
+```
+
+Rows examined 1000 -> 10, and `filtered` 11.11 -> 100.00 because MySQL is no longer guessing a
+selectivity it could not compute. **One assertion guards both changes**: `rows` of 10 can only come
+from the width bound, and `type` of `range` only from the flag's removal.
+
+The width bound had been deleted days earlier on the correct grounds that no test could observe
+it, and restored once the flag's removal made it visible. Neither decision invalidates the other.
+
+An exact `len_in_range` would still beat the width bound on a **sparse** range, where the width
+over-estimates. It was priced at three C and C++ ABI boundaries and is not built, because nothing
+demonstrates a plan that needs it -- which is the bar that entry set for itself.
+
+**The transferable form: ask what is refusing before asking what is imprecise.** The entry named
+the estimate, the estimate was genuinely wrong, and four hours of pricing an exact count went into
+a path the optimizer never walked.
+
 ## Files
 
 - `yesno-flight/` - shared Rust client and Flight protocol integration.

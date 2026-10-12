@@ -95,6 +95,87 @@ PostgreSQL and MySQL use the ordinary Monty binary and one featureless generic f
 
 Interactive `psql -a` sessions use a PTY because tuple output block-buffers behind a pipe and can appear after a synchronization marker. Marker comments and bounded waits establish ordering without sleeps or host `stdbuf`. The accept target is the only path that writes expected output back to the workspace.
 
+### The plugin channel as a second transport
+
+`Transport` abstracts over Flight ( gRPC and Arrow ) and the plugin channel ( a Unix socket plus a
+memfd arena ), selected per `SERVER`. `yesno_pg.channel_socket` sits beside `yesno_pg.endpoint` as
+a GUC so the index and table access methods can reach a daemon over the channel; both openers
+return `Box< dyn Transport >`.
+
+**A GUC that can be set two ways needs one answer for being set both.** `configured_transport`
+returns three outcomes rather than two -- `Ok( Some )`, `Ok( None )` for unset, and `Err` when
+both are set -- and `configured_identity` raises an error on ambiguity rather than answering,
+because a misconfiguration answered as an empty table is indistinguishable from an empty table.
+
+The reloption that would let one database reach two servers is deliberately not built: it "buys
+nothing until someone wants two servers from one database", and probing a server for its
+capabilities was rejected because the planner would connect once per planned scan for a fact that
+cannot change between statements, and planning would start failing when the server was merely
+unreachable. **Two settings disagreeing is a query that fails naming the option, not a wrong
+answer.**
+
+### Two bugs the GUC exposed, both of which answered rather than failed
+
+Adding the channel transport surfaced two defects that had been latent, and both had the same
+shape: a wrong answer where an error belonged.
+
+- **`fdw::modify::flush` dialed the buffer identity as a gRPC endpoint**, so channel-backed writes
+  died at pre-commit. The repair tags the buffer key ( `flight:` / `channel:` ) with an inverse
+  `from_buffer_key`, and the tests include a socket spelled `grpc://not-a-host` and an endpoint
+  spelled like a path, so the distinction cannot be made by sniffing the string.
+- **`fetch_tid_into` read a correct rejection as "absent".** It called `.unwrap_or( 0 ) > 0` on an
+  `And( Key, Range )` the channel could not evaluate, turning "I cannot answer this" into "no such
+  row". Fixed by giving `Transport` an explicit `contains( key, ordinal )`.
+
+### Filter pushdown, and the crate split it required
+
+Pushed-down `yesno-wire` expressions are evaluated host-side over the channel by
+`SnapshotEvalCardinality` and `SnapshotEvalLoad`. The evaluator was moved out into its own crate
+so the channel host -- a C-linked `cdylib` -- need not drag tonic and arrow in; the move was
+verbatim and the file contained no references to its former crate, which is what made it a move
+rather than a rewrite.
+
+**A `pushdown` server option decides whether the planner may lower quals**, and it is the operator
+half of the daemon's own expression-size limit. Probing was rejected for the reasons above, so the
+two settings disagreeing produces a query that fails naming
+`ALTER SERVER ... OPTIONS ( ADD pushdown 'off' )`.
+
+**Two bare-key materialization bugs surfaced here and one of them was pre-existing.** An
+unfiltered scan was sending an expression descriptor rather than a key, which made the host
+materialize whole keys per page; `cmd_of` now normalizes a bare-key expression to a key. The
+identical defect was already in Flight's `windowed_source`, which gained a streaming arm for the
+same shape.
+
+### Snapshot stability, and a ticket that outlives its statement
+
+**The FDW had no snapshot stability at all**, and the access methods pinned nothing: a
+`REPEATABLE READ` transaction could observe two different versions across statements, and two keys
+read in one statement could come from different versions.
+
+The channel has no "open a snapshot at version V" frame -- the pin *is* the snapshot handle -- so a
+handle lives in a thread-local keyed by `( socket, version )` rather than in the per-statement
+transport, which lets a ticket minted in one statement be honoured by the next. A thread-local is
+the right scope because a PostgreSQL backend is one process serving one session, which is what the
+FDW's write buffer already rests on. `release_transaction_pins` runs on the same transaction
+callback that clears tickets, and **the two must stay one moment**: a ticket outliving its pin is a
+recoverable error, a pin outliving its ticket holds data.
+
+### Counting the round trips, and correcting the claim about them
+
+A doubled `count(*)` round trip was removed, and the attempt to *prove* the saving is the part
+worth recording: the first measurement did not demonstrate it, and the claim was corrected rather
+than restated. Flight gained `RequestCounts` ( `flight_infos`, `do_gets`, `do_puts` ) so a fixture
+can assert the number of requests a plan makes instead of inferring it from timing -- a work
+counter rather than a wall clock, which is the form that survives a loaded host.
+
+### Two open limits hiding inside a closed entry
+
+A backlog entry marked done contained two limits that were still open, because new bullets had
+been inserted into a single-line four-limit entry and migrated its later limits onto the closed
+one. The citation checker stayed green throughout, since nothing about the *citations* was wrong.
+**A structural edit to a backlog entry can move its content between items without breaking any
+check that reads it.**
+
 ## Files
 
 - `yesno-pg/` - extension sources, Bazel targets, and SQL declarations.
