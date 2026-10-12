@@ -189,6 +189,71 @@ Where the remaining time goes, measured rather than inferred: the index work is 
 
 One framing correction belongs with it: shortening the exclusive region is aimed at the **364 ms worst case**, not at the 83 ms p99. A commit takes `Shard::write` plus `Shard::mem.write()` while a reader takes `mem.read()`, so a reader meets that exclusion on **every commit** rather than once per checkpoint -- which is why the two halves of this document are separate items and not one.
 
+### The exclusive region scales with the index, not the delta
+
+The checkpoint's exclusive region was measured at 13% of itself at 40 000 index entries and
+**27.5% at 1 600 000**, growing as a share because `Tree::node_ids` visits every page of the old
+index while the delta does not grow with it. At 1 600 000 entries the region was 25.2 ms and a
+concurrent reader's worst query was 25.6 ms -- **the region is the stall.** The repair enumerates
+the previous tree *before* taking the store lock, because only the root and the segment handle
+need it and the walk reads published, immutable pages.
+
+Soundness rests on the checkpoint lease already being held, so no other checkpoint can republish
+the root underneath the walk, and a commit cannot: it writes the WAL and the memtable, never index
+pages. A belt-and-braces check discards the enumeration if the root moved while the lock was
+down, because a wrong free list is expensive and discarding is cheap.
+
+### Fine-grained locks moved contention rather than removing it
+
+Three results in this area are worth keeping together, because they are a sequence of refutations
+rather than a progression of wins:
+
+- Replacing one coarse mutex with three fine ones **moved** contention rather than ending it;
+  measured 0.22x against a 0.23x baseline.
+- Making the segment caches an `RwLock` is **slower**, and the entry being worked on had already
+  recorded that -- read and quoted that same morning, then re-derived by experiment.
+- **Striping** `verified` and `pinned` into 64 independent mutexes is worth **+9.5% with
+  non-overlapping ranges**, which is the one arm that survived.
+
+Three candidate locks were each eliminated with one experiment: the checksum cache's `verified`
+mutex ( 0.28x to 0.30x ), `buffer_at`'s `pinned` mutex ( 0.28x to 0.37x ), and making `segs` an
+`RwLock` because it is append-only, which had **no effect at all** ( 0.26x against 0.28x ). **A
+lock that looks like contention is not, when something coarser upstream already serialized
+everything.**
+
+A trap for anyone doing both halves: the inner `segs` / `pinned` / `verified` mutexes are
+redundant *only while the store lock is exclusive*. Converting that lock to an `RwLock` makes them
+immediately load-bearing, so removing them first and converting second gives data races on two
+maps, and each step looks locally justified.
+
+### The measurement failures in this thread
+
+This area produced the session's sharpest measurement lessons, recorded in full in the
+methodology document and summarized here because they attach to these numbers:
+
+- **A harness of the wrong shape measured no change**, and the null was nearly reported. Four
+  successive harness versions were each confidently wrong.
+- **A denominator made three results meaningless**: they were built on a quantity that varies by
+  50% run to run, and what survives of those numbers is their **sign, not their value**.
+- The 1-shard degradation reproduced ( 0.23x against a recorded 0.22x ) while **the 3.51x at 20
+  shards did not**, which is the usual shape -- a sweep's monotonicity is durable and its headline
+  ratio is taken between the two noisiest points.
+- A superlinear seek loop turned out to be **cache behaviour rather than the loop**, decided by a
+  counter-measurement that was nearly skipped.
+
+### The verification cache is a threshold, not a curve
+
+The checksum verification cache's benefit is **entirely in a reused mapping**, so it behaves as a
+threshold rather than a curve, and the bound it was once raised on must not be raised again on
+that evidence. Both costs an earlier report flagged as unknown turned out small, and one of them is
+structural rather than measured.
+
+### A shared published view, and a byte-wide class map
+
+The published view is shared rather than rebuilt per reader, retained **only while a reader holds
+the previous snapshot**. It is a memo and not a parallel structure, and it is compared for exact
+equality at open. Class 0 is reserved so the class map fits in a byte.
+
 ## Files
 
 - `yesno-core/src/db/mod.rs` -- `Db::checkpoint`, `Db::commit`, `enforce_policy`, the shard participants and the lock order.

@@ -696,6 +696,43 @@ successful and failed compilation paths and ensure no function pointer
 outlives the mapping. These are open findings, not fixed by the
 map/fold scratch prototype.
 
+### The Scaled8 `sdot` arm, and what four optimizations were worth
+
+The packed-integer dot kernel for Scaled8 landed after an arc in which **one of four
+optimizations worked**, and the discarded ones are the useful part of the record.
+
+- The ceiling was **not** the 2.5x first claimed. An MSRV bump to 1.98, for the AArch64 `dotprod`
+  intrinsics that stabilized between 1.97.1 and 1.98.0, bought **5.47x**.
+- The kernel reaches **4.947 of the 5.55 MAC/cycle `smlal` ceiling -- 89%**, which is the figure
+  that bounds further work on the kernel itself.
+- **Row blocking is worth 1%**, against an op-count model that predicted 1.44x. The model was
+  wrong because the operand is the same array for every row, so the reuse it assumed was already
+  happening.
+- A fourth arm was **broken, and discarded rather than caveated**.
+
+**The remaining 56% is scan and contention, not the kernel.** Per-row overhead inside the kernel
+was measured and is small; memory contention appears at eight workers. So further kernel work is
+mis-aimed, and this is why the open item is named for the scan rather than for the arm.
+
+Two method notes attach here. **Check a decomposition by multiplying it back** -- a split of total
+time into parts is a claim, and the parts must sum. And the per-product magnitude of the packed
+form is **width-invariant by construction**, which is what makes a width sweep a test of the
+plumbing rather than of the arithmetic; `i16` is a trap this corpus will not reveal, because its
+values never reach the range where the narrow type overflows.
+
+The admission thresholds that came out of this arc are **2047 at twelve bits and 127 at eight**.
+
+### Exact top-k offloading wins on traffic, not on scan speed
+
+A measured prototype for exact top-k offloading **wins the served path, and it wins on traffic
+rather than on scan speed** -- the distinction matters because a scan-speed framing invites kernel
+work that the traffic framing shows is beside the point. Verified against all 799 MIRACL EN e5
+queries with complete ordered `( id, score )` top-100 and **zero mismatches**, which is the shape
+a correctness claim for a reordering optimization has to take.
+
+One hazard surfaced in the harness rather than the kernel: a pinned snapshot still seeing deleted
+rows, which is a reader-registration question and not an offload question.
+
 ## Files
 
 - `yesno-core/src/ops/array.rs` -- the NEON and x86 ( `pcmpestrm` ) arms, the shared `SHUFFLE` table in the parent module, and the direct-call test wrappers.

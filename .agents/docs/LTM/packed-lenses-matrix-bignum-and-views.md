@@ -1501,3 +1501,41 @@ The `Big` sort reads one set as one integer. `BigExpr::Read` and `ReadSigned` ca
 Six independent bounds protect the language's distinct amplification axes. Depth and node count bound tree structure; `MAX_VIEW_SETS = 4096` bounds view fan-out; `MAX_VALUE_BITS = 1 << 20` bounds each node's integer width; `MAX_RESULT_BITS = 1 << 24` bounds vector output size; and `MAX_WORK = 1 << 28` bounds arithmetic effort. The last bound is necessary because `PowMod` may return a modulus-width answer after expensive exponentiation. It also covers full-width multiplication elsewhere in the tree and is an admission upper bound, not a planner cost estimate. `PowMod` rejects zero modulus and negative exponent, reduces a negative base into `[ 0, m )`, and returns zero for modulus one even when the exponent is zero. These rules are tested on both sides of their limits; `rsa_scale_exponentiation_is_admitted` prevents an overzealous budget from refusing ordinary work.
 
 The transport lesson is broader than integer arithmetic: a local evaluator test can pass for a query no client can send, and a correct batch can arrive with the wrong declared schema. Keep a live `GetFlightInfo` to `DoGet` test for every new result sort, alongside the independent numeric oracle and cross-language byte vector.
+
+## The numeric fold streams, and the dot product was already expressible
+
+The numeric fold now streams rather than materializing, and the structural observation that made
+the work small is that **the dot product is `fold( zip( a, b, mul ), add )`** -- already
+expressible in the existing node set, so fusing it needed no new `Expr` variant.
+
+**The claim is the allocation count, and only that.** The wall-clock claim was withheld, because
+the measurement that would support it was not taken on a host that could support it. Recording the
+withheld claim is what keeps a later session from assuming the timing exists.
+
+## A machine-integer evaluator for the narrow `Big` sort
+
+The `Big` sort evaluates entirely in `BigInt`, and at the widths callers actually request -- 4, 8,
+16, 32, 64 bits -- that costs about **8 ns an operation against 0.13 ns for the native one**, flat
+across every one of those widths. **The flatness is the tell**: both types hold such values in
+registers, so the cost is the type's own branching and its 40-byte moves rather than the arithmetic
+or any allocation. Two cheaper explanations were measured and refuted first -- a missing `#[inline]`
+on the operators ( 1.00x to 1.20x interleaved, with the opaque arm sometimes winning ) and the
+heap, which `INLINE_LIMBS = 2` already removed below 128 bits.
+
+So the machine-integer evaluator is a **parallel implementation** of the numeric evaluator, admitted
+on the usual terms: the generic one stays the oracle, and a differential test holds the two against
+each other over every node and every edge of the fast path's range. Every arm is checked --
+an overflow, a value past two limbs, a width past the machine bound, or any unimplemented node
+returns `None` and the caller evaluates the **whole** expression in `BigInt` instead. Never a
+mixture, which is what keeps the two paths from disagreeing about an intermediate.
+
+It is worth **4x on arithmetic-dominated expressions and nothing on read-dominated ones**, which
+is the honest shape: the win is in **interpretation, not arithmetic**.
+
+### The two mistakes in it
+
+- **`width_bound` is the wrong pre-filter, and the measurement said so.** It admits expressions by
+  a declared width rather than by whether the values fit, which both over-admits and under-admits.
+- A literal **allocated a limb vector per occurrence**, costing 2x on every row *including the
+  control* -- which is how it stayed invisible: a cost paid by both arms of a comparison does not
+  appear in the ratio.

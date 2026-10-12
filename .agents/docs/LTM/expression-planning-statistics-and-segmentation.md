@@ -182,3 +182,97 @@ strict prefix ordering and the exact range-end semantics; a flat cursor must
 still honor `seek`, `peek_prefix`, `next_chunk`, and cardinality equivalence.
 The over-wire request also repeats the expression in `GetFlightInfo` and
 `DoGet`, and Arrow/Flight costs remain outside this core-only profile.
+
+## Leaf planning is not the rewrite planner, and the index descent is where the cost is
+
+Two things called "the planner" were conflated in the backlog for several days, and separating
+them is what unblocked the work.
+
+- The **rewrite planner** ( `stream/plan.rs` ) carries Theorem 7's termination measure
+  `mu( e ) = ||e||`, a weighted node count on the `Expr` tree, audited arm by arm against
+  `pass_b`.
+- **Leaf planning** is `KeyStream::build_plan`'s index range scan, which resolves one key's
+  visible chunks to references.
+
+A `Big`-sorted query over many distinct keys spends most of its time in the second, measured at
+roughly **545 ns of a 953 ns element** over 1024 keys, with `KeySource` deferring the scan to a
+`OnceLock` so a measurement that times `key_expr` concludes planning is 5%. **Batching leaf plan
+construction adds no rewrite arm and changes no node count, so it cannot touch Theorem 7** --
+`stream/plan.rs` names neither `build_plan` nor `KeySource` outside one comment. The item had been
+deferred since 2026-10-07 on that conflation.
+
+### What the batched planner actually saves, in two stages
+
+Per-key planning takes the memtable read lock, takes the store lock to build a node reader, and
+descends the index from the root.
+
+**Hoisting the first two is worth tens of nanoseconds, not hundreds.** `Store::published_nodes` is
+three `Arc` clones and **no allocation**, so what sharing it removes per key is one uncontended
+mutex, one rwlock read and two refcount bumps. This was discovered by going looking for a
+load-immune witness to the change, and it reframed the work from "the fix" to a rounding error --
+an argument for wanting a witness even when nothing can be timed.
+
+**The descents are the bulk**, and `Cursor::reaim` cuts them: it re-aims at `[ key, key + 1 )` by
+resuming inside the leaf already held and descending from the root only when that leaf does not
+reach the new lower bound. One cursor per shard then serves the shard's distinct keys in ascending
+order, and since consecutive keys are adjacent in `ChunkKey` order most re-aims cost no descent.
+
+Measured as an A/B in one process, 1024 keys over 4 shards checkpointed to disk, 7 alternating
+passes, medians with ranges:
+
+| chunks per key | per-key ( ns/key ) | batched ( ns/key ) | speedup |
+|---|---:|---:|---:|
+| 4 | 693 ( 690-769 ) | 305 ( 299-349 ) | 2.27x |
+| 8 | 834 ( 832-942 ) | 436 ( 432-490 ) | 1.91x |
+| 24 | 2363 ( 2337-2557 ) | 1657 ( 1636-1874 ) | 1.43x |
+
+**The gradient is the evidence rather than the ratio**: the win falls as chunks per key rises,
+which is what `reaim` predicts -- a longer key exhausts the cursor's leaf before the next key
+begins -- and is not what noise produces. The comparison is conservative, because the batched arm
+additionally peeks a prefix per stream that the per-key arm never pays.
+
+### The leaf-reach test in `reaim` is a correctness condition
+
+It reads like a cost choice and is not. `next_leaf` resets the index to 0 and `step` compares only
+against the upper bound -- **the cursor has no lower bound anywhere** -- so a re-aim that lets an
+exhausted leaf fall through yields that leaf from its start, below the requested bound, and gives
+the next key a plan beginning with the previous key's trailing chunks. So "walk a leaf or two
+forward instead of descending" is **unsound**, not merely untuned, and nothing between
+resume-or-descend is available without teaching `step` a lower bound.
+
+### A bound borrowed from another module's test
+
+`shard_keys` and `shard_keys_limited` enumerate distinct keys by seeking past each one, which is
+what makes them `O( distinct keys )` rather than `O( chunks )`. They now share one re-aimed cursor
+-- but **nothing at those sites can guard it**: a `reaim` that advanced past nothing would
+re-report the same key, the candidate list is sorted and deduped, so the answer would be identical
+and the only symptom is the `O( chunks )` degeneration the comment forbids. Verified by sabotage,
+which fails the *planning* site's differential test and no test of key enumeration at all. The
+bound is pinned at one site and borrowed at two, and the comment says so by name.
+
+## A dead-symbol hit that was a wrong answer
+
+`ViewIntersectionCounter::recommended_strategy` appeared in the unwired sweep's dead list, and
+reading it twice -- once as "should this exist", once as "is production doing this already" --
+found something neither framing predicts. It tested `self.selected.len() * 2 < logical_end`, and
+`new` populates `selected` **only when the strategy it was handed is already `Selective`**. So it
+read a field whose existence depended on the decision it claimed to make, and returned the
+inverse of its own construction: with a filter covering 1000 of 1000 logical positions it answered
+`Selective` when built `FullScan`, and `FullScan` when built `Selective`.
+
+Nothing called it for a structural reason -- the strategy is an *argument* to `new`, so no caller
+can hold a counter before it needs the answer -- and `yesno-eval` therefore open-coded the choice
+pre-construction from `sum( filter.len() )`.
+
+The resolution is the lift: `IntersectionCountStrategy::recommend( layout, support_upper,
+logical_end )` carries the work ratio beside the type it returns, and the one open-coded site calls
+it. **The bound it takes is loose by the batch width, deliberately** -- a sum over `k` filters
+overstates their union by up to `k`, and the call site is the batch path for sibling planes of one
+key where they overlap heavily, so `FullScan` where selective traversal would have won is the
+common case there rather than a corner one. That is a safe answer rather than a good one, since
+both strategies produce identical counts; passing the exact union would select more often and is a
+measured performance question.
+
+**"Unused" and "untested" are the same condition seen from two sides.** This had returned an
+inverted recommendation for its entire existence, and nothing noticed because having no callers
+means having no tests.
