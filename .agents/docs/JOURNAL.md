@@ -6168,3 +6168,173 @@ and silently. That is a worse property than an untested invariant, because it re
   I was two lines away from relying on it for a change with the same failure mode.
 * **A borrowed invariant should be documented at both ends.** The planning test now carries a
   bound for code in another module that cannot observe it, and nothing but a comment links them.
+
+## 2026-10-12 -- Write transaction ownership: the identity already existed
+
+Took `flight-write-transaction-ownership`, which had been open since 2026-09-23 behind the
+sentence "fix this together with the connection identity the Flight surface does not yet have".
+
+### The framing was the blocker, and it was wrong twice
+
+I had declined this myself earlier in the session for the reason the entry gives: binding a
+transaction to a tonic connection breaks any client that pools or reconnects, and a proxy
+presents one connection for many callers, so connection identity is simultaneously too strict and
+too weak. That reasoning is sound and it does not matter, because **the Flight surface did not
+need a new identity concept.** `yesno-server` already authenticates -- bearer tokens, mTLS client
+certificates, kernel credentials on the local socket -- and resolves each into a `Principal` in
+the request extensions. The identity existed; it was only unreachable.
+
+Unreachable for a real reason: the dependency runs host to flight, so `yesno-flight` cannot name
+`Principal`. The fix is a one-field `CallerIdentity` that this crate owns and the host fills. Three
+interceptors populate it, through a single `attach_principal` helper rather than three call sites,
+because an interceptor that inserted the principal and forgot the identity would authenticate its
+caller and then leave that caller's transactions unowned -- a failure that reads as working.
+
+The entry was also wrong about the threat in a smaller way. It says a caller that "learns or
+guesses" a handle can take over a transaction; handles are not guessable, because `mint` hashes a
+counter through a per-service `RandomState`, which the comment beside it already recorded. The
+exposure was *learning*, which is what ownership closes.
+
+### `NotFound`, not `PermissionDenied`
+
+The refusal had to be the same answer a handle that was never begun gets. `PermissionDenied`
+confirms the handle names a live transaction, which turns a logged or guessed handle into an
+oracle for enumerating other callers' work -- a worse leak than the one being fixed, offered by
+the fix. The test asserts the code, not just the failure.
+
+### What the test had to be shaped to prove
+
+Both principals are **Admin**. That is not laziness about roles: every Flight action but `stats`
+needs Admin by default-deny, so the only way to put two callers with *identical rights* on the
+wire is two admins. With different roles the test would have passed on authorization and proved
+nothing about ownership.
+
+It takes all three refusals before asserting, as a tuple, so a partial failure names which gate
+leaked. Each gate is then independently sabotage-verified -- removing the check at commit gives
+`( Err, Ok, Err )`, at abort `( Err, Err, Ok )`, at staging `( Ok, Err, Err )`. My first version
+asserted the three separately and the sabotage stopped at the first, which told me the first gate
+was live and nothing about the other two.
+
+The last assertion is that the owner can still stage and commit afterwards. Without it the test
+would pass against an implementation that refused the intruder by poisoning or consuming the
+transaction, which refuses the attack and loses the work.
+
+### Honest limits, both recorded in the entry
+
+Ownership is exactly as strong as the authentication behind it: an unconfigured deployment
+resolves everyone to one `anonymous` principal, so every transaction has the same owner and
+ownership distinguishes nobody. And **fencing is still unmet** -- the other half of the CDC
+handoff's acceptance item 5 -- because ownership says who, not whether the leader that granted the
+transaction is still the leader.
+
+### Carry away
+
+* **"Needs a concept X does not have" is a claim to check, not a reason.** The concept existed one
+  crate away. The entry had been deferred for nineteen days, and I had deferred it again myself
+  hours earlier, on a dependency direction rather than on an absence.
+* **Choose the error code as part of the security property.** The natural code confirms the
+  resource exists, which is the leak the fix is for.
+* **Give two test subjects identical rights when testing identity.** Otherwise authorization
+  satisfies the assertion and the property under test is never exercised.
+* **Collect all the refusals, then assert.** Three separate asserts let one sabotage mask the
+  state of the other two gates.
+
+## 2026-10-12 -- The ownership scenario, and the limit that turned out to be reachable
+
+Asked whether I had enhanced the e2e scenario for write-transaction ownership, I had not. The
+Rust test in `yesno-server/tests/auth.rs` was the right first home -- `server_auth.py`'s own
+header states the division, that `auth.rs` pins the grid while a scenario varies the *deployment*
+-- but that division is also what the scenario was missing, because the interesting half of
+ownership is a deployment property.
+
+### Checking whether my own documented limit was real
+
+I had written, in the entry and in the host-side rustdoc, that ownership is only as strong as the
+authentication behind it: an unconfigured deployment resolves everyone to one `anonymous`
+principal, so ownership distinguishes nobody. Going to pin it, I nearly found the opposite.
+`srv_anonymous` offers only `none` and `read`, and every Flight action but `stats` needs Admin by
+default-deny -- so an anonymous caller can never open a write transaction, and the limit would
+have been **vacuous**.
+
+It is not, for a reason one level down: `Principal::may` returns `true` unconditionally when
+`unconfigured`, which is the state of a deployment with no principals configured at all. So such a
+caller is `anonymous` *with full rights*, can open a transaction, and shares its name with every
+other caller. Two unrelated clients own each other's transactions. The limit is real, reachable,
+and now asserted rather than claimed -- including the line saying it is not a bug to fix there,
+because `second` genuinely *is* `first` as far as the server can tell.
+
+Worth noting what the check cost: had `may` not had that early return, I would have published a
+documented limitation that cannot occur, which is its own kind of wrong -- a caveat that makes a
+reader defend against nothing.
+
+### The surface had no scenario coverage at all
+
+No scenario drove begin, stage, commit or abort; `archive.py` only mentions the word. So four
+verbs are new -- `flight_txn_begin`, `_stage`, `_commit`, `_abort` -- and they reach the rest of
+that surface too: the row and container caps, the poison-on-partial-staging rule, the reclaim
+deadline, none of which a scenario could express before. `flight_txn_stage` uses the **mutation**
+wire rather than the pair wire, because a transaction carries its operation per row; the Rust test
+had to learn the same thing the hard way, through an `InvalidArgument` I first read as a malformed
+descriptor.
+
+### Carry away
+
+* **Pin a documented limitation, or find out it cannot happen.** Mine was one `if` away from
+  unreachable, and a caveat that cannot occur is worse than no caveat: it directs attention at a
+  threat that is not there.
+* **A division of labour in a header is also a list of what is missing.** `server_auth.py` said
+  scenarios exist to vary the deployment, which is exactly the thing my Rust test could not do,
+  and reading that sentence is what identified the gap.
+* **Check `--list`-style invariants when adding verbs.** `every_verb_has_a_caller_in_some_scenario`
+  and `every_advertised_verb_is_dispatched` both have to hold, and a verb added for a future
+  scenario would fail the first.
+
+## 2026-10-12 -- A gate failure that was not mine, attributed without re-rolling
+
+`scripts/gate.sh` failed on the ownership change with
+`a_staggered_checkpoint_persists_what_an_unstaggered_one_does` panicking
+`AlreadyOpen( "/tmp/yesno-db-<pid>-ckpt-plain" )` at its **reopen**, immediately after dropping
+the handle it had just checkpointed through.
+
+Filed as `a-dropped-db-may-not-have-released-its-flock`, deliberately as a possible **product**
+defect rather than a flaky test: `Db::open` takes a non-blocking exclusive `flock` and dropping
+the handle is the only release, so if the lock can outlive the handle then a close-then-reopen --
+a legal sequence -- fails for any caller, and this test is currently the only thing reporting it.
+The entry says not to repair it by retrying the open, which is the one fix that greens the gate
+and hides the bug.
+
+### Attributing it without re-running until green
+
+The temptation was to re-run and move on. What settled it instead was reachability: everything
+this change touched -- `shard_keys`, `shard_keys_limited`, `build_plans`, `KeyStream::batch`,
+`Cursor::reaim` -- is reachable only from key enumeration and `KeyLanes`, and the failing line is
+a `Db::open` that **precedes** all of them in that iteration. The first call that could reach my
+code is the `snap.load` after the line that failed. The same test had also passed in three gate
+runs that already contained those changes.
+
+Then a rate, because structure alone does not say how often: 0 in 3 `cargo test --workspace`, 0 in
+6 `cargo test -p yesno-core --lib`, 0 in 5 of the test alone. Twelve attempts, no reproduction.
+
+### The detail that would have wasted an hour
+
+`cargo test -p yesno-core --lib` runs **991** tests; the binary that failed ran **1000**.
+`cargo test --workspace` unifies features across the workspace, so yesno-core compiles with
+features its own crate-scoped run does not enable -- a different binary, different parallelism.
+I had five clean isolated runs before noticing the count mismatch, and all five were of the wrong
+thing. The "990 filtered out" line in the output is what gave it away.
+
+I also recorded a confound against myself rather than only the exculpating evidence: this session
+added two daemon launches to `server_auth.py`, which raises the concurrent work in a workspace
+run and could widen a pre-existing window without causing it.
+
+### Carry away
+
+* **Check the test count before trusting a clean re-run.** Two commands that name the same test
+  can build different binaries; feature unification under `--workspace` is enough to change the
+  suite, and an isolated pass against the wrong binary is worse than no evidence because it reads
+  as exoneration.
+* **File a flake by its worst plausible reading.** "The test reopens too eagerly" and "a dropped
+  handle can keep its lock" produce the same red line and completely different repairs, and only
+  one of them is a bug a user can hit.
+* **Say what would make the finding wrong.** The added daemon launches are the confound; leaving
+  it out would have made the attribution look stronger than it is.
