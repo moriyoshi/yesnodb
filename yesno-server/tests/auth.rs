@@ -225,6 +225,160 @@ async fn try_action(c: &mut Client, name: &str) -> Result<(), Code> {
     }
 }
 
+/// One action with a body, returning its first response payload.
+async fn action_with_body(c: &mut Client, name: &str, body: Vec<u8>) -> Result<Vec<u8>, Code> {
+    match c
+        .do_action(Action {
+            r#type: name.into(),
+            body: body.into(),
+        })
+        .await
+    {
+        Err(e) => Err(e.code()),
+        Ok(resp) => {
+            let mut s = resp.into_inner();
+            let mut out = Vec::new();
+            while let Some(r) = s.next().await {
+                match r {
+                    Err(e) => return Err(e.code()),
+                    Ok(v) => {
+                        if out.is_empty() {
+                            out = v.body.to_vec();
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Stage one row into an open transaction, by handle.
+async fn try_stage(c: &mut Client, handle: u64) -> Result<(), Code> {
+    // A transaction stages the mutation wire: the op travels with the row, so
+    // one transaction can insert and remove.
+    let schema = yesno_flight::mutations_schema();
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(arrow_array::UInt64Array::new(vec![1u64].into(), None)),
+            std::sync::Arc::new(arrow_array::UInt64Array::new(vec![9u64].into(), None)),
+            std::sync::Arc::new(arrow_array::UInt64Array::new(vec![9u64].into(), None)),
+            std::sync::Arc::new(arrow_array::UInt8Array::new(
+                vec![yesno_flight::OP_INSERT].into(),
+                None,
+            )),
+        ],
+    )
+    .unwrap();
+    let mut cmd = yesno_flight::PUT_TXN_PREFIX.to_vec();
+    cmd.extend_from_slice(&handle.to_le_bytes());
+    let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(cmd)))
+        .build(futures::stream::iter(vec![Ok(batch)]))
+        .map(|r| r.unwrap());
+    match c.do_put(input).await {
+        Err(e) => Err(e.code()),
+        Ok(resp) => {
+            let mut s = resp.into_inner();
+            while let Some(r) = s.next().await {
+                if let Err(e) = r {
+                    return Err(e.code());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A write transaction belongs to the principal that opened it.
+///
+/// **A bound is not an owner.** The caps on open transactions, staged rows and
+/// the reclaim deadline limit what a stranger holding a handle can do; they do
+/// not stop it. Before ownership, any caller that learned a handle -- from a
+/// log, a proxy, or the `do_put` descriptor it rides in -- could stage into,
+/// commit or abort someone else's transaction.
+///
+/// The two principals hold **identical** rights -- both Admin, which is what
+/// every action but `stats` needs by default-deny -- so this isolates
+/// ownership from authorization. Neither is refused because of what it may do;
+/// one is refused because of whose transaction it is.
+///
+/// The refusal is `NotFound` rather than `PermissionDenied` on purpose, and the
+/// test asserts which: `PermissionDenied` would confirm the handle names a live
+/// transaction, turning a guessed or logged handle into an oracle for
+/// enumerating other callers' work. A stranger gets the answer a handle that
+/// was never begun gets.
+///
+/// The last assertion is the one that matters most: after the intruder's three
+/// attempts the owner's own commit still succeeds, so the attempts did not
+/// poison, consume or expire what they could not take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_transaction_belongs_to_the_principal_that_opened_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path(), Anonymous::None);
+    // A second admin, so the pair differs only in identity. Added here rather
+    // than in the shared `config` so no other test's grid changes.
+    cfg.auth
+        .principals
+        .push(principal("admin2", PrincipalRole::Admin, "a2-tok"));
+    let running = yesno_server::start(&cfg).await.unwrap();
+    let addr = running.flight_addr;
+
+    let mut owner = client(addr, Some("a-tok")).await;
+    let mut intruder = client(addr, Some("a2-tok")).await;
+
+    let handle = action_with_body(&mut owner, yesno_flight::ACTION_BEGIN_WRITE, Vec::new())
+        .await
+        .expect("an admin may open a transaction");
+    assert_eq!(handle.len(), 8, "begin_write returns an 8-byte handle");
+    let id = u64::from_le_bytes(handle.clone().try_into().unwrap());
+
+    // The intruder holds the handle and has the same rights as the owner.
+    // All three taken before asserting, so a partial failure names which of
+    // the three gates leaked instead of stopping at the first.
+    let staged = try_stage(&mut intruder, id).await;
+    let committed = action_with_body(
+        &mut intruder,
+        yesno_flight::ACTION_COMMIT_WRITE,
+        handle.clone(),
+    )
+    .await
+    .map(|_| ());
+    let aborted = action_with_body(
+        &mut intruder,
+        yesno_flight::ACTION_ABORT_WRITE,
+        handle.clone(),
+    )
+    .await
+    .map(|_| ());
+    assert_eq!(
+        (staged, committed, aborted),
+        (
+            Err(Code::NotFound),
+            Err(Code::NotFound),
+            Err(Code::NotFound)
+        ),
+        "an intruder reached another principal's transaction ( stage, commit, abort )"
+    );
+
+    // Untouched: the owner can still stage and commit.
+    try_stage(&mut owner, id)
+        .await
+        .expect("the owner may still stage after the intruder's attempts");
+    let version = action_with_body(&mut owner, yesno_flight::ACTION_COMMIT_WRITE, handle)
+        .await
+        .expect("the owner may still commit after the intruder's attempts");
+    assert_eq!(version.len(), 8);
+    assert!(
+        u64::from_le_bytes(version.try_into().unwrap()) > 0,
+        "the commit reported no version"
+    );
+
+    running.shutdown().await;
+}
+
 async fn try_checkpoint(c: &mut ControlClient) -> Result<(), Code> {
     c.checkpoint(yesno_server::control::pb::CheckpointRequest {})
         .await

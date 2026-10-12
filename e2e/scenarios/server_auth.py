@@ -32,6 +32,8 @@ srv_principal(cfg, "analytics", "reader", "r-tok")
 srv_principal(cfg, "loader", "writer", "w-tok")
 srv_principal(cfg, "ops", "admin", "a-tok")
 srv_principal(cfg, "standby-b", "replica", "s-tok")
+# A second administrator, so one pair of callers differs only in identity.
+srv_principal(cfg, "ops-b", "admin", "a2-tok")
 srv_anonymous(cfg, "none")
 srv_control_admin(cfg, "ops")
 srv = srv_launch(cfg)
@@ -101,6 +103,54 @@ assert "Unauthenticated" in msg, msg
 # is asserting an identity; turning that into "some of your requests work" is
 # far harder to diagnose than a refusal.
 assert "unknown bearer token" in msg, msg
+
+# ---- a write transaction belongs to the principal that opened it
+#
+# Both callers here are administrators, so this is ownership and not
+# authorization: each is allowed every operation it attempts, and one is
+# refused only because of whose transaction it is.
+ops_b = srv_flight_as(srv, "a2-tok")
+txn = flight_txn_begin(admin)
+assert flight_txn_stage(admin, txn, [9], [1]) == 1
+
+# `NotFound`, not `PermissionDenied`: a stranger must not learn that the handle
+# names a live transaction, or a logged handle becomes a way to enumerate other
+# callers' work.
+for attempt, why in [
+    (lambda: flight_txn_stage(ops_b, txn, [9], [2]), "stage into"),
+    (lambda: flight_txn_commit(ops_b, txn), "commit"),
+    (lambda: flight_txn_abort(ops_b, txn), "abort"),
+]:
+    msg = refused(attempt, "an administrator could " + why + " another's transaction")
+    assert "NotFound" in msg, msg
+
+# And the attempts took nothing: the owner still commits its own work.
+assert flight_txn_commit(admin, txn) > 0
+assert flight_get(admin, 9) == [1]
+
+t = srv_stop(srv)
+assert t["clean"] is True, t
+
+# ---- the deployment where ownership distinguishes nobody
+#
+# **The honest limit, pinned so it is not mistaken for isolation.** Ownership is
+# exactly as strong as the authentication behind it. With no principals
+# configured at all, `Principal::may` returns true for everything and every
+# caller resolves to the one `anonymous` name -- so two unrelated clients own
+# each other's transactions, and the caps on open transactions and staged rows
+# are the only defences left. A reader who saw "transactions are owned" and
+# deployed without principals would get none of it.
+cfg = srv_config("opennode", shards=1)
+srv = srv_launch(cfg)
+first = srv_flight(srv)
+second = srv_flight(srv)
+
+txn = flight_txn_begin(first)
+assert flight_txn_stage(first, txn, [3], [7]) == 1
+# Not a bug, and not something to fix here: `second` *is* `first` as far as the
+# server can tell.
+assert flight_txn_commit(second, txn) > 0
+assert flight_get(first, 3) == [7]
 
 t = srv_stop(srv)
 assert t["clean"] is True, t

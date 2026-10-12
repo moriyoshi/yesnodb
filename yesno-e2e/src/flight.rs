@@ -58,6 +58,10 @@ pub const OWNS: &[&str] = &[
     "flight_ticket",
     "flight_fetch",
     "flight_put",
+    "flight_txn_begin",
+    "flight_txn_stage",
+    "flight_txn_commit",
+    "flight_txn_abort",
     "flight_action",
     "flight_actions",
     "flight_expect_term",
@@ -207,6 +211,38 @@ fn query_result(total_records: u64, rows: Vec<u64>) -> MontyObject {
 }
 
 impl World {
+    /// One `do_action` against a Flight endpoint, returning its raw body.
+    ///
+    /// Shared by the three transaction verbs rather than inlined three times:
+    /// each differs only in the action name and the body, and a copy that
+    /// drifted would be a scenario reading a different wire than its siblings.
+    fn txn_action(
+        &mut self,
+        verb: &str,
+        h: usize,
+        name: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, MontyException> {
+        let rt = self.rt_handle(verb)?;
+        let ep = self.endpoint(h, verb)?;
+        rt.block_on(async {
+            let mut s = ep
+                .client
+                .do_action(ep.req(Action {
+                    r#type: name.to_owned(),
+                    body: body.into(),
+                }))
+                .await?
+                .into_inner();
+            let mut out = Vec::new();
+            while let Some(r) = s.next().await {
+                out.extend_from_slice(&r?.body);
+            }
+            Ok::<_, tonic::Status>(out)
+        })
+        .map_err(|e| grpc_err(verb, e))
+    }
+
     fn endpoint(&mut self, h: usize, verb: &str) -> Result<&mut Endpoint, MontyException> {
         let i = self.slot(h, HandleKind::Flight, verb)?;
         self.flight.endpoints[i]
@@ -675,6 +711,136 @@ impl World {
                         "{verb}(): sent {n} pairs and the server acknowledged {rows}"
                     )));
                 }
+                Ok(int_obj(rows))
+            }
+
+            // ---- write transactions
+            //
+            // The surface had no scenario coverage at all before these: the
+            // row caps, the poisoning semantics, the reclaim deadline and
+            // ownership were each pinned only by a Rust test. A scenario can
+            // vary the *deployment* -- which principals exist, whether
+            // anonymous access is allowed -- and that is what ownership's
+            // strength actually depends on.
+            //
+            // A handle is an opaque integer to a scenario. It is the server's
+            // to mint and the scenario's only to pass back, which is why these
+            // return and accept a plain `int` and never decode it.
+            "flight_txn_begin" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let h = a.handle(0)?;
+                let body =
+                    self.txn_action(verb, h, yesno_flight::ACTION_BEGIN_WRITE, Vec::new())?;
+                let bytes: [u8; 8] = body.as_slice().try_into().map_err(|_| {
+                    value_err(format!(
+                        "{verb}(): begin_write returned {} bytes, expected an 8-byte handle",
+                        body.len()
+                    ))
+                })?;
+                Ok(int_obj(u64::from_le_bytes(bytes)))
+            }
+
+            "flight_txn_commit" => {
+                a.exact(2)?;
+                a.no_kwargs()?;
+                let h = a.handle(0)?;
+                let txn = a.u64(1)?;
+                let body = self.txn_action(
+                    verb,
+                    h,
+                    yesno_flight::ACTION_COMMIT_WRITE,
+                    txn.to_le_bytes().to_vec(),
+                )?;
+                let bytes: [u8; 8] = body.as_slice().try_into().map_err(|_| {
+                    value_err(format!(
+                        "{verb}(): commit_write returned {} bytes, expected a version",
+                        body.len()
+                    ))
+                })?;
+                Ok(int_obj(u64::from_le_bytes(bytes)))
+            }
+
+            "flight_txn_abort" => {
+                a.exact(2)?;
+                a.no_kwargs()?;
+                let h = a.handle(0)?;
+                let txn = a.u64(1)?;
+                self.txn_action(
+                    verb,
+                    h,
+                    yesno_flight::ACTION_ABORT_WRITE,
+                    txn.to_le_bytes().to_vec(),
+                )?;
+                Ok(int_obj(0))
+            }
+
+            "flight_txn_stage" => {
+                a.exact(4)?;
+                a.no_kwargs()?;
+                let h = a.handle(0)?;
+                let txn = a.u64(1)?;
+                let keys = a.u64_list(2)?;
+                let ords = a.u64_list(3)?;
+                if keys.len() != ords.len() {
+                    return Err(value_err(format!(
+                        "{verb}(): {} keys and {} ordinals; staging takes pairs, so the \
+                         lists must be the same length",
+                        keys.len(),
+                        ords.len()
+                    )));
+                }
+                if keys.is_empty() {
+                    return Err(value_err(format!("{verb}(): nothing to stage")));
+                }
+                let n = keys.len();
+                let rt = self.rt_handle(verb)?;
+                let ep = self.endpoint(h, verb)?;
+
+                // The **mutation** wire, not the pair wire: a transaction can
+                // insert and remove, so the operation travels with the row.
+                // This verb stages insertions.
+                let schema = yesno_flight::mutations_schema();
+                let ops = vec![yesno_flight::OP_INSERT; n];
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt64Array::new(keys.into(), None)),
+                        Arc::new(UInt64Array::new(ords.clone().into(), None)),
+                        Arc::new(UInt64Array::new(ords.into(), None)),
+                        Arc::new(arrow_array::UInt8Array::new(ops.into(), None)),
+                    ],
+                )
+                .map_err(|e| db_err(verb, e))?;
+                let mut cmd = yesno_flight::PUT_TXN_PREFIX.to_vec();
+                cmd.extend_from_slice(&txn.to_le_bytes());
+                let input = arrow_flight::encode::FlightDataEncoderBuilder::new()
+                    .with_schema(schema)
+                    .with_flight_descriptor(Some(arrow_flight::FlightDescriptor::new_cmd(cmd)))
+                    .build(futures::stream::iter(vec![Ok(batch)]))
+                    .map(|r| r.expect("a locally built batch encodes"));
+
+                let rows = rt.block_on(async {
+                    let mut acked = ep
+                        .client
+                        .do_put(ep.req(input))
+                        .await
+                        .map_err(|e| grpc_err(verb, e))?
+                        .into_inner();
+                    let mut rows = 0u64;
+                    while let Some(r) = acked.next().await {
+                        let r = r.map_err(|e| grpc_err(verb, e))?;
+                        let md = r.app_metadata.as_ref();
+                        if !matches!(md.len(), 8 | 16) {
+                            return Err(value_err(format!(
+                                "{verb}(): staging acknowledgement has {} bytes, expected 8 or 16",
+                                md.len()
+                            )));
+                        }
+                        rows = u64::from_le_bytes(md[..8].try_into().unwrap());
+                    }
+                    Ok::<_, MontyException>(rows)
+                })?;
                 Ok(int_obj(rows))
             }
 

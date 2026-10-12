@@ -1035,6 +1035,15 @@ struct PendingWrite {
     /// row total cannot bound the memory and the byte total cannot bound the work.
     container_bytes: u64,
     deadline: std::time::Instant,
+    /// Who opened this transaction, when the host said. See [`CallerIdentity`].
+    ///
+    /// **A bound is not an owner**, which is what this closes. The caps on open
+    /// transactions, staged rows and the reclaim deadline limit how much damage
+    /// a stranger with a handle can do; they do not stop it. Any caller that
+    /// learned a handle -- from a log, a proxy, or the `do_put` descriptor it
+    /// travels in -- could stage into, commit or abort someone else's
+    /// transaction.
+    owner: Option<CallerIdentity>,
     /// Why this transaction may no longer be committed, if it may not.
     ///
     /// **A staging call is atomic per record batch, not per call**, and that
@@ -1110,6 +1119,53 @@ impl Drop for StagingGuard {
     }
 }
 
+/// Who the host says is calling, for requests where it knows.
+///
+/// This crate authenticates nobody. The host that mounts the service does --
+/// `yesno-server` resolves a bearer token, an mTLS client certificate or a
+/// kernel-authenticated local peer into a principal -- and it puts the name
+/// here, in the request extensions, so that a service which cannot depend on
+/// the host's types can still tell two callers apart. The dependency runs
+/// host -> flight, so the name has to be carried in a type this crate owns.
+///
+/// **Absence means the host established no identity, not that the caller is
+/// anonymous.** A deployment with no authentication configured never inserts
+/// one, and write transactions opened without an identity are unowned and
+/// behave exactly as they did before ownership existed. That is deliberate:
+/// the alternative is refusing every write on an unauthenticated service.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallerIdentity(pub std::sync::Arc<str>);
+
+/// The caller's identity, if the host established one.
+#[cfg(feature = "server")]
+fn caller_of<T>(request: &Request<T>) -> Option<CallerIdentity> {
+    request.extensions().get::<CallerIdentity>().cloned()
+}
+
+/// Refuse a caller that does not own this transaction.
+///
+/// `not_found` rather than `permission_denied`, and the distinction is the
+/// point: a stranger holding a handle must not learn whether it names a live
+/// transaction. `permission_denied` confirms the handle is real, which turns a
+/// guessed or logged handle into an oracle for enumerating other callers'
+/// work. The message is the same one a handle that was never begun gets.
+#[cfg(feature = "server")]
+fn check_owner(
+    id: u64,
+    owner: Option<&CallerIdentity>,
+    caller: Option<&CallerIdentity>,
+) -> Result<(), Status> {
+    match owner {
+        // Opened without an identity: unowned, and nothing to enforce.
+        None => Ok(()),
+        Some(owner) if caller == Some(owner) => Ok(()),
+        Some(_) => Err(Status::not_found(format!(
+            "write transaction {id} is not open; it was never begun, was aborted, or expired"
+        ))),
+    }
+}
+
 /// Open transactions, plus a bounded memory of committed ones.
 #[cfg(feature = "server")]
 #[derive(Default)]
@@ -1119,7 +1175,11 @@ struct WriteTransactions {
     /// first. Makes `commit` idempotent **within one live service**: a prompt
     /// retry after a lost response finds its own outcome instead of a missing
     /// transaction. See [`COMMIT_MEMORY`] for what this does not promise.
-    committed: std::collections::VecDeque<(u64, u64)>,
+    ///
+    /// The owner is remembered with the outcome so that the idempotent replay
+    /// below is idempotent *for its own caller* and a stranger holding the
+    /// handle is refused rather than told which version it committed at.
+    committed: std::collections::VecDeque<(u64, u64, Option<CallerIdentity>)>,
     counter: u64,
     /// Randomly seeded per service, which is what keeps handles from repeating
     /// across a restart.
@@ -1157,7 +1217,7 @@ impl WriteTransactions {
             // free to exclude -- simply draws again.
             if id != 0
                 && !self.open.contains_key(&id)
-                && !self.committed.iter().any(|&(t, _)| t == id)
+                && !self.committed.iter().any(|(t, _, _)| *t == id)
             {
                 return id;
             }
@@ -1186,7 +1246,11 @@ impl YesnoFlightService {
     }
 
     /// Take exclusive staging rights on an open transaction.
-    fn claim_staging(&self, id: u64) -> Result<StagingGuard, Status> {
+    fn claim_staging(
+        &self,
+        id: u64,
+        caller: Option<&CallerIdentity>,
+    ) -> Result<StagingGuard, Status> {
         let mut w = self
             .writes
             .lock()
@@ -1195,6 +1259,10 @@ impl YesnoFlightService {
             .open
             .get_mut(&id)
             .ok_or_else(|| Status::not_found(format!("write transaction {id} is not open")))?;
+        // Before the deadline sweep and before `staging` is claimed: a
+        // stranger must not be able to learn that a handle is live, nor to
+        // poison a transaction by dropping a stream it never owned.
+        check_owner(id, tx.owner.as_ref(), caller)?;
         if std::time::Instant::now() > tx.deadline {
             w.open.remove(&id);
             return Err(Status::deadline_exceeded(format!(
@@ -1993,6 +2061,9 @@ impl FlightService for YesnoFlightService {
         self.requests
             .do_puts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Taken before `into_inner`, which drops the extensions the host put
+        // the identity in.
+        let caller = caller_of(&r);
         // The mode rides on the **first message's** descriptor, and reading it
         // means peeking the stream before handing it to the decoder — a
         // `FlightRecordBatchStream` consumes the descriptor without exposing it.
@@ -2037,7 +2108,7 @@ impl FlightService for YesnoFlightService {
 
         // Claimed for the whole stream, released by the guard however it ends.
         let mut _staging = match mode {
-            PutMode::Txn(id) => Some(self.claim_staging(id)?),
+            PutMode::Txn(id) => Some(self.claim_staging(id, caller.as_ref())?),
             _ => None,
         };
 
@@ -2246,6 +2317,9 @@ impl FlightService for YesnoFlightService {
         &self,
         r: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
+        // Taken before `into_inner`, which drops the extensions the host put
+        // the identity in.
+        let caller = caller_of(&r);
         let a = r.into_inner();
         tracing::Span::current().record("action", a.r#type.as_str());
         let body: Vec<u8> = match a.r#type.as_str() {
@@ -2281,6 +2355,7 @@ impl FlightService for YesnoFlightService {
                         ops: 0,
                         container_bytes: 0,
                         poisoned: None,
+                        owner: caller.clone(),
                         deadline: now + self.write_ttl,
                         staging: false,
                     },
@@ -2302,7 +2377,11 @@ impl FlightService for YesnoFlightService {
                     // rather than committing a second time. This is the
                     // property a CDC pipe needs to resume after an ambiguous
                     // network failure without risking double application.
-                    if let Some(&(_, version)) = w.committed.iter().find(|&&(tx, _)| tx == id) {
+                    if let Some((_, version, owner)) =
+                        w.committed.iter().find(|(tx, _, _)| *tx == id)
+                    {
+                        let version = *version;
+                        check_owner(id, owner.as_ref(), caller.as_ref())?;
                         tracing::debug!(
                             transaction = id,
                             version,
@@ -2323,6 +2402,7 @@ impl FlightService for YesnoFlightService {
                              aborted, or expired"
                         ))
                     })?;
+                    check_owner(id, tx.owner.as_ref(), caller.as_ref())?;
                     if let Some(why) = &tx.poisoned {
                         return Err(Status::failed_precondition(format!(
                             "write transaction {id} cannot be committed: {why}. Abort it \
@@ -2343,6 +2423,7 @@ impl FlightService for YesnoFlightService {
                     w.open.remove(&id).expect("checked above")
                 };
 
+                let taken_owner = taken.owner.clone();
                 let rows = taken.rows;
                 let batch = taken.batch;
                 let span = tracing::Span::current();
@@ -2358,7 +2439,7 @@ impl FlightService for YesnoFlightService {
                         .writes
                         .lock()
                         .map_err(|_| Status::internal("write transaction table poisoned"))?;
-                    w.committed.push_back((id, version));
+                    w.committed.push_back((id, version, taken_owner));
                     while w.committed.len() > COMMIT_MEMORY {
                         w.committed.pop_front();
                     }
@@ -2382,10 +2463,15 @@ impl FlightService for YesnoFlightService {
                 // Aborting something already committed is an error, not a
                 // no-op: the caller believes nothing was applied, and a
                 // version exists that says otherwise.
-                if let Some(&(_, version)) = w.committed.iter().find(|&&(tx, _)| tx == id) {
+                if let Some((_, version, owner)) = w.committed.iter().find(|(tx, _, _)| *tx == id) {
+                    let version = *version;
+                    check_owner(id, owner.as_ref(), caller.as_ref())?;
                     return Err(Status::failed_precondition(format!(
                         "write transaction {id} already committed at version {version}"
                     )));
+                }
+                if let Some(tx) = w.open.get(&id) {
+                    check_owner(id, tx.owner.as_ref(), caller.as_ref())?;
                 }
                 // An unknown transaction is *not* an error. It was aborted, or
                 // it expired, and either way the caller's intent -- that none of

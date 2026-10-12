@@ -417,6 +417,27 @@ impl Authenticator {
     }
 }
 
+/// Attach the principal, and the identity the Flight service reads from it.
+///
+/// Both, from one place, because they must not diverge. `yesno-flight` cannot
+/// name [`Principal`] -- the dependency runs host to flight -- so write
+/// transaction ownership reads a [`yesno_flight::CallerIdentity`] instead, and
+/// an interceptor that inserted only the principal would authenticate its
+/// caller and then leave that caller's transactions unowned. A fourth
+/// interceptor added later gets both by calling this.
+///
+/// **Ownership is exactly as strong as the authentication behind it.** An
+/// unconfigured deployment resolves every caller to the one `anonymous`
+/// principal, so every transaction has the same owner and ownership
+/// distinguishes nobody -- which is the honest position for a service that
+/// authenticates nobody, and leaves the caps on open transactions and staged
+/// rows as the only defences. Configure principals and it separates them.
+fn attach_principal(req: &mut Request<()>, p: Principal) {
+    req.extensions_mut()
+        .insert(yesno_flight::CallerIdentity(Arc::clone(&p.name)));
+    req.extensions_mut().insert(p);
+}
+
 /// The interceptor tonic installs. Resolves a [`Principal`] into the request's
 /// extensions, where Flight guards or the shared-endpoint authorizer read it.
 pub fn interceptor(
@@ -424,7 +445,7 @@ pub fn interceptor(
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone {
     move |mut req: Request<()>| {
         let p = auth.resolve(&req)?;
-        req.extensions_mut().insert(p);
+        attach_principal(&mut req, p);
         Ok(req)
     }
 }
@@ -441,7 +462,7 @@ pub fn host_interceptor(
     };
     move |mut req: Request<()>| {
         let p = auth.resolve(&req)?;
-        req.extensions_mut().insert(p);
+        attach_principal(&mut req, p);
         req.extensions_mut().insert(channel);
         Ok(req)
     }
@@ -458,11 +479,14 @@ pub fn local_interceptor() -> impl FnMut(Request<()>) -> Result<Request<()>, Sta
             .get::<crate::local_transport::LocalConnectInfo>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("the local peer has no kernel credentials"))?;
-        req.extensions_mut().insert(Principal {
-            name: Arc::from(format!("uid:{}", info.uid)),
-            role: PrincipalRole::Replica,
-            unconfigured: false,
-        });
+        attach_principal(
+            &mut req,
+            Principal {
+                name: Arc::from(format!("uid:{}", info.uid)),
+                role: PrincipalRole::Replica,
+                unconfigured: false,
+            },
+        );
         req.extensions_mut().insert(AuthzChannel::Local);
         if info.privileged_snapshot_agent {
             req.extensions_mut().insert(SnapshotAgentCredential);
