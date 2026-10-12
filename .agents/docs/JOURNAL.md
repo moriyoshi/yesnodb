@@ -6444,3 +6444,58 @@ only, spawns nothing, clones no `Arc`.
   this morning, reached from the opposite direction.
 * **A wrong reproduce command in a backlog entry is worse than none.** It transfers the author's
   dead end to the next reader with the authority of a recorded fact.
+
+## 2026-10-12 -- The load average was the wrong instrument, and the planner fix is 1.43x to 2.27x
+
+I had declined to measure the batched planner three times today, each time citing "load average
+29-32 on 20 cores". That reading was worthless on this host and I should have checked it sooner.
+
+### 21 processes wedged for 87 days
+
+Load average counts runnable **and** uninterruptible processes. This host carries 21 in `D`
+state -- almost all `root`-owned `sync`, plus three `fsyncg`, aged 5.3 to 7.5 million seconds
+against a 97-day uptime. They are 62 to 87 days old, they consume nothing, and they never leave,
+so the load average has a permanent floor near 28 that says nothing about contention. The
+readings that actually moved were per-core idle ( 99%, so under a fifth of one core of foreign
+work ) and the disk half ( `bi + bo` at 8/0 and 76/0 ), which is exactly the pair QG section 4
+prescribes and exactly what I was not looking at.
+
+The irony is that QG's own bullet on this says a host-wide mean has the wrong *resolution* --
+and I generalised that into distrusting the host-wide numbers while trusting a load average that
+is not a contention measure at all.
+
+### The measurement, and why it is an A/B rather than a re-run
+
+The entry's table is per element and mixes planning with the read. Re-running it would have
+compared against numbers taken on another day. So instead: two arms in one process, alternating,
+differing in exactly what changed --
+
+```text
+  chunks/key    A per-key      B batched      speedup
+      4        693 (690-769)  305 (299-349)    2.27x
+      8        834 (832-942)  436 (432-490)    1.91x
+     24       2363(2337-2557) 1657(1636-1874)  1.43x
+```
+
+A is `for k in keys { snap.key_stream( k ) }`; B is `KeyLanes::new( &snap, &keys )`. Both public,
+both yielding N streams, 1024 keys over 4 shards checkpointed to disk, 7 passes, fresh snapshot
+per pass because a `KeySource` caches its plan.
+
+**The gradient is the evidence, not the ratio.** The win falls as chunks per key rises, which is
+what `reaim` predicts -- a longer key exhausts the cursor's leaf before the next key starts, so it
+resumes less and re-descends more -- and is not what noise produces. Ranges do not overlap between
+arms at any width. And it is conservative: `KeyLanes::new` additionally calls `peek_prefix` on
+every stream, which arm A never pays, so B does strictly more work and still wins.
+
+### Carry away
+
+* **Know what the instrument measures before trusting it to block work.** Load average includes
+  `D`-state processes, so on a host with something permanently stuck it is a constant, not a
+  signal. Three deferrals rested on it.
+* **Measure the change, not the entry's table.** The table mixed planning with reads and belonged
+  to another day; an A/B in one process isolates the thing that changed and needs no cross-day
+  comparison, which is what the project's rule about stating the set is really protecting.
+* **A gradient beats a ratio.** One speedup number invites "is that noise?". Three widths whose
+  speedups move the way the mechanism predicts answer it without another run.
+* **Prefer the arm that does more work.** B pays for a `peek_prefix` per stream that A does not,
+  so the measured win understates the change rather than flattering it.
