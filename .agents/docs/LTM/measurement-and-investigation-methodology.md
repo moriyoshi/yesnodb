@@ -57,8 +57,17 @@ Performance and correctness investigations in this repository are designed to di
 - Black-box the **operands**, not the result, or the timed call hoists out of the loop and the measurement tracks inlining in unrelated modules.
 - A timing guard's scope is its enclosing block; end a probe explicitly at the expression it is named for.
 - **Reproducibility is not validity.** Three tight repetitions of a differently-constructed experiment read exactly like a regression; re-derive the construction of the number being compared against before believing a gap.
-- A sweep's **shape** ( monotonicity over many points ) is far more durable than its **headline ratio**, which is usually taken between the two noisiest endpoints. Date a noisy ratio's citations rather than overwriting them.
+- A sweep's **shape** ( monotonicity over many points ) is far more durable than its **headline ratio**, which is usually taken between the two noisiest endpoints. Date a noisy ratio's citations rather than overwriting them. The constructive form: when a change's speedup is expected to vary with a parameter, **measure the gradient and check it moves the way the mechanism predicts**. One ratio invites "is that noise"; three points whose trend matches the mechanism answer it without another run.
 - Emulation ( `qemu` ) establishes correctness and **inverts** throughput verdicts. See [SIMD Arch Arms and Kernel Selection](./simd-arch-arms-and-kernel-selection.md).
+- **Load average is not a contention measure.** It counts uninterruptible ( `D` ) processes as well as runnable ones, so one host carrying 21 wedged `sync` and `fsyncg` processes aged 62 to 87 days holds a permanent floor near 28 that never falls and says nothing about current load. Per-core idle and the disk half ( `bi + bo` ) are the readings that move. Three separate deferrals of a measurement rested on the load average alone.
+- **A quiet check must be per-core over the cores the measurement uses, count only foreign work, and be sampled at both edges.** A host-wide mean has resolution `1/ncores`, so on 20 cores a fully busy co-tenant costs five points of idle and a 95% reading passes an 85% threshold while a pinned worker has been lost.
+- **Reproduce the failing binary; do not infer it from the feature list.** Feature unification is **not monotonic** in the test count -- one crate ran 991 tests at default, 1004 with `tracing`, and 1000 under `--features jit` -- so "more features, more tests" identifies nothing. Read the binary out of the failing log. Twenty clean attempts across three builds were all of binaries that had never failed, and a clean run of the wrong binary reads as exoneration.
+- **An error that collapses two causes makes its own recurrence useless.** Two sightings of one failure bought nothing because the message could not distinguish them. The repair is not more sampling, it is making the next sighting informative.
+- **Attribute a failure structurally before statistically.** Reachability settles it faster than re-running: if the change's functions are callable only from paths the failing test never enters, and the failing line precedes them, the change is excluded regardless of the reproduction rate.
+- **A sabotage that runs and passes is a fact about the fixture.** Three consecutive fixtures let a real defect through, each for a different reason the test could not express: every subject had the same shape so misattribution was invisible, the tree was one leaf deep so the second code path never ran, and every row the test asked for was also a row it had written so skipping nothing was still correct.
+- **Ask which assertion failed.** Red is not confirmation. One sabotage went red on a debug overflow panic rather than on the property under test, and the same drift passed in `--release` where overflow checks are off.
+- **Know which control you are specifying.** A guard against *vacuity* needs a vacuity control -- would this still fail if the **setup** were removed -- which is a different question from the regression control, would it still fail if the **subject** were removed. A proposed fix that satisfied the stated control and gutted the test passed review because only the other control had been written down.
+- **Prefer the arm that does more work.** When an A/B is not perfectly matched, arrange for the winning arm to carry the extra cost; the measured advantage then understates the change instead of flattering it.
 
 ## Details
 
@@ -414,3 +423,100 @@ A third axis, separate from whether the check is **sound** and whether the subje
 What both sides observed: **every catch came from a mechanism** -- clippy, a slug checker, an injected counter, a sabotage arm -- **and every miss came from someone who had just thought carefully about that exact failure**. A documented trap does not prevent its own recurrence: the insertion bug swept for across 200 items was committed hours later, in the paragraph describing it; a checker's docstring warns about backticked examples in its opening lines and the exclusion added below it used one.
 
 **This cuts against reading the gate as bureaucracy around judgement.** The obvious lesson -- be more careful -- is the one every instance refutes. Not claimed: that these errors cluster in scaffolding. The direction held in every case, but nearly everything written during the exchange *was* scaffolding, so the denominator is unknown and neither dataset supports the mechanism.
+
+## Diagnosing a failure that will not reproduce
+
+Four failures over 2026-10-11 and 2026-10-12 were each pursued the wrong way first, and the
+corrections generalize.
+
+### Identify the binary from the log, never from the flags
+
+A gate log can contain **two** test binaries for the same crate. One run's workspace step
+executed 1004 tests and passed; the failure was in a later off-by-default step at 1000. The
+counts are not ordered by feature breadth -- some tests are gated *off* by a feature -- so the
+build cannot be deduced, only read. Twenty reproduction attempts across three binaries preceded
+this discovery, every one of them clean and every one of the wrong target. **A clean run of the
+wrong binary is worse than no evidence, because it reads as exoneration.**
+
+A wrong reproduce command recorded in a backlog entry is worse still: it hands the next reader
+the author's dead end with the authority of a recorded fact.
+
+### An error that cannot distinguish its causes cannot be diagnosed by recurrence
+
+`Db::open` mapped every `File::try_lock` failure to `AlreadyOpen`. `TryLockError` has two arms
+that mean opposite things -- `WouldBlock` is a genuine second holder, `Error( io )` is the lock
+call failing with possibly no holder at all -- and the event classifier called both
+`Contention`. So an operator was told to find a process that need not exist, and two sightings of
+the failure proved nothing about which case occurred. An hour went into looking for a retained
+`Arc` on the strength of a string that did not mean what it said.
+
+**The repair for an unreproducible failure is usually not more sampling. It is making the next
+occurrence informative.** The same conclusion was reached independently that week from the
+opposite direction, when an archiver's bare `ENOENT` named no path.
+
+### Structural attribution beats a reproduction rate
+
+A gate failure under a change was excluded by reachability, not by re-running: every function the
+change touched was callable only from key enumeration and one lane constructor, and the failing
+line was an open that preceded all of them. The same test had passed in three earlier runs
+containing the change. The rate ( 0 in 26 ) was gathered afterwards and said only how often, not
+whether.
+
+Record the confound in the same breath. The session that excluded itself had also added two
+daemon launches to a scenario, which raises concurrent work in a gate run and could widen a
+pre-existing window without causing it; omitting that would have made the attribution look
+stronger than it was.
+
+### Load average, on a host with something permanently stuck
+
+Load average counts uninterruptible processes. One host carried 21 in `D` state -- almost all
+root-owned `sync`, plus `fsyncg` -- aged 5.3 to 7.5 million seconds against a 97-day uptime. They
+consume nothing and never leave, so the load average floor is near 28 and is not a contention
+signal at all. **Three deferrals of a measurement rested on it**, while per-core idle sat at 99%
+and `bi + bo` at effectively zero.
+
+The irony worth keeping: the project's own rule says a host-wide *mean* has the wrong resolution,
+and that was generalized into distrusting the host-wide readings while trusting a number that is
+not a contention measure in the first place.
+
+## Which control, and what a passing sabotage means
+
+### A passing sabotage indicts the fixture
+
+Three fixtures in a row let a real defect through, each for a reason invisible from reading the
+test:
+
+| what the fixture could not express | why the sabotage passed |
+|---|---|
+| every key had the same chunk count and cardinality | a chunk attributed to the wrong key was indistinguishable from the right one |
+| 72 index entries fitted a single leaf | the re-descend path never executed |
+| every key the test requested was also a key it had written | skipping no entries below the bound was still correct |
+
+The fix in each case was the data, not the assertion: distinct per-subject shapes, enough entries
+to span several leaves, and a row present in the index but absent from the request.
+
+### Distinguish the control from the drift in advance
+
+A control **must pass**; a drift **must fail**. Knowing which is which before running either is
+what converts a red line into information. One prediction was wrong in exactly that way -- a
+sabotage expected to be slower-but-correct instead produced a wrong answer -- and the surprise is
+what exposed a soundness condition that had been documented as a cost choice.
+
+### A vacuity control is not a regression control
+
+When a guard exists to stop an assertion being trivially true, two different questions apply:
+
+- would this still fail if the **subject** were removed ( regression )
+- would this still fail if the **setup** were removed ( vacuity )
+
+A proposed fix for a flaky test satisfied the first and destroyed the second: it would have
+passed with the write deleted, because the counter it read increments on every tick whether or not
+there was work to do. Only the regression control had been written down, which is how a plausible
+fix gets through.
+
+### Red is not confirmation
+
+Ask which assertion failed. One saturation guard's sabotage went red on a debug overflow panic
+rather than on a wrong answer, and the same drift passed under `--release`, where overflow checks
+are off by default. An input that pinned the property by its answer existed and was not the one
+chosen.

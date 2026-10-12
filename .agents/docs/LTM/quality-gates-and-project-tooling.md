@@ -38,6 +38,15 @@ The project gate combines formatting, clippy, tests, documentation checks, publi
 - Running individual commands is not equivalent to running `scripts/gate.sh`. The step-count verdict is part of the gate and must be updated only after proving whether a mismatch is an added step or an early exit.
 - The repository contains no emoji in prose, comments, strings, or fixtures. Mathematical and typographic notation remains allowed.
 
+- **A checker and the instructions describing it are two implementations of one rule, and both decay.** A Rust-floor checker reported success while three release images sat at 1.95, because it audited the manifests and not the images; the count it was meant to cover was sixteen declarations, not the fourteen the entry claimed.
+- **"Documentation only" is not a gate exemption in a tree whose gate checks its documentation.** Six gate steps read `.agents/docs`, and one of them parses a specific sentence out of `TODO.md`. A doc-only commit pushed on that reasoning passed only because its wording happened not to collide with that anchor; the same paragraph phrased more naturally would have pushed a red gate.
+- **An anchored checker makes nearby prose load-bearing.** `check-unsafe-count.py` verifies exactly one sentence matching a fixed phrasing and fails when a second matches, so restating the same figures in the same words near it breaks the gate.
+- **Before re-deriving a number by hand, look for the checker that already does it.** One backlog entry instructs the reader to re-derive its `unsafe` counts and predates the gate step that verifies them continuously; the advice outlived the automation that retired it, and following the entry cost an exercise the gate performs on every run.
+- **A backlog entry can be older than the automation that answers it, and nothing links the two.** Treat an entry's stated method as a claim about the tooling of its own date.
+- **Prose in a backlog drifts faster than the code it describes.** Two sweeps of the same list found the citations accurate and the surrounding narrative stale -- a quantifier wrong, a scope wrong, a fix proposed that the same entry's own warning forbade.
+- **A quantifier in a findings document is an assertion a grep can check.** "Every filesystem site in those two files" was wrong in both halves and named the wrong scope besides; state the set, name the modules in it, name what is deliberately outside it, and record the search that checks it.
+- **An editable count in a document needs its construction recorded, not just its value.** A number without the command that produced it can only be re-measured, never re-derived.
+
 ## Details
 
 ### Formatting history
@@ -286,3 +295,41 @@ The operator gate remained red for a week after `yesno put` began printing ` at 
 A full disk caused WAL I/O failures in unrelated durability tests: 215 GB in 4,343 leftover `yesno-*` scratch directories. Eleven tests had called a `tmpdir()` helper returning a bare path without constructing the separate `CleanDir` guard; `db/readers.rs` had no guard path at all. Its helper now returns a `Scratch` guard that dereferences to `Path`, making the cleanup inseparable from obtaining the path. The full 21-binary core suite left zero directories after the fixes. The remaining two-step helpers and the deliberately retained E2E scenario roots have separate open items in `TODO.md`; a reaper needs an age and liveness policy so it does not delete a running scenario or evidence a developer still needs.
 
 The operator guide was divided from one 1,615-line `docs/operations.md` into `docs/operations/`, with one file per operating task and an index. Human-facing deployment and recovery instructions live there rather than in agent memory; `.agents/docs/` records implementation reasoning and evidence. Keep the standing `docs/` guide self-contained under the repository's docs-path checker.
+
+## When the gate is red for reasons that are not the change
+
+Over 2026-10-06 to 2026-10-12 the local gate and CI failed in six distinct ways, only two of
+which were defects in the change under test. Distinguishing them quickly is most of the value.
+
+| symptom | actual cause | how it was told apart |
+|---|---|---|
+| CI red for ten days | four unrelated faults at once, one of them the runner out of disk for nine days | each fault reproduced separately; the disk one left no test failure at all |
+| a test panics on a precondition | the subject succeeded early and the guard rejected it | the assertion the test exists for would have passed |
+| `ld terminated with signal 9` | the linker OOM-killed on a shared host | no cgroup cap, 94 GB free afterwards, no verdict was produced |
+| `AlreadyOpen` on a reopen | an error that collapses contention with a failed lock call | the message could not distinguish them; see the methodology document |
+| a doc-only commit reddens the gate | `TODO.md` is gate input and one step parses a sentence from it | the step name, not the test list |
+| public docs fail to build | an intra-doc link to a private item | the `doc links resolve` step, in a step never seen failing before |
+
+**Read the step name before concluding a failure is the one already being tracked.** The
+private-link failure appeared in a step that had never failed, and was found only because the
+test list was checked first and showed nothing. Re-running on the assumption that a known flake
+had recurred would have pushed a genuine error under cover of it.
+
+**A resource failure and an assertion failure deserve opposite responses.** A test that asserts
+and fails may be reporting a real defect and should be diagnosed before any retry. A toolchain
+killed by the kernel produced no verdict at all, so there is nothing to bury and re-running is
+the correct response.
+
+## Assessments that produce no code
+
+Four consecutive investigations over 2026-10-06 ended without a commit, and that was the right
+outcome in each case: the question was answered, the answer was "no change", and the finding was
+recorded. A session that measures its output in diffs will instead produce the change it was
+investigating.
+
+The corresponding failure to watch for is the opposite one -- implementing a fix whose benefit
+was never established. Three checks in a single day were found to be **vacuous** before landing:
+a leadership-term comparison that would have compared a constant with itself, an allocation
+witness for a function that allocates nothing, and a documented limitation that could not occur.
+Each was one read away from a change that did nothing or a caveat about nothing. **Ask what the
+value can actually be before writing the comparison.**
