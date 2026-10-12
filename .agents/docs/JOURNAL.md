@@ -6499,3 +6499,41 @@ every stream, which arm A never pays, so B does strictly more work and still win
   speedups move the way the mechanism predicts answer it without another run.
 * **Prefer the arm that does more work.** B pays for a `peek_prefix` per stream that A does not,
   so the measured win understates the change rather than flattering it.
+
+---
+
+## LTM Consolidation Record, 2026-10-12
+
+The record above was audited on 2026-10-03. The 87 entries from `2026-10-03 -- the write wire, and
+a bound that refused the case it was built for` through
+`2026-10-12 -- The load average was the wrong instrument, and the planner fix is 1.43x to 2.27x`
+are consolidated as below. **No new LTM documents were created**: every entry merged into one of
+the 47 existing topic documents, which is the outcome a mature index should produce.
+
+| Journal entries | Durable home |
+|---|---|
+| the write wire and its bound; the peer socket can write; the advertised write cap; the differential review of two channel clients; the C ABI's placement; splitting the peer half; filter pushdown and `yesno-eval`; the `pushdown` option; the channel ticket's lifetime; one version per transaction | [Plugin Channel Protocol and Security](LTM/plugin-channel-protocol-and-security.md) |
+| `Transport::Channel` for PostgreSQL and the bug the gate caught; transport fidelity in one fixture; `yesno_pg.channel_socket` and its two bugs; the FDW's absent snapshot stability; two limits hiding in a closed entry; paying back the round trip; counting the requests | [PostgreSQL Extension and Query Pushdown](LTM/postgresql-extension-and-query-pushdown.md) |
+| the MySQL channel backend and leg; `Backend` widened and the retraction; the four-entry MySQL range-estimate arc | [Client Libraries and Search Integrations](LTM/client-libraries-and-search-integrations.md) |
+| the verification cache as a threshold; the checkpoint's exclusive region; the seek loop's ratio; the read/write mix; the published chunk reader; `RwLock` on the segment caches; striping the caches; the shared published view | [Checkpoint and Commit Lock Contention](LTM/checkpoint-and-commit-lock-contention.md) |
+| exact top-k offloading; Scaled8 top-k opportunities; the Scaled8 arm's four optimizations; `sdot` and the MSRV bump; row blocking; the missing 56% | [SIMD Arch Arms and Kernel Selection](LTM/simd-arch-arms-and-kernel-selection.md) |
+| the unwired sweep's dead-symbol hit; lifting the view intersection strategy; the adversarial review of that diff; the numeric fold's planning cost; cutting the descents; `reaim`'s other two callers; the planner measurement | [Expression Planning, Statistics and Segmentation](LTM/expression-planning-statistics-and-segmentation.md) |
+| the numeric fold streams; the machine-integer evaluator and its two mistakes | [Packed Lenses: Matrix, Bignum and Views](LTM/packed-lenses-matrix-bignum-and-views.md) |
+| the span API that already existed; the ladder recomputed; nine tautologies deleted; measuring the ladder shift | [Storage Format, Index and Zero-Copy](LTM/storage-format-index-and-zero-copy.md) |
+| failing to reproduce the mis-pointed extent, four ways; eliminating reclaim-and-reuse; the inverted path; the entry that was stale with an unopened index | [Allocation, Reclamation and Fsck](LTM/allocation-reclamation-and-fsck.md) |
+| real SimHash correlation and the constraint worth more | [Compression Models and Space Economics](LTM/compression-models-and-space-economics.md) |
+| seeding a follower from the archive; static archive credentials; follower readiness; the archiver's bare `ENOENT` | [Backup, Archive and PITR](LTM/backup-archive-and-pitr.md) |
+| ECS checks the HTTP liveness probe | [Kubernetes Operator and Failover](LTM/kubernetes-operator-and-failover.md) |
+| write transaction ownership; the ownership scenario and its reachable limit; the fencing half | [Flight Write Transactions](LTM/flight-write-transactions.md) |
+| fixing the checkpointer flake and the control not written down; the transaction verbs | [Testing and E2E Harness](LTM/testing-and-e2e-harness.md) |
+| the consumer's own measurement; a host-wide idle gate and a co-tenant; four right numbers and four wrong frames; the quiet-host rule's absence then its wrongness; a gate failure attributed without re-rolling; the error that made its own diagnosis impossible; the load average as the wrong instrument | [Measurement and Investigation Methodology](LTM/measurement-and-investigation-methodology.md) |
+| the user-documentation drift audit; four assessments that produced no code; CI red for ten days; two TODO sweeps and the backlog's prose drift; out of disk for nine days; CI green and a refusal that outlived its cause; the Rust-floor checker; the floor checker green at 1.95; verifying to-dos instead of dispatching; re-deriving the unsafe counts; the recount already automated | [Quality Gates and Project Tooling](LTM/quality-gates-and-project-tooling.md) |
+
+`2026-10-03 — Deep-sleep synthesis of plugin hosting and query acceleration` is itself a synthesis
+record and is not re-consolidated.
+
+**To-do extraction was an audit, not an append.** Every finding in these entries that warranted an
+item was already filed in `.agents/docs/TODO.md` as the work happened, verified slug by slug for
+the seven opened in this range; nothing was added and nothing duplicated.
+
+See `.agents/docs/LTM/INDEX.md` for the full index, which needed no new rows.

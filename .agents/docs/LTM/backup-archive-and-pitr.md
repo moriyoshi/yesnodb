@@ -149,3 +149,53 @@ WAL floors are computed per `( term, shard )` only when every retained base of t
 - Do not report a recovery window from listed objects alone; bound it by the durable cursor a restore will walk to.
 - Do not fix that by letting a restore walk past the durable tip — the tip is a durability boundary, not a hint.
 - Do not treat a `Notify` wakeup as proof its condition holds.
+
+## A new follower can seed from the durable archive
+
+A follower with an empty directory can be seeded from the archive rather than from the leader,
+which is what makes a rebootstrap independent of the leader's retention window. Readiness is
+gated on both the archive seed completing **and** a first full pass, so a follower does not
+advertise itself on partial state.
+
+**A PVC mount root cannot be replaced by a rename.** The seed therefore publishes into the mount
+rather than swapping a directory under it, and `seed.rs` declines to fail a committed seed on a
+cleanup error -- the manifest is already durable, so a cleanup failure must not turn a committed
+seed into a startup failure. That reasoning is the precedent the archiver's own staging removal
+should have followed and did not.
+
+**Static archive credentials can reach operator followers**, which is a privilege-separation
+finding rather than a mechanism one: the credential that lets a follower read the archive is
+long-lived and therefore reaches every follower the operator creates.
+
+## The archiver's error messages carried no path
+
+`std::io::Error` carries no path, and the archiver's error alias is a boxed `dyn Error`, so the
+`?` that boxes an io failure is where the only identifying information is lost. The sidecar is a
+detached task whose error surfaces through a metric wait seconds later and in another process, so
+**that string is the entire report** -- and it twice read as a bare `No such file or directory
+( os error 2 )` with no indication of which file.
+
+A `ctx( doing, path, error )` helper attaches the path. The important part is the scope, because
+a previous pass claimed to have covered "every filesystem site in those two files" and had not:
+
+- Six sites remained in the sidecar, and **two in the file the mechanism was built in** -- one of
+  them a write inside a function whose six neighbouring io calls had all been given context.
+- Three further files on the same base-capture path were outside the claim's scope entirely,
+  including the transport's TLS reads, which are what a mistyped certificate path produces and so
+  the most operator-visible of the lot.
+
+**State the claim so it can be checked.** Every io site reachable from the sidecar's task tree now
+names its path, across the nine modules on that tree, with two modules deliberately outside it
+because they are reached only from the CLI binary. The grep vocabulary is recorded, because a
+narrower one missed `OpenOptions::open`, `set_len` and `rewind`.
+
+### A removal that treated its own post-condition as a failure
+
+`remove_staged_base` mapped `NotFound` to an error. Its post-condition is that the staging
+directory is gone, which an absent directory already satisfies -- and its callers join it with
+`Result::and` **after** a base has been published, so a cleanup error became the sidecar's
+terminal error on a capture that had already advanced `base_generation`. That is precisely the
+reported symptom: a wait on that metric reporting a task death rather than a timeout.
+
+The server's own portable snapshot provider already maps `NotFound` to success in both `cleanup`
+and `reconcile`, so this was the remover on the capture path that did not.

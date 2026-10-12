@@ -213,3 +213,25 @@ An mmap-backed container held after closing and reopening a directory must not b
 `new_slab_for` now skips slabs below `punch_floor`, aligning reuse with punching. On the first open of a directory in a process, `Db::open_with` lowers the floor to zero because no container from an earlier instance in that process exists. Thus the usual long-lived daemon strands no space. Repeated reopen-and-replace cycles do pay: a 20-cycle 120-dense-chunk probe grew allocated blocks from 1.9 to 19.3 MiB with a fresh `Db` each cycle, while one `Db` held across all cycles stayed at 1.9 MiB. The cost buys correctness for the population able to hold an inherited container.
 
 `slab_reuse_after_a_reopen_does_not_overwrite_a_held_container` is the large regression and was verified red on the old allocator. Unit coverage checks both that an inherited slab is refused while the floor stands and that it becomes reusable when the floor is lifted; the latter prevents a blanket no-reuse implementation from masquerading as a fix. The small reopen test remains as a cheap companion, with its reachability limit understood.
+
+## Failing to reproduce a mis-pointed extent, and what each failure eliminated
+
+A consumer reported mis-pointed extents at 1024-bit codes. Four attempts to reproduce it all
+failed, and the value is in what each one ruled out:
+
+- **Reclaim-and-reuse** was eliminated directly, and the attempt found **evacuation off**
+  ( `EVACUATE_PER_CHECKPOINT` at 0 ), which is a separate standing fact about why partly-live
+  slabs never reach `Free`.
+- **The inverted path**, which reads lanes rather than rows, did not reproduce it either.
+- A cross-class slab reuse was initially judged unlikely and that judgement was **wrong**; the
+  `ARRAY_MAX` reasoning behind it did not hold for reuse across size classes.
+
+**The entry was already stale and the index said so.** The tree contained the fix -- a slab free
+leaving a stale bump pointer, repaired 2026-09-15 and recorded in this document's own history --
+and the investigation ran for hours without opening `LTM/INDEX.md`, having noticed its staged
+changes and treated that as a reason to avoid it. The corpus the reproduction was built against
+was also mis-read from the consumer's report: a different embedding dimension than the one they
+used.
+
+**Check whether a reported defect is already fixed, and read the subsystem's long-term memory
+document first.** Both halves of that were available before any code was written.

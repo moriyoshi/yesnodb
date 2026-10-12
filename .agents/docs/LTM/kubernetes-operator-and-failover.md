@@ -136,3 +136,10 @@ The AWS arm also found a follower-bootstrap defect outside the operator itself. 
 - Do not read `CommandAccepted` as proof a command took effect; it reports journaling.
 - Do not make `promote` synchronous to fix that — the accept-and-journal shape is deliberate; retry on the operator side instead.
 - Do not bind a metrics listener per role, and do not raise `failureThreshold` to hide a window where the process closes it.
+
+## ECS checks the daemon's HTTP liveness probe
+
+The ECS task definition now checks the daemon's own HTTP liveness endpoint rather than a process
+or port check, so a daemon that is running but not serving is restarted rather than left in the
+rotation. This is the same distinction the Kubernetes arm already drew, applied to the second
+scheduler.

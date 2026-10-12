@@ -158,3 +158,63 @@ An external audit found that a staging call could partially apply rows before re
 Committed outcomes remain a bounded in-memory `VecDeque`, so retry idempotency survives only a prompt lost response against a still-running service. It does not survive restart or eviction and cannot provide one durable yesno version per source transaction. `durable-write-transaction-idempotency` and `flight-write-transaction-ownership` remain open in `TODO.md`; state convergence from replaying idempotent set mutations is a weaker guarantee than recovering the original commit identity.
 
 The corrected `ticket_version.py` scenario asserts both that a live lease keeps a ticket valid across checkpoint and that an unpinned version is refused after the floor advances. Its old assertion expected the leased version to disappear, and passed only because leasing was unreachable in the daemon. To establish an unpinned old version, it restarts, writes a newer version, and checkpoints; restart alone does not undo the earlier lease's effect on the stored floor. This is a concrete example of a fixture encoding the bug it meant to test.
+
+## A transaction belongs to the principal that opened it
+
+Ownership landed on 2026-10-12, and the route matters because the backlog entry had been open
+since 2026-09-23 behind "fix this together with the connection identity the Flight surface does
+not yet have".
+
+**No connection identity was needed.** Binding a transaction to a tonic connection breaks every
+client that pools or reconnects, and a proxy presents one connection for many callers, so it is
+both too strict and too weak. But the host **already authenticates** -- bearer tokens, mTLS client
+certificates and kernel-credentialed local peers resolve into a principal in the request
+extensions -- so the identity existed and only had to be reachable. The dependency runs host to
+flight, so this crate cannot name the host's principal type; it defines a one-field
+`CallerIdentity` of its own and the host's interceptors populate it.
+
+Those interceptors go through a **single helper** rather than three call sites, because one that
+inserted the principal and forgot the identity would authenticate its caller and then leave that
+caller's transactions unowned -- a failure that reads as working.
+
+`PendingWrite` records the opener, and staging, commit and abort each refuse a caller that does
+not match, as do the remembered outcomes of committed transactions so a stranger holding a handle
+is refused rather than told which version it committed at.
+
+**The refusal is `NotFound`, not `PermissionDenied`, and that is part of the property.**
+`PermissionDenied` confirms the handle names a live transaction, which turns a logged or guessed
+handle into an oracle for enumerating other callers' work -- a worse leak than the one being
+fixed, offered by the fix. A stranger gets the answer a handle that was never begun gets, and the
+tests assert the code rather than merely the failure.
+
+**Guessing was already closed**, and the entry overstated it: handles are not a counter but a
+per-service `RandomState` hash of one, so the exposure was a caller that *learned* a handle.
+
+**Ownership is exactly as strong as the authentication behind it.** A deployment with no
+principals configured resolves every caller to one `anonymous` principal *with full rights*, so
+every transaction has the same owner and ownership separates nobody. That is asserted rather than
+claimed -- and checking it nearly showed the limit was unreachable, since an anonymous caller can
+never be an admin unless the deployment is entirely unconfigured.
+
+### Fencing against a superseded leader is structural
+
+The other half of the acceptance item needs no check, and a term comparison at commit could never
+fire. `Db::term` reads a field assigned once at construction and never reassigned, so a term
+change requires a **new** database instance; the host caches one service per database instance
+keyed on pointer equality, so a new database means a **new service**; and the transaction table
+lives in the service, so a new service means an **empty table** and an old handle resolves to
+nothing.
+
+The chain's consequence is already asserted by `a_handle_from_a_previous_service_is_not_reissued`,
+which pins that a handle from a previous service commits nothing against a new one and that the
+first service's staged work died with it.
+
+### Where the tests live, and why not here
+
+The ownership tests are not in this crate, and that is not an omission: this crate authenticates
+nobody, so a test here would insert the identity extension itself and assert against its own
+fixture. They live in the host's auth test, which drives two **Admin** principals over a socket --
+identical rights, so the refusal isolates ownership from authorization -- and in the server-auth
+scenario, which additionally exercises the unconfigured deployment. The test takes all three
+refusals before asserting, so a partial failure names which gate leaked, and each gate is
+independently sabotage-verified.

@@ -205,3 +205,41 @@ Use `--show-output` for passing measurement tables and `--arg name=value` for fu
 - Do not let a harness timeout expire before the timeout whose diagnostic it is waiting to collect.
 - Do not collect post-mortem state after the cleanup that deletes it.
 - Do not summarize identifiers, status, or error tails into a count or truncated fragment when the full evidence is already available.
+
+## Write transactions reached the scenario harness
+
+`flight_txn_begin`, `flight_txn_stage`, `flight_txn_commit` and `flight_txn_abort` are the first
+verbs to drive a write transaction from a scenario; before them the whole surface -- the row and
+container caps, the poison-on-partial-staging rule, the reclaim deadline, ownership -- was pinned
+only by Rust tests. A handle is an opaque integer to a scenario: the server's to mint and the
+scenario's only to pass back.
+
+`flight_txn_stage` uses the **mutation** wire rather than the pair wire, because a transaction
+carries its operation per row so one transaction can insert and remove.
+
+The division of labour is the one the server-auth scenario's own header states: the Rust test pins
+the grid, and the scenario **varies the deployment**. That is why ownership is tested in both
+places rather than one -- the Rust test cannot naturally express a deployment with no principals
+configured, which is where ownership separates nobody.
+
+## A test that fails when its subject succeeds early
+
+`an_idle_database_still_checkpoints` failed under gate load on its **precondition**, not its
+assertion: `dirty_bytes() > 0` immediately after a write. The maintenance ticker runs from server
+start with a one-second interval, so a tick can land between the write returning and the guard
+reading, flush the memtable and reclaim the log. Had the tick come a moment later the assertion
+the test exists for would have passed -- **the early checkpoint is the behaviour under test**, and
+only the guard rejected it. Red there carried no information about the ticker, which is about the
+worst property a test can have.
+
+The precondition is now a fact about the **data** rather than about the transient state holding
+it: the visible version advanced. A checkpoint reads the oracle's watermark and never moves it, so
+no tick can falsify it.
+
+**The fix first proposed for this was wrong, and the reason is the reusable part.** It said to read
+the checkpoint counter before and after and drop both guards. The ticker calls `checkpoint()`
+unconditionally each tick and increments on every success -- and the module header says
+`checkpoint()` early-outs on a quiescent database -- so the counter rises from zero on a database
+that never wrote, and the two assertions the test exists for are trivially true of one. The
+proposal would have passed with the write deleted, and it satisfied the one control that had been
+written down.

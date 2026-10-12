@@ -69,3 +69,15 @@ Any proposal for a new container or index encoding should therefore report total
 - Do not accumulate a bound after binning. Evaluate it per chunk at the exact `(m, r)` so that totals are exact and bin edges remain a display device.
 - Do not order a waste table by ratio. A full chunk has a bound of exactly zero and therefore infinite ratio against six bytes of real waste, and the perfectly alternating chunk reaches a ratio of 4,369 while being measure-negligible in any real corpus.
 - Do not count payload compression while ignoring index metadata, alignment, conversion buffers, or navigation structures.
+
+## Real SimHash correlation, and a constraint worth more than the correlation
+
+Measuring real SimHash output against the assumption behind a skew argument produced
+**5 963 ordinals in a 65 536-wide chunk**, and the sharper result is a negative one:
+**"skew is load-bearing" cannot mean container-kind variety among full chunks**, because the
+distribution does not produce that variety at this density. That makes one of two named causes for
+a downstream defect unlikely.
+
+**A knob with a printed measurement beats a model.** The constraint that came out of the exercise
+was worth more than the correlation it was looking for, because it is checkable against a corpus
+rather than argued from a distribution.

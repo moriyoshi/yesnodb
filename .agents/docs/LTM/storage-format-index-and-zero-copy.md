@@ -169,3 +169,40 @@ The upper scan bound must use `ChunkKey::range_end`; computing maximum prefix pl
 - A merge walking two sorted sides with one cursor has a **trailing drain**, and a fixture whose inserts all fall inside the base key range never reaches it. Deleting the drain stayed green until an `append past the end` case existed.
 - An optimization whose slow path is *semantically identical* -- decode then reuse anyway -- is invisible to every correctness test. Only an allocation count separates them, and its bound must be measured on **both** sides: 2095 with the fast path, 3375 without, bound 2800.
 
+
+## The dense-span API already existed, and reads every byte it lends
+
+Asked whether a `KeyStream` span API would pay for warming a cold peer's pages, the reasoning was
+sound and the conclusion wrong: **the API existed and had been written four days earlier.**
+`unstable_arrow::dense_span( snap, key, lo, hi )` returns a borrowed buffer over a contiguous run
+of bitmap payloads, deriving the run from the index.
+
+What matters is a property its own doc comment already states: each chunk is still read through
+`read_container_for`, so **its trailer is verified before any of its bytes are lent**. As a span
+*lookup* that is a weakness -- it reads and CRCs everything it hands back. As a background
+**warmer** it is exactly right: a `pread` equivalent that also populates the verification cache on
+the way.
+
+So a warmer calling `dense_span` over a key's prefix range leaves a foreground read finding
+**both** caches warm -- the page cache, removing the serialized major faults a cold peer restore
+pays, and the verification cache, removing the re-verifications. The second half only pays because
+the verification generation bound was raised above the working set beforehand; at the older bound
+that half would have bought nothing.
+
+**Check whether the API exists before designing it, including against your own recent work.** The
+convergence of the two halves was not designed, and the method lesson is the reusable part.
+
+## The size-class ladder is recomputed, and the comments above it were not
+
+The ladder was recomputed and **nine source comments were stale** against it. Separately, nine
+row comments of the form `payload <= slot - 8` were deleted as tautologies -- they restated the
+arithmetic of the line above them -- and the rationale paragraph above them was found **inverted**
+relative to what the ladder actually does.
+
+Measuring the proposed shift narrowed the fix from ten classes to **one**: un-shifting class 5
+alone, at a cost of **+6.25% index space** ( independently checkable as 64/1024 ). The remaining
+classes stay. The format migration is a separate decision because `DbStore::open` rejects a
+mismatched ladder, so changing it is not backward compatible on its own.
+
+`scripts/check-storage-ladder.py` now forbids `<=` inside the `CLASS_SIZES` block, which is
+sabotage-verified, and its failure message no longer names a document that does not own the rule.
