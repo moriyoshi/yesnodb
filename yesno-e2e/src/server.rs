@@ -685,7 +685,10 @@ impl World {
                         )
                     })
                     .map_err(|e| db_err(verb, e))?;
-                Ok(self.adopt_flight_endpoint(client, token))
+                // The daemon's own listener address, so `flight_location`
+                // works against a real `yesnod` and a client outside the
+                // harness -- the Java driver -- can be pointed at it.
+                Ok(self.adopt_flight_endpoint(client, token, Some(format!("grpc+tcp://{addr}"))))
             }
 
             // The Prometheus text, as a string. Left unparsed on purpose: a

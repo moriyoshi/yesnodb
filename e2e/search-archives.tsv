@@ -1,0 +1,19 @@
+# The pinned search-engine distributions, and the only place they are listed.
+#
+# Two readers, which is why this is a file and not four constants in Rust.
+# `yesno-e2e/src/search.rs` includes it to download, verify and unpack an
+# engine; `e2e/Dockerfile` reads it in a stage placed *above* the source copy,
+# so editing any other file in the tree never re-fetches 1.4 GB. Two lists
+# would drift silently in the direction that costs the most: a stage that
+# fetched a stale URL would publish an archive the harness then rejects, half
+# an hour into a build.
+#
+# Columns, tab separated: engine, arch, file, url, sha512.
+#
+# `arch` is spelled as Rust's `std::env::consts::ARCH` reports it, because that
+# is the reader that cannot be told otherwise; the Dockerfile maps Docker's
+# `TARGETARCH` onto it.
+opensearch	aarch64	opensearch-3.8.0-linux-arm64.tar.gz	https://artifacts.opensearch.org/releases/bundle/opensearch/3.8.0/opensearch-3.8.0-linux-arm64.tar.gz	c3d873bbbbce9f08f003b884ec07a4610b9ef30f8916ca12feb13c9863521c5afc61e508ebeabbb565e10b45e8e87e5f2eff5f7e49e39c69375f309d1d476d07
+opensearch	x86_64	opensearch-3.8.0-linux-x64.tar.gz	https://artifacts.opensearch.org/releases/bundle/opensearch/3.8.0/opensearch-3.8.0-linux-x64.tar.gz	cba25b10114e796273fa9399af27fe9c2daaf25a190c37e4b5feb9cfd088e371e0fbd3cddf2bc0fbb753c2e681c0b55f08c0926d11718bf76f77e830017b06ff
+elasticsearch	aarch64	elasticsearch-9.5.2-linux-aarch64.tar.gz	https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-9.5.2-linux-aarch64.tar.gz	73ac07127a41a961edc83daec6dad333df467d8470c812feded6cbdf76cad5db78adbdebe3e8831d6ab52599268bf892e831ff0bf3f760ed987629728a8fa2a6
+elasticsearch	x86_64	elasticsearch-9.5.2-linux-x86_64.tar.gz	https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-9.5.2-linux-x86_64.tar.gz	f5ff4a6f6e9c00f6a5c46080b053042dfccee04a019bf285d6aee263a738d1046c24556e51be3f8adcef01673a2a10e67a9340d3b5a3d777008de7499cd786f0

@@ -86,6 +86,63 @@ RUN apt-get update && \
 FROM docker:29.2.1-cli@sha256:cab69e2d0a1a2ea9a1ce1060252f439e83483ae41ec09317aecb33b08a0656a5 AS docker-cli
 
 # ---------------------------------------------------------------------------
+# The pinned search engines, fetched once and never again.
+#
+# These are 1.4 GB and they used to be downloaded by the *search artifact* step
+# far below, which lives under `COPY . /workspace` -- so editing a single
+# scenario re-fetched both. On 2026-10-13 the second rebuild of the day was
+# served at 350 kB/s against 11 MB/s an hour earlier: a build whose duration was
+# set by someone else's throttle rather than by anything that changed here.
+#
+# A stage, and not a `--mount=type=cache`, because these archives are consumed
+# at **run** time as well -- `search_engine_start` unpacks one per scenario --
+# and a build-time mount does not exist by then. The same mistake is recorded
+# twice further down about the Bazel disk cache. A stage's output is copied into
+# the image, which is what run time needs, while its layer is keyed only on the
+# instructions below.
+#
+# Only `search-archives.tsv` is copied in, so the one thing that invalidates
+# this stage is a change to the pinned list itself. That file is also what
+# `yesno-e2e/src/search.rs` reads: one list, two readers, no drift.
+# ---------------------------------------------------------------------------
+
+FROM debian:bookworm-slim AS search-archives
+ARG TARGETARCH
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+COPY e2e/search-archives.tsv /tmp/search-archives.tsv
+# Three things about the loop below, stated here because a `#` line inside a
+# backslash-continued `RUN` is not worth relying on:
+#
+#   * `TARGETARCH` is Docker's spelling and the table uses Rust's, because Rust
+#     is the reader that cannot be told otherwise. This is the one place that
+#     has both vocabularies.
+#   * Each archive is saved under its *engine's* name rather than the pinned
+#     file's, so the two `ENV` overrides in the final stage name one path on
+#     every architecture.
+#   * The count is checked at the end. A table that matched nothing would
+#     otherwise leave an empty directory here and fail much later, inside the
+#     harness, as a missing file rather than as a bad table.
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      arm64) arch=aarch64 ;; \
+      amd64) arch=x86_64 ;; \
+      *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /archives; \
+    found=0; \
+    while IFS="$(printf '\t')" read -r engine row_arch file url sha512; do \
+      case "$engine" in ''|'#'*) continue ;; esac; \
+      [ "$row_arch" = "$arch" ] || continue; \
+      echo "fetching $file"; \
+      curl -fL --retry 3 --output "/archives/$engine.tar.gz" "$url"; \
+      printf '%s  %s\n' "$sha512" "/archives/$engine.tar.gz" | sha512sum -c -; \
+      found=$((found + 1)); \
+    done < /tmp/search-archives.tsv; \
+    [ "$found" -eq 2 ] || { echo "expected 2 archives for ${arch}, got ${found}" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 # The shared toolchain. rules_foreign_cc supplies pinned source archives, but
 # their conventional configure/CMake builds still need a complete host
 # toolchain; qemu, openssh-client and the KVM guest serve the filesystem
@@ -233,6 +290,9 @@ COPY --chown=yesno-builder:yesno-builder . /workspace
 COPY --from=build /out/yesno-e2e /out/yesno-operator \
     /out/yesno-aws-cleanup /usr/local/bin/
 COPY --from=guest-image /guest.qcow2 /vmlinuz /opt/yesno-e2e/
+# Placed above the source copy's own `RUN` steps for the reason the stage
+# states: this is 1.4 GB that must not be re-fetched because a scenario changed.
+COPY --from=search-archives /archives /opt/yesno-e2e/search-archives
 COPY --from=guest-key /yesno-e2e-key /opt/yesno-e2e/ssh-key
 RUN chmod 0600 /opt/yesno-e2e/ssh-key
 
@@ -241,6 +301,12 @@ ENV JAVA_HOME=/opt/java/openjdk
 ENV YESNO_E2E_JAVA_HOME=/opt/java/openjdk
 ENV PATH="/opt/java/openjdk/bin:${PATH}"
 ENV DOCKER_HOST=unix:///var/run/docker.sock
+# The two overrides `yesno-e2e/src/search.rs` already honours, so the engines
+# come from the stage above at build time *and* at run time. The harness still
+# verifies each file against the SHA-512 in the shared table, so the stage is
+# a courier and never the thing that vouches for the bytes.
+ENV YESNO_E2E_OPENSEARCH_ARCHIVE=/opt/yesno-e2e/search-archives/opensearch.tar.gz
+ENV YESNO_E2E_ELASTICSEARCH_ARCHIVE=/opt/yesno-e2e/search-archives/elasticsearch.tar.gz
 WORKDIR /workspace
 USER yesno-builder
 
@@ -302,6 +368,16 @@ RUN --mount=type=cache,target=/home/yesno-builder/.gradle,uid=10001,gid=10001,sh
     --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001,sharing=locked \
     --mount=type=cache,target=/workspace/target,uid=10001,gid=10001,sharing=locked \
     ./scripts/build-database-artifacts.sh search
+
+# The Java client's live-daemon check, staged as classes plus its runtime jars.
+#
+# Separate from the step above because it needs no cargo and no `target/`, and
+# because the reason it is a build-time step is different: the `.gradle` mount
+# does not exist at run time, so a scenario that invoked Gradle would download
+# from Maven Central inside a gate. After this, running the check is a plain
+# `java -cp` against a directory in the image.
+RUN --mount=type=cache,target=/home/yesno-builder/.gradle,uid=10001,gid=10001,sharing=locked \
+    ./scripts/build-database-artifacts.sh java
 
 # One harness entrypoint. The operator binary and the KVM guest are workload
 # artifacts, not additional scenario endpoints, so neither is ever the command.

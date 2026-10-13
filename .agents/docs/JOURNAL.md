@@ -384,3 +384,47 @@ them separate is what stops a consolidation pass from quietly rewriting them.
   exempt, and that a checker anchored on a sentence makes nearby prose load-bearing.
 - Already filed as a backlog item rather than a candidate:
   `architecture-describes-a-removed-plugin-facility`.
+
+---
+
+## 2026-10-13 — The Java client gets a live daemon, and the image stops redownloading 1.4 GB
+
+### What the Java client's own gate could not see
+
+`yesno-flight-java/gate.sh` compiles the client, runs its unit tests and runs javadoc. Its only server is a fake in its own test sources, and that fake minted its ticket with `ByteBuffer.allocate( QueryTicket.HEADER_LENGTH )` -- the client's own constant. A fake built from the subject's constants agrees with the subject by construction, which is how the module stayed **green and broken for a week** through the Flight ticket header widening from 40 to 48 bytes while the Go and Python integration suites failed every test.
+
+What landed at the time was a 48-byte hex vector mirrored across the Rust, Go, Python and Java ticket tests. That pins a layout a vector can express. It cannot pin a changed refusal, a changed status code, or a schema whose metadata moved, and it only pins the layout because someone remembers to update all four copies.
+
+`e2e/java/client.py` is the missing half. It starts a real `yesnod` with `srv_start`, hands `flight_location` to a new `java_client()` verb, and checks every observation against Python's own sets before re-reading the same server through the harness's **Rust** Flight client -- two independent implementations agreeing about one server's state. The Java side is a `main` that *prints* and asserts nothing, so the oracle is Python's arithmetic rather than the client agreeing with itself. The one judgement it makes locally is the name of a refusal's status code, which a scenario cannot observe from outside the client.
+
+### The blocker was imaginary, and the real constraint was elsewhere
+
+I had been saying the host has a JRE and no `javac`, so this could not be built here. True of the *host*, and irrelevant: `e2e/Dockerfile` already pulls `eclipse-temurin:21-jdk-jammy`, sets `JAVA_HOME` and `YESNO_E2E_JAVA_HOME`, copies the whole repo to `/workspace`, and carries a built `yesnod`. A JDK, the client source and a daemon to talk to were in one place the entire time.
+
+The real constraint was Gradle. The image's dependency cache is a BuildKit `--mount=type=cache`, so it exists while the image is being built and is gone by the time a gate runs inside it -- a scenario that invoked Gradle would reach Maven Central from inside a gate. So the check is a plain `main` in a `liveCheck` source set, a `liveCheckInstall` Sync task stages its classes and whole runtime classpath at image build time, and the verb runs `java -cp` against an ordinary directory in the image. No Gradle, no JUnit, no network. The `search_*` family does invoke Gradle at scenario time and pays that cost; this one does not.
+
+### Two findings from the first live run, both kept
+
+**Arrow Java folds `FAILED_PRECONDITION` into `INVALID_ARGUMENT`.** I predicted `UNKNOWN` -- reasoning that `FlightStatusCode` has no `FAILED_PRECONDITION` and `StatusUtils` would fall through -- and the measurement said otherwise. The consequence is sharper than the one I guessed: **aborting an already-committed transaction and fetching a malformed ticket are the same status code to a Java caller.** One means the request was nonsense and the other means the request was well formed and the world had moved on, and nothing but the message text separates them. The scenario pins the collapse, with a second assertion that fails if the two ever diverge so the comment cannot go stale silently. This is exactly the class of thing a wire vector cannot express.
+
+**A client cannot observe the teardown of streams it just closed.** The driver read `stats().liveReaders()` before disconnecting and saw **3**, with nothing leaked: the server unwinds those tasks after answering the request. The observation was removed rather than re-baselined to 3, which would have been equally arbitrary and equally racy. `srv_stop`'s `readers_left`, taken after the daemon has drained, is where that question has a settled answer, and the scenario already asserted it.
+
+Of 23 observations, 21 matched on the first live run.
+
+### The image was re-downloading 1.4 GB on every rebuild
+
+Found by rebuilding twice in one day. `search.rs`'s `download_archive` cached the pinned OpenSearch and Elasticsearch tarballs under `crate::scratch_dir( workspace )` -- `.agents-workspace/tmp/search-e2e-cache` -- and `.agents-workspace` is in `.dockerignore`. So the cache was written into the layer that `COPY . /workspace` invalidates, and every source edit re-fetched both archives. **Measured: the second rebuild was served at 350 kB/s, a 37-minute projection, against 11 MB/s an hour earlier.** A build whose duration is set by someone else's throttle is not a slow build, it is an unpredictable one.
+
+Fixed with a `search-archives` stage above the source copy, which is the shape the Dockerfile already uses for every other pinned fixture. Two `ENV` lines set `YESNO_E2E_OPENSEARCH_ARCHIVE` and `YESNO_E2E_ELASTICSEARCH_ARCHIVE`, overrides `search.rs` already honoured, so build time and run time both read the staged copies.
+
+**A stage and not a cache mount, and the reason generalizes.** These archives are consumed at **run** time too -- `search_engine_start` unpacks one per scenario -- and a build-time mount does not exist by then. The Dockerfile already records that same mistake twice about the Bazel caches. A stage's output is copied into the image, which is what run time needs, while its layer is keyed only on its own instructions.
+
+The pinned list moved to `e2e/search-archives.tsv` so the stage and `search.rs` read one table rather than two; a second list would drift in the direction that costs the most, with the stage fetching a stale URL and the harness rejecting the result half an hour into a build. `search.rs` includes it with `include_str!` and parses it strictly, because a lenient parser's failure reads as "no pinned archive for this architecture" and sends the next reader looking at a platform limitation instead of a malformed table. The digest is still verified by the harness on every use including the overridden path, so the stage is a courier and never the thing that vouches for the bytes.
+
+Measured after: the search artifact step went from **203 s to 88 s**, and no longer downloads anything.
+
+### Verified
+
+`./scripts/gate-java.sh` passes ( `ok client.py`, 11 verb calls ). `./scripts/gate.sh` passes, with `yesno-flight-java/gate.sh` reported skipped for want of `javac` on this host, as it always is. `gate-pg.sh` was not run and is not implicated: neither `yesno-core` nor `yesno-flight` changed.
+
+Both new tests are sabotage-checked. Dropping a field from a table row fails `the_whole_pinned_table_parses`; swapping an engine's two architecture rows fails `every_supported_engine_architecture_is_checksum_pinned`, which is why that test asserts the architecture token appears in the file name rather than only that the digest is well formed.

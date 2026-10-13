@@ -524,6 +524,7 @@ cargo run -p yesno-e2e --bin yesno-e2e -- --show-output --arg n=100000 e2e/scena
 ./scripts/gate-pg.sh                       # includes e2e/postgresql/postgres.py on PG 17 and 18
 ./scripts/gate-mysql.sh                    # includes e2e/mysql/mysql.py against pinned MySQL 8.4
 ./scripts/gate-search.sh                   # Java helper plus pinned OpenSearch and Elasticsearch
+./scripts/gate-java.sh                     # the shipped Java Flight client against a live yesnod
 ./scripts/gate-operator.sh                 # live yesno-operator lifecycle in a disposable kind cluster
 ./scripts/gate-filesystems.sh              # deployed archive/S3 lifecycle on real ZFS, Btrfs, and LVM in KVM
 ./scripts/gate-mount-propagation.sh        # agent/daemon mount propagation under Docker's own flags
@@ -554,6 +555,36 @@ native C++ client against the same in-process Flight primitive used by
 PostgreSQL. Both modes assert the engine's schema, boundary, scan, mutation,
 aliasing, transactional rollback, and plugin-lifecycle contracts. Both suites keep
 every mutable file under the scenario's temporary world.
+
+The Java client gate is an opt-in scenario through that same runner too, and
+it exists because the Java client's own gate cannot reach the server.
+`yesno-flight-java/gate.sh` compiles the client, runs its unit tests and runs
+javadoc; its only server is a fake in its own test sources, and that fake mints
+its ticket with `QueryTicket.HEADER_LENGTH` -- the client's own constant -- so
+it agrees with the client by construction. That is how the module stayed green
+and broken for a week through the Flight ticket header widening from 40 to 48
+bytes, while the Go and Python integration suites failed every test. The
+48-byte hex vector mirrored across the four implementations pins the layout a
+vector can express; it cannot pin a changed refusal, a changed status code, or
+a schema whose metadata moved.
+
+`e2e/java/client.py` starts a real `yesnod` with `srv_start`, hands
+`flight_location` to `java_client()`, and asserts every observation against
+Python's own sets before re-reading the same server through the harness's Rust
+Flight client -- two independent implementations agreeing about one server's
+state. The Java side is a `main` that **prints** and asserts nothing, so the
+oracle is Python's arithmetic rather than the client agreeing with itself. The
+one judgement it makes locally is the name of a refusal's status code, which a
+scenario cannot observe from outside the client.
+
+It runs `java -cp` and never Gradle, which is the one structural difference
+from the `search_*` family. The image's Gradle dependency cache is a BuildKit
+`--mount=type=cache`: it exists while the image is being built and is gone by
+the time a gate runs inside it, so a scenario that invoked Gradle would
+download from Maven Central from inside a gate. `scripts/build-database-artifacts.sh java`
+runs the `liveCheckInstall` task at image build time, which stages the compiled
+classes and the whole runtime classpath into an ordinary directory in the
+image; the verb then runs the installed `/usr/local/bin/yesno-e2e` against it.
 
 Operator integration is an opt-in scenario through that same runner, not a
 second binary or fixed Rust lifecycle. `e2e/operator/operator.py` sequences the

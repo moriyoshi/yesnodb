@@ -196,10 +196,13 @@ impl Config {
         let specification = engine.archive()?;
         match supplied {
             Some(path) => {
-                verify_archive(path, specification)?;
+                // An override still goes through the digest, which is what
+                // lets the image copy these in from a download stage without
+                // the stage becoming the only thing that vouches for them.
+                verify_archive(path, &specification)?;
                 Ok(path.clone())
             }
-            None => download_archive(&self.cache, specification),
+            None => download_archive(&self.cache, &specification),
         }
     }
 }
@@ -261,18 +264,14 @@ impl Engine {
             .join(file)
     }
 
-    fn archive(self) -> Result<&'static Archive> {
+    fn archive(self) -> Result<Archive> {
         let architecture = std::env::consts::ARCH;
-        match (self, architecture) {
-            (Self::OpenSearch, "aarch64") => Ok(&OPENSEARCH_ARM64),
-            (Self::OpenSearch, "x86_64") => Ok(&OPENSEARCH_X64),
-            (Self::Elasticsearch, "aarch64") => Ok(&ELASTICSEARCH_ARM64),
-            (Self::Elasticsearch, "x86_64") => Ok(&ELASTICSEARCH_X64),
-            _ => Err(format!(
+        pinned_archive(self.id(), architecture)?.ok_or_else(|| {
+            format!(
                 "{} E2E has no pinned Linux archive for architecture {architecture}",
                 self.name()
-            )),
-        }
+            )
+        })
     }
 
     fn executable(self) -> &'static str {
@@ -469,32 +468,50 @@ fn build_plugin(config: &Config, engine: Engine) -> Result<()> {
     checked_status(&mut build, &format!("{} plugin build", engine.name()))
 }
 
+/// The pinned engine distributions, and the only place they are listed.
+///
+/// A file rather than four constants here because it has **two** readers. This
+/// module downloads, verifies and unpacks an engine; `e2e/Dockerfile` reads the
+/// same rows in a stage placed *above* its source copy, so an ordinary edit no
+/// longer re-fetches 1.4 GB. Before that stage existed, the archive cache was
+/// written into the layer the source copy invalidates, and a second rebuild on
+/// 2026-10-13 was served at 350 kB/s -- a build whose duration was set by
+/// someone else's throttle.
+const ARCHIVE_TABLE: &str = include_str!("../../e2e/search-archives.tsv");
+
 struct Archive {
     file: &'static str,
     url: &'static str,
     sha512: &'static str,
 }
 
-const OPENSEARCH_ARM64: Archive = Archive {
-    file: "opensearch-3.8.0-linux-arm64.tar.gz",
-    url: "https://artifacts.opensearch.org/releases/bundle/opensearch/3.8.0/opensearch-3.8.0-linux-arm64.tar.gz",
-    sha512: "c3d873bbbbce9f08f003b884ec07a4610b9ef30f8916ca12feb13c9863521c5afc61e508ebeabbb565e10b45e8e87e5f2eff5f7e49e39c69375f309d1d476d07",
-};
-const OPENSEARCH_X64: Archive = Archive {
-    file: "opensearch-3.8.0-linux-x64.tar.gz",
-    url: "https://artifacts.opensearch.org/releases/bundle/opensearch/3.8.0/opensearch-3.8.0-linux-x64.tar.gz",
-    sha512: "cba25b10114e796273fa9399af27fe9c2daaf25a190c37e4b5feb9cfd088e371e0fbd3cddf2bc0fbb753c2e681c0b55f08c0926d11718bf76f77e830017b06ff",
-};
-const ELASTICSEARCH_ARM64: Archive = Archive {
-    file: "elasticsearch-9.5.2-linux-aarch64.tar.gz",
-    url: "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-9.5.2-linux-aarch64.tar.gz",
-    sha512: "73ac07127a41a961edc83daec6dad333df467d8470c812feded6cbdf76cad5db78adbdebe3e8831d6ab52599268bf892e831ff0bf3f760ed987629728a8fa2a6",
-};
-const ELASTICSEARCH_X64: Archive = Archive {
-    file: "elasticsearch-9.5.2-linux-x86_64.tar.gz",
-    url: "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-9.5.2-linux-x86_64.tar.gz",
-    sha512: "f5ff4a6f6e9c00f6a5c46080b053042dfccee04a019bf285d6aee263a738d1046c24556e51be3f8adcef01673a2a10e67a9340d3b5a3d777008de7499cd786f0",
-};
+/// The row for one engine on one architecture, or `None` if the table has none.
+///
+/// `arch` is spelled as [`std::env::consts::ARCH`] reports it. Parsing is
+/// deliberately strict: a row with the wrong number of fields is an error
+/// rather than a row that silently matches nothing, because the failure a
+/// lenient parser produces is "no pinned archive for this architecture", which
+/// reads as a platform limitation rather than as a malformed table.
+fn pinned_archive(engine: &str, arch: &str) -> Result<Option<Archive>> {
+    for (number, line) in ARCHIVE_TABLE.lines().enumerate() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [row_engine, row_arch, file, url, sha512] = fields[..] else {
+            return Err(format!(
+                "e2e/search-archives.tsv line {} has {} tab-separated fields, expected 5",
+                number + 1,
+                fields.len()
+            ));
+        };
+        if row_engine == engine && row_arch == arch {
+            return Ok(Some(Archive { file, url, sha512 }));
+        }
+    }
+    Ok(None)
+}
 
 /// Download a pinned engine archive into the harness cache.
 ///
@@ -709,17 +726,56 @@ mod tests {
         assert!(parse_search_ids(r#"{"hits":{"total":3}}"#).is_err());
     }
 
+    /// The table now has a reader this test cannot see -- the image's download
+    /// stage -- so what it checks is the contract between them: that every
+    /// supported pair is present, pinned, and named consistently. A typo that
+    /// used to be a compile error is now a runtime lookup returning `None`,
+    /// and this is what turns that back into a test failure.
     #[test]
     fn every_supported_engine_architecture_is_checksum_pinned() {
-        for archive in [
-            &OPENSEARCH_ARM64,
-            &OPENSEARCH_X64,
-            &ELASTICSEARCH_ARM64,
-            &ELASTICSEARCH_X64,
-        ] {
-            assert_eq!(archive.sha512.len(), 128);
-            assert!(archive.sha512.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert!(archive.url.ends_with(archive.file));
+        for engine in ["opensearch", "elasticsearch"] {
+            for arch in ["aarch64", "x86_64"] {
+                let archive = pinned_archive(engine, arch)
+                    .expect("the table must parse")
+                    .unwrap_or_else(|| panic!("no pinned archive for {engine} on {arch}"));
+                assert_eq!(archive.sha512.len(), 128, "{engine} {arch}");
+                assert!(archive.sha512.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert!(archive.url.ends_with(archive.file), "{engine} {arch}");
+                // The architecture a row claims must appear in the file it
+                // names, or the two rows of an engine could be swapped and
+                // every assertion above would still hold.
+                let token = match (engine, arch) {
+                    ("opensearch", "aarch64") => "arm64",
+                    ("opensearch", "x86_64") => "x64",
+                    (_, other) => other,
+                };
+                assert!(
+                    archive.file.contains(token),
+                    "{} lacks {token}",
+                    archive.file
+                );
+            }
         }
+        assert!(
+            pinned_archive("opensearch", "riscv64")
+                .expect("the table must parse")
+                .is_none(),
+            "an unlisted architecture must be absent rather than matched"
+        );
+    }
+
+    /// Every row must be well formed, not just the four the lookup above asks
+    /// for. A fifth row with four fields would make the *next* lookup fail
+    /// rather than this one, and the error would surface inside an image build.
+    #[test]
+    fn the_whole_pinned_table_parses() {
+        let rows = ARCHIVE_TABLE
+            .lines()
+            .filter(|line| !line.trim_end().is_empty() && !line.starts_with('#'))
+            .count();
+        assert_eq!(rows, 4, "the table has {rows} data rows");
+        // A lookup that matches nothing still walks every row, so asking for
+        // something absent is what type-checks all of them.
+        pinned_archive("nothing", "nowhere").expect("every row must have five fields");
     }
 }

@@ -93,6 +93,7 @@ pub mod eager;
 pub mod filesystems;
 pub mod fixture;
 pub mod flight;
+pub mod javaclient;
 pub mod lazy;
 pub mod matrix;
 pub mod operator;

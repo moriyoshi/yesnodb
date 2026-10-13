@@ -24,6 +24,26 @@ Apache Arrow's Netty memory backend needs this JVM option on Java 17 and later:
 --add-opens=java.base/java.nio=ALL-UNNAMED
 ```
 
+## Where this client is tested against a real server
+
+`./gradlew build` runs the unit tests, and their server is a **fake**. That is
+enough for encoding and decoding and not enough for the wire: the fake once
+minted its ticket from the client's own `QueryTicket.HEADER_LENGTH`, so when
+the Flight ticket header widened from 40 to 48 bytes this module stayed green
+while the Go and Python clients failed every integration test.
+
+The live half lives in the repository's end-to-end image. The `liveCheck`
+source set holds `LiveDaemonCheck`, a `main` that drives this client against a
+real `yesnod` and prints what it observed; `scripts/gate-java.sh` starts the
+daemon, runs it, and checks every observation in Python. Changing this client's
+behaviour on the wire -- a status code, a refusal, a schema -- means changing
+what that gate expects.
+
+```console
+./gradlew liveCheckInstall   # stage the check and its runtime classpath
+./scripts/gate-java.sh       # from the repository root; Docker is the only prerequisite
+```
+
 ## Query and ingest
 
 ```java

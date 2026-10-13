@@ -64,17 +64,34 @@ build_search() {
     cargo run --locked -p yesno-e2e --bin yesno-prepare-search
 }
 
+# Stage the Java client's live-daemon check so the gate can run it with a plain
+# `java -cp`.
+#
+# Gradle runs **here** and never at test time. The image's Gradle dependency
+# cache is a BuildKit cache mount, so it exists while the image is being built
+# and is gone by the time a gate runs inside it; anything that invoked Gradle
+# from a scenario would reach Maven Central from inside a gate. `liveCheckInstall`
+# copies the compiled classes and the whole runtime classpath under
+# `yesno-flight-java/build/live-check`, which is an ordinary directory in the
+# finished image.
+build_java_client() {
+    JAVA_HOME="${YESNO_E2E_JAVA_HOME:-${JAVA_HOME:-}}" \
+        ./yesno-flight-java/gradlew -p yesno-flight-java --no-daemon liveCheckInstall
+}
+
 case "${1:-}" in
     postgresql) build_postgresql ;;
     mysql) build_mysql ;;
     search) build_search ;;
+    java) build_java_client ;;
     all)
         build_postgresql
         build_mysql
         build_search
+        build_java_client
         ;;
     *)
-        printf 'usage: %s {all|postgresql|mysql|search}\n' "$0" >&2
+        printf 'usage: %s {all|postgresql|mysql|search|java}\n' "$0" >&2
         exit 2
         ;;
 esac

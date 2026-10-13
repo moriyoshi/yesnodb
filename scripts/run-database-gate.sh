@@ -18,8 +18,11 @@ case "$edge" in
     search)
         gate=gate-search.sh
         ;;
+    java)
+        gate=gate-java.sh
+        ;;
     *)
-        printf 'usage: %s {postgresql|mysql|search} [gate arguments...]\n' "$0" >&2
+        printf 'usage: %s {postgresql|mysql|search|java} [gate arguments...]\n' "$0" >&2
         exit 2
         ;;
 esac

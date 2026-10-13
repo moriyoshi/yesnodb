@@ -30,6 +30,10 @@ fn search_scenario_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/search")
 }
 
+fn java_scenario_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/java")
+}
+
 fn mysql_scenario_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../e2e/mysql")
 }
@@ -128,6 +132,7 @@ fn every_opt_in_scenario_compiles() {
         filesystem_scenario_dir(),
         aws_scenario_dir(),
         search_scenario_dir(),
+        java_scenario_dir(),
         mysql_scenario_dir(),
     ] {
         let files = scenario_files(&dir).expect("an opt-in scenario directory must be readable");
@@ -185,6 +190,9 @@ fn every_verb_has_a_caller_in_some_scenario() {
     files.extend(scenario_files(&aws_scenario_dir()).expect("AWS scenarios must be readable"));
     files
         .extend(scenario_files(&search_scenario_dir()).expect("search scenarios must be readable"));
+    files.extend(
+        scenario_files(&java_scenario_dir()).expect("Java client scenarios must be readable"),
+    );
     let mut corpus = String::new();
     for path in &files {
         corpus.push_str(&std::fs::read_to_string(path).expect("a scenario must be readable"));

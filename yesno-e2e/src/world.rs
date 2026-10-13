@@ -173,6 +173,7 @@ pub fn all_names() -> &'static [&'static str] {
         v.extend_from_slice(crate::aws::OWNS);
         v.extend_from_slice(crate::cloud::OWNS);
         v.extend_from_slice(crate::search::OWNS);
+        v.extend_from_slice(crate::javaclient::OWNS);
         v.extend_from_slice(crate::arrow::OWNS);
         v.extend_from_slice(crate::datafusion::OWNS);
         v
@@ -610,6 +611,9 @@ impl World {
         }
         if crate::search::OWNS.contains(&verb) {
             return self.call_search(verb, &a);
+        }
+        if crate::javaclient::OWNS.contains(&verb) {
+            return self.call_java_client(verb, &a);
         }
         if crate::server::OWNS.contains(&verb) {
             return self.call_server(verb, &a);

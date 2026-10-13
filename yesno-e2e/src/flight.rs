@@ -71,7 +71,10 @@ pub const OWNS: &[&str] = &[
 /// A Flight service on loopback, plus a client connected to it.
 pub(crate) struct Endpoint {
     pub(crate) client: FlightServiceClient<Channel>,
-    /// Reusable only for a service created by `flight_serve`.
+    /// The `grpc+tcp://` address, for a scenario that must hand this endpoint
+    /// to a client outside the harness. Present for a service `flight_serve`
+    /// started and for the daemon's own listener behind `srv_flight`; absent
+    /// only where the endpoint was adopted without one.
     location: Option<String>,
     /// The lowest leadership term this client will accept, sent on every call.
     ///
@@ -969,10 +972,11 @@ impl World {
         &mut self,
         client: FlightServiceClient<Channel>,
         token: Option<String>,
+        location: Option<String>,
     ) -> MontyObject {
         self.flight.endpoints.push(Some(Endpoint {
             client,
-            location: None,
+            location,
             token,
             expect_term: None,
             owned: None,

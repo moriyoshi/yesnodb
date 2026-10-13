@@ -4,8 +4,10 @@
 #
 # The database and search gates run initdb, mysqld, OpenSearch and
 # Elasticsearch, every one of which refuses to run as root, and they must leave
-# the baked artifact tree owned by the identity that built it. They enter as
-# `yesno-builder`, which is the image default and needs no `--user`.
+# the baked artifact tree owned by the identity that built it. The Java client
+# gate starts no such server, but it reads that same baked tree and is listed
+# for the second reason. They enter as `yesno-builder`, which is the image
+# default and needs no `--user`.
 #
 # The operator and filesystem scenarios drive a bind-mounted Docker socket and
 # /dev/kvm and start no server in this container, so they enter as root with an
@@ -23,7 +25,8 @@ if [[ "${1:-}" == -* ]]; then
 fi
 
 case "${1:-}" in
-    ./scripts/gate-pg.sh | ./scripts/gate-mysql.sh | ./scripts/gate-search.sh)
+    ./scripts/gate-pg.sh | ./scripts/gate-mysql.sh | ./scripts/gate-search.sh | \
+    ./scripts/gate-java.sh)
         if [[ "$(id -u)" != 10001 || "$(id -g)" != 10001 ]]; then
             printf '%s must run as uid/gid 10001, not %s:%s\n' \
                 "$1" "$(id -u)" "$(id -g)" >&2
