@@ -675,3 +675,43 @@ A per-call temporary -- `.{name}.{pid}.{seq}.partial`, following `capture_target
 **The strongest suspect was wrong, and it was a good suspect.** The entry named the direct-path snapshot flow and `remove_staged_base` -- "a lease release or checkpoint cleanup landing between the two is exactly a bare `ENOENT` on a path the sidecar never chose". It reads well and it is false: `remove_staged_base` removes `work_dir/base-...`, a subdirectory, never the work directory the state file sits in. The `NotFound` tolerance added for it on 2026-10-11 is correct on its own terms and fixed nothing here. A plausible mechanism that explains a symptom is not evidence for it, and the cost of treating it as evidence was two sessions.
 
 **Diagnosability beat reproduction, and it was much cheaper.** 26 attempts to reproduce yielded nothing. One `map_err` adding the path turned the next occurrence into a ten-minute read. When an error can arise from several places and says which only by luck, spend the effort on making the next sighting informative rather than on making it happen again -- which is what the entry itself concluded on 2026-09-29, and it was right.
+
+
+---
+
+## 2026-10-14 — Four serial fetch loops on the restore path, and the one that was hiding
+
+A consumer suggested that letting a follower retrieve the base archive *incrementally* would cut boot time. Reading the path to evaluate that found something simpler and larger: **every object fetch on the restore path was a plain `for` loop with an `.await` inside**, so a restore paid one full round trip per object, in series.
+
+### What the audit found
+
+Four loops, and the first pass over the code only saw two of them:
+
+| loop | shape |
+|---|---|
+| `load_wal_descriptors` | one `get_bytes` per `.wal.pb` across the whole retained WAL history -- many small objects, pure latency |
+| `list_bases` | one manifest fetch per retained base |
+| `materialize_base` | one `shard-NNNN.yno` image per shard -- few, large |
+| `assemble_wal` | per shard, each walking its own fingerprint chain |
+
+The widest is `load_wal_descriptors`, and it is the one that was missed on the first read. Earlier in the same session I had characterized the base as "a few large objects, so per-object latency is negligible" -- true of `materialize_base`, and wrong about the path as a whole, because the *descriptors* are the many-small-objects case and they are fetched separately.
+
+### The change
+
+All four now run at `ARCHIVE_FETCH_CONCURRENCY`, with two deliberate choices.
+
+**`buffered`, not `buffer_unordered`.** Results and errors arrive in the order the serial code produced them, so nothing downstream reasons about completion order and a failure still names the first offending object in listing order. The concurrency is identical; only the retirement order differs.
+
+**Eight, deliberately modest.** The caller is usually a follower booting, and a cluster restart boots all of them at once. A large per-follower fan-out turns a recovery into a thundering herd against a single object-store prefix. Eight hides latency without being a load generator.
+
+Within a shard the WAL walk stays sequential: the next object is selected by the *current* fingerprint, so there is nothing to overlap. The loop body became `assemble_shard_wal` unchanged; shards are independent because each writes its own `shard-NNNN.wal`.
+
+### What was left alone, and why it is a decision rather than an omission
+
+`bootstrap_shard`, the leader-driven path, is serial across shards too. It is **not** parallelised here. It opens with `check_leader`, which mutates `FollowerClient::adopted` and `term` and carries the comment "Before a byte is written, not after: this is the whole point." Concurrent shards either race that adoption check or require hoisting it out of the loop -- and hoisting turns a per-shard fence into a per-bootstrap one, so a leadership change mid-bootstrap is no longer caught between shards. The MANIFEST fence still sits behind it, but that is a semantic change to a fencing path in replication and belongs to whoever owns the failover contract, not to a performance pass.
+
+### On the original claim
+
+Worth recording because the question was asked and answered rather than acted on blind. "Incremental retrieval" has three readings and they do not fare alike. *Resumable* helps only the retry path -- though an interrupted seed does re-download everything today, since `restore_to` refuses an existing target and `create_staging` mints a fresh directory per attempt. *Lazy or demand-paged* fights three invariants: `inspect_base` verifies the whole base against its manifest, recovery must land exactly on the selected version, and readiness requires a full replication pass -- so it would defer precisely the bytes a read-serving follower exists to serve. *Delta* already exists under another name: a follower that keeps its MANIFEST never refetches the base and closes the gap by WAL.
+
+None of the three touches `sync_tree`, which fsyncs the whole restored tree before publication, or the first full replication pass that gates `/readyz`. **Where boot time actually goes is still unmeasured**, and the parallelism above was taken on the separate ground that independent network transfers running in series is a defect whatever the profile says.

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Args;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
@@ -338,24 +338,51 @@ async fn load_base(
 }
 
 /// Every completed base manifest for this database, with its object key.
+/// Object fetches a restore runs at once.
+///
+/// Every fetch loop on this path used to be a plain `for` with an `.await`
+/// inside, so a restore paid one full round trip per object in series. That is
+/// worst for the two loops that fetch *many small* objects -- one base manifest
+/// per retained base, and one `.wal.pb` descriptor per WAL object in the whole
+/// retained history -- where the transfer is a few hundred bytes and the cost
+/// is latency.
+///
+/// Deliberately modest rather than as large as it could be. The caller is
+/// usually a follower booting, and a cluster restart boots all of them at once;
+/// an aggressive fan-out per follower turns a recovery into a thundering herd
+/// against one object-store prefix. Eight hides latency without being a load
+/// generator.
+///
+/// Every loop uses `buffered` rather than `buffer_unordered`, so results and
+/// errors arrive in the order the serial code produced them. The speedup is the
+/// same -- the futures still run concurrently -- and nothing downstream has to
+/// reason about completion order.
+const ARCHIVE_FETCH_CONCURRENCY: usize = 8;
+
 async fn list_bases(
     store: &ArchiveStore,
     database_uuid: &[u8],
 ) -> Result<Vec<(String, pb::BaseManifest)>, ArchiveError> {
     let prefix = format!("db/{}/term/", uuid_hex(database_uuid));
-    let mut out = Vec::new();
-    for key in store.list_relative(&prefix).await? {
-        if !key.ends_with("/manifest.pb") || !key.contains("/base/") {
-            continue;
-        }
-        let manifest = pb::BaseManifest::decode(store.get_bytes(&key).await?)?;
-        validate_base_manifest(&manifest)?;
-        if manifest.database_uuid != database_uuid {
-            continue;
-        }
-        out.push((key, manifest));
-    }
-    Ok(out)
+    let keys: Vec<String> = store
+        .list_relative(&prefix)
+        .await?
+        .into_iter()
+        .filter(|key| key.ends_with("/manifest.pb") && key.contains("/base/"))
+        .collect();
+    let fetched: Vec<(String, pb::BaseManifest)> =
+        futures::stream::iter(keys.into_iter().map(|key| async move {
+            let manifest = pb::BaseManifest::decode(store.get_bytes(&key).await?)?;
+            validate_base_manifest(&manifest)?;
+            Ok::<_, ArchiveError>((key, manifest))
+        }))
+        .buffered(ARCHIVE_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+    Ok(fetched
+        .into_iter()
+        .filter(|(_, manifest)| manifest.database_uuid == database_uuid)
+        .collect())
 }
 
 async fn download_base_file(
@@ -404,9 +431,15 @@ async fn materialize_base(
     manifest: &pb::BaseManifest,
     target: &Path,
 ) -> Result<(), ArchiveError> {
-    for file in &manifest.files {
-        download_base_file(store, file, target).await?;
-    }
+    futures::stream::iter(
+        manifest
+            .files
+            .iter()
+            .map(|file| download_base_file(store, file, target)),
+    )
+    .buffered(ARCHIVE_FETCH_CONCURRENCY)
+    .try_collect::<Vec<()>>()
+    .await?;
     tokio::fs::File::open(target).await?.sync_all().await?;
     let inspection = inspect_base(target)?;
     if inspection.database_uuid.as_slice() != manifest.database_uuid
@@ -438,16 +471,30 @@ async fn load_wal_descriptors(
         manifest.term
     );
     let mut by_shard: BTreeMap<u32, Vec<pb::WalObject>> = BTreeMap::new();
-    for key in store.list_relative(&prefix).await? {
-        if !key.ends_with(".wal.pb") {
-            continue;
-        }
-        let descriptor = pb::WalObject::decode(store.get_bytes(&key).await?)?;
-        if descriptor.database_uuid != manifest.database_uuid || descriptor.term != manifest.term {
-            return Err(
-                format!("WAL descriptor '{key}' escaped its database or term prefix").into(),
-            );
-        }
+    let keys: Vec<String> = store
+        .list_relative(&prefix)
+        .await?
+        .into_iter()
+        .filter(|key| key.ends_with(".wal.pb"))
+        .collect();
+    // The widest loop on the restore path: one descriptor per WAL object in the
+    // whole retained history, each a few hundred bytes and a full round trip.
+    let descriptors: Vec<pb::WalObject> =
+        futures::stream::iter(keys.into_iter().map(|key| async move {
+            let descriptor = pb::WalObject::decode(store.get_bytes(&key).await?)?;
+            if descriptor.database_uuid != manifest.database_uuid
+                || descriptor.term != manifest.term
+            {
+                return Err(ArchiveError::from(format!(
+                    "WAL descriptor '{key}' escaped its database or term prefix"
+                )));
+            }
+            Ok(descriptor)
+        }))
+        .buffered(ARCHIVE_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+    for descriptor in descriptors {
         by_shard
             .entry(descriptor.shard)
             .or_default()
@@ -467,70 +514,87 @@ async fn assemble_wal(
     let state_tip = (manifest_key == state.latest_base_manifest && manifest.term == state.term)
         .then_some(&state.wal_cursors);
 
-    for base_cursor in &manifest.wal_cursors {
-        let path = target.join(format!("shard-{:04}.wal", base_cursor.shard));
-        let mut writer = WalWriter::open(&path, base_cursor.archived_lsn)?;
-        if writer.end_lsn() != base_cursor.archived_lsn {
-            return Err(format!(
-                "base shard {} WAL ends at {}, manifest says {}",
-                base_cursor.shard,
-                writer.end_lsn(),
-                base_cursor.archived_lsn
-            )
-            .into());
-        }
-        let expected_tip =
-            state_tip.and_then(|tips| tips.iter().find(|cursor| cursor.shard == base_cursor.shard));
-        let mut lsn = base_cursor.archived_lsn;
-        let mut fingerprint = base_cursor.history_fingerprint.clone();
-        loop {
-            if expected_tip.is_some_and(|tip| {
-                tip.archived_lsn == lsn && tip.history_fingerprint == fingerprint
-            }) {
-                break;
-            }
-            let children = descriptors
-                .get(&base_cursor.shard)
-                .into_iter()
-                .flatten()
-                .filter(|object| {
-                    object.first_lsn == lsn && object.previous_fingerprint == fingerprint
-                })
-                .collect::<Vec<_>>();
-            match children.as_slice() {
-                [] if expected_tip.is_none() => break,
-                [] => {
-                    return Err(format!(
-                        "WAL history for shard {} ends at {lsn} before the durable state tip",
-                        base_cursor.shard
-                    )
-                    .into());
-                }
-                [object] => {
-                    if expected_tip.is_some_and(|tip| object.last_lsn > tip.archived_lsn) {
-                        return Err(format!(
-                            "WAL object for shard {} runs past the durable state tip",
-                            base_cursor.shard
-                        )
-                        .into());
-                    }
-                    let records = store.get_bytes(&object.object_key).await?;
-                    validate_wal_object(object, &records)?;
-                    writer.append_frames_at(object.first_lsn, &records)?;
-                    lsn = object.last_lsn;
-                    fingerprint = object.history_fingerprint.clone();
-                }
-                _ => {
-                    return Err(format!(
-                        "WAL history for shard {} forks at LSN {lsn}",
-                        base_cursor.shard
-                    )
-                    .into());
-                }
-            }
-        }
-        writer.sync()?;
+    // Each shard writes its own `shard-NNNN.wal` and walks its own fingerprint
+    // chain, so shards are independent. Within a shard the walk stays strictly
+    // sequential -- the next object is chosen by the *current* fingerprint, so
+    // there is nothing to overlap there and nothing to reorder.
+    futures::stream::iter(manifest.wal_cursors.iter().map(|base_cursor| {
+        assemble_shard_wal(store, &descriptors, state_tip, base_cursor, target)
+    }))
+    .buffered(ARCHIVE_FETCH_CONCURRENCY)
+    .try_collect::<Vec<()>>()
+    .await?;
+    Ok(())
+}
+
+/// Rebuild one shard's WAL from the archive, from the base cursor to the tip.
+async fn assemble_shard_wal(
+    store: &ArchiveStore,
+    descriptors: &BTreeMap<u32, Vec<pb::WalObject>>,
+    state_tip: Option<&Vec<pb::WalCursor>>,
+    base_cursor: &pb::WalCursor,
+    target: &Path,
+) -> Result<(), ArchiveError> {
+    let path = target.join(format!("shard-{:04}.wal", base_cursor.shard));
+    let mut writer = WalWriter::open(&path, base_cursor.archived_lsn)?;
+    if writer.end_lsn() != base_cursor.archived_lsn {
+        return Err(format!(
+            "base shard {} WAL ends at {}, manifest says {}",
+            base_cursor.shard,
+            writer.end_lsn(),
+            base_cursor.archived_lsn
+        )
+        .into());
     }
+    let expected_tip =
+        state_tip.and_then(|tips| tips.iter().find(|cursor| cursor.shard == base_cursor.shard));
+    let mut lsn = base_cursor.archived_lsn;
+    let mut fingerprint = base_cursor.history_fingerprint.clone();
+    loop {
+        if expected_tip
+            .is_some_and(|tip| tip.archived_lsn == lsn && tip.history_fingerprint == fingerprint)
+        {
+            break;
+        }
+        let children = descriptors
+            .get(&base_cursor.shard)
+            .into_iter()
+            .flatten()
+            .filter(|object| object.first_lsn == lsn && object.previous_fingerprint == fingerprint)
+            .collect::<Vec<_>>();
+        match children.as_slice() {
+            [] if expected_tip.is_none() => break,
+            [] => {
+                return Err(format!(
+                    "WAL history for shard {} ends at {lsn} before the durable state tip",
+                    base_cursor.shard
+                )
+                .into());
+            }
+            [object] => {
+                if expected_tip.is_some_and(|tip| object.last_lsn > tip.archived_lsn) {
+                    return Err(format!(
+                        "WAL object for shard {} runs past the durable state tip",
+                        base_cursor.shard
+                    )
+                    .into());
+                }
+                let records = store.get_bytes(&object.object_key).await?;
+                validate_wal_object(object, &records)?;
+                writer.append_frames_at(object.first_lsn, &records)?;
+                lsn = object.last_lsn;
+                fingerprint = object.history_fingerprint.clone();
+            }
+            _ => {
+                return Err(format!(
+                    "WAL history for shard {} forks at LSN {lsn}",
+                    base_cursor.shard
+                )
+                .into());
+            }
+        }
+    }
+    writer.sync()?;
     Ok(())
 }
 
