@@ -123,7 +123,22 @@ def scripts_half(files: list[pathlib.Path]) -> list[str]:
         if (f.parent.name == "scripts" and f.suffix in (".py", ".sh"))
         or f.name == "gate.sh"
     )
-    blob = "\n".join(t for f in files if f.suffix != ".md" and (t := read(f)))
+    # **This file is not part of its own corpus.** `BASELINE_SCRIPTS` names
+    # every script it baselines, in string literals that no comment stripper
+    # removes, so leaving it in makes each baseline look invoked by the very
+    # statement that it is not. A baseline is a claim *about* invocation, not
+    # an invocation.
+    #
+    # Found the hard way: this was verified while the file was still untracked,
+    # so `git ls-files` excluded it and the defect could not appear. It
+    # appeared on the first gate run after the commit. A checker whose corpus
+    # is the tracked tree has to be validated from inside the tracked tree.
+    me = pathlib.Path(__file__).resolve()
+    blob = "\n".join(
+        t
+        for f in files
+        if f.suffix != ".md" and f.resolve() != me and (t := read(f))
+    )
     if not scripts:
         sys.exit("check-unwired: no scripts found; the ruler is broken")
 

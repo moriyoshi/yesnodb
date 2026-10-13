@@ -544,7 +544,7 @@ step "the Flight capability bitmask agrees across all four implementations"
 # same weakness; this holds without anyone remembering.
 check python3 scripts/check-feature-bits.py
 
-step "nothing newly unwired: every script invoked, every core `pub fn` called"
+step 'nothing newly unwired: every script invoked, every core pub fn called'
 # This sweep was run by hand at least six times before becoming a script, and
 # the backlog entry that owns it records its own construction, both controls
 # and two earlier ruler corrections. The next person rebuilt the ruler anyway
