@@ -301,6 +301,33 @@ impl BitmapContainer {
     }
 
     /// Maximal runs as `(start, end)` inclusive pairs.
+    ///
+    /// # Per run, not per bit
+    ///
+    /// This used to test all 64 bits of every non-zero word, short-circuiting
+    /// only all-**zero** words. A dense bitmap has no zero words, so it paid
+    /// 65 536 bit tests — and the caller that matters is
+    /// [`Container::optimize`](crate::Container::optimize), which runs on every
+    /// mixed-kernel result. Measured: `optimize` on a 65 535-bit bitmap cost
+    /// **23.3 us**, of which cloning the words was 90 ns, and that was the whole
+    /// cost of producing one chunk of a complement — `Not::produce` builds its
+    /// window as a run, subtracts the input, and the subtraction's bitmap result
+    /// is re-encoded here.
+    ///
+    /// [`Self::run_count`] was already word-wise, using the same `x & !(x << 1)`
+    /// transition trick. The two compute the same structure, so the asymmetry
+    /// was the defect: one counted runs in 1 024 word operations while the other
+    /// enumerated them in 65 536 bit tests.
+    ///
+    /// Now both are word-wise. Each iteration pairs the word's run **starts**
+    /// with its run **ends** and advances by `trailing_zeros`, so the inner loop
+    /// runs once per run rather than once per bit.
+    ///
+    /// # Why `ends` consults the following word
+    ///
+    /// Runs must be **maximal**. A word of all ones followed by another has no
+    /// run end at bit 63, so masking bit 63 out of `ends` when the next word's
+    /// bit 0 is set is what keeps a 1 024-word span one run instead of 1 024.
     pub fn runs(&self) -> Vec<(u16, u16)> {
         let mut out = Vec::new();
         // The seventh site. `runs()` feeding an empty vector to a run-container
@@ -313,28 +340,44 @@ impl BitmapContainer {
                 &owned[..]
             }
         };
-        let mut start: Option<u32> = None;
+        // Start of a run opened in an earlier word and not yet closed.
+        let mut open: Option<u32> = None;
         for (i, &x) in w.iter().enumerate() {
             if x == 0 {
-                if let Some(s) = start.take() {
+                if let Some(s) = open.take() {
                     out.push((s as u16, (i as u32 * 64 - 1) as u16));
                 }
                 continue;
             }
-            for b in 0..64u32 {
-                let set = x & (1u64 << b) != 0;
-                let pos = i as u32 * 64 + b;
-                match (set, start) {
-                    (true, None) => start = Some(pos),
-                    (false, Some(s)) => {
-                        out.push((s as u16, (pos - 1) as u16));
-                        start = None;
+            let base = i as u32 * 64;
+            let next_low = w.get(i + 1).is_some_and(|&y| y & 1 != 0);
+            // `0 -> 1` transitions, and `1 -> 0` transitions with bit 63
+            // suppressed when the run continues into the next word.
+            let mut starts = x & !(x << 1);
+            let mut ends = x & !((x >> 1) | (u64::from(next_low) << 63));
+            if x & 1 != 0 && open.is_some() {
+                // Bit 0 continues a run opened earlier; it is not a new start.
+                starts &= starts - 1;
+            }
+            while ends != 0 {
+                let end = ends.trailing_zeros();
+                let start = match open.take() {
+                    Some(s) => s,
+                    None => {
+                        let s = starts.trailing_zeros();
+                        starts &= starts - 1;
+                        base + s
                     }
-                    _ => {}
-                }
+                };
+                out.push((start as u16, (base + end) as u16));
+                ends &= ends - 1;
+            }
+            // A start with no end in this word runs on into the next one.
+            if starts != 0 {
+                open = Some(base + starts.trailing_zeros());
             }
         }
-        if let Some(s) = start {
+        if let Some(s) = open {
             out.push((s as u16, (CHUNK_CARD - 1) as u16));
         }
         out
@@ -669,5 +712,117 @@ mod tests {
         b.insert_range(0, 65535);
         assert_eq!(b.run_count(), 1);
         assert_eq!(b.runs(), vec![(0, 65535)]);
+    }
+
+    /// The per-bit implementation `runs()` replaced, kept as the oracle.
+    ///
+    /// Word-wise run extraction is bit arithmetic with three boundary cases --
+    /// a run opened in an earlier word, a word of all ones, and a run that ends
+    /// exactly at bit 63 -- and the only honest check is against the obvious
+    /// implementation. This is that implementation, and it is deliberately the
+    /// slow one.
+    fn runs_per_bit(b: &BitmapContainer) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        let mut start: Option<u32> = None;
+        for pos in 0..CHUNK_CARD {
+            let set = b.contains(pos as u16);
+            match (set, start) {
+                (true, None) => start = Some(pos),
+                (false, Some(s)) => {
+                    out.push((s as u16, (pos - 1) as u16));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            out.push((s as u16, (CHUNK_CARD - 1) as u16));
+        }
+        out
+    }
+
+    /// Word-wise `runs()` must agree with the per-bit oracle everywhere.
+    ///
+    /// The shapes are chosen for the boundaries the word arithmetic has and the
+    /// per-bit loop does not: all ones ( one run spanning every word ), a
+    /// single cleared bit ( which is the complement case `Not::produce` builds
+    /// and the reason this was found ), runs that end exactly at bit 63, runs
+    /// that start exactly at bit 0 of a later word, and alternating bits, where
+    /// every bit is its own run and the word-wise loop degenerates to the
+    /// per-bit one.
+    #[test]
+    fn word_wise_runs_agree_with_the_per_bit_oracle() {
+        let mut cases: Vec<(&str, BitmapContainer)> = Vec::new();
+
+        let mut all = BitmapContainer::zeroed();
+        all.insert_range(0, (CHUNK_CARD - 1) as u16);
+        cases.push(("all ones", all.clone()));
+
+        let mut hole = all.clone();
+        hole.remove(0);
+        cases.push(("all but bit 0", hole));
+
+        let mut hole_mid = all.clone();
+        hole_mid.remove(64);
+        cases.push(("all but a word boundary bit", hole_mid));
+
+        let mut hole_63 = all.clone();
+        hole_63.remove(63);
+        cases.push(("all but bit 63", hole_63));
+
+        let mut seams = BitmapContainer::zeroed();
+        for w in 0..16u32 {
+            // Ends exactly at bit 63 of one word, resumes at bit 0 two later.
+            seams.insert_range((w * 128) as u16, (w * 128 + 63) as u16);
+        }
+        cases.push(("runs ending at bit 63", seams));
+
+        let mut alternating = BitmapContainer::zeroed();
+        for v in (0..CHUNK_CARD).step_by(2) {
+            alternating.insert(v as u16);
+        }
+        cases.push(("alternating bits", alternating));
+
+        let mut single = BitmapContainer::zeroed();
+        single.insert(0);
+        cases.push(("one bit at 0", single));
+
+        let mut last = BitmapContainer::zeroed();
+        last.insert((CHUNK_CARD - 1) as u16);
+        cases.push(("one bit at the top", last));
+
+        // A deterministic pseudo-random spread, so the agreement is not only
+        // over shapes chosen to be interesting.
+        let mut mixed = BitmapContainer::zeroed();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..4000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            mixed.insert((state >> 33) as u16);
+        }
+        cases.push(("pseudo-random", mixed));
+
+        for (name, b) in &cases {
+            let want = runs_per_bit(b);
+            assert_eq!(b.runs(), want, "{name}: runs() disagrees with the oracle");
+            // `run_count` is the other word-wise reader of the same structure,
+            // and nothing else checks the two against each other.
+            assert_eq!(
+                b.run_count() as usize,
+                want.len(),
+                "{name}: run_count disagrees with the runs it would enumerate"
+            );
+            // Every run must be maximal and ordered, which a correct count
+            // alone does not establish.
+            for pair in want.windows(2) {
+                assert!(
+                    pair[1].0 > pair[0].1 + 1,
+                    "{name}: {:?} and {:?} touch and should be one run",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
     }
 }

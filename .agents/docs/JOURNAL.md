@@ -547,3 +547,131 @@ Scripts half reproduces the recorded result exactly -- 39 considered, 3 never in
 ### One rule I broke
 
 Restoring a sabotaged file during the controls, I used `git checkout -- <path>` once. The standing rule in this repository is not to, because another agent may be working in the same checkout. No harm done -- the file was restored and `git status` confirms the tree is clean -- but the correct move was the backup copy I used for every other control, and I should not have reached for the other thing.
+
+---
+
+## 2026-10-14 — The cost model was being taught to predict a defect
+
+`cost-model-cannot-see-materialization` records that `cardinality_cost` rates `And( ¬p, ¬q )` and `¬( p ∪ q )` equal while they differ 214x in execution, and concludes that "what is needed is a cost model that charges an operator for operands it must materialize, which is a real modelling change". A later pass measured a ten-shape corpus, found a second inversion family, and sharpened the prescription to "a second dimension ... keyed on the materialized cardinality".
+
+I rebuilt the corpus to get before-numbers for that change. It refuted the prescription and relocated the defect.
+
+### Materialized cardinality is not the key, and the corpus says so
+
+`And( dense, dense )` materializes **131 072 ordinals in 17 ns**. `And( ¬p, ¬q )` materialized the same 131 070 in **46 981 ns**. Same quantity, 2 700x apart. Draining each operand on its own says why: a **stored** chunk costs 15-32 ns to produce *regardless of cardinality* -- `dense`, one chunk holding 65 536 ordinals, drains in 32 ns -- while a **complement** chunk cost 23 502 ns. The question was never how much gets built. It was what builds it.
+
+### What built it slowly
+
+`Not::produce` builds its window as a one-interval `Run` and calls `and_not( universe, input )`. `mixed::try_apply_array_run` has a fast arm for `AndNot` **only when the array is the left operand**, so `Run \ Array` falls through to bitmap expansion, and the bitmap result is re-encoded by `Container::optimize`.
+
+Timed directly: **`optimize` on a 65 535-bit bitmap was 23 292 of the 23 424 ns**, and cloning its 8 KiB of words was 90 ns, so this was not memory traffic. `BitmapContainer::runs()` short-circuited all-**zero** words and then tested all 64 bits of every other word. A dense bitmap has no zero words, so it paid 65 536 bit tests at ~0.36 ns each.
+
+**`run_count()` was already word-wise**, using `( x & !( x << 1 ) ).count_ones()`. The two functions compute the same structure. That asymmetry was the whole defect: one counted runs in 1 024 word operations while the other enumerated them in 65 536 bit tests.
+
+### The fix, and what it is worth
+
+`runs()` is now word-wise too: per word it pairs the run **starts** `x & !( x << 1 )` with the run **ends** `x & !( x >> 1 )` and advances with `trailing_zeros`, so the inner loop runs once per run rather than once per bit. Bit 63 is suppressed from `ends` when the next word's bit 0 is set, which is what keeps a 1 024-word span one maximal run instead of 1 024.
+
+```text
+  measurement                      before      after   factor
+  optimize( bitmap, 65 535 bits )  23 292 ns  2 848 ns    8.2x
+  and_not( Run, Array )            23 424     2 974       7.9x
+  drain !p, 1-chunk window         23 528     3 063       7.7x
+  And( !p, !q ) 1-chunk            46 981     6 127       7.7x
+  And( !p, !q ) 32-chunk          423 925    56 244       7.5x
+```
+
+Every shape with no complement in it is unchanged within noise -- `And( p, q )` 27 781 -> 27 639, `Or` 24 173 -> 24 537, `Xor` 24 057 -> 23 993 -- which is the control that says this is the path it claims to be.
+
+The gain is not confined to complements. `optimize` runs on every mixed-kernel result, so any dense bitmap that re-encodes as runs was paying this.
+
+### The test is the old implementation
+
+`word_wise_runs_agree_with_the_per_bit_oracle` keeps the per-bit loop `runs()` replaced and asserts the two agree, over all-ones, a single cleared bit at position 0 / 63 / a word boundary, runs ending exactly at bit 63, alternating bits, single bits at each end, and a deterministic pseudo-random spread. It also cross-checks `run_count()` against the length of the runs it would enumerate, which nothing did before, and asserts every emitted pair is non-touching so a correct *count* cannot stand in for maximality.
+
+Four sabotages, each failing it and each restored byte-identical: dropping the next-word suppression, treating bit 0 as a new start when a run is open, forgetting to carry an unterminated start, and an off-by-one on the run end.
+
+### What this leaves
+
+The entry survives: the model still rates the De Morgan pair equal and they still differ. But **24.5x, not 187x** -- a seventh of the prize the modelling change was being justified against, and the second inversion family has shrunk on its own too ( `And( p, q )` against `Or( p, q )` is 1.15x in runtime now, not 3x; the 4x is a pricing difference, not a runtime one ). Re-derive before pricing that work.
+
+What remains on the fast path is filed as `run-minus-array-expands-to-a-bitmap`: the missing `Run \ Array` arm is still 2 974 ns against 17 ns for the array-on-the-left pair, about 300x, with the generic kernel available as the differential oracle the crate's own policy promises.
+
+### The order of the questions
+
+Two sessions went into designing a cost model faithful to an execution cost that was a defect. A cost model's job is to predict what the engine does; before making it predict an expensive operation faithfully, check that the operation has to be expensive. The neighbouring entry already had the slogan -- *ask what is refusing before asking what is imprecise* -- and this is the same shape with "slow" in place of "refusing".
+
+---
+
+## 2026-10-14 — I pushed a red gate, and the reason is the lesson from the commit that broke it
+
+`9c09ab8` added `scripts/check-unwired.py` and a gate step for it. I ran `scripts/gate.sh` before pushing and it passed. The next full run, on a clean tree, **failed** — on that step, with three false positives:
+
+```text
+  scripts/fmt-scoped.py is baselined as uninvoked but now has a caller
+  scripts/gate-mount-propagation.sh is baselined as uninvoked but now has a caller
+  scripts/miri.sh is baselined as uninvoked but now has a caller
+```
+
+### Why the verifying run could not see it
+
+The checker's corpus is `git ls-files`. When I validated it, `check-unwired.py` was **untracked**, so it was not in its own corpus. The commit made it tracked, and its `BASELINE_SCRIPTS` dictionary — which names every script it baselines, in string literals no comment stripper removes — started counting as a caller of each one. The baseline is a statement *about* invocation; the checker read it as an invocation.
+
+So I verified the tool in a state it would never be in again, and the first state it could never be verified in was the one it shipped in. **A checker whose corpus is the tracked tree has to be validated from inside the tracked tree.**
+
+That is the same failure as the ruler bug in the same commit, one level up. There I wrote that a control must discriminate the distinction the checker exists to make. Here the missing control was the file's own tracked-ness, and I did not think to vary it because the tool worked.
+
+### The second bug, which is plainer
+
+```text
+  ./scripts/gate.sh: line 547: pub: command not found
+```
+
+The step title was `step "... every core `pub fn` called"`. Backticks inside a **double-quoted** shell string are command substitution, so the gate ran `pub fn` as a command on every invocation. Harmless only because no `pub` exists on the path. The header printed as "every core  called", which is the visible tell I walked past in the passing run — the substitution had already eaten the words before I read the output.
+
+### Fixes, and the controls that now hold them
+
+The step title is single-quoted. The checker excludes its own file from the invocation corpus, with the reason written beside it.
+
+Two controls, both run with the file tracked this time: removing the self-exclusion reproduces all three false positives exactly, and a baselined script that gains a **real** caller still fails. The second is the one that matters — excluding a file from the corpus could easily have blinded the shrink-only direction, and it does not.
+
+### What to carry
+
+Two things. **Read the header a passing step prints**, not just its verdict; "every core  called" was the bug announcing itself in the run I accepted. And when a tool's input is the repository state, the states to vary include *whether the tool itself is committed* — which is invisible from inside a working tree where it already is.
+
+---
+
+## 2026-10-14 — The archive ENOENT was a shared temporary, and the path it finally printed said so
+
+`the-archive-sidecar-fails-with-enoent-under-load` had been open since 2026-09-28: `pitr_retention.py` and `archive.py` failing at `srv_archive_wait` with a bare `No such file or directory ( os error 2 )`, 0 reproductions in 26 isolated runs, two sessions of reading, and a recorded "strongest suspect" that turned out to be innocent.
+
+It failed a third time, in a routine gate run, and this time it named its file:
+
+```text
+  cannot rename the state temporary
+    '.../archive-work/.state.pb.partial': No such file or directory ( os error 2 )
+```
+
+That was the whole investigation. The 2026-09-29 note had asked only that the next occurrence capture the path, and `archive::ctx` was added for it; the named path identified the defect in about ten minutes of reading.
+
+### The defect
+
+`write_local_state` writes to a temporary and renames. Its temporary was derived from the **target's** file name -- `.{name}.partial` -- so it was one name per *path*, not one per *call*.
+
+The sidecar spawns a `wal_loop` **per shard** plus `event_loop`, `term_loop`, `writer_lease_loop` and `retention_loop` into a single `JoinSet`, and four of those call `publish_state` on the same `runtime.local_state`. Two concurrent writers therefore created, wrote and `sync_all`'d the *same* temporary. Whichever renamed first took it away; the other's `rename` failed `ENOENT` **on a file it had itself just synced a microsecond earlier**. In the local-objects mode every e2e scenario uses there is nothing to serialize them: that arm is a plain `put`, with no writer-lease renewal and no compare-and-swap.
+
+### Why it never reproduced
+
+Every reproduction attempt re-ran the *scenario*, and the scenario's concurrency is incidental to the bug. The window is the few microseconds between one writer's `sync_all` and its `rename`; two publishers almost never land inside it, and 26 runs of a workload that happens to produce two publishers is a poor way to sample it.
+
+Sixteen concurrent `write_local_state` calls against one path reproduce it **deterministically in 20 ms**, with the identical message. That is the regression test.
+
+### The fix
+
+A per-call temporary -- `.{name}.{pid}.{seq}.partial`, following `capture_target`'s naming for the same reason -- and removal of the temporary on any failure, since a per-call name cannot be reused and would otherwise accumulate in the work directory. The test fails under a sabotage restoring the shared name, with the original error.
+
+### Two things to carry
+
+**The strongest suspect was wrong, and it was a good suspect.** The entry named the direct-path snapshot flow and `remove_staged_base` -- "a lease release or checkpoint cleanup landing between the two is exactly a bare `ENOENT` on a path the sidecar never chose". It reads well and it is false: `remove_staged_base` removes `work_dir/base-...`, a subdirectory, never the work directory the state file sits in. The `NotFound` tolerance added for it on 2026-10-11 is correct on its own terms and fixed nothing here. A plausible mechanism that explains a symptom is not evidence for it, and the cost of treating it as evidence was two sessions.
+
+**Diagnosability beat reproduction, and it was much cheaper.** 26 attempts to reproduce yielded nothing. One `map_err` adding the path turned the next occurrence into a ten-minute read. When an error can arise from several places and says which only by luck, spend the effort on making the next sighting informative rather than on making it happen again -- which is what the entry itself concluded on 2026-09-29, and it was right.

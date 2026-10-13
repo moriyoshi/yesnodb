@@ -7,6 +7,7 @@
 //! corresponding object and protobuf cursor are durable.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -801,16 +802,48 @@ async fn write_local_state(path: &Path, bytes: Vec<u8>) -> Result<(), ArchiveErr
         let name = path
             .file_name()
             .ok_or_else(|| format!("state path '{}' has no file name", path.display()))?;
-        let temporary = parent.join(format!(".{}.partial", name.to_string_lossy()));
-        let mut file = std::fs::File::create(&temporary)
-            .map_err(|e| ctx("create the state temporary", &temporary, e))?;
-        use std::io::Write as _;
-        file.write_all(&bytes)
-            .map_err(|e| ctx("write the state temporary", &temporary, e))?;
-        file.sync_all()
-            .map_err(|e| ctx("sync the state temporary", &temporary, e))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|e| ctx("rename the state temporary", &temporary, e))?;
+        // **One temporary per call, not one per target.**
+        //
+        // This used to be `.{name}.partial`, derived from the file being
+        // written. The sidecar spawns a `wal_loop` per shard plus `event_loop`,
+        // `term_loop`, `writer_lease_loop` and `retention_loop` into one
+        // `JoinSet`, and four of those publish state on the same path -- so
+        // every concurrent writer opened, wrote and synced the *same*
+        // temporary, and whichever renamed first took it away. The others'
+        // `rename` then failed with a bare `ENOENT` on a file they had just
+        // synced.
+        //
+        // That is `the-archive-sidecar-fails-with-enoent-under-load`, open from
+        // 2026-09-28 and never reproduced in isolation, because the window is
+        // the few microseconds between one writer's `sync_all` and its
+        // `rename`. Load widened it; load was never the cause.
+        //
+        // The pid and counter follow `capture_target`'s naming for the same
+        // reason: unique within a process, and distinguishable between two.
+        let unique = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.{}.{unique}.partial",
+            name.to_string_lossy(),
+            std::process::id(),
+        ));
+        let write = (|| -> Result<(), ArchiveError> {
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|e| ctx("create the state temporary", &temporary, e))?;
+            use std::io::Write as _;
+            file.write_all(&bytes)
+                .map_err(|e| ctx("write the state temporary", &temporary, e))?;
+            file.sync_all()
+                .map_err(|e| ctx("sync the state temporary", &temporary, e))?;
+            std::fs::rename(&temporary, &path)
+                .map_err(|e| ctx("rename the state temporary", &temporary, e))?;
+            Ok(())
+        })();
+        if write.is_err() {
+            // A per-call name cannot be reused, so a failed attempt would
+            // otherwise leave its temporary in the work directory forever.
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write?;
         std::fs::File::open(parent)
             .map_err(|e| ctx("open the state directory to sync it", parent, e))?
             .sync_all()
@@ -820,6 +853,9 @@ async fn write_local_state(path: &Path, bytes: Vec<u8>) -> Result<(), ArchiveErr
     .await??;
     Ok(())
 }
+
+/// Distinguishes the temporaries of two concurrent [`write_local_state`] calls.
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -865,6 +901,63 @@ mod tests {
             state
         );
         lease.release().await.unwrap();
+    }
+
+    /// Concurrent writers of the local state cache must not collide.
+    ///
+    /// The sidecar spawns a `wal_loop` **per shard** plus `event_loop`,
+    /// `term_loop`, `writer_lease_loop` and `retention_loop` into one
+    /// `JoinSet`, and four of those publish state on the same
+    /// `runtime.local_state` path. `write_local_state` used to derive its
+    /// temporary from the *target's* file name, so every concurrent writer
+    /// used the same `.state.pb.partial`: whoever renamed first took it away,
+    /// and the others' `rename` failed with a bare `ENOENT`.
+    ///
+    /// That was `the-archive-sidecar-fails-with-enoent-under-load`, open since
+    /// 2026-09-28 and never reproduced in isolation because it needs two
+    /// writers interleaved between one's `sync_all` and its `rename`. Load was
+    /// the trigger and never the cause.
+    ///
+    /// Sixteen writers rather than two, because the window is a few
+    /// microseconds wide and one pair almost never lands inside it.
+    #[tokio::test]
+    async fn concurrent_local_state_writers_do_not_share_a_temporary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.pb");
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..16u8 {
+            let path = path.clone();
+            tasks.spawn(async move { write_local_state(&path, vec![i; 256]).await });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined
+                .expect("no writer may panic")
+                .expect("no writer may fail: a shared temporary makes the loser ENOENT");
+        }
+        // Whoever renamed last wins, and the file must be one writer's bytes
+        // whole rather than a mixture -- which is what rename buys.
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(
+            got.len(),
+            256,
+            "the published state is one writer's payload"
+        );
+        assert!(
+            got.iter().all(|&b| b == got[0]),
+            "the published state is torn: {:?}..",
+            &got[..8]
+        );
+        // No temporary may survive a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "state.pb")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporaries left behind: {leftovers:?}"
+        );
     }
 
     #[tokio::test]

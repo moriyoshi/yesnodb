@@ -799,7 +799,25 @@ Guarded by `segmentation_still_engages_for_sources_above_the_threshold` in `test
 
   **Worth doing only if a client is actually bulk-loading.** The 64.8x is on the write wire for dense data; a client inserting a few thousand pairs pays nothing for the pair wire. The question to answer first is whether any non-Rust caller has that shape, because the answer decides whether this is three pieces of work or none. `e2e/java/client.py` is where a Java answer would be proved, and it now exists.
 
-- [ ] **the-archive-sidecar-fails-with-enoent-under-load** ( *2026-09-28, seen once while two gates ran concurrently; not reproduced in isolation* ): `e2e/scenarios/pitr_retention.py` failed at `srv_archive_wait( archive, "base_generation", ... , 30000 )` with `No such file or directory ( os error 2 )`. **Not a timeout.** Reading the verb, that message comes from the `Ok( Err( error ) )` arm, which means the archive **sidecar task itself terminated with that error** and the verb reported it faithfully; a timeout would have said the sidecar stopped before the metric was reached.
+- [x] **the-archive-sidecar-fails-with-enoent-under-load** ( **ROOT-CAUSED, REPRODUCED AND CLOSED 2026-10-14, on the third occurrence, by the path the second occurrence's work made it print** ): the third sighting named its file, which is exactly what `ctx` was added for:
+
+  ```text
+    cannot rename the state temporary
+      '/tmp/yesno-e2e-pitr-retention-.../archive-work/.state.pb.partial':
+      No such file or directory ( os error 2 )
+  ```
+
+  **The cause is a shared temporary, not a racing remover.** `write_local_state` derived its temporary from the *target's* file name -- `.state.pb.partial` -- so it was one name per **path**, not one per **call**. The sidecar spawns a `wal_loop` **per shard** plus `event_loop`, `term_loop`, `writer_lease_loop` and `retention_loop` into a single `JoinSet`, and four of those call `publish_state` on the same `runtime.local_state`. Two concurrent writers therefore opened, wrote and `sync_all`'d the *same* temporary; whichever renamed first took it away, and the other's `rename` failed `ENOENT` **on a file it had itself just synced**. In the local-objects mode every e2e scenario uses, nothing serializes them at all -- that arm is a plain `put` with no lease renewal and no compare-and-swap.
+
+  **Reproduced in 20 ms, deterministically.** `concurrent_local_state_writers_do_not_share_a_temporary` runs sixteen concurrent `write_local_state` calls against one path and produces the identical message. Sixteen rather than two because the window is the few microseconds between one writer's `sync_all` and its `rename`. **This is why it never reproduced in isolation**: every attempt re-ran the scenario, and the scenario's concurrency is incidental to it.
+
+  **Every recorded observation now fits.** Load was the trigger and never the cause -- it widens an interleaving window. It appeared only in archive scenarios, because only the sidecar has several tasks publishing one state file. It survived 26 scenario re-runs. And the "capture a path" ask from 2026-09-29 is what closed it: the bare message named no file, and the named file named the defect immediately.
+
+  **Fixed** by making the temporary unique per call ( `.{name}.{pid}.{seq}.partial`, following `capture_target`'s naming ), with the temporary removed on any failure, since a per-call name cannot be reused and would otherwise accumulate. The test fails under a sabotage that restores the shared name, with the original message.
+
+  **The strongest suspect in this entry was wrong, and that is worth keeping.** It named the direct-path snapshot flow in `sidecar.rs` and `remove_staged_base` -- "a lease release or checkpoint cleanup landing between the two is exactly a bare `ENOENT` on a path the sidecar never chose". `remove_staged_base` removes `work_dir/base-...`, a *subdirectory*, and never the work directory the state file lives in. The `NotFound` tolerance added for it on 2026-10-11 is still right on its own terms and fixed nothing here. **A plausible mechanism that explains the symptom is not evidence**, and two sessions of reading went into one that could not have produced this path.
+
+- [x] **the-archive-sidecar-fails-with-enoent-under-load, original entry** ( *2026-09-28, seen once while two gates ran concurrently; not reproduced in isolation* ): `e2e/scenarios/pitr_retention.py` failed at `srv_archive_wait( archive, "base_generation", ... , 30000 )` with `No such file or directory ( os error 2 )`. **Not a timeout.** Reading the verb, that message comes from the `Ok( Err( error ) )` arm, which means the archive **sidecar task itself terminated with that error** and the verb reported it faithfully; a timeout would have said the sidecar stopped before the metric was reached.
 
   **Conditions.** `scripts/gate.sh` and `scripts/gate-pg.sh` were running at the same time, the latter building Arrow and PostgreSQL under Docker, so the machine was heavily loaded on CPU and disk. The scenario passes in isolation in 17.1 s against its own 30 s budget, and passed in every earlier gate run today.
 
@@ -1101,6 +1119,14 @@ Grepping the constant finds nothing wrong — it is defined, it has a sensible v
 
   **An earlier version of `sketch.rs`'s header claimed `plan` "memoizes per `plan()` call". It does not, and never did.** That sentence is why the cost went unmeasured. -- *source: recovered from `yesno-core/src/stream/sketch.rs`, `stream/plan.rs` and `benches/setops.rs`, 2026-09-14*
 
+- [ ] **run-minus-array-expands-to-a-bitmap** ( *2026-10-14, found by measuring `cost-model-cannot-see-materialization` and worth about 300x on the path that entry is about* ): `mixed::try_apply_array_run` has a fast arm for `AndNot` **only when the array is the left operand** ( `SetOp::AndNot if array_is_lhs` ). `Run \ Array` -- which is exactly what `Not::produce` computes for every complement chunk, a one-interval window minus the input -- falls through to expanding the run into a 1 024-word bitmap, clearing the array's bits, and re-encoding.
+
+  **Priced after the `runs()` fix landed**, so this is what remains: `and_not( Run[0..65535], Array[0] )` is **2 974 ns** against **17 ns** for the same pair with the array on the left. The work is `O( words )` where `O( nruns + |array| )` would do -- removing a point from a run splits at most one interval, so the direct form is a handful of operations for the shape that matters.
+
+  **The crate's own policy makes this safe to add**: `ops/mod.rs` says the generic kernel "stays as the differential oracle for every specialization, which is what makes adding one safe", and `apply` already dispatches through the specialization chain so a new arm is reached by every caller. Pair it with a differential test against `generic::apply` over random run/array pairs, including an array value inside a run, outside every run, at an interval's first and last position, and an array that empties the result.
+
+  **Do not reach for it before checking the caller is still hot.** The complement path is 7.7x faster than it was; if `Not::produce` is no longer visible in a profile of a real shape, this is a kernel improvement with no demonstrated consumer, which is the bar `merge_set` failed.
+
 - [ ] **cost-model-cannot-see-materialization** ( *found by arbitrating a neighbouring session's report, 2026-08-27* ): `cardinality_cost` rates `And( ¬p, ¬q )` and `¬( p ∪ q )` **equal**, and they differ **214x** in execution. Measured in release, 2 000 iterations, both answering 65 535, with `p`/`q` 2 000 chunks each and a one-chunk complement window: `And( ¬p, ¬q )` **53 095 ns**, `¬( p ∪ q )` **248 ns**. The planner declines the rewrite and takes the slow form.
 
   The mechanism is that two operators answer `cardinality` by routes the cost model does not distinguish. `Not::cardinality_dyn` seeks to its window, stops at `last_prefix()`, and counts by **subtraction** — `( hi - lo ) - |input ∩ range|` — building no container. `And::cardinality_dyn` has to materialize both operands and intersect, and here that is two 65 535-element complements. `cardinality_cost( And )` is `min( yield_chunks )` over its operands, which charges nothing for materializing an operand that cannot be counted arithmetically.
@@ -1133,7 +1159,28 @@ Grepping the constant finds nothing wrong — it is defined, it has a sensible v
 
 **A single scalar constant cannot fix it.** `ns/cost` spans **3.0 to 47 384** — a factor of ~16 000 — across shapes the model is meant to order. Fitting a constant to the De Morgan pair leaves the `And`-vs-`Or` family wrong and can easily make it worse, which is exactly how the 27 538-allocation regression happened.
 
-**What the fix needs, now evidence-backed**: a second dimension charging an operator for operands it must *build*, keyed on the materialized cardinality rather than the chunk count. `Not::cardinality_dyn` already computes `( hi - lo ) - |input ∩ range|`, so the quantity exists. Re-measure this corpus **and** `tests/allocation.rs` **and** the `union_gate` bench before and after; the corpus is cheap to rebuild from the construction above.
+**RE-MEASURED 2026-10-14, and the diagnosis moves out of the cost model entirely.** The corpus above was rebuilt from `de_morgan_is_declined_here_and_that_is_currently_wrong`'s construction and re-run on the current engine. Two things changed.
+
+  **First, the second inversion family has largely closed on its own.** `And( p, q )` was recorded at 75 025 ns against `Or( p, q )` at 24 053 -- "priced 4x cheaper and running 3x slower". It now measures **27 781 ns against 24 173**, so `And` runs 1.15x slower, not 3x. Per chunk *visited* the two are within 15% of each other ( ~6.9 ns against ~6.0 ), and the remaining 4x is a pricing difference: `cardinality_cost( And )` charges `min( a, b )` where the operator walks **both**, while `Or` is charged `MERGE_STEP` x the union. That is a real inversion and a much smaller one than recorded; do not quote the 3x.
+
+  **Second, the stated cost key is refuted by the corpus it came from.** The entry asks for a dimension "keyed on the materialized cardinality". `And( dense, dense )` materializes **131 072 ordinals in 17 ns**; `And( !p, !q )` materialized the same 131 070 in 46 981. Same materialized cardinality, 2 700x apart, so cardinality cannot be the key. Draining each operand separately says why: a **stored** chunk costs 15-32 ns to produce *regardless of its cardinality* ( `dense`, one chunk of 65 536 ordinals: 32 ns ), while a **complement** chunk cost 23 502 ns. The question was never how much is built; it was what builds it.
+
+  **And the complement was slow for a reason that is a defect rather than a cost.** `Not::produce` builds its window as a one-interval `Run` and calls `and_not( universe, input )`. For a `Run` left operand that falls past the array-run fast arm -- which handles `AndNot` only when the **array** is on the left -- into bitmap expansion, whose result is re-encoded by `Container::optimize`. **`optimize` on a 65 535-bit bitmap cost 23 292 of those 23 502 ns**, and cloning the 8 KiB of words was 90 ns of it, so this was not memory traffic. `BitmapContainer::runs()` short-circuited all-**zero** words and tested all 64 bits of every other one, so a dense bitmap paid 65 536 bit tests -- while `run_count()`, which computes the same structure, was already word-wise via `x & !( x << 1 )`. **Fixed 2026-10-14**: `runs()` is word-wise too, pairing each word's starts with its ends and advancing by `trailing_zeros`, so the inner loop runs once per run rather than once per bit.
+
+  ```text
+    measurement                      before      after   factor
+    optimize( bitmap, 65 535 bits )  23 292 ns  2 848 ns    8.2x
+    and_not( Run, Array )            23 424     2 974       7.9x
+    drain !p, 1-chunk window         23 528     3 063       7.7x
+    And( !p, !q ) 1-chunk            46 981     6 127       7.7x
+    And( !p, !q ) 32-chunk          423 925    56 244       7.5x
+  ```
+
+  Shapes with no complement are unchanged within noise, as they must be. **The De Morgan inversion is now 24.5x rather than 187x** ( 6 127 against 250 ), so this entry survives -- the model still rates the two equal -- but it is a seventh of the size, and the case for a modelling change rests on a smaller prize than the entry was written against. Re-derive before pricing the work.
+
+  **The transferable part is the order of the questions.** This entry spent two sessions designing a cost model faithful to an execution cost that was itself a defect. A cost model's job is to predict what the engine does; before making it predict an expensive operation faithfully, check that the operation needs to be expensive.
+
+  **What the fix needs, now evidence-backed**: a second dimension charging an operator for operands it must *build*, keyed on the materialized cardinality rather than the chunk count. `Not::cardinality_dyn` already computes `( hi - lo ) - |input ∩ range|`, so the quantity exists. Re-measure this corpus **and** `tests/allocation.rs` **and** the `union_gate` bench before and after; the corpus is cheap to rebuild from the construction above.
 
 **One cross-reference in this entry is stale**: `disjoint-or-is-overcharged` was closed 2026-08-27, so the `Or` arm already runs the strict-span test and the `Or` numbers above are the honest overlapping-merge case.
 
