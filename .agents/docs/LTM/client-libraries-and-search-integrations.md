@@ -13,6 +13,8 @@ The shared Flight protocol is consumed by Rust, Python, Java, Go, C++, PostgreSQ
 - `yesno-tantivy` maps stable application ordinals through an explicit fast-field resolver; yesno ordinals are never Tantivy `DocId` values.
 - Remote materialization is bounded by advertised cardinality and then verified for type, nullability, ordering, and row count.
 - Ingest acknowledgements accept the legacy 8-byte row count or the 16-byte row-count-plus-version form; exact-version reads may wait briefly for that commit to enter the visible prefix.
+- The capability bitmask is checked across all four implementations rather than restated in them. `FEATURE_CONTAINER_PUT` reached the server ten days before any client could name it, so a checker compares Rust, Python, Go and Java rather than relying on someone remembering four copies.
+- Only the Rust client sends container batches. A Java client can produce the payloads through public `org.roaringbitmap` API with **no new encoder** -- measured, see below -- and Python and Go have no equivalent container access.
 
 ## Details
 
@@ -152,6 +154,57 @@ demonstrates a plan that needs it -- which is the bar that entry set for itself.
 **The transferable form: ask what is refusing before asking what is imprecise.** The entry named
 the estimate, the estimate was genuinely wrong, and four hours of pricing an exact count went into
 a path the optimizer never walked.
+
+### A Java client can build yesno container payloads with no new encoder
+
+Verified 2026-10-13, against the shipped decoder rather than by reading. Container payloads on the
+write wire cost **64.8x less** than one row per set bit, and at the time of measurement only the
+Rust client could send them. The question that decides whether Java is cheap to wire up is whether
+`org.roaringbitmap` can emit yesno's payload bytes; it can.
+
+**The contract**, read out of `codec::decode`: an array is `2 * card` little-endian `u16` values,
+strictly ascending, with no leading count; a bitmap is exactly 8192 little-endian bytes whose
+popcount must equal the declared cardinality; a run is a little-endian `u16` interval count
+followed by that many `( start, len - 1 )` `u16` pairs, so `2 + 4 * nruns` bytes. That is the
+Roaring container layout, which is why this works at all.
+
+**The access path is public, and the obvious one is not.** `RoaringArray.getContainerAtIndex` and
+`getKeyAtIndex` are `protected` and `RoaringBitmap.highLowContainer` is package-private, so none of
+them is reachable. `RoaringBitmap.getContainerPointer()` **is** public, and `ContainerPointer`
+yields everything a row needs: `key()` for the prefix, `getContainer()` for the payload,
+`getCardinality()` for the cardinality column, and `isBitmapContainer()` / `isRunContainer()` as
+the kind discriminator with array as neither. `Container.writeArray( ByteBuffer )` writes the
+bytes.
+
+**Measured, not argued.** Three containers built from one `RoaringBitmap` -- a 4-value array, a
+9000-bit bitmap and a two-interval run after `runOptimize()` -- were dumped as hex from Java and
+fed to the shipped `codec::decode`. All three were accepted, and the 17 004 decoded ordinals
+compared equal to a set recomputed independently in Rust from the same construction rather than
+from the dump.
+
+**Four traps, each of which would have cost a session:**
+
+- **`serializedSizeInBytes()` is not the payload length.** For an array container it is
+  `2 + 2 * card`, two bytes more than the values, so sizing a buffer by it and taking the whole
+  array appends two zero bytes. The decoder refuses that ( `payload length 10 is not valid for
+  "array" with cardinality 4` ), which is the right failure, but the fix is to take the buffer's
+  written `position()`.
+- **`ByteBuffer` defaults to big-endian.** The order has to be set explicitly; Roaring's format and
+  yesno's decoder are both little-endian.
+- **`runOptimize()` is required** or there are no run containers to send at all.
+- **A 32-bit `RoaringBitmap` covers only `prefix48` in `[0, 2^16)`**, because its keys are the high
+  16 bits of a 32-bit value. The 64-bit domain needs `Roaring64NavigableMap`, whose high 32 bits
+  compose with the inner key as `( high32 << 16 ) | key`.
+
+**Reproduce** with a Java `main` using only the public API above, printing
+`kind`, `card` and the hex payload per container, and a scratch crate with a path dependency on
+`yesno-core` that feeds each row to `codec::decode` and compares against an independently
+constructed `BTreeSet<u64>`. The instrument was discarded; this derivation is what survives.
+
+**What this does and does not settle.** It settles that the encoder is free, which was the stated
+risk. It does not settle whether the work is worth doing: the 64.8x is on the write wire for dense
+data, and a client inserting a few thousand pairs pays nothing for the pair wire. The prior
+question is still whether any non-Rust caller has a bulk-load shape.
 
 ## Files
 

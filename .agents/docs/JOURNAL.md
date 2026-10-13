@@ -470,3 +470,37 @@ Worth recording because the guard is easy to read as noise and is not: a checker
 ### The rule
 
 Recorded in `QUALITY_GATE.md` § 2: a constant the wire defines is restated by four implementations, and a convention is not a mechanism. The ticket header, the capability bitmask and the mutation opcodes are all of this shape. **Look for the third instance.**
+
+---
+
+## 2026-10-13 — A Java client can build yesno container payloads with no new encoder
+
+Container payloads on the write wire cost **64.8x less** than one row per set bit, and only the Rust client sends them. The entry I had just filed named Java as probably the cheapest of the three remaining clients, on the grounds that it already depends on `org.roaringbitmap` and that the payloads are recorded as byte-identical to a `.roaring` file -- and told the next reader to **check that claim before budgeting the work**, because "byte-identical to a `.roaring` file" is a statement about the container payload while the batch also carries key, prefix and cardinality columns.
+
+Checked. It holds, and the encoder is free.
+
+### The contract, read out of the decoder rather than the commit message
+
+`codec::decode` wants: an array as `2 * card` little-endian `u16` values, strictly ascending, **no leading count**; a bitmap as exactly 8192 little-endian bytes whose popcount must equal the declared cardinality; a run as a little-endian `u16` interval count followed by that many `( start, len - 1 )` pairs, so `2 + 4 * nruns` bytes. That is the Roaring container layout, which is the whole reason this is possible.
+
+### The public access path is not the obvious one
+
+`RoaringArray.getContainerAtIndex` and `getKeyAtIndex` are `protected`, and `RoaringBitmap.highLowContainer` is package-private, so the route a reader would reach for first is closed. `RoaringBitmap.getContainerPointer()` is public, and `ContainerPointer` happens to expose exactly a yesno row: `key()` for the prefix, `getContainer()` for the payload, `getCardinality()` for the cardinality column, and `isBitmapContainer()` / `isRunContainer()` as the kind discriminator with array as neither. Established with `javap` against the jar already staged in the E2E image by the live-daemon gate, which is what made the check cheap.
+
+### Measured against the shipped decoder, with an independent oracle
+
+A Java `main` built one `RoaringBitmap` spanning three prefixes -- a 4-value array, 9000 strided bits, and two contiguous intervals after `runOptimize()` -- and printed each container's kind, cardinality and hex payload. A scratch crate with a path dependency on `yesno-core` fed each row to `codec::decode`. All three accepted, and the 17 004 decoded ordinals compared equal to a `BTreeSet<u64>` recomputed **in Rust from the same construction** rather than from the dump, so the comparison is against an oracle and not against the thing under test.
+
+### Four traps, and the first one is why the check was worth running
+
+**`serializedSizeInBytes()` is not the payload length.** For an array container it is `2 + 2 * card` -- two bytes more than the values -- so the natural `ByteBuffer.allocate( c.serializedSizeInBytes() )` followed by `buf.array()` appends two zero bytes. The first run produced exactly that: `bytes=10` for a 4-value array where yesno wants 8. The decoder refuses it ( `payload length 10 is not valid for "array" with cardinality 4` ), which is the right failure and is recorded as a negative control, but a reader who trusted the method name would have shipped it. The answer is the buffer's written `position()`.
+
+The other three: `ByteBuffer` defaults to **big-endian** and both formats are little-endian; `runOptimize()` is required or there are no run containers to send; and a 32-bit `RoaringBitmap` reaches only `prefix48 < 2^16`, so the 64-bit domain needs `Roaring64NavigableMap` composed as `( high32 << 16 ) | key`.
+
+### What it settles, and what it does not
+
+It settles the stated risk -- the encoder is free for Java. It does not make the work worth doing: the 64.8x is on the write wire for dense data, and a client inserting a few thousand pairs pays nothing for the pair wire. The prior question stands, and it is a workload question rather than a code one: does any non-Rust caller have a bulk-load shape at all?
+
+It also sharpens the entry in the other direction. **Python and Go have no per-container access to a roaring value**, so for them this is a payload encoder as well as a wire change. Pricing all three together, which the original entry implicitly did, would have been wrong by a wide margin.
+
+Derivation recorded in `LTM/client-libraries-and-search-integrations.md`; the instrument was a scratch crate under `.agents-workspace/tmp/` and is discarded, per the research rule.
