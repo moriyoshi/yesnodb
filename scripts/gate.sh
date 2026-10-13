@@ -101,7 +101,10 @@ client_skips=()
 # commit, so the delta is an addition by construction and counts in both modes.
 # The guard reported `ran 23 of 22 steps` on the first run of that commit,
 # which is exactly what it is for.
-EXPECT_STEPS=23
+# **Raised 23 -> 24 and 29 -> 30 on 2026-10-14** for "nothing newly unwired".
+# Same diagnosis, same direction: one new unconditional `check` added in the
+# commit that adds the step.
+EXPECT_STEPS=24
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -148,7 +151,7 @@ EXPECT_STEPS=23
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=29
+EXPECT_STEPS_DEEP=30
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -540,6 +543,20 @@ step "the Flight capability bitmask agrees across all four implementations"
 # remembers. The vector mirrored in four test files fixed that one and has the
 # same weakness; this holds without anyone remembering.
 check python3 scripts/check-feature-bits.py
+
+step "nothing newly unwired: every script invoked, every core `pub fn` called"
+# This sweep was run by hand at least six times before becoming a script, and
+# the backlog entry that owns it records its own construction, both controls
+# and two earlier ruler corrections. The next person rebuilt the ruler anyway
+# and stripped `#` lines as comments from `.rs` files -- which deletes every
+# Rust **attribute**, `#[cfg(test)]` included, collapsing the production/test
+# split and reporting a differential oracle as dead code. Third error of one
+# family, which is what turned a recorded procedure into a mechanism.
+#
+# Both baselines shrink and never grow, like `check-r1.py`. It is a triage
+# lead rather than a verdict -- removing public API is a semver decision --
+# and what it guarantees is that a *new* orphan is seen the day it lands.
+check python3 scripts/check-unwired.py
 
 step "the channel C ABI links from C and C++, and the shared cursor behaves"
 # `cabi.rs` is reached from C through `yesno-plugin/include/yesno_channel.h`,

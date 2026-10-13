@@ -421,6 +421,11 @@ jobs:
         # unrecognised command as insert. FEATURE_CONTAINER_PUT landed on
         # 2026-10-03 and three of the four clients were never told.
         run: python3 scripts/check-feature-bits.py
+      - name: nothing newly unwired
+        # A hand sweep run six times, with two recorded ruler corrections and
+        # a third made the day it became a script. Both baselines shrink and
+        # never grow; it is a triage lead, not a verdict.
+        run: python3 scripts/check-unwired.py
 
   msrv:
     name: msrv (workspace builds at 1.98)
