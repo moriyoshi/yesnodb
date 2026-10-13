@@ -95,7 +95,13 @@ client_skips=()
 # unconditional `check` added deliberately in this commit, not a mismatch found
 # after the fact, so the delta is an addition by construction and it counts in
 # both modes.
-EXPECT_STEPS=22
+# **Raised 22 -> 23 and 28 -> 29 on 2026-10-13** for "the Flight capability
+# bitmask agrees across all four implementations". Diagnosed in the easy
+# direction again: one new unconditional `check` added deliberately in this
+# commit, so the delta is an addition by construction and counts in both modes.
+# The guard reported `ran 23 of 22 steps` on the first run of that commit,
+# which is exactly what it is for.
+EXPECT_STEPS=23
 # Went 15 -> 14 on 2026-08-29 when the MIRI step was removed, and back to 15 on
 # 2026-08-30 with the two-node failover drill. The number is a coincidence,
 # not a restoration -- the MIRI step is gone and is not coming back here.
@@ -142,7 +148,7 @@ EXPECT_STEPS=22
 # `if [[ $deep -eq 0 ]]`, and deep mode is all of them. Counting `^step` with
 # grep gets a different answer, because some calls are indented and the whole
 # file is not one mode.
-EXPECT_STEPS_DEEP=28
+EXPECT_STEPS_DEEP=29
 step() {
     steps_run=$((steps_run + 1))
     printf '\n\033[1m== %s\033[0m\n' "$1"
@@ -518,6 +524,22 @@ step "storage-format.md's size-class ladder follows from CLASS_SIZES"
 # at the wrong row, and a prose mention of "class-0" that survived until a human
 # asked. A ladder that is eleven-twelfths right reads as right.
 check python3 scripts/check-storage-ladder.py
+
+step "the Flight capability bitmask agrees across all four implementations"
+# `ServerStats.features` is a bitmask a client is *required* to consult before
+# sending a new `do_put` command, because a server predating a bit reports zero
+# and treats an unrecognised command as insert -- so an unchecked mixed batch
+# has its removals applied as insertions with no error anywhere. The mechanism
+# rests entirely on client and server agreeing which bit means what.
+#
+# They did not. `FEATURE_CONTAINER_PUT` landed in `yesno-flight` on 2026-10-03
+# and the Python, Go and Java clients were never told, so for ten days three of
+# four implementations could not name a capability the server advertises on
+# every `stats` call. Same shape as the ticket header widening from 40 to 48
+# bytes: a shared constant, four copies, and a convention that someone
+# remembers. The vector mirrored in four test files fixed that one and has the
+# same weakness; this holds without anyone remembering.
+check python3 scripts/check-feature-bits.py
 
 step "the channel C ABI links from C and C++, and the shared cursor behaves"
 # `cabi.rs` is reached from C through `yesno-plugin/include/yesno_channel.h`,

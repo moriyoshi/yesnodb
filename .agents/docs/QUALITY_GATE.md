@@ -250,6 +250,7 @@ Confirm the change preserves the invariants listed in `ARCHITECTURE.md` § Invar
 - **`len` stays incremental.** `OrdSet::len()` and `Container::len()` are O(1) by contract. A change that recomputes cardinality by iterating is a regression even when it returns the right number — the cardinality identities in `ops::card` depend on cheap `len()`.
 - **Run containers stay non-adjacent.** Two runs that touch must be merged into one. An adjacent pair is a valid *decode* input from some producers but never a valid in-memory state for us.
 - **`Prefix48 < 1 << 48`.** Anything constructing a prefix from arithmetic rather than `split()` needs a check.
+- **A constant the wire defines is restated by four implementations, and a convention is not a mechanism.** The Flight ticket header, the capability bitmask and the mutation opcodes each exist in Rust, Python, Go and Java. Twice now a change landed in one and not the other three: the ticket header widened from 40 to 48 bytes on 2026-09-30 and three clients failed every integration test, and `FEATURE_CONTAINER_PUT` landed on 2026-10-03 and three clients could not name it for ten days. **When you change such a constant, add or extend a checker rather than updating the copies.** `scripts/check-feature-bits.py` is the model: it parses all four sources, compares sets and positions, normalizes the one real case-convention difference, and refuses to pass on a source it found no constants in. A mirrored literal in four test files, which is what the ticket header got, only holds while someone remembers all four.
 
 ---
 

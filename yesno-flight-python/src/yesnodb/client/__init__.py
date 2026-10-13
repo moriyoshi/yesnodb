@@ -76,6 +76,7 @@ from .expression import (
 )
 from .flight import (
     BATCH_ROWS,
+    FEATURE_CONTAINER_PUT,
     FEATURE_MIXED_PUT,
     FEATURE_WRITE_TRANSACTIONS,
     MUTATIONS_SCHEMA,
@@ -99,6 +100,7 @@ from .ticket import TICKET_HEADER_LEN, SetWire, Ticket
 
 __all__ = [
     "BATCH_ROWS",
+    "FEATURE_CONTAINER_PUT",
     "FEATURE_MIXED_PUT",
     "FEATURE_WRITE_TRANSACTIONS",
     "MAGIC",

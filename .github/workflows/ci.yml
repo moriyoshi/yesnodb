@@ -415,6 +415,12 @@ jobs:
         # arithmetic on one array in yesno-core. Reserving class 0 on
         # 2026-10-07 drifted two of them in a single commit.
         run: python3 scripts/check-storage-ladder.py
+      - name: the Flight capability bitmask agrees across all four implementations
+        # A client must consult ServerStats.features before sending a new
+        # do_put command; a server predating a bit reports zero and treats an
+        # unrecognised command as insert. FEATURE_CONTAINER_PUT landed on
+        # 2026-10-03 and three of the four clients were never told.
+        run: python3 scripts/check-feature-bits.py
 
   msrv:
     name: msrv (workspace builds at 1.98)

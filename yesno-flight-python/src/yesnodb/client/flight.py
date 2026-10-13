@@ -50,6 +50,12 @@ OP_DELETE_KEY = 4
 #: mixed batch's removals into insertions with no error anywhere.
 FEATURE_MIXED_PUT = 1 << 0
 FEATURE_WRITE_TRANSACTIONS = 1 << 1
+#: Container payloads on the write wire, 64.8x less than one row per set bit.
+#:
+#: This names what the *server* accepts. This client cannot build such a batch
+#: yet, so the bit is here to answer :meth:`YesnoClient.supports` honestly
+#: rather than to unlock a path.
+FEATURE_CONTAINER_PUT = 1 << 2
 
 TokenProvider: TypeAlias = str | Callable[[], str]
 PemSource: TypeAlias = bytes | bytearray | memoryview | str | os.PathLike[str]

@@ -428,3 +428,45 @@ Measured after: the search artifact step went from **203 s to 88 s**, and no lon
 `./scripts/gate-java.sh` passes ( `ok client.py`, 11 verb calls ). `./scripts/gate.sh` passes, with `yesno-flight-java/gate.sh` reported skipped for want of `javac` on this host, as it always is. `gate-pg.sh` was not run and is not implicated: neither `yesno-core` nor `yesno-flight` changed.
 
 Both new tests are sabotage-checked. Dropping a field from a table row fails `the_whole_pinned_table_parses`; swapping an engine's two architecture rows fails `every_supported_engine_architecture_is_checksum_pinned`, which is why that test asserts the architecture token appears in the file name rather than only that the digest is well formed.
+
+---
+
+## 2026-10-13 — The capability bitmask had drifted in three of four clients, and now it cannot
+
+Filed as a Java defect while writing the live-daemon gate: `ServerStats.java` names two of the server's three capability bits. The survey the entry asked for said it was not Java's defect. `FEATURE_CONTAINER_PUT` ( bit 2 ) landed in `yesno-flight` on 2026-10-03, and the Python, Go **and** Java clients were all never told. For ten days three of four implementations could not name a capability the server advertises on every `stats` call.
+
+### Why that is worse than a missing constant
+
+`ServerStats.features` is not decoration. A client is required to consult it before sending a new `do_put` command, because a server predating a bit reports zero and treats an unrecognised command as insert -- so an unchecked mixed batch has its removals applied as **insertions**, with no error anywhere. The entire mechanism rests on client and server agreeing which bit means what, and nothing was checking that they did.
+
+This is the second instance of one shape. The Flight ticket header widened from 40 to 48 bytes on 2026-09-30, three clients were not widened with it, and the Go and Python integration suites failed every test for a week while Java stayed green because its only server was a fake built from its own constants. The repair then was a 48-byte hex vector mirrored across four test files. That works, and it has exactly the weakness that produced this entry: it holds only while someone remembers all four copies.
+
+### What closes it
+
+`scripts/check-feature-bits.py` parses the bits out of all four sources and fails when the sets or the positions disagree. Three details are the whole value:
+
+* It normalizes case and separators, because Go spells them `FeatureMixedPut` and the others `FEATURE_MIXED_PUT`. That is a real convention difference, not drift, and a checker that called it drift would be turned off.
+* It **refuses to pass on a source it found no bits in.** A regex checker's characteristic failure is matching nothing and reporting agreement with an empty set; that is the same "tools that cannot see their subject" failure this tree keeps finding, applied to the tool.
+* `yesno-flight/src/lib.rs` is the authority rather than a fifth hand-written list, because that is where the server decides what it implements and what `FEATURES` puts on the wire.
+
+Sabotage-checked both directions: a bit moved to the wrong position, and a bit a client invented. Wired into `scripts/gate.sh` and `ci.yml`, so `check-gate-parity.py` sees it in both -- 21 shared scripts now, up from 20.
+
+### The constant question, answered the other way
+
+The backlog entry asked whether to add a constant for a path no client can take, and leaned towards no: "a constant for a path the client cannot take is API surface with no caller." That reasoning was wrong, and the reason it was wrong is worth keeping. **The bitmask is server capability discovery.** What the server accepts is a fact about the server, and a caller may legitimately want it whatever this client happens to be able to send -- to choose a different tool for a bulk load, to report what a deployment supports, to fail early. The three new constants each say in their own doc comment that they name what the server accepts and that the client cannot build such a batch yet, which makes the honest answer available without implying a path that is not there.
+
+It also makes the checker possible. A deliberate omission would need an exception list, and an exception list is the thing that grows every time someone is in a hurry.
+
+### The gap that remains is bigger than the one that was filed
+
+Container payloads on the write wire measured **64.8x less wire** than one row per set bit, and 1058-1212 ms to 41.0-42.1 ms on a 64-chunk half-dense page. Only the Rust client can send them. Filed as `three-clients-cannot-send-container-batches`, with the note that Java may be the cheap one -- it already depends on `org.roaringbitmap:roaringbitmap` and the payloads are recorded as byte-identical to a `.roaring` file -- and with the prior question that actually decides it: whether any non-Rust caller has a bulk-load shape at all. The 64.8x is nothing to a client inserting a few thousand pairs.
+
+### The gate's own guard fired, correctly
+
+The first full run after adding the step reported `INCOMPLETE: ran 23 of 22 steps` and failed, with every individual check green. `EXPECT_STEPS` is a hardcoded count that exists to catch a gate that stopped early and reported a verdict on a partial run; a new step is indistinguishable from an extra one until someone says which it is. Diagnosed before raising, as the comment beside it demands, and in the easy direction: one new unconditional `check` added deliberately in this commit, so the delta is an addition by construction and counts in both the routine and the deep mode. Raised 22 -> 23 and 28 -> 29.
+
+Worth recording because the guard is easy to read as noise and is not: a checker added without touching that number would have made the gate fail for a reason unrelated to the change, and a checker added while *lowering* it would hide a real early exit.
+
+### The rule
+
+Recorded in `QUALITY_GATE.md` § 2: a constant the wire defines is restated by four implementations, and a convention is not a mechanism. The ticket header, the capability bitmask and the mutation opcodes are all of this shape. **Look for the third instance.**

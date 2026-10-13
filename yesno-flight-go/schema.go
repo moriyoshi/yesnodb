@@ -40,6 +40,11 @@ const (
 const (
 	FeatureMixedPut          uint64 = 1 << 0
 	FeatureWriteTransactions uint64 = 1 << 1
+	// FeatureContainerPut reports container payloads on the write wire, which
+	// cost 64.8x less than one row per set bit. It names what the *server*
+	// accepts: this client cannot build such a batch yet, so the bit answers
+	// Supports honestly rather than unlocking a path.
+	FeatureContainerPut uint64 = 1 << 2
 )
 
 // Mutation is one row of MutationsSchema.
