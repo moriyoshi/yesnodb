@@ -966,7 +966,7 @@ fn opening_a_stream_does_not_allocate_per_open() {
 /// decoded them all anyway would return the same values and pass every
 /// correctness test in the tree.
 ///
-/// **What that costs is allocations, not payload bytes.** `read_container`
+/// **What that costs is allocations, not payload bytes.** The store read path
 /// aliases the mapping rather than copying it, so the figure below is the
 /// honest one: this test counts allocations because that is what `load`
 /// actually spends. Do not restate it as megabytes.

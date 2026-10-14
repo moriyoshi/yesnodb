@@ -39,7 +39,7 @@
 //! the memtable — `prune()` is a separate call the checkpointer never makes — so
 //! a `load()` on the same `Db` instance is answered from memory and never
 //! touches the mapping. Every test below therefore **reopens** the database
-//! first, so the memtable is empty and `ShardStore::read_container` takes the
+//! first, so the memtable is empty and `ShardStore::read_container_for` takes the
 //! `decode_buffer` path that aliases the mmap. The first draft of this file
 //! missed that and tested nothing.
 //!

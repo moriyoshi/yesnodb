@@ -18,7 +18,7 @@
 //! So the rules here are:
 //!
 //! - **Always reopen before reading.** A fresh `Db` has an empty memtable, which
-//!   is the only way to force `ShardStore::read_container`.
+//!   is the only way to force `ShardStore::read_container_for`.
 //! - **Never assert only on cardinality.** It is answered from `card_m1` in the
 //!   index and stayed correct all the way through that bug. Contents are the
 //!   assertion that has teeth.
@@ -249,7 +249,7 @@ fn writes_against_disk_resident_chunks_merge_correctly() {
 /// # Why this was missing, and it is this file's own rule that hid it
 ///
 /// The header above says "always reopen before reading", and it is right: a
-/// reopen is the only way to force `ShardStore::read_container`. But every test
+/// reopen is the only way to force `ShardStore::read_container_for`. But every test
 /// here obeys it, so **no test ever read a key while the memtable held newer
 /// state for a chunk that is also on disk** — the one configuration in which
 /// `Snapshot::merged_chunks` has to actually merge rather than pass one side
@@ -1892,7 +1892,7 @@ fn a_snapshot_clone_crosses_threads() {
 
 /// A reference pointing at the wrong chunk must be caught, not decoded.
 ///
-/// `read_container` trusts its `ChunkRef` completely: a stale or corrupt one
+/// `read_container_in` trusts its `ChunkRef` completely: a stale or corrupt one
 /// decodes whatever bytes it lands on and returns them as the key's contents —
 /// wrong answers with no error, which is the worst failure mode a storage layer
 /// has.

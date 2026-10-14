@@ -372,15 +372,8 @@ impl ShardStore {
             .collect()
     }
 
-    /// Materialize a chunk, zero-copy where the payload allows it.
-    /// Bytes of payload a reference covers.
-    ///
-    /// A run's length lives in its own payload prefix, so it costs a two-byte
-    /// read. Shared with the extent checksum check so the two cannot disagree
-    /// about the span -- a CRC compared over a different length than the writer
-    /// used fails on intact data, which is the failure mode that would have this
-    /// check switched off rather than debugged.
-    /// Reserve space for `n` more bytes of allocation.
+    /// Grow the file to cover one slab beyond what the allocator holds, or
+    /// refuse because that slab would be past [`MAX_SHARD_BYTES`].
     fn ensure_capacity(&self) -> Result<()> {
         let want = capacity_for(self.alloc.slab_count() as u64)?;
         self.seg.grow_to(want).map_err(io_err)
@@ -388,7 +381,7 @@ impl ShardStore {
 
     /// Read a chunk, checking that the reference really points at **this** key.
     ///
-    /// `read_container` trusts its `ChunkRef` completely: a corrupt or stale one
+    /// `read_container_in` trusts its `ChunkRef` completely: a corrupt or stale one
     /// decodes whatever bytes it lands on and returns them as the key's
     /// contents. Wrong answers, no error. The format has two mechanisms against
     /// exactly that and neither was consulted —
@@ -778,7 +771,16 @@ impl PublishedChunks {
     }
 }
 
-/// `ShardStore::payload_len_of`, over a mapping rather than a store.
+/// Bytes of payload a reference covers.
+///
+/// A run's length lives in its own payload prefix, so it costs a two-byte
+/// read. Shared with the extent checksum check so the two cannot disagree
+/// about the span -- a CRC compared over a different length than the writer
+/// used fails on intact data, which is the failure mode that would have this
+/// check switched off rather than debugged.
+///
+/// Over a mapping rather than a store, so the live store and a published
+/// snapshot resolve a span the same way.
 fn payload_len_in(
     seg: &crate::store::segment::SegmentedMmap,
     segs: Option<&[std::sync::Arc<crate::store::segment::MmapSegment>]>,
@@ -794,7 +796,10 @@ fn payload_len_in(
     })
 }
 
-/// `ShardStore::read_container`, over a mapping rather than a store.
+/// Materialize a chunk, zero-copy where the payload allows it.
+///
+/// Over a mapping rather than a store, for the reason
+/// [`read_container_for_in`] gives: one copy, two callers.
 fn read_container_in(
     seg: &crate::store::segment::SegmentedMmap,
     segs: Option<&[std::sync::Arc<crate::store::segment::MmapSegment>]>,

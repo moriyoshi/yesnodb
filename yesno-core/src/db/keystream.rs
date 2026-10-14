@@ -13,7 +13,7 @@
 //! the key, a count — paid all of them up front.
 //!
 //! **The cost is the per-chunk work, not the payload bytes**, and it is worth
-//! being exact about which. `ShardStore::read_container` is zero-copy: a
+//! being exact about which. `ShardStore::read_container_for` is zero-copy: a
 //! store-backed container aliases the mapping rather than copying it, so `load`
 //! does not read 125 MB into memory and the pages fault in only as they are
 //! touched. What it does pay is a container built per chunk, measured at about
