@@ -110,7 +110,14 @@ timeline's identically numbered WAL.
 
 Writer fencing and history commitments are archive schema version 2. A version
 1 prefix is rejected because it has no trustworthy fingerprint from which to
-continue. Start version 2 in a new object prefix and retain the old completed
+continue. Storing a base object without its empty regions did **not** advance
+that number: it adds fields to a manifest rather than changing what the existing
+ones mean, so every archive already in a store still restores unchanged, and the
+history fingerprints -- which commit to a file's length and checksum, both still
+the whole file's -- are untouched. The compatibility that does not hold is the
+other direction: a release older than this one, pointed at a base stored without
+its empty regions, refuses it by object length rather than restoring something
+wrong. Start version 2 in a new object prefix and retain the old completed
 bases according to the previous recovery policy; do not fabricate a version 2
 `state.pb` over version 1 objects.
 
@@ -169,12 +176,16 @@ yesno-archive \
   --retention-window 7d
 ```
 
-Each retained base generation costs its apparent size in the object store, not
-the size of the data in it: a shard image is a sparse file whose apparent length
-is a whole memory-mapping segment, currently one gibibyte, and the archived
-object carries every byte of it. A four-shard database therefore stores four
-gibibytes per base generation however little it holds. Weigh that against how
-often a new base is rooted and how many generations the window retains.
+A retained base generation costs what its data occupies, not what a shard image
+appears to be. A shard image is a sparse file whose apparent length is a whole
+memory-mapping segment, currently one gibibyte, whatever the database holds, and
+an upload weighs it a megabyte at a time and stores only the parts that carry
+something. Measured on a four-shard database holding a few hundred kilobytes:
+**5.01 MiB of base objects against an apparent 4.00 GiB**. A dense file is still
+stored whole, so the saving is whatever fraction of the image is empty, and a
+base generation's cost is roughly the `du` of the running database. Weigh that
+against how often a new base is rooted and how many generations the window
+retains.
 
 The window is a promise about recovery points, not about object age: **every
 wall-clock instant within it stays restorable.** A pass keeps the newest base at

@@ -244,6 +244,8 @@ mod tests {
                 object_key: file_key.clone(),
                 size: 1,
                 crc32c: 0,
+                sparse: false,
+                extents: Vec::new(),
             }],
             wal_cursors: vec![pb::WalCursor {
                 shard: 0,

@@ -120,6 +120,9 @@ pub(crate) struct ArchiveStats {
     pub(crate) event_sequence: u64,
     term: u32,
     pub(crate) base_files: usize,
+    /// The base's length with its holes counted, and without.
+    base_apparent_bytes: u64,
+    base_object_bytes: u64,
     pub(crate) wal_objects: usize,
     pub(crate) wal_bytes: u64,
     cursor_total: u64,
@@ -130,6 +133,8 @@ impl ArchiveStats {
         match name {
             "base_generation" => Some(self.base_generation),
             "event_sequence" => Some(self.event_sequence),
+            "base_apparent_bytes" => Some(self.base_apparent_bytes),
+            "base_object_bytes" => Some(self.base_object_bytes),
             "wal_objects" => Some(self.wal_objects as u64),
             "wal_bytes" => Some(self.wal_bytes),
             "cursor_total" => Some(self.cursor_total),
@@ -143,6 +148,8 @@ impl ArchiveStats {
             ("event_sequence", int_obj(self.event_sequence)),
             ("term", int_obj(self.term as u64)),
             ("base_files", whole_obj(self.base_files)),
+            ("base_apparent_bytes", int_obj(self.base_apparent_bytes)),
+            ("base_object_bytes", int_obj(self.base_object_bytes)),
             ("wal_objects", whole_obj(self.wal_objects)),
             ("wal_bytes", int_obj(self.wal_bytes)),
             ("cursor_total", int_obj(self.cursor_total)),
@@ -178,18 +185,30 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
     })?;
     let manifest = BaseManifest::decode(manifest_bytes.as_slice())
         .map_err(|error| format!("base manifest is not valid Protobuf: {error}"))?;
+    // What the base costs in the store, against what it would cost if its
+    // holes were shipped. A sparse object holds only the runs the manifest
+    // names; a dense one is the file, which is the `extents`-free encoding
+    // every archive written before sparse objects used.
+    let mut base_apparent_bytes = 0u64;
+    let mut base_object_bytes = 0u64;
     for file in &manifest.files {
         let path = object_dir.join(&file.object_key);
         let size = std::fs::metadata(&path)
             .map_err(|error| format!("base object '{}' is not readable: {error}", path.display()))?
             .len();
-        if size != file.size {
+        let expected = if file.sparse {
+            file.extents.iter().map(|extent| extent.length).sum()
+        } else {
+            file.size
+        };
+        if size != expected {
             return Err(format!(
-                "base object '{}' is {size} bytes, manifest says {}",
+                "base object '{}' is {size} bytes, manifest says {expected}",
                 path.display(),
-                file.size
             ));
         }
+        base_apparent_bytes = base_apparent_bytes.saturating_add(file.size);
+        base_object_bytes = base_object_bytes.saturating_add(size);
     }
 
     let mut files = Vec::new();
@@ -242,6 +261,8 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
         event_sequence: state.event_sequence,
         term: state.term,
         base_files: manifest.files.len(),
+        base_apparent_bytes,
+        base_object_bytes,
         wal_objects,
         wal_bytes,
         cursor_total: state.wal_cursors.iter().fold(0u64, |total, cursor| {

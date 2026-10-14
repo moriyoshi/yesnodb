@@ -11,6 +11,8 @@ Backups and archives are separate recovery products built over server-owned snap
 - The archive writes immutable individual WAL-frame objects, then durable remote state, then its local cache, and only then acknowledges retention to the leader.
 - WAL generation seal events are observations, not transfer sources; replication supplies the bytes because a sealed pathname may be reclaimed before a subscriber opens it.
 - Archive schema v2 uses a conditional writer lease, compare-and-swap state publication, immutable history descriptors, base anchors, and per-shard SHA-256 chains.
+- A base object stores only the parts of its file that are not empty. `pb::ArchiveFile` carries `sparse` and an extent list; `size` and `crc32c` stay the *file's*, holes included, so the history anchor still commits to content and every pre-existing archive still reads. Measured: 4.00 GiB of objects became 5.01 MiB, and materializing a base on restore went 3.11 s to 0.24 s.
+- Do not bump `SCHEMA_VERSION` to introduce an archive field. `history::base_anchor` hashes it and every validator compares it with `!=`, so a bump refuses every existing archive and invalidates every fingerprint derived from one. Add fields and leave the anchor alone, as `checkpoint_time` did.
 - Every reconnect verifies retained leader history from the current base root. A missing retained root forces a new base instead of inventing continuity.
 - An ordinary checkpoint activates a fresh archive but does not create repeated full bases once a recovery root exists. Retention loss and leadership-term changes are distinct rebase triggers.
 - Every commit marker carries the wall-clock time its version was assigned, non-decreasing in commit version ( **I9** ), which is what makes a wall-clock recovery target name a prefix.
@@ -199,3 +201,40 @@ reported symptom: a wait on that metric reporting a task death rather than a tim
 
 The server's own portable snapshot provider already maps `NotFound` to success in both `cleanup`
 and `reconcile`, so this was the remover on the capture path that did not.
+
+## A base object stores what the database holds, not what the image appears to hold
+
+A shard image is grown to a whole 1 GiB mmap segment by `set_len`, so a database holding a few
+hundred kilobytes presents four apparent gibibytes across four shards and occupies megabytes. Both
+ends of the archive used to move all of it. The restore side was fixed first ( set the length,
+write only non-empty 1 MiB windows ); the upload side followed, and it is the half that costs real
+money: 4 294 975 488 B of base objects became 5 251 072 B, **818x**, with `materialize_base` going
+from 3.11 s to 0.24 s on a `file://` store -- a local store, where the saved transfer is only a
+page-cache read, so a remote one gains more.
+
+**Why no schema bump, which is the part that is counter-intuitive.** The entry that filed this
+assumed the format change needed `SCHEMA_VERSION` to go from 2 to 3. It must not. `base_anchor`
+hashes `SCHEMA_VERSION`, and `validate_base_manifest`, `validate_state` and `validate_wal_object`
+all compare with `!=` rather than a range -- so a bump refuses every archive in existence *and*
+invalidates every history fingerprint derived from one, which is the opposite of the compatibility
+the change required. `BaseManifest.checkpoint_time` already records the same rule for the anchor in
+its own comment. The extents are additive, uncommitted fields, and `size` and `crc32c` remain the
+file's with holes included; a dense file is written with no extents at all, so a base with nothing
+to save produces exactly the manifest it always did.
+
+**What still verifies.** A restore hashes the holes as the zeros they stand for and checks the
+whole file against the manifest, so an extent list disagreeing with the file it came from fails
+rather than restoring something else. The encoding is canonical -- runs ascend, carry bytes, stay
+inside the file and are separated by a real hole -- so one file has one valid list. The residual
+cost of the stage is now *exactly* that CRC: `crc32c` over zeros runs at 16.0 GiB/s, 250 ms for
+4 GiB, against a measured 0.24 s stage. A GF(2) shift of the CRC polynomial would remove it and is
+declined: it saves a quarter of a second on a one-off operation and must be proved correct.
+
+**Backward compatibility holds one way only.** A release older than the change, reading a sparse
+object, refuses it on object length rather than restoring something wrong. That is an operator
+fact and belongs in `docs/operations/backup.md`, not only here.
+
+**Make the saving a gate, because shipping the holes is correct.** The e2e archive inspector
+reports `base_apparent_bytes` and `base_object_bytes` and a scenario asserts the ratio. Nothing
+else would notice a regression: a restore from an object carrying every zero is byte-identical and
+merely slow and expensive.

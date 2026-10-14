@@ -23,11 +23,39 @@ message WalCursor {
   bytes history_fingerprint = 3;
 }
 
+// A run of bytes a sparse base object carries. Offsets are into the file, not
+// into the object; the object is the runs concatenated in this order.
+message FileExtent {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
 message ArchiveFile {
   string name = 1;
   string object_key = 2;
+  // The file's length and CRC32C, holes included. These keep their meaning
+  // whether or not the object carries the holes, which is what lets a restore
+  // verify the file it reconstructs rather than the bytes it received, and
+  // what keeps `BaseManifest.history_anchor` a commitment to content.
   uint64 size = 3;
   uint32 crc32c = 4;
+  // False when the object is the file, byte for byte, and `extents` is empty.
+  // Every archive written before sparse objects existed reads as this, and a
+  // file with no holes is still written as this, so a dense base produces the
+  // same manifest it always did.
+  //
+  // True when the object holds only `extents`, concatenated in offset order,
+  // and every byte of the file outside them is zero. An empty `extents` under
+  // a true flag is a file that is entirely zero, which is why the flag exists
+  // rather than being inferred from the list being non-empty.
+  //
+  // Deliberately NOT part of `history_anchor`, for the reason
+  // `checkpoint_time` gives below: adding a field to that hash would change
+  // the fingerprint of every existing history. It needs no commitment of its
+  // own -- `size` and `crc32c` already commit to the content, and an extent
+  // list disagreeing with the file fails the CRC on the way in.
+  bool sparse = 5;
+  repeated FileExtent extents = 6;
 }
 
 message BaseManifest {

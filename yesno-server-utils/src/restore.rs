@@ -69,6 +69,7 @@ use yesno_core::{Db, DbOptions};
 
 use crate::archive::{
     inspect_base, pb, validate_base_manifest, validate_wal_object, ArchiveError, ArchiveStore,
+    SPARSE_WINDOW,
 };
 
 static STAGING_ID: AtomicU64 = AtomicU64::new(0);
@@ -414,29 +415,34 @@ async fn list_bases(
         .collect())
 }
 
-/// Bytes of a base file weighed for emptiness at a time.
+/// CRC32C of a hole, over the zeros it stands for.
 ///
-/// A shard image is a **sparse** file: the store grows it to a whole 1 GiB mmap
-/// segment with `set_len`, so a database holding kilobytes has an apparent size
-/// in gigabytes and occupies almost nothing -- measured, a live shard was 1 to
-/// 2 MiB allocated against an apparent 1 GiB. Writing every byte back
-/// materialized every hole: a four-shard database holding 6 401 keys restored
-/// to **4.00 GiB allocated**, and materializing the base was 92% of the
-/// restore's wall clock. It is now 5.0 MiB allocated and 89%, with the stage
-/// itself down from 4.15 s to 3.09 s -- the local store still has to deliver
-/// every zero, so what is saved here is the follower's disk, not the
-/// transfer.
+/// The manifest's `crc32c` is the **file's**, holes included, which is what
+/// keeps `history_anchor` a commitment to content and keeps a sparse object
+/// verifiable against the same number a dense one was. A restore therefore has
+/// to hash bytes it never received.
 ///
-/// The same decision, with the same reasoning, is already made on the
-/// replication bootstrap path, which skips all-zero chunks on the wire and sets
-/// the length first on the follower. One megabyte matches the chunk that path
-/// weighs, and is large enough that the skip reliably leaves a hole rather than
-/// a run of allocated zeros.
+/// Measured at 16.0 GiB/s on this host, so the 4 GiB of holes in the four-shard
+/// database this was built on costs 250 ms -- and the whole stage that used to
+/// take 3.11 s now takes 0.24 s, which is to say it is now *this*. Hashing the
+/// holes is a quarter of a second; receiving them was three seconds on a local
+/// store and would be minutes on a remote one.
 ///
-/// The transfer is **not** narrowed by this: the object still holds every byte,
-/// including the holes, because the object is the file and narrowing it is an
-/// archive format change rather than a write-side one.
-const BASE_WRITE_WINDOW: usize = 1 << 20;
+/// That is also why this is a loop over a zero buffer and not a GF(2) shift of
+/// the CRC polynomial. The clever version would make the stage O( what the
+/// database holds ) instead of O( what it appears to hold ), which is the
+/// right shape -- but it saves a quarter of a second off a one-off operation
+/// and has to be proved correct. Revisit if a restore's apparent size ever
+/// grows far past its real one.
+fn crc_hole(mut checksum: u32, mut length: u64) -> u32 {
+    static ZEROS: [u8; 1 << 16] = [0u8; 1 << 16];
+    while length > 0 {
+        let take = length.min(ZEROS.len() as u64) as usize;
+        checksum = crc32c::crc32c_append(checksum, &ZEROS[..take]);
+        length -= take as u64;
+    }
+    checksum
+}
 
 /// Write one window unless it is entirely zero.
 ///
@@ -455,19 +461,27 @@ async fn write_window(
     Ok(())
 }
 
-/// Stream one base object into `output`, leaving its empty windows unwritten.
+/// Stream one base object into `output`, leaving its holes unwritten.
 ///
-/// Returns the bytes seen and their CRC32C, both over *every* byte including
-/// the skipped ones, so the caller verifies the object it was sent rather than
-/// the file it wrote.
+/// `extents` says where in the file the object's bytes belong. A dense object
+/// is the single extent `( 0, size )` and takes the same path, so there is one
+/// implementation and the sparse case is not a parallel one.
+///
+/// Returns the object bytes consumed and the CRC32C of the **file**: the runs
+/// as they arrive, and the holes between them hashed as the zeros they are. So
+/// the caller verifies the file it reconstructed against the manifest, not
+/// merely the bytes the store handed over, and an extent list that disagrees
+/// with the file it was derived from fails here rather than silently restoring
+/// something else.
 ///
 /// `size` is the manifest's length and is set before anything is written: a
 /// window that is skipped is only correct because the file already ends past
 /// it. Incoming chunks are whatever the object store hands over and need not
-/// line up with the window, so they are re-cut here.
+/// line up with the windows, so they are re-cut here.
 async fn write_sparse_body<S, E>(
     output: &mut tokio::fs::File,
     size: u64,
+    extents: &[pb::FileExtent],
     stream: &mut S,
 ) -> Result<(u64, u32), ArchiveError>
 where
@@ -477,26 +491,80 @@ where
     output.set_len(size).await?;
     let mut seen = 0u64;
     let mut checksum = 0u32;
-    let mut window: Vec<u8> = Vec::with_capacity(BASE_WRITE_WINDOW);
-    let mut window_at = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(Into::into)?;
-        seen = seen.saturating_add(chunk.len() as u64);
-        checksum = crc32c::crc32c_append(checksum, &chunk);
-        let mut rest: &[u8] = &chunk;
-        while !rest.is_empty() {
-            let take = (BASE_WRITE_WINDOW - window.len()).min(rest.len());
-            window.extend_from_slice(&rest[..take]);
-            rest = &rest[take..];
-            if window.len() == BASE_WRITE_WINDOW {
+    let mut hashed = 0u64;
+    let mut held = bytes::Bytes::new();
+    let mut window: Vec<u8> = Vec::with_capacity(SPARSE_WINDOW);
+    let mut ended = false;
+    for extent in extents {
+        checksum = crc_hole(checksum, extent.offset.saturating_sub(hashed));
+        hashed = extent.offset;
+        let mut owed = extent.length;
+        let mut window_at = extent.offset;
+        window.clear();
+        while owed > 0 {
+            if held.is_empty() {
+                match stream.next().await {
+                    Some(chunk) => held = chunk.map_err(Into::into)?,
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            let take = owed
+                .min(held.len() as u64)
+                .min((SPARSE_WINDOW - window.len()) as u64) as usize;
+            let piece = held.split_to(take);
+            seen = seen.saturating_add(take as u64);
+            checksum = crc32c::crc32c_append(checksum, &piece);
+            hashed = hashed.saturating_add(take as u64);
+            owed -= take as u64;
+            window.extend_from_slice(&piece);
+            if window.len() == SPARSE_WINDOW {
                 write_window(output, window_at, &window).await?;
-                window_at = window_at.saturating_add(BASE_WRITE_WINDOW as u64);
+                window_at = window_at.saturating_add(SPARSE_WINDOW as u64);
                 window.clear();
             }
         }
+        write_window(output, window_at, &window).await?;
+        window.clear();
+        if ended {
+            break;
+        }
     }
-    write_window(output, window_at, &window).await?;
+    if ended {
+        // Short of what the extents promised. The caller compares `seen`
+        // against them and reports it; the checksum is deliberately left
+        // unfinished rather than completed over a file that was not written.
+        return Ok((seen, checksum));
+    }
+    // Anything past the last extent is counted but not written, so an object
+    // longer than its manifest is reported rather than silently truncated.
+    seen = seen.saturating_add(held.len() as u64);
+    while let Some(chunk) = stream.next().await {
+        seen = seen.saturating_add(chunk.map_err(Into::into)?.len() as u64);
+    }
+    checksum = crc_hole(checksum, size.saturating_sub(hashed));
     Ok((seen, checksum))
+}
+
+/// Where a base object's bytes belong, and how many of them there are.
+///
+/// A file that is not sparse is the single extent covering it, which is how
+/// every archive written before sparse objects existed reads.
+fn object_layout(file: &pb::ArchiveFile) -> (Vec<pb::FileExtent>, u64) {
+    if !file.sparse {
+        return (
+            vec![pb::FileExtent {
+                offset: 0,
+                length: file.size,
+            }],
+            file.size,
+        );
+    }
+    let length = file.extents.iter().map(|extent| extent.length).sum();
+    (file.extents.clone(), length)
 }
 
 async fn download_base_file(
@@ -512,19 +580,20 @@ async fn download_base_file(
     {
         return Err(format!("base manifest file name '{}' is not flat", file.name).into());
     }
+    let (extents, object_len) = object_layout(file);
     let result = store.inner.get(&store.path(&file.object_key)).await?;
-    if result.meta.size != file.size {
+    if result.meta.size != object_len {
         return Err(format!(
             "base object '{}' is {} bytes, manifest says {}",
-            file.object_key, result.meta.size, file.size
+            file.object_key, result.meta.size, object_len
         )
         .into());
     }
     let mut stream = result.into_stream();
     let mut output = tokio::fs::File::create(target.join(&file.name)).await?;
-    let (size, checksum) = write_sparse_body(&mut output, file.size, &mut stream).await?;
+    let (seen, checksum) = write_sparse_body(&mut output, file.size, &extents, &mut stream).await?;
     output.sync_all().await?;
-    if size != file.size || checksum != file.crc32c {
+    if seen != object_len || checksum != file.crc32c {
         return Err(format!(
             "base object '{}' failed size or CRC verification",
             file.object_key
@@ -1558,7 +1627,7 @@ mod tests {
     async fn an_empty_window_is_left_as_a_hole_and_still_reads_as_zero() {
         use std::os::unix::fs::MetadataExt;
 
-        let window = BASE_WRITE_WINDOW;
+        let window = SPARSE_WINDOW;
         let mut body = vec![0u8; 3 * window];
         for (i, byte) in body[..window].iter_mut().enumerate() {
             *byte = (i % 251) as u8 | 1;
@@ -1577,9 +1646,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shard-0000.yno");
         let mut output = tokio::fs::File::create(&path).await.unwrap();
-        let (seen, checksum) = write_sparse_body(&mut output, body.len() as u64, &mut stream)
-            .await
-            .unwrap();
+        let (seen, checksum) = write_sparse_body(
+            &mut output,
+            body.len() as u64,
+            &whole(body.len()),
+            &mut stream,
+        )
+        .await
+        .unwrap();
         output.sync_all().await.unwrap();
         drop(output);
 
@@ -1604,20 +1678,210 @@ mod tests {
     /// A body that is entirely empty is still a file of the right length.
     #[tokio::test]
     async fn an_entirely_empty_object_restores_to_a_file_of_the_right_length() {
-        let body = vec![0u8; BASE_WRITE_WINDOW + 7];
+        let body = vec![0u8; SPARSE_WINDOW + 7];
         let mut stream = futures::stream::iter(vec![Ok::<_, ArchiveError>(
             bytes::Bytes::copy_from_slice(&body),
         )]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.yno");
         let mut output = tokio::fs::File::create(&path).await.unwrap();
-        let (seen, checksum) = write_sparse_body(&mut output, body.len() as u64, &mut stream)
-            .await
-            .unwrap();
+        let (seen, checksum) = write_sparse_body(
+            &mut output,
+            body.len() as u64,
+            &whole(body.len()),
+            &mut stream,
+        )
+        .await
+        .unwrap();
         output.sync_all().await.unwrap();
         drop(output);
         assert_eq!(seen, body.len() as u64);
         assert_eq!(checksum, crc32c::crc32c(&body));
         assert_eq!(std::fs::read(&path).unwrap(), body);
+    }
+
+    /// The single extent a dense object restores through.
+    fn whole(length: usize) -> Vec<pb::FileExtent> {
+        vec![pb::FileExtent {
+            offset: 0,
+            length: length as u64,
+        }]
+    }
+
+    /// An object carrying only its non-empty runs still restores the file the
+    /// manifest describes, hole for hole and CRC for CRC.
+    ///
+    /// This is the property the extent encoding exists for, and the one that
+    /// would break silently: the bytes are correct in both regimes, so only
+    /// comparing against the original file catches an extent placed wrong.
+    #[tokio::test]
+    async fn a_sparse_object_restores_the_file_and_not_just_its_runs() {
+        use std::os::unix::fs::MetadataExt;
+
+        let window = SPARSE_WINDOW;
+        // Hole, run, hole, run, hole -- so a leading hole, an interior one and
+        // a trailing one are all exercised, and the file ends on a hole, which
+        // is the case a length-driven write gets wrong.
+        let mut file = vec![0u8; 5 * window];
+        for (i, byte) in file[window..2 * window].iter_mut().enumerate() {
+            *byte = (i % 251) as u8 | 1;
+        }
+        for (i, byte) in file[3 * window..4 * window].iter_mut().enumerate() {
+            *byte = (i % 241) as u8 | 1;
+        }
+        let extents = vec![
+            pb::FileExtent {
+                offset: window as u64,
+                length: window as u64,
+            },
+            pb::FileExtent {
+                offset: 3 * window as u64,
+                length: window as u64,
+            },
+        ];
+        // The object is the runs concatenated, and its chunks deliberately do
+        // not line up with either a window or an extent boundary.
+        let mut object = Vec::new();
+        for extent in &extents {
+            let at = extent.offset as usize;
+            object.extend_from_slice(&file[at..at + extent.length as usize]);
+        }
+        let chunks: Vec<Result<bytes::Bytes, ArchiveError>> = object
+            .chunks(window / 3 + 17)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let mut stream = futures::stream::iter(chunks);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard-0000.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, checksum) =
+            write_sparse_body(&mut output, file.len() as u64, &extents, &mut stream)
+                .await
+                .unwrap();
+        output.sync_all().await.unwrap();
+        drop(output);
+
+        assert_eq!(seen, object.len() as u64, "only the runs are received");
+        assert_eq!(
+            checksum,
+            crc32c::crc32c(&file),
+            "the CRC is the file's, holes hashed as the zeros they are"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), file, "content-identical");
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), file.len() as u64, "the trailing hole counts");
+        assert!(
+            meta.blocks() * 512 < file.len() as u64,
+            "the holes must not be allocated: {} bytes allocated for {}",
+            meta.blocks() * 512,
+            file.len()
+        );
+    }
+
+    /// An object shorter than its extents promise is reported, not restored.
+    #[tokio::test]
+    async fn an_object_short_of_its_extents_is_refused_by_the_byte_count() {
+        let extents = vec![pb::FileExtent {
+            offset: 0,
+            length: 64,
+        }];
+        let mut stream = futures::stream::iter(vec![Ok::<_, ArchiveError>(
+            bytes::Bytes::from_static(&[7u8; 8]),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, _) = write_sparse_body(&mut output, 4096, &extents, &mut stream)
+            .await
+            .unwrap();
+        assert_eq!(seen, 8, "the caller compares this against the extents");
+    }
+
+    /// An object longer than its extents promise is counted rather than
+    /// quietly ignored, so the caller's size check fails.
+    #[tokio::test]
+    async fn an_object_longer_than_its_extents_is_counted_in_full() {
+        let extents = vec![pb::FileExtent {
+            offset: 0,
+            length: 8,
+        }];
+        let mut stream = futures::stream::iter(vec![
+            Ok::<_, ArchiveError>(bytes::Bytes::from_static(&[7u8; 12])),
+            Ok::<_, ArchiveError>(bytes::Bytes::from_static(&[7u8; 5])),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, _) = write_sparse_body(&mut output, 4096, &extents, &mut stream)
+            .await
+            .unwrap();
+        assert_eq!(seen, 17);
+    }
+
+    /// A file that is entirely zero is a sparse object with no extents at all,
+    /// which is why the flag is carried rather than inferred from the list.
+    #[tokio::test]
+    async fn an_entirely_empty_file_is_sparse_with_no_extents() {
+        let file = pb::ArchiveFile {
+            name: "empty.yno".into(),
+            object_key: "k".into(),
+            size: 4096,
+            crc32c: crc32c::crc32c(&vec![0u8; 4096]),
+            sparse: true,
+            extents: Vec::new(),
+        };
+        let (extents, object_len) = object_layout(&file);
+        assert!(extents.is_empty());
+        assert_eq!(object_len, 0, "nothing is transferred");
+
+        let mut stream = futures::stream::iter(Vec::<Result<bytes::Bytes, ArchiveError>>::new());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, checksum) = write_sparse_body(&mut output, file.size, &extents, &mut stream)
+            .await
+            .unwrap();
+        drop(output);
+        assert_eq!(seen, 0);
+        assert_eq!(checksum, file.crc32c);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; 4096]);
+    }
+
+    /// A manifest written before sparse objects existed reads as the whole
+    /// file, so every archive already in a store still restores.
+    #[test]
+    fn a_dense_file_lays_out_as_one_extent_covering_it() {
+        let file = pb::ArchiveFile {
+            name: "MANIFEST".into(),
+            object_key: "k".into(),
+            size: 8192,
+            crc32c: 7,
+            sparse: false,
+            extents: Vec::new(),
+        };
+        let (extents, object_len) = object_layout(&file);
+        assert_eq!(object_len, 8192);
+        assert_eq!(extents, whole(8192));
+    }
+
+    /// A hole hashes as the zeros it stands for, at every length the loop
+    /// cuts on.
+    #[test]
+    fn a_hole_hashes_as_the_zeros_it_stands_for() {
+        for length in [0usize, 1, 4096, (1 << 16) - 1, 1 << 16, (1 << 16) + 7] {
+            assert_eq!(
+                crc_hole(0, length as u64),
+                crc32c::crc32c(&vec![0u8; length]),
+                "{length}"
+            );
+            let prefix = b"not zero";
+            assert_eq!(
+                crc_hole(crc32c::crc32c(prefix), length as u64),
+                crc32c::crc32c_append(crc32c::crc32c(prefix), &vec![0u8; length]),
+                "{length} after a prefix"
+            );
+        }
     }
 }

@@ -866,3 +866,39 @@ Resolving the chain first paid twice more. A forked or short history is reported
 **The first run said the fix was a 2.7x regression.** Materializing the base went 7.0 s to 19.2 s. It was a debug build: the all-zero scan is a byte loop, `-O` vectorizes it and `cargo run` without `--release` does not. The `Run \ Array` probe earlier the same day taught variance within a process; this one is about the profile the measurement is taken in, and the same discipline caught it -- repeat, and do not conclude from a pair of runs. In release and warm, baseline materialize still ranged 4.09 to 5.89 s across five runs, so a single pair could have been made to show anything.
 
 **An entry that says "measure first" can be right about the method and wrong about the target.** This one was. Its structural reasoning -- one task, a blocking call stalls the others -- was correct and checkable, and the measurement it demanded is what found the real defect sitting beside the one it named. The value was in the instruction, not in the hypothesis.
+
+## 2026-10-14 — The other half of the holes: 4.00 GiB of archive objects became 5.01 MiB
+
+Earlier today's entry fixed the restore side of the base-image holes and filed the rest as `the-archived-base-object-still-carries-its-holes`, on the grounds that the archive object *is* the file and narrowing it is a format decision. Taken now. Measured on the same construction -- four shards, 6 401 keys, 200 commits of retained history, a `file://` store, a release build, four runs per arm with the first discarded:
+
+| | before | after |
+|---|---|---|
+| base objects in the store | 4 294 975 488 B ( 4.00 GiB ) | 5 251 072 B ( 5.01 MiB ) |
+| materialize base | 3.11 s | 0.24 s |
+| assemble WAL | 0.25 s | 0.25 s |
+
+**818x fewer bytes stored and transferred, and 12.9x off the stage that was 92% of a restore** -- on a local store, where there is no network latency to hide and the "transfer" is a page-cache read. A real object store has more to gain, not less.
+
+### The decision the entry was parked on, and why it went the other way
+
+The entry said the fix needed "a representation, a `SCHEMA_VERSION` bump ( currently 2 ), and a read path that still accepts every existing archive". The representation is a list of extents on `pb::ArchiveFile` plus a `sparse` flag; the version bump turned out to be exactly the wrong move, and the reason is already written in this tree.
+
+`BaseManifest.checkpoint_time` carries the precedent verbatim: it is "deliberately NOT part of `history_anchor` -- adding a field to that hash would change the fingerprint of every existing history and break chain continuity at the sidecar's next reconnect." The same is true of the schema number itself, more strongly: `history::base_anchor` hashes `SCHEMA_VERSION` into the anchor, and every `validate_*` compares it with `!=` rather than a range. **Bumping it to 3 would refuse every archive in existence and invalidate every fingerprint derived from one** -- the precise opposite of "a read path that still accepts every existing archive".
+
+So the extents are additive and uncommitted, and `size` and `crc32c` keep their meaning: the **file's** length and checksum, holes included. That is what makes the change safe rather than merely compatible. The anchor still commits to content; a restore still verifies the file it reconstructed, not the bytes it received; and an extent list that disagrees with the file it was derived from fails the CRC instead of quietly restoring something else. The encoding is canonical -- runs ascend, carry bytes, stay inside the file, and are separated by a real hole -- so adjacent runs are a writer bug and are refused rather than accepted.
+
+**The one direction that does not hold is the old one.** A release from before this change, pointed at a base stored without its holes, refuses it on object length: "base object X is N bytes, manifest says M". A loud refusal, not a wrong restore, and the same outcome a schema bump would have produced at a hundredth of the cost. Written down in `docs/operations/backup.md` beside the version-2 paragraph, because it is the kind of thing an operator finds out during a recovery otherwise.
+
+### What is left of the stage is the checksum over bytes that were never sent
+
+The manifest's `crc32c` is the whole file's, so a restore has to hash holes it did not receive. Measured, `crc32c` over zeros runs at 16.0 GiB/s on this host: 250 ms for 4 GiB. Measured end to end, the stage after the change is **0.24 s**. The materialize stage is now, to within noise, *exactly* the cost of hashing the absent zeros, and nothing else.
+
+That makes the next move obvious and also makes it not worth taking. A GF(2) shift of the CRC polynomial -- the `crc32_combine` trick -- would turn the stage from O( what the database appears to hold ) into O( what it holds ). It saves a quarter of a second off a one-off operation and has to be proved correct. The loop over a zero buffer stays, with the reasoning next to it, so a later session with a genuinely enormous apparent size knows what the lever is.
+
+### The harness was checking the thing that changed
+
+`inspect_archive` in `yesno-e2e` asserted `size != file.size` on every base object. It would have failed every archive scenario the moment the first sparse object was written -- which is the gate working, but it is also the measurement: the harness now reports `base_apparent_bytes` and `base_object_bytes`, and `archive.py` asserts the objects are under a sixty-fourth of the apparent length. Measured there, a two-shard database at 2 147 491 840 B apparent against 3 153 920 B stored: **681x**, so the threshold has two orders of magnitude of headroom and still fails the day someone ships the holes again. Shipping them is *correct*, which is exactly why only a scenario notices.
+
+### Not taken
+
+`SEEK_DATA`, again, and for the third time with the same reasoning: it would let the upload skip *reading* the holes as well, and it needs a `libc` call and the unsafe rules that come with it to save a scan whose cost is memory bandwidth on a one-off operation. The leader still reads its own gigabyte per shard; the store no longer stores it. If a leader's CPU during a base upload is ever shown to matter, that is the note to revisit.

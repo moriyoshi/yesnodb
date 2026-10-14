@@ -415,6 +415,8 @@ mod tests {
                     object_key: format!("db/aa/term/0000000000/base/{generation:020}/MANIFEST"),
                     size: 1,
                     crc32c: 0,
+                    sparse: false,
+                    extents: Vec::new(),
                 }],
                 wal_cursors: vec![pb::WalCursor {
                     shard: 0,

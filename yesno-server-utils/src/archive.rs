@@ -32,6 +32,37 @@ use crate::ctx;
 /// Archive metadata schema emitted by this version of the sidecar.
 pub const SCHEMA_VERSION: u32 = 2;
 const MULTIPART_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes of a base file weighed for emptiness at a time, on both sides.
+///
+/// A shard image is a **sparse** file: the store grows it to a whole 1 GiB mmap
+/// segment with `set_len`, so a database holding kilobytes has an apparent size
+/// in gigabytes and occupies almost nothing -- measured, a live shard was 1 to
+/// 2 MiB allocated against an apparent 1 GiB. An upload weighs each window and
+/// ships only the ones that carry something; a restore sets the length and
+/// writes only the windows it receives, so the holes survive the round trip
+/// instead of being materialized at either end.
+///
+/// Measured on a four-shard database holding 6 401 keys, a `file://` store, a
+/// release build: **4.00 GiB of base objects became 5.01 MiB**, 818x less, and
+/// materializing the base on restore went from **3.11 s to 0.24 s**. What is
+/// left of that stage is almost exactly the cost of hashing the holes the
+/// restore did not receive -- see `crc_hole` in `restore.rs`.
+///
+/// The same decision, with the same reasoning, is already made on the
+/// replication bootstrap path, which skips all-zero chunks on the wire and sets
+/// the length first on the follower. One megabyte matches the chunk that path
+/// weighs, and is large enough that a skip reliably leaves a hole rather than a
+/// run of allocated zeros.
+///
+/// It is one constant and not two because it is one format decision: an extent
+/// boundary written by an upload is a window boundary a restore seeks to.
+///
+/// **Do not reach for `SEEK_DATA`** to avoid *reading* the holes. The
+/// replication path considered and declined it for this exact job, because it
+/// needs a `libc` call and the unsafe rules that come with it to save a scan
+/// whose cost is memory bandwidth on a one-off operation.
+pub(crate) const SPARSE_WINDOW: usize = 1 << 20;
 pub(crate) const STATE_OBJECT: &str = "state.pb";
 pub(crate) const WRITER_OBJECT: &str = "writer.pb";
 
@@ -390,6 +421,8 @@ impl ArchiveStore {
                 object_key: key,
                 size: file.size,
                 crc32c: file.crc32c,
+                sparse: file.sparse,
+                extents: file.extents,
             });
         }
         if manifest.files.is_empty() {
@@ -413,6 +446,31 @@ impl ArchiveStore {
         Ok((manifest_key, manifest))
     }
 
+    /// Upload one base file, leaving its holes behind.
+    ///
+    /// Reads the file a [`SPARSE_WINDOW`] at a time and uploads only the
+    /// windows that carry something, recording the runs they form as extents
+    /// on the manifest. The returned `size` and `crc32c` are still the
+    /// **file's**, holes included, so the manifest commits to the content and
+    /// a restore verifies what it reconstructs rather than what it received.
+    ///
+    /// Holes are still *read* here: a page of a sparse file reads as zeros
+    /// without touching a disk, so the cost is memory bandwidth on the leader
+    /// and the saving is the object store's.
+    ///
+    /// A file with no holes at all is reported as **not sparse** with no
+    /// extents, which is byte for byte the manifest this function has always
+    /// produced.
+    ///
+    /// Parts are accumulated to [`MULTIPART_BYTES`] before being sent, because
+    /// skipping windows would otherwise produce parts below the five-mebibyte
+    /// floor S3 imposes on all but the last one. They are still *exactly* that
+    /// size, as they were before windows could be skipped, because
+    /// `MULTIPART_BYTES` is a whole number of windows and only the window at
+    /// end-of-file can be short -- keep that divisibility if either constant
+    /// moves. A file that fits in a single part is sent with `put` rather than
+    /// a multipart upload, which is also what makes an entirely empty file
+    /// expressible, since a multipart upload with no parts is not.
     async fn put_file(&self, source: &Path, key: &str) -> Result<UploadedFile, ArchiveError> {
         let size = tokio::fs::metadata(source)
             .await
@@ -422,56 +480,127 @@ impl ArchiveStore {
             self.inner
                 .put(&self.path(key), PutPayload::from(Vec::<u8>::new()))
                 .await?;
-            return Ok(UploadedFile { size, crc32c: 0 });
+            return Ok(UploadedFile {
+                size,
+                crc32c: 0,
+                sparse: false,
+                extents: Vec::new(),
+            });
         }
 
         let mut source_file = tokio::fs::File::open(source)
             .await
             .map_err(|e| ctx("open the upload source", source, e))?;
-        let mut upload = self.inner.put_multipart(&self.path(key)).await?;
+        let mut upload: Option<Box<dyn object_store::MultipartUpload>> = None;
         let mut checksum = 0u32;
-        let mut transferred = 0u64;
+        let mut read_total = 0u64;
+        let mut extents: Vec<pb::FileExtent> = Vec::new();
+        let mut part: Vec<u8> = Vec::with_capacity(MULTIPART_BYTES);
+        let mut window = vec![0u8; SPARSE_WINDOW];
         loop {
-            let mut part = vec![0u8; MULTIPART_BYTES];
-            let count = match source_file.read(&mut part).await {
+            // Whole windows, so an extent boundary is a window boundary. A
+            // short read in the middle of a file is not end-of-file, and one
+            // taken for a window would shift every later extent.
+            let count = match fill(&mut source_file, &mut window).await {
                 Ok(count) => count,
-                Err(error) => {
-                    let _ = upload.abort().await;
-                    return Err(error.into());
-                }
+                Err(error) => return abort_with(upload, error.into()).await,
             };
             if count == 0 {
                 break;
             }
-            part.truncate(count);
-            checksum = crc32c::crc32c_append(checksum, &part);
-            transferred = transferred.saturating_add(count as u64);
-            if let Err(error) = upload.put_part(Bytes::from(part).into()).await {
-                let _ = upload.abort().await;
-                return Err(error.into());
+            let filled = &window[..count];
+            checksum = crc32c::crc32c_append(checksum, filled);
+            let at = read_total;
+            read_total = read_total.saturating_add(count as u64);
+            if filled.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            match extents.last_mut() {
+                Some(last) if last.offset.saturating_add(last.length) == at => {
+                    last.length = last.length.saturating_add(count as u64);
+                }
+                _ => extents.push(pb::FileExtent {
+                    offset: at,
+                    length: count as u64,
+                }),
+            }
+            part.extend_from_slice(filled);
+            if part.len() >= MULTIPART_BYTES {
+                if upload.is_none() {
+                    upload = Some(self.inner.put_multipart(&self.path(key)).await?);
+                }
+                let body = std::mem::replace(&mut part, Vec::with_capacity(MULTIPART_BYTES));
+                let writer = upload.as_mut().expect("just opened");
+                if let Err(error) = writer.put_part(Bytes::from(body).into()).await {
+                    return abort_with(upload, error.into()).await;
+                }
             }
         }
-        if let Err(error) = upload.complete().await {
-            let _ = upload.abort().await;
-            return Err(error.into());
+
+        let uploaded = extents.iter().map(|extent| extent.length).sum::<u64>();
+        match upload.as_mut() {
+            None => {
+                self.inner
+                    .put(&self.path(key), PutPayload::from(part))
+                    .await?;
+            }
+            Some(writer) => {
+                if !part.is_empty() {
+                    if let Err(error) = writer.put_part(Bytes::from(part).into()).await {
+                        return abort_with(upload, error.into()).await;
+                    }
+                }
+                let writer = upload.as_mut().expect("matched Some");
+                if let Err(error) = writer.complete().await {
+                    return abort_with(upload, error.into()).await;
+                }
+            }
         }
-        if transferred != size {
+        if read_total != size {
             return Err(format!(
-                "'{}' changed size while being uploaded: expected {size}, read {transferred}",
+                "'{}' changed size while being uploaded: expected {size}, read {read_total}",
                 source.display()
             )
             .into());
         }
+        let sparse = uploaded != size;
         Ok(UploadedFile {
             size,
             crc32c: checksum,
+            sparse,
+            extents: if sparse { extents } else { Vec::new() },
         })
     }
+}
+
+/// Read until `buf` is full or the file ends, reporting how much was filled.
+async fn fill(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]).await? {
+            0 => break,
+            count => filled += count,
+        }
+    }
+    Ok(filled)
+}
+
+/// Abandon a multipart upload that has already sent parts, then report why.
+async fn abort_with<T>(
+    upload: Option<Box<dyn object_store::MultipartUpload>>,
+    error: ArchiveError,
+) -> Result<T, ArchiveError> {
+    if let Some(mut upload) = upload {
+        let _ = upload.abort().await;
+    }
+    Err(error)
 }
 
 struct UploadedFile {
     size: u64,
     crc32c: u32,
+    sparse: bool,
+    extents: Vec<pb::FileExtent>,
 }
 
 /// Metadata and per-shard WAL ends derived from one complete database copy.
@@ -714,6 +843,41 @@ pub fn validate_base_manifest(manifest: &pb::BaseManifest) -> Result<(), Archive
     }
     if manifest.files.is_empty() || manifest.wal_cursors.is_empty() {
         return Err("base manifest has no files or no WAL cursors".into());
+    }
+    for file in &manifest.files {
+        validate_extents(file)?;
+    }
+    Ok(())
+}
+
+/// Check that one file's extent list describes a reconstructible file.
+///
+/// The encoding is canonical: runs ascend, carry bytes, stay inside the file
+/// and are separated by a real hole. Adjacent runs are a writer that failed to
+/// merge them, and are refused rather than accepted, so one file has exactly
+/// one valid extent list and a restore's arithmetic has one shape to handle.
+fn validate_extents(file: &pb::ArchiveFile) -> Result<(), ArchiveError> {
+    let name = &file.name;
+    if !file.sparse {
+        if file.extents.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("base file '{name}' carries extents without the sparse flag").into());
+    }
+    let mut end = 0u64;
+    for (index, extent) in file.extents.iter().enumerate() {
+        if extent.length == 0 {
+            return Err(format!("base file '{name}' extent {index} is empty").into());
+        }
+        if index > 0 && extent.offset <= end {
+            return Err(format!("base file '{name}' extent {index} does not follow a hole").into());
+        }
+        end = match extent.offset.checked_add(extent.length) {
+            Some(end) if end <= file.size => end,
+            _ => {
+                return Err(format!("base file '{name}' extent {index} runs past its size").into())
+            }
+        };
     }
     Ok(())
 }
@@ -1031,5 +1195,165 @@ mod tests {
             combined_store.list_relative("db/").await.unwrap(),
             split_store.list_relative("db/").await.unwrap()
         );
+    }
+
+    /// Build a file of `windows` whole [`SPARSE_WINDOW`]s, filling only the
+    /// indices named and leaving the rest as holes.
+    fn sparse_file(dir: &Path, name: &str, windows: usize, filled: &[usize]) -> PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len((windows * SPARSE_WINDOW) as u64).unwrap();
+        for index in filled {
+            file.seek(SeekFrom::Start((index * SPARSE_WINDOW) as u64))
+                .unwrap();
+            let body: Vec<u8> = (0..SPARSE_WINDOW)
+                .map(|i| (i.wrapping_add(*index) % 251) as u8 | 1)
+                .collect();
+            file.write_all(&body).unwrap();
+        }
+        file.sync_all().unwrap();
+        path
+    }
+
+    /// Only the windows that carry something are uploaded, and the runs they
+    /// form are what the manifest records.
+    ///
+    /// The two filled windows are adjacent on purpose: they must merge into
+    /// one extent, because `validate_extents` refuses a list whose runs touch.
+    #[tokio::test]
+    async fn a_sparse_file_uploads_only_its_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "shard-0000.yno", 8, &[1, 2, 5]);
+        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let uploaded = store.put_file(&path, "base/shard").await.unwrap();
+
+        assert!(uploaded.sparse);
+        assert_eq!(uploaded.size, 8 * SPARSE_WINDOW as u64, "the file's length");
+        assert_eq!(
+            uploaded.crc32c,
+            crc32c::crc32c(&std::fs::read(&path).unwrap()),
+            "the file's CRC, holes included"
+        );
+        assert_eq!(
+            uploaded
+                .extents
+                .iter()
+                .map(|extent| (extent.offset, extent.length))
+                .collect::<Vec<_>>(),
+            vec![
+                (SPARSE_WINDOW as u64, 2 * SPARSE_WINDOW as u64),
+                (5 * SPARSE_WINDOW as u64, SPARSE_WINDOW as u64),
+            ]
+        );
+        let object = store.get_bytes("base/shard").await.unwrap();
+        assert_eq!(
+            object.len(),
+            3 * SPARSE_WINDOW,
+            "five of eight windows never left the host"
+        );
+        validate_extents(&pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: "base/shard".into(),
+            size: uploaded.size,
+            crc32c: uploaded.crc32c,
+            sparse: uploaded.sparse,
+            extents: uploaded.extents,
+        })
+        .unwrap();
+    }
+
+    /// A file with no holes is uploaded exactly as it always was, so a dense
+    /// base produces the manifest it produced before extents existed.
+    #[tokio::test]
+    async fn a_dense_file_is_reported_as_the_object_it_has_always_been() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "MANIFEST", 2, &[0, 1]);
+        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let uploaded = store.put_file(&path, "base/manifest").await.unwrap();
+        assert!(!uploaded.sparse);
+        assert!(uploaded.extents.is_empty());
+        assert_eq!(
+            store.get_bytes("base/manifest").await.unwrap().len() as u64,
+            uploaded.size
+        );
+    }
+
+    /// A file that is entirely holes transfers nothing at all, which is the
+    /// case an empty extent list has to be able to mean.
+    #[tokio::test]
+    async fn an_entirely_empty_file_uploads_no_bytes_and_still_has_a_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sparse_file(dir.path(), "blank.yno", 4, &[]);
+        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let uploaded = store.put_file(&path, "base/blank").await.unwrap();
+        assert!(uploaded.sparse);
+        assert!(uploaded.extents.is_empty());
+        assert_eq!(uploaded.size, 4 * SPARSE_WINDOW as u64);
+        assert_eq!(
+            uploaded.crc32c,
+            crc32c::crc32c(&vec![0u8; uploaded.size as usize])
+        );
+        assert_eq!(store.get_bytes("base/blank").await.unwrap().len(), 0);
+    }
+
+    /// Runs spanning more than one multipart part still arrive whole.
+    ///
+    /// Skipping windows makes the parts no longer a fixed slice of the file,
+    /// and a part below five mebibytes is refused by S3 unless it is the last
+    /// one -- so the accumulation is the part of this that can be wrong.
+    #[tokio::test]
+    async fn runs_are_accumulated_into_whole_multipart_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let filled: Vec<usize> = (0..20).filter(|i| i % 2 == 1).collect();
+        let path = sparse_file(dir.path(), "wide.yno", 40, &filled);
+        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let uploaded = store.put_file(&path, "base/wide").await.unwrap();
+
+        assert_eq!(
+            uploaded.extents.len(),
+            filled.len(),
+            "no run touches another"
+        );
+        let object = store.get_bytes("base/wide").await.unwrap();
+        assert_eq!(object.len(), filled.len() * SPARSE_WINDOW);
+        let file = std::fs::read(&path).unwrap();
+        let expected: Vec<u8> = filled
+            .iter()
+            .flat_map(|i| file[i * SPARSE_WINDOW..(i + 1) * SPARSE_WINDOW].to_vec())
+            .collect();
+        assert_eq!(object.as_ref(), expected.as_slice(), "the runs, in order");
+        assert_eq!(uploaded.crc32c, crc32c::crc32c(&file));
+    }
+
+    /// The extent encoding is canonical: each refusal is one way a writer
+    /// could produce a list a restore would have to guess at.
+    #[test]
+    fn a_non_canonical_extent_list_is_refused() {
+        let file = |sparse: bool, extents: Vec<(u64, u64)>| pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: "k".into(),
+            size: 4096,
+            crc32c: 0,
+            sparse,
+            extents: extents
+                .into_iter()
+                .map(|(offset, length)| pb::FileExtent { offset, length })
+                .collect(),
+        };
+        validate_extents(&file(false, vec![])).unwrap();
+        validate_extents(&file(true, vec![])).unwrap();
+        validate_extents(&file(true, vec![(0, 1024), (2048, 1024)])).unwrap();
+        for (why, bad) in [
+            ("extents without the flag", file(false, vec![(0, 16)])),
+            ("an empty run", file(true, vec![(0, 0)])),
+            ("runs that touch", file(true, vec![(0, 1024), (1024, 16)])),
+            ("runs that overlap", file(true, vec![(0, 1024), (512, 16)])),
+            ("runs out of order", file(true, vec![(2048, 16), (16, 16)])),
+            ("a run past the end", file(true, vec![(4000, 1024)])),
+            ("a run that overflows", file(true, vec![(u64::MAX, 2)])),
+        ] {
+            assert!(validate_extents(&bad).is_err(), "{why}");
+        }
     }
 }

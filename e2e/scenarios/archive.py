@@ -21,6 +21,15 @@ initial = srv_archive_wait(archive, "base_generation", 1, 30000)
 assert initial["base_files"] > 0, initial
 assert initial["term"] == 0, initial
 
+# The base is almost entirely holes and the archive no longer ships them. A
+# shard image is grown to a whole memory-mapping segment, so its apparent
+# length is gigabytes whatever the database holds; the objects are what the
+# store is billed for and what a restore transfers. Ratios this large are the
+# point of the extent encoding, and only a scenario notices it regressing,
+# because shipping the holes is still correct.
+assert initial["base_object_bytes"] > 0, initial
+assert initial["base_object_bytes"] * 64 < initial["base_apparent_bytes"], initial
+
 # A later ordinary checkpoint is observation, not a new recovery root. Wait
 # until both checkpoint phases have crossed the durable event cursor so this
 # assertion is about processed behavior rather than timing.
