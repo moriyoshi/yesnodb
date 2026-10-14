@@ -169,6 +169,13 @@ yesno-archive \
   --retention-window 7d
 ```
 
+Each retained base generation costs its apparent size in the object store, not
+the size of the data in it: a shard image is a sparse file whose apparent length
+is a whole memory-mapping segment, currently one gibibyte, and the archived
+object carries every byte of it. A four-shard database therefore stores four
+gibibytes per base generation however little it holds. Weigh that against how
+often a new base is rooted and how many generations the window retains.
+
 The window is a promise about recovery points, not about object age: **every
 wall-clock instant within it stays restorable.** A pass keeps the newest base at
 or below the start of the window -- the root a restore to that instant would

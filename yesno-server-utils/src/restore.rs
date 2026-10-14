@@ -25,6 +25,27 @@
 //! pre-stamping history before every target an operator could type, which is the
 //! precise-looking wrong answer this module exists to avoid.
 //!
+//! # Holes are not restored
+//!
+//! A shard image is a sparse file whose apparent length is a whole 1 GiB mmap
+//! segment, so a database holding kilobytes reports gigabytes. The archive
+//! object holds every one of those bytes -- it is the file -- but the restored
+//! copy does not: the length is set first and only the windows that carry
+//! something are written, so the holes come back as holes. The copy is
+//! content-identical and differently allocated, which is the same bargain the
+//! replication bootstrap path already makes.
+//!
+//! # The chain is resolved before anything is fetched
+//!
+//! A shard's WAL history is a fingerprint chain, and the chain is strictly
+//! sequential -- but it is resolved from descriptors that are already in
+//! memory, because the listing pass fetches one for every object in the
+//! retained history before the walk starts. Only the *bodies* cost round trips,
+//! and their order is known in full once the chain is walked, so they are
+//! fetched concurrently and appended in that order. A history that forks, or
+//! that stops short of the durable tip, is therefore reported before a byte is
+//! downloaded.
+//!
 //! # Where the times are trusted from
 //!
 //! The archive's Protobuf descriptors carry commit times so a restore can narrow
@@ -342,10 +363,18 @@ async fn load_base(
 ///
 /// Every fetch loop on this path used to be a plain `for` with an `.await`
 /// inside, so a restore paid one full round trip per object in series. That is
-/// worst for the two loops that fetch *many small* objects -- one base manifest
-/// per retained base, and one `.wal.pb` descriptor per WAL object in the whole
-/// retained history -- where the transfer is a few hundred bytes and the cost
-/// is latency.
+/// worst for the loops that fetch *many small* objects -- one base manifest per
+/// retained base, one `.wal.pb` descriptor per WAL object in the whole retained
+/// history, and the WAL bodies those descriptors name -- where the transfer is
+/// a few hundred bytes and the cost is latency, which is the whole of the cost:
+/// appending a fetched body to the shard log is 0.4% of a restore, measured.
+///
+/// The WAL bodies are one `buffered` across all shards rather than one per
+/// shard, so the budget below is the restore's total however the history is
+/// distributed -- and a one-shard database gets all eight on its one chain
+/// instead of one. Measured on a `file://` store with 2 000 objects on a single
+/// shard, assembling the log went from 770 ms to 240 ms; the local store has no
+/// latency to hide, so a network store has more to gain, not less.
 ///
 /// Deliberately modest rather than as large as it could be. The caller is
 /// usually a follower booting, and a cluster restart boots all of them at once;
@@ -385,6 +414,91 @@ async fn list_bases(
         .collect())
 }
 
+/// Bytes of a base file weighed for emptiness at a time.
+///
+/// A shard image is a **sparse** file: the store grows it to a whole 1 GiB mmap
+/// segment with `set_len`, so a database holding kilobytes has an apparent size
+/// in gigabytes and occupies almost nothing -- measured, a live shard was 1 to
+/// 2 MiB allocated against an apparent 1 GiB. Writing every byte back
+/// materialized every hole: a four-shard database holding 6 401 keys restored
+/// to **4.00 GiB allocated**, and materializing the base was 92% of the
+/// restore's wall clock. It is now 5.0 MiB allocated and 89%, with the stage
+/// itself down from 4.15 s to 3.09 s -- the local store still has to deliver
+/// every zero, so what is saved here is the follower's disk, not the
+/// transfer.
+///
+/// The same decision, with the same reasoning, is already made on the
+/// replication bootstrap path, which skips all-zero chunks on the wire and sets
+/// the length first on the follower. One megabyte matches the chunk that path
+/// weighs, and is large enough that the skip reliably leaves a hole rather than
+/// a run of allocated zeros.
+///
+/// The transfer is **not** narrowed by this: the object still holds every byte,
+/// including the holes, because the object is the file and narrowing it is an
+/// archive format change rather than a write-side one.
+const BASE_WRITE_WINDOW: usize = 1 << 20;
+
+/// Write one window unless it is entirely zero.
+///
+/// Offsets only ever advance, so the seek is forward and the file's length is
+/// already final.
+async fn write_window(
+    output: &mut tokio::fs::File,
+    at: u64,
+    window: &[u8],
+) -> Result<(), ArchiveError> {
+    if window.iter().all(|byte| *byte == 0) {
+        return Ok(());
+    }
+    tokio::io::AsyncSeekExt::seek(output, std::io::SeekFrom::Start(at)).await?;
+    output.write_all(window).await?;
+    Ok(())
+}
+
+/// Stream one base object into `output`, leaving its empty windows unwritten.
+///
+/// Returns the bytes seen and their CRC32C, both over *every* byte including
+/// the skipped ones, so the caller verifies the object it was sent rather than
+/// the file it wrote.
+///
+/// `size` is the manifest's length and is set before anything is written: a
+/// window that is skipped is only correct because the file already ends past
+/// it. Incoming chunks are whatever the object store hands over and need not
+/// line up with the window, so they are re-cut here.
+async fn write_sparse_body<S, E>(
+    output: &mut tokio::fs::File,
+    size: u64,
+    stream: &mut S,
+) -> Result<(u64, u32), ArchiveError>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: Into<ArchiveError>,
+{
+    output.set_len(size).await?;
+    let mut seen = 0u64;
+    let mut checksum = 0u32;
+    let mut window: Vec<u8> = Vec::with_capacity(BASE_WRITE_WINDOW);
+    let mut window_at = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(Into::into)?;
+        seen = seen.saturating_add(chunk.len() as u64);
+        checksum = crc32c::crc32c_append(checksum, &chunk);
+        let mut rest: &[u8] = &chunk;
+        while !rest.is_empty() {
+            let take = (BASE_WRITE_WINDOW - window.len()).min(rest.len());
+            window.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if window.len() == BASE_WRITE_WINDOW {
+                write_window(output, window_at, &window).await?;
+                window_at = window_at.saturating_add(BASE_WRITE_WINDOW as u64);
+                window.clear();
+            }
+        }
+    }
+    write_window(output, window_at, &window).await?;
+    Ok((seen, checksum))
+}
+
 async fn download_base_file(
     store: &ArchiveStore,
     file: &pb::ArchiveFile,
@@ -408,13 +522,7 @@ async fn download_base_file(
     }
     let mut stream = result.into_stream();
     let mut output = tokio::fs::File::create(target.join(&file.name)).await?;
-    let mut size = 0u64;
-    let mut checksum = 0u32;
-    while let Some(chunk) = stream.try_next().await? {
-        size = size.saturating_add(chunk.len() as u64);
-        checksum = crc32c::crc32c_append(checksum, &chunk);
-        output.write_all(&chunk).await?;
-    }
+    let (size, checksum) = write_sparse_body(&mut output, file.size, &mut stream).await?;
     output.sync_all().await?;
     if size != file.size || checksum != file.crc32c {
         return Err(format!(
@@ -514,88 +622,134 @@ async fn assemble_wal(
     let state_tip = (manifest_key == state.latest_base_manifest && manifest.term == state.term)
         .then_some(&state.wal_cursors);
 
-    // Each shard writes its own `shard-NNNN.wal` and walks its own fingerprint
-    // chain, so shards are independent. Within a shard the walk stays strictly
-    // sequential -- the next object is chosen by the *current* fingerprint, so
-    // there is nothing to overlap there and nothing to reorder.
-    futures::stream::iter(manifest.wal_cursors.iter().map(|base_cursor| {
-        assemble_shard_wal(store, &descriptors, state_tip, base_cursor, target)
+    // Every shard's chain is resolved before a single body is requested, and
+    // `chain_objects` reaches the store not at all: `load_wal_descriptors` has
+    // already fetched the descriptor for every object in the retained history,
+    // and the descriptor is what names the next link. So the whole fetch order
+    // is known up front, and a history that forks or stops short is reported
+    // before anything is downloaded rather than part-way through.
+    let mut writers = Vec::with_capacity(manifest.wal_cursors.len());
+    let mut bodies: Vec<(usize, &pb::WalObject)> = Vec::new();
+    for base_cursor in &manifest.wal_cursors {
+        let path = target.join(format!("shard-{:04}.wal", base_cursor.shard));
+        let writer = WalWriter::open(&path, base_cursor.archived_lsn)?;
+        if writer.end_lsn() != base_cursor.archived_lsn {
+            return Err(format!(
+                "base shard {} WAL ends at {}, manifest says {}",
+                base_cursor.shard,
+                writer.end_lsn(),
+                base_cursor.archived_lsn
+            )
+            .into());
+        }
+        let shard = writers.len();
+        writers.push(writer);
+        bodies.extend(
+            chain_objects(&descriptors, state_tip, base_cursor)?
+                .into_iter()
+                .map(|object| (shard, object)),
+        );
+    }
+
+    // One `buffered` over every object of every shard, rather than one per
+    // shard over that shard's objects. The budget is the point: eight fetches
+    // are in flight for the whole restore either way, but a two-shard database
+    // with a long history now gets all eight working on the long chain instead
+    // of two. `buffered` keeps the completion order the serial walk produced,
+    // and each shard's objects appear in chain order within it, so appending as
+    // results arrive appends in LSN order per shard.
+    let mut fetched = futures::stream::iter(bodies.into_iter().map(|(shard, object)| async move {
+        let records = store.get_bytes(&object.object_key).await?;
+        validate_wal_object(object, &records)?;
+        Ok::<_, ArchiveError>((shard, object.first_lsn, records))
     }))
-    .buffered(ARCHIVE_FETCH_CONCURRENCY)
-    .try_collect::<Vec<()>>()
-    .await?;
+    .buffered(ARCHIVE_FETCH_CONCURRENCY);
+    while let Some((shard, first_lsn, records)) = fetched.try_next().await? {
+        writers[shard].append_frames_at(first_lsn, &records)?;
+    }
+    drop(fetched);
+
+    for writer in &mut writers {
+        writer.sync()?;
+    }
     Ok(())
 }
 
-/// Rebuild one shard's WAL from the archive, from the base cursor to the tip.
-async fn assemble_shard_wal(
-    store: &ArchiveStore,
-    descriptors: &BTreeMap<u32, Vec<pb::WalObject>>,
+/// One shard's WAL chain, from the base cursor to the tip, in order.
+///
+/// Pure: every decision -- which object follows, where the chain stops, whether
+/// it forks or ends short of the durable tip -- is made from descriptors that
+/// are already in memory. Resolving the whole chain before fetching anything is
+/// what lets the bodies be fetched concurrently; the *fingerprint* chain is
+/// strictly sequential, but it is not what the round trips are spent on.
+fn chain_objects<'a>(
+    descriptors: &'a BTreeMap<u32, Vec<pb::WalObject>>,
     state_tip: Option<&Vec<pb::WalCursor>>,
     base_cursor: &pb::WalCursor,
-    target: &Path,
-) -> Result<(), ArchiveError> {
-    let path = target.join(format!("shard-{:04}.wal", base_cursor.shard));
-    let mut writer = WalWriter::open(&path, base_cursor.archived_lsn)?;
-    if writer.end_lsn() != base_cursor.archived_lsn {
-        return Err(format!(
-            "base shard {} WAL ends at {}, manifest says {}",
-            base_cursor.shard,
-            writer.end_lsn(),
-            base_cursor.archived_lsn
-        )
-        .into());
+) -> Result<Vec<&'a pb::WalObject>, ArchiveError> {
+    let shard = base_cursor.shard;
+    let listed = descriptors.get(&shard).map_or(&[][..], Vec::as_slice);
+    // Indexed by starting LSN rather than scanned per step. The scan was
+    // quadratic in the retained history: an instrumented build measured 8.5 ms
+    // of pure comparison over 2 000 objects and 126 ms over 8 000, for a walk
+    // that visits each object exactly once. A retention window worth having is
+    // far larger than 8 000.
+    let mut by_first_lsn: BTreeMap<u64, Vec<&pb::WalObject>> = BTreeMap::new();
+    for object in listed {
+        by_first_lsn
+            .entry(object.first_lsn)
+            .or_default()
+            .push(object);
     }
-    let expected_tip =
-        state_tip.and_then(|tips| tips.iter().find(|cursor| cursor.shard == base_cursor.shard));
+    let expected_tip = state_tip.and_then(|tips| tips.iter().find(|cursor| cursor.shard == shard));
     let mut lsn = base_cursor.archived_lsn;
     let mut fingerprint = base_cursor.history_fingerprint.clone();
+    let mut chain: Vec<&pb::WalObject> = Vec::new();
     loop {
         if expected_tip
             .is_some_and(|tip| tip.archived_lsn == lsn && tip.history_fingerprint == fingerprint)
         {
             break;
         }
-        let children = descriptors
-            .get(&base_cursor.shard)
-            .into_iter()
-            .flatten()
-            .filter(|object| object.first_lsn == lsn && object.previous_fingerprint == fingerprint)
+        let children = by_first_lsn
+            .get(&lsn)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .copied()
+            .filter(|object| object.previous_fingerprint == fingerprint)
             .collect::<Vec<_>>();
         match children.as_slice() {
             [] if expected_tip.is_none() => break,
             [] => {
                 return Err(format!(
-                    "WAL history for shard {} ends at {lsn} before the durable state tip",
-                    base_cursor.shard
+                    "WAL history for shard {shard} ends at {lsn} before the durable state tip"
                 )
                 .into());
             }
             [object] => {
                 if expected_tip.is_some_and(|tip| object.last_lsn > tip.archived_lsn) {
                     return Err(format!(
-                        "WAL object for shard {} runs past the durable state tip",
-                        base_cursor.shard
+                        "WAL object for shard {shard} runs past the durable state tip"
                     )
                     .into());
                 }
-                let records = store.get_bytes(&object.object_key).await?;
-                validate_wal_object(object, &records)?;
-                writer.append_frames_at(object.first_lsn, &records)?;
                 lsn = object.last_lsn;
                 fingerprint = object.history_fingerprint.clone();
+                chain.push(object);
             }
             _ => {
-                return Err(format!(
-                    "WAL history for shard {} forks at LSN {lsn}",
-                    base_cursor.shard
-                )
-                .into());
+                return Err(format!("WAL history for shard {shard} forks at LSN {lsn}").into());
             }
         }
+        // The walk visits each listed object at most once, so a chain longer
+        // than the listing is a cycle. The serial walk would have looped for
+        // ever on one; this one accumulates, so the bound is also what stops it
+        // exhausting memory.
+        if chain.len() > listed.len() {
+            return Err(format!("WAL history for shard {shard} does not terminate").into());
+        }
     }
-    writer.sync()?;
-    Ok(())
+    Ok(chain)
 }
 
 /// Whether a listed WAL object lies past the durable tip a restore will walk to.
@@ -1272,5 +1426,198 @@ mod tests {
         assert!(base_is_at_or_below(&unstamped, RecoveryTarget::Version(5)));
         assert!(!base_is_at_or_below(&unstamped, RecoveryTarget::Version(4)));
         assert!(base_is_at_or_below(&unstamped, RecoveryTarget::Tip));
+    }
+
+    /// One descriptor in a shard's chain, linked by fingerprint.
+    fn wal_object(shard: u32, first_lsn: u64, last_lsn: u64, prev: u8, next: u8) -> pb::WalObject {
+        pb::WalObject {
+            schema_version: crate::archive::SCHEMA_VERSION,
+            database_uuid: vec![7; 16],
+            term: 0,
+            shard,
+            first_lsn,
+            last_lsn,
+            object_key: format!("wal/{shard:04}/{first_lsn:020}"),
+            size: last_lsn.saturating_sub(first_lsn),
+            crc32c: 0,
+            previous_fingerprint: vec![prev; 32],
+            history_fingerprint: vec![next; 32],
+            first_version: 0,
+            last_version: 0,
+            first_time: 0,
+            last_time: 0,
+        }
+    }
+
+    fn listing(objects: Vec<pb::WalObject>) -> BTreeMap<u32, Vec<pb::WalObject>> {
+        let mut by_shard: BTreeMap<u32, Vec<pb::WalObject>> = BTreeMap::new();
+        for object in objects {
+            by_shard.entry(object.shard).or_default().push(object);
+        }
+        by_shard
+    }
+
+    fn base_cursor(shard: u32, archived_lsn: u64, fingerprint: u8) -> pb::WalCursor {
+        pb::WalCursor {
+            shard,
+            archived_lsn,
+            history_fingerprint: vec![fingerprint; 32],
+        }
+    }
+
+    /// The whole order is known before a byte is fetched, which is what lets
+    /// the bodies be fetched concurrently.
+    #[test]
+    fn a_chain_resolves_in_lsn_order_from_descriptors_alone() {
+        // Deliberately listed out of order: the listing is a directory, not a
+        // sequence, and only the fingerprints say what follows what.
+        let descriptors = listing(vec![
+            wal_object(0, 200, 300, 2, 3),
+            wal_object(0, 100, 200, 1, 2),
+            wal_object(1, 500, 600, 9, 8),
+            wal_object(0, 300, 400, 3, 4),
+        ]);
+        let tip = vec![base_cursor(0, 400, 4)];
+        let chain = chain_objects(&descriptors, Some(&tip), &base_cursor(0, 100, 1)).unwrap();
+        assert_eq!(
+            chain.iter().map(|o| o.first_lsn).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "shard 0's chain, and nothing of shard 1's"
+        );
+    }
+
+    /// With no durable tip the chain is walked to the end of what is listed.
+    #[test]
+    fn a_superseded_base_walks_its_chain_to_the_end() {
+        let descriptors = listing(vec![
+            wal_object(0, 100, 200, 1, 2),
+            wal_object(0, 200, 300, 2, 3),
+        ]);
+        let chain = chain_objects(&descriptors, None, &base_cursor(0, 100, 1)).unwrap();
+        assert_eq!(chain.len(), 2);
+    }
+
+    /// A fork is two histories claiming the same predecessor, and it is
+    /// refused rather than resolved by picking one.
+    #[test]
+    fn a_forked_history_is_refused_before_anything_is_fetched() {
+        let descriptors = listing(vec![
+            wal_object(0, 100, 200, 1, 2),
+            wal_object(0, 100, 250, 1, 7),
+        ]);
+        let error = chain_objects(&descriptors, None, &base_cursor(0, 100, 1)).unwrap_err();
+        assert!(format!("{error}").contains("forks at LSN 100"), "{error}");
+    }
+
+    /// A chain that runs out below the durable tip promises a version the
+    /// restore cannot reach, so it is an error rather than a short answer.
+    #[test]
+    fn a_chain_short_of_the_durable_tip_is_refused() {
+        let descriptors = listing(vec![wal_object(0, 100, 200, 1, 2)]);
+        let tip = vec![base_cursor(0, 300, 5)];
+        let error = chain_objects(&descriptors, Some(&tip), &base_cursor(0, 100, 1)).unwrap_err();
+        assert!(
+            format!("{error}").contains("ends at 200 before the durable state tip"),
+            "{error}"
+        );
+    }
+
+    /// An object listed past the tip is not restorable: the sidecar may publish
+    /// an object before the cursor that admits it.
+    #[test]
+    fn an_object_past_the_durable_tip_is_refused() {
+        let descriptors = listing(vec![wal_object(0, 100, 400, 1, 2)]);
+        let tip = vec![base_cursor(0, 300, 5)];
+        let error = chain_objects(&descriptors, Some(&tip), &base_cursor(0, 100, 1)).unwrap_err();
+        assert!(
+            format!("{error}").contains("runs past the durable state tip"),
+            "{error}"
+        );
+    }
+
+    /// A listing whose fingerprints close a loop used to spin the walk for
+    /// ever. It now accumulates, so the same input would exhaust memory
+    /// instead -- the bound reports it.
+    #[test]
+    fn a_cycle_in_the_listing_is_reported_rather_than_walked_for_ever() {
+        let descriptors = listing(vec![
+            wal_object(0, 100, 200, 1, 2),
+            wal_object(0, 200, 100, 2, 1),
+        ]);
+        let error = chain_objects(&descriptors, None, &base_cursor(0, 100, 1)).unwrap_err();
+        assert!(format!("{error}").contains("does not terminate"), "{error}");
+    }
+
+    /// An empty window is left unwritten, and the file still reads back the
+    /// bytes the object carried.
+    ///
+    /// The chunks deliberately do not line up with the window: an object store
+    /// hands over whatever size it likes, and cutting on the chunk instead of
+    /// on the window would weigh the wrong span for emptiness.
+    #[tokio::test]
+    async fn an_empty_window_is_left_as_a_hole_and_still_reads_as_zero() {
+        use std::os::unix::fs::MetadataExt;
+
+        let window = BASE_WRITE_WINDOW;
+        let mut body = vec![0u8; 3 * window];
+        for (i, byte) in body[..window].iter_mut().enumerate() {
+            *byte = (i % 251) as u8 | 1;
+        }
+        for (i, byte) in body[2 * window..].iter_mut().enumerate() {
+            *byte = (i % 241) as u8 | 1;
+        }
+        // The middle window stays zero, and no chunk boundary coincides with
+        // a window boundary.
+        let chunks: Vec<Result<bytes::Bytes, ArchiveError>> = body
+            .chunks(window / 3 + 17)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let mut stream = futures::stream::iter(chunks);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard-0000.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, checksum) = write_sparse_body(&mut output, body.len() as u64, &mut stream)
+            .await
+            .unwrap();
+        output.sync_all().await.unwrap();
+        drop(output);
+
+        assert_eq!(seen, body.len() as u64, "every byte is weighed");
+        assert_eq!(
+            checksum,
+            crc32c::crc32c(&body),
+            "the CRC covers the skipped window too"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), body, "content-identical");
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), body.len() as u64);
+        assert!(
+            meta.blocks() * 512 < body.len() as u64,
+            "the empty window must not be allocated: {} bytes allocated for {}",
+            meta.blocks() * 512,
+            body.len()
+        );
+    }
+
+    /// A body that is entirely empty is still a file of the right length.
+    #[tokio::test]
+    async fn an_entirely_empty_object_restores_to_a_file_of_the_right_length() {
+        let body = vec![0u8; BASE_WRITE_WINDOW + 7];
+        let mut stream = futures::stream::iter(vec![Ok::<_, ArchiveError>(
+            bytes::Bytes::copy_from_slice(&body),
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.yno");
+        let mut output = tokio::fs::File::create(&path).await.unwrap();
+        let (seen, checksum) = write_sparse_body(&mut output, body.len() as u64, &mut stream)
+            .await
+            .unwrap();
+        output.sync_all().await.unwrap();
+        drop(output);
+        assert_eq!(seen, body.len() as u64);
+        assert_eq!(checksum, crc32c::crc32c(&body));
+        assert_eq!(std::fs::read(&path).unwrap(), body);
     }
 }

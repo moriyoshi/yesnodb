@@ -23,6 +23,26 @@ ordinary replica recovery before publishing it with one rename. Omit
 `--target-version` to restore the durable archive tip. A requested version that
 is not present as a complete commit fails rather than rounding silently.
 
+### How much space a restore needs
+
+A shard image is a sparse file. Its apparent length is a whole memory-mapping
+segment, currently one gibibyte, whatever the database holds, so `ls -l` and
+`du` on a restored directory disagree by whatever fraction of that segment is
+actually in use -- often three orders of magnitude. Size the target volume from
+`du` on the running database, not from `ls -l` and not from the size of the
+archive objects.
+
+The restored copy is content-identical to the original and allocated the same
+way: empty regions are left as holes rather than written out as zeros. A
+filesystem that does not support sparse files will allocate the whole apparent
+length instead, which is correct but needs the space.
+
+Archive objects are a separate matter and are **not** sparse: an archived base
+occupies its apparent length in the object store, one segment per shard per
+base generation. Budget object-store capacity and transfer from that number,
+and keep the retention window in mind, because each retained base generation
+pays it again.
+
 ## Point-in-time recovery
 
 A target may instead be a wall clock:

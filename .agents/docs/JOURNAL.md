@@ -824,3 +824,45 @@ End to end: **42 707 spawns and 0 refusals**, against 2.5% of reopens before. Bo
 **A live `Snapshot` does hold the directory lock**, which is worth knowing independently: five descriptors remain open after `drop( db )` and a reopen is refused until the snapshot drops. That is by design -- `Snapshot` and `ReaderSlot` are the only things outside tests that clone `Arc< DbInner >` -- and it means the entry's leading suspect was genuinely reachable. It was simply not what happened, because the failing test takes no snapshot before its drop and no production path in `db/mod.rs` takes one at all.
 
 One exposure remains and is stated rather than fixed: a child that forks and never `exec`s holds the lock indefinitely, and the retry only delays the report by 45 ms. That is correct -- there really is a holder -- but an operator reading `AlreadyOpen` should know a stray child can be the one holding it.
+
+## 2026-10-14 — A restore is 92% holes, and the WAL walk was serial for a reason that did not apply
+
+Two TODO entries were parked on the same measurement and said to take them together: `where-follower-boot-time-actually-goes-is-unmeasured` and `the-restore-path-makes-blocking-core-calls-inside-async`. Taken together, the measurement closed the second, inverted the first, and found a third thing neither had named.
+
+### The construction
+
+A scratch scenario under `.agents-workspace/tmp/` ( not admitted to `e2e/scenarios/`: its assertions are about timings, not about the crate ) launches a leader, starts the shipped sidecar against a `file://` archive, checkpoints to root a base, commits 200 transactions of 32 keys across 4 shards, waits until the restore window stops advancing, and then restores to the tip through `srv_restore`, which is `restore_to` in process. `restore.rs` was instrumented with stage timers, measured, and the instrumentation removed; the original was kept in the scratch directory and copied back, so what shipped was re-derived from the pristine file rather than un-edited.
+
+### The split
+
+Four shards, 6 401 keys, 8 000 WAL objects of retained history, release build, mode of five runs:
+
+| stage | before | after |
+|---|---|---|
+| base selection | 105 ms | 110 ms |
+| materialize base | 4 150 ms | 3 090 ms |
+| assemble WAL | 280 ms | 250 ms |
+| plan and cut | 1.1 ms | 1.1 ms |
+| recovery replay | 7 ms | 6 ms |
+| `sync_tree` | 5 ms | 5 ms |
+| **total** | **4 500 ms** | **3 470 ms** |
+
+**Materializing the base is 92% of a restore, and the base is almost entirely holes.** A shard image is grown to a whole 1 GiB mmap segment by `set_len`. Measured on the leader: 1 and 2 MiB allocated against an apparent 1 GiB each. Measured on the restored copy, before: **1 GiB allocated each, 4.00 GiB in total**, for a database holding a few hundred kilobytes of state. The restore was writing back every zero.
+
+`LTM/network-service-replication-and-operations.md` already carries the rule as policy -- "Do not materialize sparse holes on the wire or in follower storage" -- and the replication bootstrap path implements it in both directions. The archive restore path violated it in both. Setting the length first and writing only non-empty 1 MiB windows takes the restored allocation to **5.0 MiB**, 818x less, and the stage to 3.09 s. The transfer is unchanged and that half is filed as `the-archived-base-object-still-carries-its-holes`: the archive object *is* the file, its `size` and `crc32c` are the file's, and shipping only the non-empty runs is a `SCHEMA_VERSION` change rather than a write-side one.
+
+### The entry that asked the right question about the wrong line
+
+`the-restore-path-makes-blocking-core-calls-inside-async` named one candidate and insisted on measuring it first. It was right to: over 8 000 objects, `append_frames_at` totalled **10.5 ms** and `sync` **24 ms** against a restore of 8 461 ms. **0.4%.** `spawn_blocking` around those writes was not worth the `'static` closure it would need, and the entry is closed as not-taken rather than as done.
+
+What the same instrumentation showed was that the *fetches* those writes were stalling totalled 2 017 ms -- and that they were serial within a shard. The 2026-10-14 entry that parallelised the other four archive fetch loops had written of this one that "the next object is selected by the *current* fingerprint, so there is nothing to overlap there". **That is true of the descriptor chain and irrelevant to the bodies.** `load_wal_descriptors` fetches a descriptor for every object in the retained history before the walk begins, so the chain is resolved entirely from memory and the whole fetch order is known up front. Only the bodies cost round trips.
+
+`chain_objects` now resolves each shard's chain as a pure function, and every shard's bodies go through **one** `buffered( ARCHIVE_FETCH_CONCURRENCY )` rather than one per shard. One shard, 2 000 objects, `file://`: **770 ms to 240 ms, 3.2x**. At four shards it is 280 to 250 ms, because four-way concurrency was already there and a local store has no latency left to hide -- which is the direction that matters, since a network store has more to gain, not less.
+
+Resolving the chain first paid twice more. A forked or short history is reported **before a byte is downloaded**. And the per-step `filter` over the shard's whole listing was **quadratic in the retained history** -- 8.5 ms of pure comparison at 2 000 objects, 126 ms at 8 000 -- for a walk that visits each object once; it is an index lookup now, and a cycle in the listing is bounded and reported rather than walked for ever.
+
+### Two notes on method
+
+**The first run said the fix was a 2.7x regression.** Materializing the base went 7.0 s to 19.2 s. It was a debug build: the all-zero scan is a byte loop, `-O` vectorizes it and `cargo run` without `--release` does not. The `Run \ Array` probe earlier the same day taught variance within a process; this one is about the profile the measurement is taken in, and the same discipline caught it -- repeat, and do not conclude from a pair of runs. In release and warm, baseline materialize still ranged 4.09 to 5.89 s across five runs, so a single pair could have been made to show anything.
+
+**An entry that says "measure first" can be right about the method and wrong about the target.** This one was. Its structural reasoning -- one task, a blocking call stalls the others -- was correct and checkable, and the measurement it demanded is what found the real defect sitting beside the one it named. The value was in the instruction, not in the hypothesis.
