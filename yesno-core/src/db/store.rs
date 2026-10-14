@@ -40,9 +40,34 @@ pub const RESERVED: u64 = 2 * PAGE as u64;
 /// A raw offset would overflow the 32-bit id past 4 GiB, silently aliasing
 /// distant pages. Every slot in every class is 64-byte aligned ( a ladder
 /// invariant ), so dividing is lossless and extends the addressable range to
-/// 256 GiB — comfortably past the 128 GiB per-shard cap, with the check below
-/// making an overflow an error rather than a wrap.
+/// [`MAX_SHARD_BYTES`], with the check below making an overflow an error
+/// rather than a wrap.
 pub const PAGE_ID_SHIFT: u64 = 64;
+
+/// The largest shard this build can address: 256 GiB.
+///
+/// **This is the real per-shard limit, and until 2026-10-14 nothing enforced
+/// it.** Index nodes are named by a `u32` [`PageId`] over `PAGE_ID_SHIFT`-byte
+/// units, so a cell at or above this is not nameable; payload is not the
+/// constraint, because `ChunkRef.cell` is 40 bits ( 1 TiB, 4x this ). But
+/// index nodes share one address space with payload, so *any* slab above the
+/// line is a slab an index node might be allocated in.
+///
+/// The old behaviour was to refuse in `cell_to_page_id`, which is correct but
+/// arrives late and unpredictably: not when the shard crosses the line, but
+/// when an index node *happens* to be allocated above it, which depends on how
+/// the size classes interleaved rather than on size. A database could sit above
+/// the line serving reads and then fail to checkpoint. [`capacity_for`] now
+/// refuses the growth itself, so the limit is reached deterministically, before
+/// the data is accepted, with the number in the message.
+///
+/// Two comments used to call this 128 GiB. Nothing enforced that either, and
+/// refusing there would have broken a working database between the two figures,
+/// so the enforced cap is the one where correctness actually breaks.
+///
+/// Raising it is a format change: `feat::LARGE_SHARD` is reserved for exactly
+/// this and is not implemented. Spread data over more shards instead.
+pub const MAX_SHARD_BYTES: u64 = (PageId::MAX as u64 + 1) * PAGE_ID_SHIFT;
 
 #[inline]
 fn cell_to_page_id(cell: u64) -> Result<PageId> {
@@ -53,6 +78,24 @@ fn cell_to_page_id(cell: u64) -> Result<PageId> {
     );
     let id = cell / PAGE_ID_SHIFT;
     u32::try_from(id).map_err(|_| CodecError::Invariant("index page id exceeds 32 bits"))
+}
+
+/// Bytes a shard holding `slab_count` slabs must be grown to, or the refusal.
+///
+/// Separate from [`ShardStore::ensure_capacity`] so the boundary is testable:
+/// building a shard with 131 071 slabs to prove the cap is not a unit test, and
+/// the property worth holding is that this limit and [`cell_to_page_id`]'s agree
+/// exactly.
+#[inline]
+fn capacity_for(slab_count: u64) -> Result<u64> {
+    let want = RESERVED + (slab_count + 1) * SLAB_SIZE;
+    if want > MAX_SHARD_BYTES {
+        return Err(CodecError::ShardAddressSpaceExhausted {
+            want,
+            cap: MAX_SHARD_BYTES,
+        });
+    }
+    Ok(want)
 }
 
 #[inline]
@@ -339,7 +382,7 @@ impl ShardStore {
     /// check switched off rather than debugged.
     /// Reserve space for `n` more bytes of allocation.
     fn ensure_capacity(&self) -> Result<()> {
-        let want = RESERVED + (self.alloc.slab_count() as u64 + 1) * SLAB_SIZE;
+        let want = capacity_for(self.alloc.slab_count() as u64)?;
         self.seg.grow_to(want).map_err(io_err)
     }
 
@@ -1052,6 +1095,37 @@ mod tests {
         p.push(format!("yesno-store-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// The growth cap and the page-id cap must be the *same* limit.
+    ///
+    /// They are computed in different places from different quantities -- one
+    /// from a slab count, one from a cell -- and a shard that could grow past
+    /// what a `PageId` can name would be back to failing at an unpredictable
+    /// checkpoint, which is the behaviour the cap exists to replace.
+    #[test]
+    fn the_growth_cap_is_exactly_what_a_page_id_can_name() {
+        assert_eq!(
+            cell_to_page_id(MAX_SHARD_BYTES - PAGE_ID_SHIFT),
+            Ok(PageId::MAX)
+        );
+        assert!(cell_to_page_id(MAX_SHARD_BYTES).is_err());
+
+        // The last slab count that fits, and the first that does not.
+        let last = (MAX_SHARD_BYTES - RESERVED) / SLAB_SIZE - 1;
+        let want = capacity_for(last).expect("the last admissible slab count is admitted");
+        assert!(want <= MAX_SHARD_BYTES);
+
+        // Every cell that slab can hand out is nameable, which is the point.
+        assert!(cell_to_page_id(want - PAGE_ID_SHIFT).is_ok());
+
+        match capacity_for(last + 1) {
+            Err(CodecError::ShardAddressSpaceExhausted { want, cap }) => {
+                assert!(want > cap);
+                assert_eq!(cap, MAX_SHARD_BYTES);
+            }
+            other => panic!("growth past the cap must be refused, got {other:?}"),
+        }
     }
 
     struct Cleanup(std::path::PathBuf);

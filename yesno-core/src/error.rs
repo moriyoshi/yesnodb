@@ -149,6 +149,27 @@ pub enum CodecError {
         waited_micros: u64,
     },
 
+    /// A shard reached the end of its index-node address space.
+    ///
+    /// **Carries both numbers because the remedy is arithmetic.** An operator
+    /// meeting this has to decide a shard count, and "the shard is full" does
+    /// not say how full or how much more a shard can hold. Raising the cap is a
+    /// format change rather than a setting, so the message must not suggest one.
+    ///
+    /// Refused at growth rather than at
+    /// [`Invariant`](Self::Invariant)-with-"index page id exceeds 32 bits",
+    /// which is the same limit reached from the other side: that one fires only
+    /// once an index node is actually allocated above the line, which is a
+    /// function of allocation history rather than of size. It stays as the
+    /// backstop for a file that is already past the cap.
+    #[error(
+        "shard is full: growing it to {want} bytes would pass the {cap}-byte addressing \
+         cap, beyond which an index node cannot be named by a 32-bit page id. Spread the \
+         data over more shards; raising the cap is a format change this build does not \
+         implement."
+    )]
+    ShardAddressSpaceExhausted { want: u64, cap: u64 },
+
     #[error("structural invariant violated: {0}")]
     Invariant(&'static str),
     /// A shard file belongs to a different database.

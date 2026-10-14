@@ -126,7 +126,8 @@ pub struct ChunkRef(u64);
 /// wherever it is legal, so this is simply what the word physically holds.
 pub const INLINE_MAX: usize = 3;
 
-/// Addressable byte offset. 40 bits is 1 TiB, 8x the 128 GiB per-shard cap.
+/// Addressable byte offset. 40 bits is 1 TiB, 4x the 256 GiB a shard may grow
+/// to -- payload is not what bounds a shard; the 32-bit index page id is.
 pub const CELL_BITS: u32 = 40;
 pub const CELL_MAX: u64 = (1 << CELL_BITS) - 1;
 

@@ -19,6 +19,14 @@ readiness claim.
   and reuse the space it is still reading.
 - Run one process per data directory. The database takes an exclusive file
   lock, so overlapping restarts fail deliberately.
+- **A single shard holds at most 256 GiB.** Index nodes are named by a 32-bit
+  identifier, so no byte beyond that point can be referenced. A shard that
+  reaches it refuses to grow, naming both its size and the cap, and the
+  database stays readable -- but the write that hit the limit fails, and no
+  setting raises it. Capacity is planned with the shard count, which is
+  creation-only ( see [Configuration](configuration.md) ). Choose it for
+  the data the database will hold, not for the data it starts with: at 60 MiB
+  per key a shard holds roughly 4 000 keys.
 - Replication is asynchronous. It is not a backup and never provides zero RPO.
 - There is no consensus-based leader election. Promotion is manual for a
   standalone server and automatic under the Kubernetes operator, which fences
