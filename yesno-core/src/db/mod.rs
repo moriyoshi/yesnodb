@@ -616,6 +616,37 @@ impl Drop for CheckpointLease {
     }
 }
 
+/// Attempts `acquire_lock` makes before reporting, and the gap between them.
+///
+/// **Not a tuning knob.** It is sized against a `fork`-to-`exec` window.
+/// `flock` attaches to the open file *description*, and `fork` hands the child
+/// a descriptor onto the same one -- so every subprocess a multi-threaded
+/// process spawns holds this database's lock from `fork` until it `exec`s.
+/// Rust opens files `O_CLOEXEC`, and close-on-exec closes at `exec`, not at
+/// `fork`. During that window a first-shot `try_lock` sees a genuine second
+/// holder and reports it correctly; the trouble is that the holder is our own
+/// child, it is already leaving, and no caller can act on the report.
+///
+/// Measured on 2026-10-14, 200 close-then-open sequences per arm: **0** refused
+/// with no child processes at all, **1.5%** refused beside one `/bin/true`
+/// spawned every 10 ms, and **100%** refused when the window was deliberately
+/// widened with a `pre_exec` sleep. That is the mechanism behind
+/// `a-dropped-db-may-not-have-released-its-flock`, whose two sightings were
+/// both in the one gate step whose binary re-runs itself as a child process.
+///
+/// `yesno-server` reaches the same window in production, not only in tests: the
+/// snapshot providers spawn `mountpoint` and the LVM and EBS tools while the
+/// database is open, so an open racing one of those would be refused naming a
+/// holder that is about to cease to exist.
+///
+/// Nine gaps is 45 ms, three orders of magnitude past a `fork`-to-`exec`, and
+/// still reports a genuinely contended open promptly -- which the follower,
+/// plugin and lifecycle paths all depend on, since each treats a persistent
+/// `AlreadyOpen` as the signal that a peer still holds the directory.
+const LOCK_ATTEMPTS: u32 = 10;
+/// Paired with [`LOCK_ATTEMPTS`]; read its rationale before changing either.
+const LOCK_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Take the database's exclusive lock and return it with this open's epoch.
 ///
 /// The epoch lives in the lock file itself: read, incremented, written back
@@ -633,19 +664,36 @@ pub(crate) fn acquire_lock(dir: &std::path::Path) -> Result<(std::fs::File, u64)
         .open(&path)
         .map_err(|_| CodecError::Invariant("cannot open the database lock file"))?;
 
-    // Non-blocking: an already-open database is an error to report, not a
-    // queue to join. Blocking here would hang a caller with no way to know why.
-    // Split, because the two arms have opposite remedies: `WouldBlock` means
+    // Bounded, not blocking: an already-open database is still an error to
+    // report rather than a queue to join, and a lock we wait on indefinitely
+    // hangs a caller with no way to know why. See `LOCK_ATTEMPTS` for why a
+    // single attempt is nonetheless wrong.
+    //
+    // The two arms have opposite remedies and stay split: `WouldBlock` means
     // find the other holder, anything else means the lock call itself failed
     // and there may be no holder at all. Collapsing them reported a transient
     // `EINTR` or `ENOLCK` as "already open by another process".
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => CodecError::AlreadyOpen(dir.display().to_string()),
-        std::fs::TryLockError::Error(error) => CodecError::LockUnavailable {
-            dir: dir.display().to_string(),
-            reason: error.to_string(),
-        },
-    })?;
+    let mut attempt = 1u32;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(e) if attempt >= LOCK_ATTEMPTS => {
+                return Err(match e {
+                    std::fs::TryLockError::WouldBlock => {
+                        CodecError::AlreadyOpen(dir.display().to_string())
+                    }
+                    std::fs::TryLockError::Error(error) => CodecError::LockUnavailable {
+                        dir: dir.display().to_string(),
+                        reason: error.to_string(),
+                    },
+                });
+            }
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(LOCK_RETRY_GAP);
+            }
+        }
+    }
 
     use std::io::{Read, Seek, Write};
     let mut buf = Vec::new();
@@ -6827,6 +6875,74 @@ mod tests {
         b.commit().unwrap();
         let snap = db.snapshot().unwrap();
         assert_eq!(snap.load(1).unwrap().iter().collect::<Vec<_>>(), vec![5]);
+    }
+
+    /// A holder that is leaving is waited out; one that stays is still reported.
+    ///
+    /// Both halves matter and they pull opposite ways, which is why they share
+    /// a test. A `fork`-to-`exec` window makes our own child a real second
+    /// holder for microseconds, and refusing the open there is a spurious
+    /// failure no caller can act on -- that is the defect `LOCK_ATTEMPTS`
+    /// exists for. But `yesno-server`'s follower, plugin and lifecycle paths
+    /// all read a persistent `AlreadyOpen` as "a peer still has the directory",
+    /// so waiting one out would be worse than the bug.
+    ///
+    /// A second `flock` on the same `LOCK` file stands in for the forked child.
+    /// It is the same mechanism from the lock's point of view -- another open
+    /// file description holding it -- and it needs no `unsafe` and no
+    /// subprocess, so it runs the same on every platform the suite does.
+    #[test]
+    fn a_transient_lock_holder_is_waited_out_but_a_lasting_one_is_reported() {
+        let dir = tmpdir("lock-transient");
+        drop(Db::open_with(&dir, DbOptions::default()).unwrap());
+
+        let lock_path = dir.0.join("LOCK");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().expect("the database is closed");
+
+        // Leaves well inside `LOCK_ATTEMPTS * LOCK_RETRY_GAP`, as a child does.
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            drop(holder);
+        });
+        let db = Db::open_with(&dir, DbOptions::default())
+            .expect("a holder that leaves must be waited out, not reported");
+        handle.join().unwrap();
+        drop(db);
+
+        // And one that does not leave is still refused, after the full budget.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().expect("the database is closed again");
+        let start = std::time::Instant::now();
+        // `Db` is not `Debug`, so the outcome is reduced to a describable one
+        // before it is asserted on.
+        let refused = match Db::open_with(&dir, DbOptions::default()) {
+            Ok(_) => "opened".to_string(),
+            Err(CodecError::AlreadyOpen(_)) => "already-open".to_string(),
+            Err(e) => format!("{e:?}"),
+        };
+        let waited = start.elapsed();
+        assert_eq!(
+            refused, "already-open",
+            "a lasting holder must still be reported"
+        );
+        // A lower bound only: `sleep` may overshoot but never returns early, so
+        // this cannot fail on a loaded host. It is what makes the retry visible
+        // -- a single-attempt `acquire_lock` returns in microseconds and fails
+        // here, which is the sabotage this assertion is for.
+        assert!(
+            waited >= LOCK_RETRY_GAP * (LOCK_ATTEMPTS - 1),
+            "reported after {waited:?}, which is less than the retry budget"
+        );
+        drop(holder);
     }
 
     /// A staggered checkpoint persists exactly what an unstaggered one does.

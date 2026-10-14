@@ -779,3 +779,48 @@ The window where it bites is narrower. `optimize` switches encoding only on a 12
 **The probe is bimodal, and it briefly showed a regression in a shape the change cannot reach.** The first A-B-A-B read `not ( p or q )` at 248 ns with the arm off and 521 with it on, reproducibly across both phases. Measuring that shape first in its own process reproduced it. A null edit -- twelve dead `#[inline(never)]` functions added to the same module -- produced **516 and then 253 from the same binary**, which is what settled it: one process in roughly eight lands at twice the modal figure, and a median of seven samples *within* a process cannot see it because the process is the bistable unit. Both arms exhibit it.
 
 Carry this: an A/B whose two sides differ by less than about 2.5x on this host is not measurable from one process per arm, however clean the interleaving looks. The 99x and 27.5x figures survive it comfortably; the 2x "regression" was the artifact, and I spent four experiments before testing the null edit that would have ruled it out first.
+
+---
+
+## 2026-10-14 — The flock holder was a forked child, and the failing build said so all along
+
+`a-dropped-db-may-not-have-released-its-flock` had two gate sightings, 0 in 24 direct reproduction attempts, and a plan that amounted to waiting for a third. It is closed instead, with a reproduction that runs in under a second.
+
+### The mechanism
+
+`flock` attaches to the open file **description**, not to the descriptor. `fork` gives the child a descriptor onto the same description, and Rust's `O_CLOEXEC` closes it at `exec` -- not at `fork`. So between those two points a spawned child holds the database's directory lock, and a `try_lock` in the parent sees a genuine second holder and is right to report it. The holder is our own child, it is already leaving, and nothing the caller is told can be acted on.
+
+### What pointed at it
+
+Not more sampling. The entry recorded that both failures were in the `cargo test -p yesno-core --features jit` step and treated that as a fact about which binary to re-run. The useful question was what is *different* about that binary: it is the only one carrying `jit::tests::jit_cache_drop_reclaims_executable_mappings`, which re-runs the test binary as a child process while every other test in the binary runs beside it.
+
+### Measured, 200 close-then-open sequences per arm
+
+| arm | reopens refused | any open refused |
+|---|---|---|
+| no child processes ( control ) | 0 | 0 |
+| one `/bin/true` every 10 ms | 3 ( 1.5% ) | 109 |
+| four spawners, continuous | 5 ( 2.5% ) | 193 |
+| `pre_exec` sleep of 20 ms | 200 ( 100% ) | 200 |
+
+The control is what makes this evidence. The first-open column is larger than the reopen column throughout for a mechanical reason worth stating: once a child holds the lock, *both* opens of a cycle fail and the loop spins, so folding the two together would have reported 98% and overstated the thing by a factor of forty.
+
+### It is a product defect, not a test artifact
+
+The entry filed it that way round and was right. `yesno-server`'s snapshot providers spawn `mountpoint` and the LVM and EBS tools while the database is open, so an open racing one of those is refused naming a holder that is about to cease to exist -- an unattributable error of exactly the kind `follower.rs` and `plugin.rs` already have comments about.
+
+### The fix, and why it does not overturn the decision it touches
+
+`acquire_lock` now tries `LOCK_ATTEMPTS` ( 10 ) times `LOCK_RETRY_GAP` ( 5 ms ) apart. The in-function comment it replaces argued for non-blocking on the grounds that "blocking here would hang a caller with no way to know why", and that still holds: this is bounded, it still reports, and 45 ms is three orders of magnitude past a `fork`-to-`exec` while failing a genuinely contended open promptly -- which the follower, plugin and lifecycle paths all depend on, since each reads a persistent `AlreadyOpen` as "a peer still has the directory".
+
+End to end: **42 707 spawns and 0 refusals**, against 2.5% of reopens before. Both halves are pinned by one test, because they pull opposite ways -- a holder that leaves must be waited out, a holder that stays must still be reported -- and it fails under both sabotages, one attempt and no sleep. The test stands a second `flock` on the same `LOCK` file in for the forked child: the same thing from the lock's point of view, and it needs no `unsafe` and no subprocess.
+
+### Three things to carry
+
+**Diagnosability was the right investment and was not sufficient.** The 2026-10-12 split of `WouldBlock` from `LockUnavailable` was correct, and this entry's plan rested on it: wait for a third sighting and let it classify itself. A third would have said `AlreadyOpen` -- truthfully, a real holder existed -- and still not named a forked child. The entry's other instruction, to run `fuser` against the directory on the next occurrence, would most likely have found nothing, because by the time anyone looked the child would have `exec`ed. Contrast the archive ENOENT, where one `map_err` carrying the path turned the next sighting into a ten-minute read: there the missing information was *in* the error, here it was in the process tree a millisecond earlier.
+
+**"Which binary" and "what is in that binary" are different questions.** Four reproduction campaigns were run against the right binary and found nothing, because re-running it does not reproduce a race between two of its tests at the density needed. Reading what else that binary contains took one grep.
+
+**A live `Snapshot` does hold the directory lock**, which is worth knowing independently: five descriptors remain open after `drop( db )` and a reopen is refused until the snapshot drops. That is by design -- `Snapshot` and `ReaderSlot` are the only things outside tests that clone `Arc< DbInner >` -- and it means the entry's leading suspect was genuinely reachable. It was simply not what happened, because the failing test takes no snapshot before its drop and no production path in `db/mod.rs` takes one at all.
+
+One exposure remains and is stated rather than fixed: a child that forks and never `exec`s holds the lock indefinitely, and the retry only delays the report by 45 ms. That is correct -- there really is a holder -- but an operator reading `AlreadyOpen` should know a stray child can be the one holding it.
