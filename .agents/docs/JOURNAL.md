@@ -715,3 +715,27 @@ Within a shard the WAL walk stays sequential: the next object is selected by the
 Worth recording because the question was asked and answered rather than acted on blind. "Incremental retrieval" has three readings and they do not fare alike. *Resumable* helps only the retry path -- though an interrupted seed does re-download everything today, since `restore_to` refuses an existing target and `create_staging` mints a fresh directory per attempt. *Lazy or demand-paged* fights three invariants: `inspect_base` verifies the whole base against its manifest, recovery must land exactly on the selected version, and readiness requires a full replication pass -- so it would defer precisely the bytes a read-serving follower exists to serve. *Delta* already exists under another name: a follower that keeps its MANIFEST never refetches the base and closes the gap by WAL.
 
 None of the three touches `sync_tree`, which fsyncs the whole restored tree before publication, or the first full replication pass that gates `/readyz`. **Where boot time actually goes is still unmeasured**, and the parallelism above was taken on the separate ground that independent network transfers running in series is a defect whatever the profile says.
+
+---
+
+## 2026-10-14 — Where the restore path's concurrency stops, and the rule that put it there
+
+Asked whether the tree uses tokio, after the four serial fetch loops were parallelised. It does, in a shape worth writing down, and the answer turned up the limit of the change made an hour earlier.
+
+### The layering is enforced, not merely intended
+
+`yesno-core` has **no tokio**, and the `lean-core` CI job fails if `cargo tree -p yesno-core -e normal` so much as mentions `tokio`, `tonic`, `prost` or `arrow-flight`. Async starts one layer out, in `yesno-server-utils`, `yesno-server` and `yesno-e2e`, and every binary entry point is `#[tokio::main]` or an explicit `Runtime::new()` -- multi-thread in both cases.
+
+### The consequence for the change just made
+
+`buffered( 8 )` is concurrency on one task, not parallelism across threads. For network fetches that is exactly right: the reactor drives the sockets and eight requests are genuinely in flight. But `WalWriter` lives in `yesno-core`, so `open`, `append_frames_at` and `sync` are **synchronous by construction** -- the lean-core rule makes them so -- and `assemble_shard_wal` alternates an awaited fetch with a blocking write. Eight of those futures now share one task, so while one shard writes, the other seven cannot issue their next fetch.
+
+Never worse than the serial loop it replaced, which made the same blocking calls with nothing to lose. But the eight-way figure overstates what was bought, and the overstatement is the thing to record. Filed as `the-restore-path-makes-blocking-core-calls-inside-async`.
+
+### Two things the audit corrected about itself
+
+**`materialize_base` has the same shape and is already clean.** `download_base_file` writes through `tokio::fs`, and its one synchronous call -- `inspect_base` -- sits *after* the join rather than inside it. So the defect is one function, not a property of the file, and a sweep that stopped at "restore.rs has zero `spawn_blocking`" would have proposed four changes where one is warranted.
+
+**The usual reason for `spawn_blocking` does not apply here.** It is normally about not starving a reactor that is also serving queries. A restore never shares a runtime with serving traffic: `yesno-server` runs the seed as a **separate helper process** ( `tokio::process::Command`, `seed-follower` ) before it starts serving, with the comment that the seed can outlast Kubernetes' liveness window, and `yesnoctl restore` is a one-shot CLI. So the cost is confined to the restore's own overlap. That is a smaller claim than the one worth making before checking, and it is why the entry asks for a measurement rather than a patch -- the fix is worth nothing if the loop is mostly network.
+
+The same reasoning retires three other call sites before anyone spends time on them: `restore_to` runs `materialize_base`, `assemble_wal`, `plan_and_cut`, `Db::open_replica` and `sync_tree` strictly in sequence, so moving any of them to a blocking thread adds a hop and overlaps with nothing.
