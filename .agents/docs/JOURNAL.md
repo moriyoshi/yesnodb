@@ -902,3 +902,382 @@ That makes the next move obvious and also makes it not worth taking. A GF(2) shi
 ### Not taken
 
 `SEEK_DATA`, again, and for the third time with the same reasoning: it would let the upload skip *reading* the holes as well, and it needs a `libc` call and the unsafe rules that come with it to save a scan whose cost is memory bandwidth on a one-off operation. The leader still reads its own gigabyte per shard; the store no longer stores it. If a leader's CPU during a base upload is ever shown to matter, that is the note to revisit.
+
+## 2026-10-14 — A plan for external slab placement, and the consumer shape that asked for it
+
+**Status: PROPOSED, nothing started.** A storage-format change behind a feature bit, in four
+phases. Phase 0 needs no `yesno-core` change at all and pays regardless of the open question;
+phases 2 and 3 bet on a number nobody has measured yet. Read the phase boundaries as decision
+points, not as a schedule.
+
+### What this is for
+
+A consumer runs yesno as a genuine key-value store carrying **60 MiB and more per key**. Three
+consequences follow immediately, and the first one is a correction to a result from the same week.
+
+- **Their images are dense, so the sparse-object work of 2026-10-14 buys them nothing.** That
+  change was 818x against *holes*. A database whose keys are 60 MiB has no holes worth skipping;
+  its base is real bytes and its restore is bandwidth-bound. See
+  `backup-archive-and-pitr.md`. The restore split measured there -- materialize base at 92% --
+  holds for them for a completely different reason, and is not improved by that fix.
+- **They are near the format's ceiling rather than comfortably inside it.** `ChunkRef.cell` is 40
+  bits ( 1 TiB ), but `PageId` is `cell / 64` as a `u32`, which caps index-node addressing at
+  256 GiB, and the documented working cap is 128 GiB per shard. At 60 MiB per key that is roughly
+  **2 100 keys per shard**. Shard count is the only lever today.
+- **A key is a small number of byte ranges.** At bitmap density a 60 MiB key is about 7 700 chunks
+  of 8 KiB, allocated through the size-class ladder out of 2 MiB slabs: **about 30 slabs**, and
+  consecutive ones when the key was ingested in one pass. Its index is roughly 20 bytes per chunk,
+  so **the index is about 0.25% of the key's bytes**. That ratio is what makes everything below
+  possible; without it there would be no small eager core to materialize.
+
+### What the format is today
+
+Stated so the plan can be checked against it rather than against memory.
+
+- One file per shard, `shard-NNNN.yno`, holding one flat byte address space. `ChunkRef` is exactly
+  8 bytes and every bit is contested: `[0:40) cell`, `[40:56) card_m1`, `[56:58) kind`,
+  `[58:59) inline`, `[59:60) enc` and `[60:64) reserved`. The last five bits are **refused when
+  non-zero**, deliberately, so a reader cannot mistake a future format for a valid file.
+- Mapped read-only in `SEGMENT_SIZE` ( 1 GiB ) segments, one `Arc<MmapSegment>` each. **I6**:
+  segments are never recreated, never unmapped while a `Buffer` may point into them, and the file
+  never shrinks. Truncation under a live mapping is `SIGBUS`, which is not catchable as a `Result`.
+- **I2**: the mapping is `PROT_READ` and every write is a `pwrite` on a separate descriptor, because
+  containers hand out slices aliasing the mapping and writing through one of those is undefined
+  behaviour rather than a torn read.
+- Space is returned by `fallocate( PUNCH_HOLE | KEEP_SIZE )` per slab, never by truncating. The
+  mechanism for turning a present region back into a hole therefore already exists.
+- Allocation is by size class into `SLAB_SIZE` ( 2 MiB ) slabs. Each slab reserves a `SLAB_META`
+  region holding its class, generation, used count and occupancy bitmap under a CRC. That region is
+  explicitly **a cache of derivable state** -- `fsck::rebuild` recomputes all of it from the index --
+  which is what makes it safe to write in place.
+- `SuperBlock` carries `feat_required` and `feat_compat`. `feat::SUPPORTED` is **0**, and `decode`
+  refuses any file whose `feat_required` names a bit this build does not implement. The mechanism is
+  live and tested and nothing uses it yet, so the first real feature bit costs no new machinery.
+
+### The decision: where the indirection goes
+
+Three places could carry "this payload is not at that offset in this file".
+
+**In `ChunkRef`.** Five spare bits exist. Rejected. The index dominates total size in the sparse
+regime, which is why those bits were left reserved rather than spent; and per-chunk relocation is
+more flexibility than the workload needs while costing more -- moving a chunk rewrites an index
+entry, which shadow-pages its leaf and every node above it.
+
+**In the segment.** 1 GiB granularity. Rejected: it is the mmap unit, and a 1 GiB fetch is not a
+lazy fetch of a 60 MiB key.
+
+**In the slab.** Taken. The slab is already the allocator's unit, already the unit `punch` operates
+on, and already the unit `slabmeta` describes. Relocating a slab touches one placement record and
+**no index entry at all**, because the cell arithmetic -- `slot_of_cell`, `trailer_offset`, the
+ladder, `verify_once`, the extent trailers -- is untouched. The 40-bit cell stops being a file
+offset and becomes a **virtual** address; a placement table says what backs each 2 MiB of it.
+
+That is the whole idea. Everything below is consequence.
+
+### Shape: the shard file becomes a cache over backing objects
+
+A slab is in one of three states:
+
+- **local** -- its bytes are at `cell` in `shard-NNNN.yno`, which is exactly today's behaviour and
+  stays the default;
+- **external, present** -- its bytes are *also* at `cell` in the file, materialized from a backing
+  object;
+- **external, absent** -- the range in the file is a hole, and a placement record says which object
+  and offset hold it.
+
+**Materializing is a `pwrite` into a hole, which is the exact inverse of `punch`.** That is what
+keeps I2 and I6 intact: the mapping stays `PROT_READ`, the file never shrinks, no segment is
+remapped, and the length was already final because `set_len` establishes it before anything is
+written. Eviction is `punch` plus clearing presence, and it must respect `any_pinned_in` -- which is
+reclamation condition 3, already implemented and already load-bearing.
+
+**Presence must be derivable, not new durable state.** An absent slab reads as zeros, and zeros are
+what a corrupt slab also looks like to `verify_once`. Rather than add an authoritative presence
+bitmap -- which would have to be crash-safe and would make a half-materialized image
+indistinguishable from a damaged one -- derive presence from the slab's own `SLAB_META`: write the
+body first, fsync, then the 8 KiB meta. A partial fill leaves a meta that fails its CRC or
+disagrees with the placement record's generation, and is simply re-fetched. Fetches are idempotent,
+so a crash costs a re-fetch and nothing else. **Do not invert that write order**, and do not let a
+reader consult `verify_once` before consulting presence.
+
+**The placement table is the only new durable state, and it is authoritative.** Nothing can derive
+which object backs slab *k*. One record per slab -- a `u16` object id into a small object-name table
+plus a `u48` offset is 8 bytes -- so a 128 GiB shard costs 512 KiB. It is rooted in the superblock
+beside the index root, shadow-paged and published by the same checkpoint, under **I4**: the
+placement a checkpoint publishes must be the placement its index entries resolve against.
+
+**The feature bit.** Define `feat::EXTERNAL_SLABS`, add it to `feat::SUPPORTED`, and set it in
+`feat_required` **only when a shard actually has a non-local slab**. A fully local shard writes the
+file it has always written, byte for byte, and an older binary opens it unchanged. One that does not
+is refused at `decode` with the existing message rather than misread. This is the same shape as the
+archive extents of 2026-10-14: additive, and inert when there is nothing to say.
+
+**`yesno-core` cannot fetch.** The lean-core budget is five direct dependencies and no tokio, so the
+fetch is a trait the server supplies -- synchronous, blocking, one range at a time -- and the server
+implements it against its runtime. **This is a latency-contract change, not plumbing**: a query
+touching an absent slab blocks inside the store on network latency. It must be opt-in per database
+and it must be single-flighted per slab, or a hot cold-key is fetched once per concurrent reader.
+
+### Phases
+
+#### Phase 0 -- slab-granular, content-addressed archive objects. No core change.
+
+Generalize `pb::ArchiveFile` so a file's `extents` may each name their own `object_key` and
+`crc32c`, rather than all coming from one object. Cut a base file on `SLAB_SIZE` boundaries and key
+each object by the content hash of its bytes.
+
+This is a straight generalization of the sparse-extent work already shipped, it touches only
+`yesno-server-utils`, and it buys three things immediately:
+
+- **Base generations become incremental.** Consecutive checkpoints of a 60 GiB database share
+  almost every slab, so generation *N+1* uploads only what changed and its manifest reuses *N*'s
+  object keys. `gc.rs` already reclaims by reachability over retained manifests, so "keep an object
+  any retained manifest names" is the rule it already implements.
+- **A restore fetches ranges in parallel** at `ARCHIVE_FETCH_CONCURRENCY` instead of one stream per
+  file, which is where a remote store's per-stream bandwidth cap currently binds.
+- **A restore becomes resumable**, because an object either arrived whole and verified or did not.
+
+**This is the phase that answers the consumer's original question**, and it answers it in a form
+nobody proposed. "Incremental base retrieval" was refuted on 2026-10-14 as *laziness* on a database
+holding a few hundred kilobytes. At 60 MiB per key the right reading of "incremental" is
+**deduplication between generations**, and that one is correct.
+
+#### Phase 1 -- the placement table, with everything still local.
+
+Add the table, the feature bit, and the virtualization of `cell`, with every slab written as
+`local`. Nothing changes observably; the table is written, read back, checked by `fsck`, and proved
+inert. Ship it on its own so that the format change and the behaviour change are separately
+bisectable.
+
+Needs: a round-trip test at a non-trivial slab count, an `fsck` mode that validates placement
+without fetching, and a sabotage test that a placement disagreeing with a slab's own meta is
+reported rather than followed.
+
+#### Phase 2 -- the fetch seam.
+
+The `SlabSource` trait, single-flight, presence derivation, and the body-then-meta fill order.
+Still no policy that makes anything external: the seam is exercised by a test source that serves
+from a second local file.
+
+#### Phase 3 -- the two policies, which are separate decisions.
+
+- **Lazy materialization on restore and bootstrap**: bring up a follower on superblock, index,
+  placement and WAL -- about 0.25% of the base -- and fetch payload slabs on touch or in the
+  background. This is the one that bets on the working set.
+- **Tiering**: let a cold slab live *only* in the object store. This is a different and larger
+  decision, because it means the database directory is no longer the database. `du` stops being the
+  answer to "how much data is this", a filesystem snapshot stops being a complete backup, and the
+  retention of the external store becomes a durability dependency. **Do not let phase 3 merge the
+  two.** Lazy materialization is a cache with a complete origin; tiering moves the origin.
+
+### What has to be decided before phase 1
+
+- **The per-shard cap.** At 60 MiB per key a 128 GiB shard holds about 2 100 keys. If that is the
+  real deployment shape, `feat::LARGE_SHARD` and the `u32` `PageId` need a plan of their own, and it
+  should be made before a second format change rather than after.
+- **Whether the placement table is per shard or per database.** Per shard keeps it beside the
+  superblock it is published with; per database would let a slab move between shards, which nothing
+  needs today and which would break the shard-id guard.
+
+### What has to be measured before phase 2
+
+**The fraction of keys a follower touches in a window.** Lazy materialization turns a multi-minute
+boot into seconds if the working set is small, and adds a network stall to every first read while
+moving exactly the same bytes if it is not. This number is a property of the consumer's workload and
+cannot be derived here.
+
+Secondarily, and obtainable here: **the restore split at their shape** -- dense, 60 MiB keys -- to
+confirm `materialize_base` is dominant for them and to size it in bytes per second rather than in
+percentages. Generating that corpus needs a native ingest fixture driving the server, because
+`flight_put` goes through monty and a scattered half-billion-ordinal key is not expressible there.
+
+### Do not
+
+- Do not spend `ChunkRef`'s reserved bits on this. They are refused-when-set on purpose, and the
+  slab is the right granularity.
+- Do not reach for `userfaultfd` or FUSE. The page fault is the wrong hook at this granularity, and
+  this tree has declined `libc`-level filesystem calls three times for smaller gains.
+- Do not land the placement table without the `fsck` path and the feature bit. Eight pieces of
+  machinery in this codebase were built to spec and wired to nothing.
+- Do not make a slab external and a slab absent the same concept. The first is a placement, the
+  second is a cache state, and conflating them is what makes a half-materialized image
+  indistinguishable from a corrupt one.
+
+### Adoption: the client stages the bytes, the server takes ownership of them
+
+A companion to the above, wanted by the same consumer shape and for the same reason. Writing a
+60 MiB key through the ordinary path pushes those bytes over Flight, into the memtable, through the
+WAL and then into the slab store -- several passes over data the client already has in hand.
+**Adoption** lets the client put the object into an object store itself, hand the server a *key*
+rather than the bytes, and have the server take the object over.
+
+#### What is adopted, and why it can be a client's bytes at all
+
+A staged object is **Roaring-serialized** or **raw bits**, at the client's choice, and the choice
+is about the data rather than about convenience -- see the subsection below. What it is *not* is an
+image in yesno's internal layout. A client that would have to reproduce the size-class ladder and
+the extent trailers could not, and should not be asked to: `SuperBlock::decode` refuses a geometry
+this build does not implement, so a client built against a different ladder would stage objects
+the server rejects.
+
+Roaring is a legitimate input rather than a lucky one because `roaring_format` round-trips `OrdSet`
+and `tests/differential.rs` asserts **byte-level identity** with the `roaring` crate. That property
+was built for importing `.roaring` files at `O( container count )`, and adoption is the same
+import arriving from an object store instead of a path.
+
+**The bytes are untrusted, and for Roaring the contract that makes that survivable already
+exists.** `container::codec::decode` is a fuzz target by contract: for *any* input it returns
+`Err` or a container satisfying its invariants, and never panics. Adoption is the first production
+path where that contract faces genuinely adversarial input rather than a corrupted file, so it is
+the reason to keep it rather than a new obligation. Raw bits need no such contract -- any 8 192
+bytes is a valid bitmap -- which moves their whole risk into the framing the request declares.
+Either way the staged object is consumed a chunk at a time: the point is not to hold 60 MiB, let
+alone a larger key, in the server's heap.
+
+#### Two staging encodings, because one of them is wrong for each half of the workload
+
+**Roaring for sparse or mixed, raw bits for dense.** They are not interchangeable and the server
+should accept both rather than making every client pay for the one that suits the other. A client
+holding a thousand scattered ordinals must not be made to stage a mask; a client holding a dense
+60 MiB key already *has* the bits and should not be made to serialize a container directory around
+them, only for the server to take it apart again.
+
+**Reuse the vocabulary that already exists.** The Flight surface names exactly this choice for
+results -- `SetWire::Ordinals`, `Containers`, `Bitvector`, with an unknown choice refused rather
+than silently answered as ordinals. Ingest should use the same names and the same refusal, so a
+client that has already chosen a wire form for reads does not learn a second taxonomy for writes.
+A sorted `u64` array is the obvious third form and `from_sorted_u32` is already there; it is not
+proposed here only because nobody has asked for it.
+
+**Raw bits have to be framed, and the framing belongs in the request.** A Roaring object is
+self-describing; a naked bit array is not, so the base ordinal, the length and the word order have
+to come from somewhere. Put them in the `adopt` message, not in a header on the object. A header
+would make the staged object a new file format to version, fuzz and document, and it would destroy
+the one property that makes raw bits worth having -- that a client can stage a memory-mapped
+bitset **verbatim**, with no serialization step at all.
+
+The framing is therefore pinned by the protocol rather than by the bytes:
+
+- `base` is the first ordinal and **must be chunk-aligned** ( a multiple of 65 536 ), so a staged
+  window is a whole number of chunks and chunk *i* is at byte offset `i * 8192`.
+- The object's length must be **exactly** `chunks * 8192`. Not at least -- exactly; a trailing
+  partial chunk is a framing error, not a short last container.
+- Words are **little-endian `u64`**, bit *i* of word *w* being ordinal `base + 64 * w + i`. This is
+  the in-memory bitmap container's own layout, which is what makes the copy a `memcpy`, and it is
+  the same layout `unstable_arrow::bitmap_words` already lends to consumers. A big-endian host
+  refuses rather than byte-swaps, as the superblock's endian field already does.
+- The window is bounded by configuration. `Bitvector` refuses a result window above 16 384 chunks
+  ( 128 MiB ) rather than clipping it, precisely because an unbounded sparse key could otherwise
+  ask for a two-pebibyte mask; ingest needs the same bound for the same reason. A 60 MiB key is
+  about 7 680 chunks, comfortably inside it.
+
+**Raw bits are not "already in our format", and assuming they are is the trap.** They are the
+*uncompressed input to kind selection*. A window staged as bits may well contain chunks that
+should be stored as arrays or runs, and storing every one of them as a bitmap would make an
+adopted key several times larger than the same data written through the ordinary path. So the
+server runs the crate's own selection -- `ARRAY_MAX`, `BITMAP_DEMOTE`, `RUN_MAX_INTERVALS`, the
+thresholds whose rationale `lib.rs` says not to touch -- and the wire form does **not** dictate the
+stored kind. An all-zero chunk is dropped entirely rather than stored empty.
+
+**Validation for raw bits costs one pass and no decode.** Any 8 192 bytes is a valid bitmap
+container, so there is nothing to reject on structure; what the server must compute is the
+popcount per chunk, which is what fills `card_m1` and what feeds the selection. That popcount runs
+in the same pass as the CRC, so the whole validation of a 60 MiB object is one vectorized read.
+Roaring is the opposite: cheap to lay out, but every container must go through
+`container::codec::decode`, and the budget there is that it never panics on any input.
+
+**Only Roaring can be adopted without a transform.** Phase C below keeps the client's object as
+the payload, which needs a directory the payload carries -- Roaring has one. Raw bits can be blobbed
+too, and more easily, since chunk *i* is simply at `i * 8192` and no directory is needed at all,
+but it is admissible **only when the selection pass says every chunk in the window would have been
+a bitmap anyway**. Otherwise blobbing raw bits is just the bloat above with a longer lifetime.
+
+#### The ordering decision, which is the whole of the design
+
+The scenario as posed is **commit first, materialize later**: the server accepts the key, the
+create-or-update travels through the WAL, and the staged object is dropped once that operation
+reaches the slab store. That ordering buys the lowest possible client latency and costs a property
+the database currently has unconditionally.
+
+**Between the commit and the materialization, the WAL names data that is not in the database.**
+Every consequence follows from that one sentence:
+
+- A crash in the window means recovery must re-read the staged object, so it has to outlive the
+  *request* by as long as the WAL retains that record -- which is a retention question, not a
+  request-scoped lease.
+- An **archive restore** replays WAL from a base root. If a retained root predates the
+  materialization, restoring through it needs the staged object too. So the staged object becomes
+  reachable state that `gc.rs` has to account for, on the same footing as a WAL object.
+- A reader between the two points either cannot see an acknowledged commit, or must fall through to
+  the staged object -- which needs the external-placement read path and makes the staging store a
+  **serving** dependency.
+
+**Recommended instead: materialize, then commit.** Copy or transform the staged object into the
+server-managed location first, verifying as it goes, and only then append the WAL record -- which
+names the managed object, never the staged one. The client's `adopt` call blocks for the copy;
+in exchange the database is self-contained at every instant, the staging lease is request-scoped,
+`gc.rs` is untouched, and restore semantics do not change at all. When staging and managed prefixes
+share a bucket and no re-layout is needed, that copy is a server-side `CopyObject` and no bytes
+cross the server.
+
+The copy is **not** free when the layout must change -- a Roaring container order is not a slab
+order -- so tier one costs the server one read of the object. That is still far better than the
+ordinary path, which costs several. **If the lower-latency ordering is wanted anyway**, the price
+is explicit and should be paid deliberately: the staged object joins the reachability set, its
+lease becomes server-renewable rather than client-held, and the archive's retention has to keep it
+until every retained base already contains the materialized slabs. Do not take that ordering by
+default, and do not take it before the reachability work is done.
+
+#### The lock
+
+The lease this needs has been written in this tree once already. `ArchiveWriterLease` plus
+`lease.rs` is a conditional, compare-and-swap, TTL'd ownership record over an object store, and
+`archive.rs` already drives `PutMode` and `UpdateVersion` for exactly that. Reuse the shape: a
+lease object beside the staged object, owner id, expiry, CAS on every transition. It answers both
+directions -- the client proves nobody else is writing the object it is about to hand over, and the
+server proves the object did not change between validation and adoption.
+
+**Constrain the key, do not trust it.** The client names a path *within* a server-configured
+staging prefix, never a bucket, a URL or an absolute key, and the server reads it with its own
+credentials. Without that rule the server is a confused deputy that fetches whatever it is told.
+The tree already has the instinct in two places -- `download_base_file` refuses a manifest file
+name that is not flat, and the e2e harness refuses a scenario path containing a separator -- and
+this is the same check. Size is declared in the lease and bounded by configuration, because an
+unbounded staged object is an unbounded server-side read.
+
+#### Phases, and the first one needs no format change
+
+- **Phase A -- ingest from an object key.** `adopt( key, staged_name, encoding, lease, content_hash )`:
+  the server reads the staged object, validates it a chunk at a time -- decode for Roaring,
+  popcount and kind selection for raw bits -- performs an ordinary bulk insert, commits, then
+  releases the lease and deletes the staged object. No new format, no
+  external placement, no change to recovery -- the bytes land exactly where an ordinary write would
+  have put them. This alone removes the Flight hop and the client-side serialization round trip,
+  and it is the honest first step because it can ship before any of the slab-placement phases.
+- **Phase B -- adopt into managed objects.** Once phase 1 and 2 of the slab plan exist, the
+  transform writes slab-formatted objects into the managed prefix and the WAL record carries their
+  placement, so a large key is never resident in the server at all.
+- **Phase C -- adopt without a transform.** Keep the client's Roaring object as the payload and
+  reference it as a blob, which is what `ChunkRef`'s `enc` bit and `feat::ALT_ARRAY_ENC` were
+  reserved for and what `per-key-blob-for-cold-keys` sketches. This makes adoption a pure
+  server-side copy and unifies three filed items -- at the cost that entry already records: a
+  blobbed key cannot carry per-chunk `card_m1`, so its `cardinality()` stops being free and becomes
+  a payload read. Decide that deliberately; it is a headline property of the index.
+
+#### Hazards worth naming now
+
+- **Idempotency.** A retried `adopt` must not insert twice. The natural key is the content hash
+  **and the declared framing**, not the hash alone: raw bits take their base and length from the
+  request, so the same bytes staged at a different base are a different write and must not collide
+  with the first. This is the same gap `no-idempotency-key-on-the-write-path` already records;
+  solve them together rather than inventing a second mechanism here.
+- **Orphans.** A staged object whose `adopt` never arrives is reclaimed by lease TTL, not left
+  forever. `reap_stale_roots` is the precedent for sweeping abandoned staging state.
+- **Partial adoption.** A transform that fails halfway must leave neither a partial key nor an
+  orphaned managed object. The existing shape applies: write the managed objects, then the WAL
+  record, then release -- so a failure before the WAL record leaves only unreferenced objects,
+  which the same reclamation sweep removes.
+- **Do not let `adopt` bypass the visibility rules.** It is a write like any other: it takes a
+  version, it is ordered by the commit clock, and I9's non-decreasing commit time applies to it.
+  An out-of-band ingest that skipped the commit clock would break wall-clock recovery targets for
+  the whole database, not just for the adopted key.
