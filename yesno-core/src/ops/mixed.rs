@@ -30,9 +30,9 @@
 //! Differential-tested against `generic::apply` over overlapping, nested,
 //! disjoint and boundary-touching inputs in both orders.
 
-use crate::container::{BitmapContainer, Container};
+use crate::container::{BitmapContainer, Container, RunContainer};
 use crate::ops::generic::SetOp;
-use crate::BITMAP_WORDS;
+use crate::{BITMAP_WORDS, RUN_MAX_INTERVALS};
 
 /// Call `f(word_index, mask)` for each word the inclusive range `[s, e]` touches.
 ///
@@ -758,6 +758,18 @@ pub fn try_apply_array_run(op: SetOp, a: &Container, b: &Container) -> Option<Op
         SetOp::AndNot if array_is_lhs => {
             return Some(finish_array(merge_array_run(vals, rn, false)))
         }
+        // `run \\ array`: removing a point from an interval splits it in two and
+        // removing one at an edge shortens it, so the answer is `O( nruns +
+        // |array| )` intervals computed directly. Expanding the run into 1 024
+        // words to clear a handful of bits -- and then asking `optimize` to find
+        // the intervals again -- is what this arm exists to avoid.
+        SetOp::AndNot => {
+            if let Some(pairs) = subtract_array_from_run(rn, vals) {
+                return Some(finish_run(pairs));
+            }
+            // More intervals than our writer emits. Fall through: the expansion
+            // below is both correct and the encoding `optimize` would pick.
+        }
         _ => {}
     }
 
@@ -798,6 +810,63 @@ pub fn try_apply_array_run(op: SetOp, a: &Container, b: &Container) -> Option<Op
     Some(Some(c))
 }
 
+/// `run \\ array` as an interval list, or `None` if it needs too many intervals.
+///
+/// Both operands are sorted, so one merged pass suffices: for each interval,
+/// consume the array values that land inside it and emit the gaps between them.
+/// `cur` is a `u32` so that a removed value of `u16::MAX` -- which can only be
+/// an interval's last ordinal -- advances past the end rather than wrapping.
+///
+/// `None` means the result would exceed [`RUN_MAX_INTERVALS`], the cap our
+/// writer honours and the one [`Container::optimize`] refuses to choose above.
+/// The caller then expands into words, which is the right encoding at that
+/// interval count anyway, so bailing costs the partial pass and nothing else.
+fn subtract_array_from_run(rn: &RunContainer, vals: &[u16]) -> Option<Vec<(u16, u16)>> {
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    let mut j = 0usize;
+    for i in 0..rn.nruns() {
+        let (s, e) = (rn.start(i), rn.end(i));
+        // Values below this interval were already removed by an earlier one, or
+        // fall in a gap the run does not hold. Either way they subtract nothing.
+        while j < vals.len() && vals[j] < s {
+            j += 1;
+        }
+        let mut cur = u32::from(s);
+        while j < vals.len() && vals[j] <= e {
+            let v = u32::from(vals[j]);
+            if v > cur {
+                if out.len() as u32 >= RUN_MAX_INTERVALS {
+                    return None;
+                }
+                out.push((cur as u16, (v - 1) as u16));
+            }
+            cur = v + 1;
+            j += 1;
+        }
+        if cur <= u32::from(e) {
+            if out.len() as u32 >= RUN_MAX_INTERVALS {
+                return None;
+            }
+            out.push((cur as u16, e));
+        }
+    }
+    Some(out)
+}
+
+/// Wrap an interval list, re-encoding if a run is no longer the best shape.
+///
+/// The intervals are already non-adjacent: pieces of one interval are separated
+/// by a removed value, and pieces of different intervals by the gap the source
+/// run's own non-adjacency invariant guarantees.
+fn finish_run(pairs: Vec<(u16, u16)>) -> Option<Container> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut c = Container::Run(RunContainer::from_pairs(&pairs));
+    c.optimize();
+    Some(c)
+}
+
 /// Wrap a filtered value list, re-encoding if it is no longer array-shaped.
 fn finish_array(vals: Vec<u16>) -> Option<Container> {
     if vals.is_empty() {
@@ -811,7 +880,6 @@ fn finish_array(vals: Vec<u16>) -> Option<Container> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::RunContainer;
     use crate::ops::generic;
 
     fn bm(vals: &[u16]) -> Container {
@@ -1256,6 +1324,222 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A named shape, the run it subtracts from, and the array it removes.
+    type RunMinusArrayCase = (&'static str, Vec<(u16, u16)>, Vec<u16>);
+
+    /// `Run \\ Array` has its own arm now; the generic kernel is still its oracle.
+    ///
+    /// The shapes are listed rather than drawn uniformly because each one is a
+    /// different branch of the merged pass: a value strictly inside an interval
+    /// takes the gap-emit, a value below one takes the skip loop, a value at
+    /// `start` leaves `cur` where it was and must emit nothing, a value at `end`
+    /// pushes `cur` past it -- which is also the `u16::MAX` wrap the `u32`
+    /// accumulator exists to prevent -- and an array covering a whole interval
+    /// must drop it rather than emit an empty one.
+    #[test]
+    fn run_minus_array_agrees_with_the_generic_kernel() {
+        let cases: Vec<RunMinusArrayCase> = vec![
+            ("inside", vec![(10, 20)], vec![15]),
+            (
+                "outside every run",
+                vec![(10, 20), (30, 40)],
+                vec![0, 25, 50],
+            ),
+            ("at first position", vec![(10, 20)], vec![10]),
+            ("at last position", vec![(10, 20)], vec![20]),
+            ("at both edges", vec![(10, 20)], vec![10, 20]),
+            (
+                "empties a single interval",
+                vec![(10, 12)],
+                vec![10, 11, 12],
+            ),
+            ("empties every interval", vec![(5, 5), (9, 9)], vec![5, 9]),
+            ("top of the chunk", vec![(65530, 65535)], vec![65535]),
+            ("whole chunk, one point", vec![(0, 65535)], vec![0]),
+            ("whole chunk, interior point", vec![(0, 65535)], vec![32768]),
+            (
+                "every ordinal of a run",
+                vec![(100, 200)],
+                (100..=200u16).collect(),
+            ),
+            (
+                "splits one interval many times",
+                vec![(0, 2000)],
+                (0..200u16).map(|i| i * 10).collect(),
+            ),
+        ];
+        for (name, rv, av) in &cases {
+            let (r, a) = (run(rv), Container::from_sorted(av));
+            let fast = try_apply_array_run(SetOp::AndNot, &r, &a).expect("run x array");
+            let slow = generic::apply(SetOp::AndNot, &r, &a);
+            let f: Vec<u16> = fast
+                .as_ref()
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            let s: Vec<u16> = slow
+                .as_ref()
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            assert_eq!(f, s, "{name}: run {rv:?} minus array {av:?}");
+            if let Some(c) = fast.as_ref() {
+                crate::container::codec::validate(c).unwrap();
+            }
+        }
+    }
+
+    /// The same arm over pseudo-random pairs, which is what catches the merge
+    /// bug a hand-written shape list does not think to write down.
+    ///
+    /// Deterministic on purpose: a seeded xorshift reproduces from the test name
+    /// alone, and `tests/proptest_oracle.rs` is where a shrinking generator
+    /// belongs. The operands are built boundary-biased for the same reason that
+    /// file is -- uniform `u16`s would rarely put a value on an interval edge.
+    #[test]
+    fn run_minus_array_agrees_over_random_pairs() {
+        let mut state = 0x5eed_1234_9abc_def0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..400 {
+            // A run of up to 24 intervals, each followed by a gap of at least
+            // one so the source satisfies the non-adjacency invariant.
+            let mut pairs: Vec<(u16, u16)> = Vec::new();
+            let mut at = (next() % 64) as u32;
+            while at <= 65_535 && pairs.len() < 24 {
+                let len = (next() % 900) as u32;
+                let end = (at + len).min(65_535);
+                pairs.push((at as u16, end as u16));
+                // At least two: a gap of one would make the next interval
+                // adjacent, which `validate` rejects and no real container
+                // holds. The first draft of this generator used one and the
+                // test failed on its own input rather than on the kernel.
+                let gap = 2 + (next() % 700) as u32;
+                at = end + gap;
+            }
+            if pairs.is_empty() {
+                continue;
+            }
+            // Values biased onto the run's own edges, so the boundary branches
+            // are hit far more often than chance would hit them.
+            let mut vals: Vec<u16> = Vec::new();
+            for _ in 0..(next() % 60) {
+                let (s, e) = pairs[(next() % pairs.len() as u64) as usize];
+                vals.push(match next() % 4 {
+                    0 => s,
+                    1 => e,
+                    2 => (u64::from(s) + next() % (u64::from(e - s) + 1)) as u16,
+                    _ => (next() % 65_536) as u16,
+                });
+            }
+            vals.sort_unstable();
+            vals.dedup();
+            if vals.is_empty() {
+                continue;
+            }
+            let (r, a) = (run(&pairs), Container::from_sorted(&vals));
+            if !matches!(a, Container::Array(_)) {
+                continue;
+            }
+            // The operands themselves must be containers the store could hold,
+            // or a disagreement says nothing about the kernel.
+            crate::container::codec::validate(&r).unwrap();
+            crate::container::codec::validate(&a).unwrap();
+            let fast = try_apply_array_run(SetOp::AndNot, &r, &a).expect("run x array");
+            let slow = generic::apply(SetOp::AndNot, &r, &a);
+            let f: Vec<u16> = fast
+                .as_ref()
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            let s: Vec<u16> = slow
+                .as_ref()
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            assert_eq!(f, s, "run {pairs:?} minus array {vals:?}");
+            if let Some(c) = fast.as_ref() {
+                crate::container::codec::validate(c).unwrap();
+            }
+        }
+    }
+
+    /// Above `RUN_MAX_INTERVALS` the arm bails and the word expansion answers.
+    ///
+    /// Worth its own test because the bail is the one path where the fast arm
+    /// does work and then throws it away, and because a cap that never fires is
+    /// indistinguishable from a cap that is wrong. 4 096 points taken out of the
+    /// full chunk leave 4 096 intervals, twice the cap, and a run container is
+    /// not merely unchosen there -- it is one our writer refuses to emit.
+    #[test]
+    fn run_minus_array_falls_back_past_the_interval_cap() {
+        let full = run(&[(0, 65_535)]);
+        let many = Container::from_sorted(&(0..4096u16).map(|i| i * 16).collect::<Vec<_>>());
+        let fast = try_apply_array_run(SetOp::AndNot, &full, &many).expect("run x array");
+        let slow = generic::apply(SetOp::AndNot, &full, &many);
+        let f: Vec<u16> = fast
+            .as_ref()
+            .map(|c| c.iter().collect())
+            .unwrap_or_default();
+        let s: Vec<u16> = slow
+            .as_ref()
+            .map(|c| c.iter().collect())
+            .unwrap_or_default();
+        assert_eq!(f, s);
+        let c = fast.expect("non-empty");
+        assert_eq!(c.kind(), crate::ContainerKind::Bitmap, "want the expansion");
+        assert!(c.run_count() > RUN_MAX_INTERVALS, "cap must actually bind");
+        crate::container::codec::validate(&c).unwrap();
+
+        // The window where the cap is load-bearing rather than merely tidy.
+        // `optimize` demotes a run to a bitmap only on a 12.5% saving, so it
+        // keeps a run until `2 + 4n` reaches 9 363 -- that is `n >= 2340`. For
+        // an interval count between `RUN_MAX_INTERVALS` and that, nothing
+        // downstream would correct an over-long run, and the writer refuses to
+        // emit one. 2 200 points taken out of the full chunk land there.
+        let awkward = Container::from_sorted(&(0..2200u16).map(|i| i * 29).collect::<Vec<_>>());
+        let got = try_apply_array_run(SetOp::AndNot, &full, &awkward)
+            .expect("run x array")
+            .expect("non-empty");
+        assert_eq!(
+            got.run_count(),
+            2200,
+            "the construction must hit the window"
+        );
+        assert!(
+            got.run_count() > RUN_MAX_INTERVALS && got.run_count() < 2340,
+            "between the writer's cap and the demotion threshold"
+        );
+        assert_eq!(
+            got.kind(),
+            crate::ContainerKind::Bitmap,
+            "want the expansion"
+        );
+        crate::container::codec::validate(&got).unwrap();
+        assert_eq!(
+            got.iter().collect::<Vec<u16>>(),
+            generic::apply(SetOp::AndNot, &full, &awkward)
+                .expect("non-empty")
+                .iter()
+                .collect::<Vec<u16>>()
+        );
+
+        // And just under it the arm answers directly, so the cap is a boundary
+        // rather than a disabled path.
+        let few = Container::from_sorted(&(0..2000u16).map(|i| i * 32).collect::<Vec<_>>());
+        let got = try_apply_array_run(SetOp::AndNot, &full, &few)
+            .expect("run x array")
+            .expect("non-empty");
+        assert_eq!(got.kind(), crate::ContainerKind::Run);
+        assert_eq!(
+            got.iter().collect::<Vec<u16>>(),
+            generic::apply(SetOp::AndNot, &full, &few)
+                .expect("non-empty")
+                .iter()
+                .collect::<Vec<u16>>()
+        );
     }
 
     #[test]

@@ -739,3 +739,43 @@ Never worse than the serial loop it replaced, which made the same blocking calls
 **The usual reason for `spawn_blocking` does not apply here.** It is normally about not starving a reactor that is also serving queries. A restore never shares a runtime with serving traffic: `yesno-server` runs the seed as a **separate helper process** ( `tokio::process::Command`, `seed-follower` ) before it starts serving, with the comment that the seed can outlast Kubernetes' liveness window, and `yesnoctl restore` is a one-shot CLI. So the cost is confined to the restore's own overlap. That is a smaller claim than the one worth making before checking, and it is why the entry asks for a measurement rather than a patch -- the fix is worth nothing if the loop is mostly network.
 
 The same reasoning retires three other call sites before anyone spends time on them: `restore_to` runs `materialize_base`, `assemble_wal`, `plan_and_cut`, `Db::open_replica` and `sync_tree` strictly in sequence, so moving any of them to a blocking thread adds a hop and overlaps with nothing.
+
+---
+
+## 2026-10-14 — `Run \ Array` gets its arm, and a bimodal probe nearly sold me a regression
+
+`mixed::try_apply_array_run` had a fast arm for `Array \ Run` and none for `Run \ Array`, so the latter expanded the run into 1 024 words, cleared a handful of bits, and asked `optimize` to find the intervals again. That is exactly what `Not::produce` computes for every complement chunk: a one-interval window minus the input.
+
+### The numbers
+
+A/B on one tree -- the arm present, then the same tree with its result discarded through a `black_box` filter -- six processes per arm, modes reported.
+
+| | arm off | arm on | |
+|---|---|---|---|
+| `and_not( Run[0..65535], Array[0] )` | 2 978 ns | **30 ns** | 99x |
+| `And( not p, not q )`, 1-chunk window | 6 140 ns | **223 ns** | 27.5x |
+| `And( not p, not q )`, 32-chunk window | 56 300 ns | **3 120 ns** | 18x |
+| `not ( p or q )`, 1 chunk | 251 ns | 249 ns | unchanged |
+| `not ( p or q )`, 32 chunks | 697 ns | 694 ns | unchanged |
+
+The last two rows are the control and had to come out flat: `Not::cardinality_dyn` counts the window width and subtracts the inner cardinality, so it reaches no set kernel at all.
+
+### Where the cost actually was
+
+Not the word loop. The probe prices `optimize` on the resulting 65 535-bit bitmap at **2 840 of the 2 978 ns** -- a popcount, a `run_count` and a `runs()` across 1 024 words, to recover the single interval the operands had already described. Building words to describe an interval and then searching the words for the interval is the whole defect; the direct arm is `O( nruns + |array| )` and never builds them.
+
+This is **not** an argument for dropping `optimize` from the expansion path, which is what stops an 8 KiB bitmap being stored for a handful of intervals. The neighbouring bitmap x run arm's cheaper `ensure_demoted` is a different trade, not a correction to this one.
+
+### The cap is load-bearing, which took a specific construction to show
+
+Above `RUN_MAX_INTERVALS` the arm bails to the word expansion. The obvious test -- 4 096 points out of the full chunk -- does not prove the cap is needed, because at 4 096 intervals `optimize` demotes the run to a bitmap anyway and removing the cap changes nothing observable.
+
+The window where it bites is narrower. `optimize` switches encoding only on a 12.5% saving, so it keeps a run until `2 + 4n >= 9363`, that is `n >= 2340`, while the writer refuses to emit more than 2 032. Between those two numbers nothing downstream corrects an over-long run. 2 200 points out of the full chunk lands there, and that is the case the test pins; raising the cap fails on it and on nothing else.
+
+### Two corrections the work made to itself
+
+**The random generator was testing an input no container holds.** It built intervals separated by a gap of one, which `validate` rejects as adjacent, and the first run failed on its own operand rather than on the kernel. The generator now leaves a gap of two and asserts both operands validate before comparing -- a disagreement on an impossible input says nothing.
+
+**The probe is bimodal, and it briefly showed a regression in a shape the change cannot reach.** The first A-B-A-B read `not ( p or q )` at 248 ns with the arm off and 521 with it on, reproducibly across both phases. Measuring that shape first in its own process reproduced it. A null edit -- twelve dead `#[inline(never)]` functions added to the same module -- produced **516 and then 253 from the same binary**, which is what settled it: one process in roughly eight lands at twice the modal figure, and a median of seven samples *within* a process cannot see it because the process is the bistable unit. Both arms exhibit it.
+
+Carry this: an A/B whose two sides differ by less than about 2.5x on this host is not measurable from one process per arm, however clean the interleaving looks. The 99x and 27.5x figures survive it comfortably; the 2x "regression" was the artifact, and I spent four experiments before testing the null edit that would have ruled it out first.
