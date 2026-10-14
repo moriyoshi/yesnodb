@@ -1281,3 +1281,181 @@ unbounded staged object is an unbounded server-side read.
   version, it is ordered by the commit clock, and I9's non-decreasing commit time applies to it.
   An out-of-band ingest that skipped the commit clock would break wall-clock recovery targets for
   the whole database, not just for the adopted key.
+
+### Self-review the same day, against the code rather than the prose
+
+Three of the conclusions above are wrong and are corrected here; two numbers were stated more
+firmly than they were derived; three constraints were missing. **Where this section and the text
+above disagree, this section is the later word.** The central decision survives -- the slab is the
+right indirection point and `ChunkRef`'s reserved bits should stay reserved -- and phase 0 comes
+out stronger than it was argued, for a reason the plan failed to credit.
+
+#### Corrected: presence cannot be derived from slab metadata while `fsck::rebuild` exists
+
+The claim was "**the placement table is the only new durable state**", resting on deriving presence
+from each slab's own `SLAB_META` under a body-then-meta write order. That does not survive the path
+that makes `slabmeta` safe to write in place in the first place. **`fsck::rebuild` recomputes slab
+metadata from the index** -- that is its whole purpose -- so run against a half-materialized image
+it writes a valid meta for a slab whose body is absent. Presence then reads true, the bytes read
+zero, and every chunk CRC in that slab fails.
+
+So the no-new-state conclusion is **not established**. Either `rebuild` becomes placement-aware and
+refuses to synthesize a meta for a slab the placement table calls absent, or presence gets an
+explicit durable home of its own. The second option was dismissed above on the grounds that it
+"would have to be crash-safe and would make a half-materialized image indistinguishable from a
+damaged one"; the first option has to solve exactly that problem anyway, so the comparison was not
+the one I drew. **Decide this before phase 2, not during it.**
+
+#### Corrected: a fill breaks I2's letter rather than preserving it
+
+The claim was that materializing a slab "keeps I2 and I6 intact" because it is a `pwrite` into a
+hole. I6 is fine -- nothing shrinks and no segment is remapped. **I2 is not.** Its text is
+"mapped pages are read-only and immutable once published", and the discipline behind it is
+write-then-publish: a checkpoint writes into free space and publishes an index pointing at it
+afterwards, so no reader can reference bytes still being written. A fill inverts that order. The
+index entry is **already published** and the bytes arrive later.
+
+The rule has to be restated as **immutable once *present***, with the presence flip as the
+publication point for the bytes. That covers readers arriving through a `ChunkRef`. It does not
+cover paths that read **by offset rather than by reference**, and the plan named only one of them:
+
+- `fsck`, which the plan does mention;
+- **`verify_once`'s backward invalidation scan**, bounded by `MAX_VERIFIED_SPAN`, which the plan
+  does not. It reaches below a write to find cached entries that overlap it, and that reach can
+  cross into an absent slab.
+
+The mirror-image guard already exists and should have been cited: `punch` is gated on
+`any_pinned_in`, which is reclamation condition 3. A fill needs its counterpart. And because I2
+lives in a `//!` block in `segment.rs`, amending it is **part of this work** rather than follow-up,
+by the rule that a stale rationale comment is worse than none.
+
+#### Corrected: a 32-bit CRC cannot be a content address
+
+Phase 0 says to key each slab object "by the content hash of its bytes" while proposing to reuse a
+manifest field named `crc32c`. Taken literally that is a silent-corruption bug. **Thirty-two bits
+collide by birthday at about 65 536 objects**; a 60 GiB database is roughly 30 000 slabs and a
+retention window holds several generations of them, so a collision is reachable in ordinary
+operation -- and its consequence is serving the wrong slab, not an error. The address must be the
+**SHA-256** `history.rs` already computes for every fingerprint in this format. A per-range
+`crc32c` may stay beside it as the transport check it already is; it is not a name.
+
+#### Corrected: `gc.rs` would leak every slab object, and that is the safe failure
+
+`classify` requires `db/<uuid>/term/<term>/{base|wal}/...`. A content-addressed prefix outside the
+term tree falls to `Kind::Unrecognized`, which is **kept and reported** rather than deleted, so
+phase 0 as written reclaims nothing at all until `classify` learns the shape. Mandatory work, and
+the failure direction is the right one.
+
+**The dedup claim itself checks out.** `Kind::BaseFile` is deleted on `!keep_files.contains( key )`,
+and `keep_files` is the union of every retained manifest's object keys -- so an object two
+manifests name survives the pruning of either. No change needed there.
+
+**One thing to record rather than assume**: a content address is deliberately **term-independent**,
+while every key shape in this archive is term-scoped on purpose, so that a promoted timeline cannot
+overwrite an older timeline's identically numbered objects. Identical bytes make sharing across
+terms safe, but that is a reasoned exception to a stated invariant and has to be written down where
+the invariant is.
+
+#### Added: what dedup is actually keyed on, and the allocator policy that makes it work
+
+Unstated above: dedup granularity is **byte-identity of a whole 2 MiB slab**, not "payloads
+unchanged". A slab with a single newly allocated slot is a new object, because its occupancy bitmap
+and trailer table moved.
+
+What rescues the hit rate is a policy the plan did not credit. `Slab::new( class, generation )`
+stamps the generation at **creation**, and `begin_generation()` only advances the allocator's
+counter -- so an untouched slab's metadata does not churn from checkpoint to checkpoint. And
+`alloc.rs` already keeps one checkpoint's allocations in a **contiguous slab run**, which there is a
+test named for. Together those are what make slab-level dedup effective rather than theoretical,
+and they are support for phase 0 rather than a caveat against it.
+
+#### Derived: two numbers that were guesses
+
+**The index ratio.** "Roughly 20 bytes per chunk, so about 0.25%" was not derived.
+`CHUNKKEY_BYTES` is 14 and `ChunkRef` is 8, so an untruncated entry is 22 bytes -- but index leaves
+store **truncated** big-endian suffixes, and across one key's consecutive chunks nearly the whole
+`ChunkKey` is shared, so 10 to 12 bytes is likelier. The honest figure is a range,
+**0.15% to 0.28%**, and every conclusion that rests on it holds across the whole range. The guess
+landing inside the range was luck.
+
+**Superblock headroom** was assumed. Checked: the fields end at offset 192 and the CRC sits at
+`PAGE - 4`, so about 3.9 KiB of the page is free. A placement root fits comfortably.
+
+#### Gaps now named
+
+- **Slab granularity is right conditional on this workload**, and the plan presents it as right
+  outright. A key with mixed container kinds spreads over several class-specific slab runs, and
+  packed pages put small payloads in a shared class -- so a 2 MiB fetch can serve an 8 KiB need and
+  drag in other keys' payloads, up to **256x read amplification**. Harmless for dense 60 MiB keys,
+  bad for a sparse workload. This is a second and independent reason phase 3 must be opt-in per
+  database; the plan argues that only from latency.
+- **The fetch must not happen while holding a store lock**, which is the constraint that actually
+  decides where the seam can sit. `verify_once` takes a per-shard mutex and the node reader takes a
+  mutex plus an rwlock read; a blocking object-store call inside either stalls every reader of that
+  shard. "A latency-contract change" understates it.
+- **"The WAL record carries the placement" is unverified.** Nothing was checked about whether WAL
+  record types are extensible or what replay would do with such a record. Read it as an assumption
+  to test before phase B, not as a decision.
+- Minor: phase A "removes the client-side serialization round trip" is true for raw bits and false
+  for Roaring, which still has to be serialized by the client.
+
+#### The content address: SHA-256, and why the choice is not a cryptographic one
+
+Settled after asking whether BLAKE3 should be preferred. **It should not, for phase 0, and the
+reason is not that SHA-256 is stronger.**
+
+**Collision resistance does not separate them.** Both target **128-bit** collision resistance.
+SHA-256 reaches it as the birthday bound on a 256-bit output; BLAKE3's security target is 128 bits
+and **does not rise with output length**, so asking its extendable output for 512 bits buys nothing
+against collisions. On the number they are identical and both are far past anything reachable.
+
+What differs is confidence in that number, and there SHA-256 is the conservative pick: **64 rounds
+with published collision work reaching roughly half of them, under continuous attack since 2001**,
+against BLAKE3's **7 rounds** -- trimmed from BLAKE2s's 10 deliberately for throughput, which is the
+design's principal criticism -- and five years of history on that particular parameterisation.
+BLAKE3 inherits real pedigree through BLAKE2 and BLAKE, so this is a margin argument, not a doubt
+about soundness. Any specific best-attack round count should be re-checked rather than quoted from
+here.
+
+**And the threat model makes the comparison moot.** Replacing an existing victim slab is a
+**second preimage**, about 2^256 for both. The only 2^128 route is a chosen-prefix collision, which
+needs the attacker to influence the victim's bytes as well as their own. Both resist. So the
+content address is not where this design's security is decided.
+
+**It is decided by scoping, which is a separate decision and has to be made.** A content-addressed
+namespace shared across tenants means one tenant's upload can be served out of another tenant's
+object, whichever hash is used -- that is what dedup *is*. Scope the address space **per database**
+unless cross-tenant dedup is explicitly wanted, and note that choosing otherwise pre-decides part of
+`tenant-and-identity-namespace-model`, which is still open.
+
+So the tiebreakers are the ones that actually separate the two. `yesno-server-utils` already
+depends on `sha2`, and every commitment in this archive format -- base anchors, per-shard WAL chain
+fingerprints, the `FINGERPRINT_DOMAIN` prefix -- is already SHA-256. **`blake3` is absent from the
+workspace entirely, not even transitively.** Reusing the hash the format already commits with beats
+adding a second family for a speed difference that does not bind: a base capture to an object store
+is network-bound, and SHA-256 with hardware extensions already outruns the upload. The three
+recorded `SEEK_DATA` refusals are the same reasoning about the same one-off operation.
+
+**Two warnings that follow.**
+
+- **Do not truncate the address.** A 128-bit object name is 64-bit collision resistance, which *is*
+  adversarially reachable. If key length becomes a problem, shorten the prefix structure around the
+  address, never the address.
+- **Build it the way `history.rs` already builds fingerprints.** SHA-256 is Merkle-Damgård and
+  length-extendable; `field()` writes an eight-byte length before every variable-length value, which
+  is exactly the mitigation. A content address over anything but a fixed-length byte range inherits
+  that obligation.
+
+#### If BLAKE3 is ever adopted, it is for the Merkle property and not for speed
+
+BLAKE3's distinctive feature is that it is internally a Merkle tree, so it supports **verified
+subrange reads**. That is precisely what a lazy fetch wants -- and the plan above designs it away by
+cutting objects at slab granularity, so every object is 2 MiB and is verified whole.
+
+The condition under which it stops being a preference and becomes the mechanism: **one object per
+shard file, BLAKE3-addressed, with verified range reads**, instead of tens of thousands of slab
+objects per generation. That trades dedup away for object count, and the count is not trivial --
+60 GiB at 2 MiB is about **30 700 objects for the first generation**, and `gc.rs`'s `survey` lists
+every key under the database prefix *and* decodes every manifest it finds, so the reclamation sweep
+grows with it. If that sweep becomes the bottleneck, this is the alternative, and BLAKE3 is what
+makes it possible. Do not reach for it before then.
