@@ -1459,3 +1459,82 @@ objects per generation. That trades dedup away for object count, and the count i
 every key under the database prefix *and* decodes every manifest it finds, so the reclamation sweep
 grows with it. If that sweep becomes the bottleneck, this is the alternative, and BLAKE3 is what
 makes it possible. Do not reach for it before then.
+
+## 2026-10-14 — Verdict on the slab plan: go on phase 0 and phase A, and the per-shard cap is promoted to a blocker
+
+**Decision recorded, not new analysis.** The plan and its self-review are the two entries above;
+this is the go / no-go over them, plus the one piece of it that was checked against the code
+afterwards and came back more serious than the plan presented it.
+
+### The verdict
+
+**Go: phase 0** -- slab-granular, content-addressed archive objects. It touches only
+`yesno-server-utils`, needs no `yesno-core` change, no feature bit, no format-version bump and no
+invariant restated. It pays on its own ( incremental base generations, parallel range fetch,
+resumable restore ) and, decisively, **it does not depend on the number nobody has measured**. The
+dedup it buys is a property of how checkpoints write slabs, and the self-review confirmed the two
+policies that make the hit rate real: `Slab::new( class, generation )` stamps the generation at
+creation, and `alloc.rs` keeps one checkpoint's allocations in a contiguous slab run. If the rest
+of the plan is never built, phase 0 is still correct work.
+
+Three things are **mandatory inside phase 0**, not follow-ups: the address is SHA-256 and
+untruncated; `gc.rs::classify` learns the new key shape before any such object exists, or the
+archive leaks silently; the address space is scoped per database unless cross-tenant dedup is
+explicitly wanted.
+
+**Go: phase A** -- `adopt` from an object key, landing through an ordinary bulk insert. Also no
+format change, also shippable alone, and it removes the Flight hop, which is the consumer's actual
+complaint. Take **materialize-then-commit**. The commit-first ordering the scenario was posed with
+is buildable, but it prices in reachability work in `gc.rs`, a server-renewable lease, and a
+staging store that becomes a *serving* dependency; do not pay that before the cheap ordering has
+been measured as insufficient. Idempotency is a precondition rather than a hazard, and it is the
+same gap `no-idempotency-key-on-the-write-path` already records.
+
+**No-go: phases 1, 2, 3, B and C.** Not rejected -- unready, and each for a stated reason. Phase 3
+rests on the fraction of keys a follower touches in a window, which is a property of the consumer's
+workload and cannot be derived here. Phase 2 carries an open correctness question the self-review
+opened and did not close: presence cannot be derived from `slabmeta` while `fsck::rebuild` exists.
+Phase B rests on "the WAL record carries the placement", which is an untested assumption about WAL
+record extensibility.
+
+### The per-shard cap, checked against the code
+
+The plan listed this under "what has to be decided before phase 1". That placement was too mild.
+Checked today:
+
+- `PageId` is `u32` ( `index/tree.rs` ) and `PAGE_ID_SHIFT` is 64 ( `db/store.rs` ), so index-node
+  addressing tops out at **256 GiB** of shard address space.
+- **The cap binds on index-node placement, not on payload.** `ChunkRef.cell` is 40 bits, 1 TiB, and
+  payload never goes through `PageId`. The sole conversion is `cell_to_page_id`, reached from
+  exactly one caller, `ShardStore::append_node`.
+- **There is exactly one enforcement site in the tree**: the `u32::try_from` in `cell_to_page_id`,
+  which yields `CodecError::Invariant( "index page id exceeds 32 bits" )`. The failure direction is
+  right -- an error, not a wrap, not corruption. What is wrong is *when* and *how predictably* it
+  arrives. It surfaces out of a checkpoint, after the data has been accepted, and it fires when an
+  index node happens to be allocated above the line rather than when the shard crosses a threshold.
+  Because the index class's slabs are interleaved with payload slabs in allocation order, the
+  crossing point is a function of allocation history, not of size. A database can sit above the
+  line for some time and then fail to checkpoint.
+- **128 GiB is a comment, not a check.** It appears in `extent.rs` and `db/store.rs` as the "cap"
+  the 40-bit cell and the 32-bit page id are sized comfortably past. Nothing enforces it, and
+  `docs/operations/index.md`'s operating envelope states **no capacity limit at all** -- so an
+  operator has no way to learn the number before meeting it.
+- `feat::LARGE_SHARD` is declared in `superblock.rs` and unimplemented; `feat::SUPPORTED` is 0.
+
+At 60 MiB per key that is roughly **2 100 keys per shard** at the documented 128 GiB and about
+**4 400** at the hard 256 GiB. Shard count is the only lever today.
+
+### What follows, in order
+
+1. **Make the cap explicit and early, and document it.** A refusal at open or at allocation with a
+   number in it, plus a line in the operating envelope. This is cheap, independent of every phase
+   above, and valuable whether or not external placement is ever built -- the present behaviour is
+   an undocumented limit that announces itself as a failed checkpoint.
+2. **Ask the consumer the shape question**: keys per shard and shards per database at their target
+   size. The answer decides whether `LARGE_SHARD` is urgent or theoretical.
+3. **Only then decide `LARGE_SHARD`.** If the deployment shape really is 60 MiB keys at volume, a
+   plan for the 32-bit `PageId` belongs *before* a second format change lands on top of the current
+   geometry, not after. This reorders the plan: the cap is now a blocker on phase 1 rather than a
+   question to settle alongside it.
+
+Item 1 does not wait on items 2 and 3, and should not be bundled with them.
