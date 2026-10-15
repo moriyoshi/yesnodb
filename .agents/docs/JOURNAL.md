@@ -1637,3 +1637,85 @@ than kept as the thing to reach for if the sweep becomes the bottleneck.
 
 That comparison is the one piece of new work these numbers create. It does not block phase 0; it
 decides what phase 0 should be.
+
+## 2026-10-15 — Measured: the object count is not what phase 0 should fear, and one-object-per-shard loses at every churn rate
+
+I said yesterday that at 256 000 objects per generation, the one-object-per-shard-file alternative
+"deserves to be priced against phase 0 before phase 0 starts". **It was priced, and it loses.** The
+correction is mine: I weighed phase 0's object count without weighing what its dedup saves, and the
+two are not close.
+
+Measured with a scratch crate under `.agents-workspace/tmp/manifest-scale`, prost 0.14 against the
+real message shapes, release profile, Rust 1.98. 500 GiB over 16 shards is 256 000 slabs, 16 000
+per shard file.
+
+### The manifest, and the 3.1x that is pure redundancy
+
+| extent encoding | manifest | per extent | decode |
+| --- | --- | --- | --- |
+| address only, object key derived from it | **13.04 MB** | 51 B | 20.1 ms |
+| address plus the key spelled out beside it | **40.94 MB** | 160 B | 38.1 ms |
+
+My estimates of 16 MB and 44 MB were high by about 20%; the shape of the conclusion stands and the
+numbers are now measured rather than counted on fingers. **Store the address and derive the key.**
+The 3.1x is a 64-character hex string written next to the 32 bytes it is made of, and it costs
+28 MB per manifest and 18 ms per decode to carry it twice.
+
+### The object count costs far less than it looks, because dedup is the point
+
+**Pricing the listing as generations times slabs is the error that makes phase 0 look
+prohibitive**, and it is the one I made. Generation N+1 adds only the slabs that changed, so after
+`g` generations at churn `c` the archive holds `SLABS * ( 1 + ( g - 1 ) * c )` objects. What
+`gc.rs::survey` holds in its `Vec<String>`, at 8 retained generations:
+
+| churn | keys | String heap | list to `Vec` | keep-set |
+| --- | --- | --- | --- | --- |
+| 2% | 291 840 | 53.7 MB | 251 ms | 24 ms |
+| 5% | 345 600 | 63.6 MB | 304 ms | 30 ms |
+| 20% | 614 400 | 113.0 MB | 526 ms | 61 ms |
+| 100% | 2 048 000 | 376.8 MB | 1.76 s | 288 ms |
+
+At any plausible churn this is tens of megabytes of transient memory and a third of a second of CPU
+on a pass whose default interval is an hour. **It is not the bottleneck and should not have been
+treated as one.**
+
+### What dedup is worth, which is the term I left out
+
+Per base generation, against the alternative of one content-addressed object per whole shard file:
+
+| churn | slab-granular | one object per shard | ratio |
+| --- | --- | --- | --- |
+| 2% | 10.0 GiB | 500.0 GiB | 50x |
+| 5% | 25.0 GiB | 500.0 GiB | 20x |
+| 20% | 100.0 GiB | 500.0 GiB | 5x |
+| 100% | 500.0 GiB | 500.0 GiB | 1x |
+
+**The alternative never wins.** Content addressing at whole-file granularity means any change to a
+shard is a new object and a full re-upload, so it pays 500 GiB per generation at every churn rate
+and converges to parity only where dedup has nothing left to find. Trading 475 GiB of upload per
+generation for 64 MB of transient memory is not a trade.
+
+**So the BLAKE3 note above is refuted at this scale rather than strengthened**, and the condition
+it set out -- "if that sweep becomes the bottleneck" -- is measured and not met. Verified subrange
+reads remain the right mechanism for a *lazy fetch* under phase 3; they are not a reason to coarsen
+phase 0's granularity. SHA-256 stays the content address.
+
+### What the pass does cost, which is network rather than CPU
+
+Two terms the model above makes visible, neither of which changes the verdict:
+
+- **`survey` downloads and decodes one manifest per retained base.** Eight generations at 13.04 MB
+  is 104 MB per reclamation pass, hourly by default. Worth knowing before someone sets
+  `--retention-interval-secs` low.
+- **The listing is the round trips, not the bytes.** `list_relative` over the whole database prefix
+  at 1 000 keys per page is ~346 requests at 5% churn. At a typical per-request latency that is
+  seconds to tens of seconds of wall clock, and it dwarfs the 304 ms of local work. If a pass ever
+  needs to be cheaper, that is the term to attack -- not the manifest, and not the object count.
+
+### Limits of this measurement
+
+Synthetic 32-byte addresses rather than real hashes, which is sound because size and parse cost do
+not depend on the bytes. No network and no object store: every figure above is local encode, decode
+and allocation. The round-trip estimate is arithmetic over a page size, not a measurement. Decode
+times are one host, release profile, and are reported to show an order of magnitude rather than to
+be compared against a budget.
