@@ -252,6 +252,48 @@ pub(crate) fn parse_duration_micros(text: &str) -> Result<u64, ArchiveError> {
         .ok_or_else(|| format!("retention window '{text}' overflows").into())
 }
 
+/// Mutual exclusion between a base capture and a reclamation pass.
+///
+/// Reclamation decides what is reachable from the manifests that exist when it
+/// surveys, and a capture in progress has published none -- its slab objects
+/// are named by a manifest still being assembled. A pass that overlapped one
+/// would plan to delete exactly the objects that capture is about to
+/// reference, and the plan would be right about every manifest it could see.
+///
+/// **This did not arise while a base file was written per generation**, under
+/// that generation's own prefix: a capture then depended on nothing but its
+/// own uploads, and an interrupted one left orphans the next pass was supposed
+/// to remove. Content-addressed slabs made a capture depend on objects an
+/// *older* generation owns -- an unchanged slab is proven present and then
+/// named without being re-sent -- so dropping the base that first stored it
+/// turns a freshly published manifest into a dangling reference.
+///
+/// The writer lease already fences a second writer, so one in-process gate is
+/// the whole of what this needs. The asymmetry is deliberate: **a capture
+/// waits for a pass, a pass skips rather than waits**, because the capture is
+/// the work and reclamation is a periodic sweep that loses nothing by running
+/// one interval later.
+///
+/// A crash mid-capture is unaffected and needs no marker. The objects it
+/// leaves are named by no manifest at all, which is the unreachability the
+/// next pass exists to collect.
+#[derive(Default)]
+pub(crate) struct CaptureGate(Mutex<()>);
+
+impl CaptureGate {
+    /// Hold reclamation off for as long as the guard lives, waiting first if a
+    /// pass is already under way.
+    pub(crate) async fn capturing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.lock().await
+    }
+
+    /// Take the gate for one reclamation pass, or `None` because a capture
+    /// holds it.
+    fn reclaiming(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.0.try_lock().ok()
+    }
+}
+
 #[derive(Clone)]
 struct Runtime {
     channel: Channel,
@@ -267,6 +309,8 @@ struct Runtime {
     term: u32,
     rebootstrap: Arc<Notify>,
     base_request: Arc<Mutex<Option<BaseRequest>>>,
+    /// Shared with the retention loop. See [`CaptureGate`].
+    gate: Arc<CaptureGate>,
 }
 
 impl ArchiveOptions {
@@ -871,7 +915,13 @@ async fn publish_captured_base(
         history_anchor: Vec::new(),
         checkpoint_time: inspection.commit_clock,
     };
-    let (manifest_key, stored_manifest) = runtime.store.put_base(path, manifest).await?;
+    // Held from the first upload until the manifest exists. From that moment
+    // the base is the newest and therefore retained, so every slab it names is
+    // reachable again and a pass may run. See [`CaptureGate`].
+    let (manifest_key, stored_manifest) = {
+        let _capturing = runtime.gate.capturing().await;
+        runtime.store.put_base(path, manifest).await?
+    };
     let cursors = {
         let mut state = runtime.state.lock().await;
         for new_cursor in &stored_manifest.wal_cursors {
@@ -1266,12 +1316,14 @@ async fn refresh_base(
     capture_base(runtime, request.sequence, true).await
 }
 
-/// Run until `shutdown` resolves or an archive task fails.
 /// Reclaim unreachable archive objects on an interval.
 ///
 /// Renews the writer lease immediately before each pass rather than relying
 /// on `writer_lease_loop`'s schedule. A pass that deletes under an expired lease
 /// is deleting from an archive another writer may already own.
+///
+/// Skips the pass entirely while a base capture holds the [`CaptureGate`],
+/// which is the other way a pass could delete something that is still wanted.
 ///
 /// A failed pass is logged and retried on the next tick rather than failing the
 /// sidecar: reclamation is capacity management, and taking archiving down
@@ -1292,10 +1344,20 @@ pub(crate) async fn retention_loop(
     policy: crate::gc::RetentionPolicy,
     interval_secs: u64,
     metrics: Arc<crate::metrics::ArchiveMetrics>,
+    gate: Arc<CaptureGate>,
 ) -> Result<(), ArchiveError> {
     let interval = Duration::from_secs(interval_secs.max(1));
     loop {
         tokio::time::sleep(interval).await;
+        // Before the renewal rather than after it: a pass that will not run
+        // needs no fence, and the lease's liveness is `writer_lease_loop`'s
+        // job. The guard then covers the renewal and the pass together, which
+        // is what makes the exclusion cover the plan and not just the deletes.
+        let Some(_reclaiming) = gate.reclaiming() else {
+            tracing::info!("archive reclamation skipped: a base capture is in progress");
+            metrics.pass_skipped();
+            continue;
+        };
         if let Err(error) = lease.renew(lease_ttl).await {
             tracing::warn!(%error, "archive reclamation skipped: writer lease not renewed");
             metrics.pass_skipped();
@@ -1314,6 +1376,7 @@ pub(crate) async fn retention_loop(
     }
 }
 
+/// Run until `shutdown` resolves or an archive task fails.
 pub async fn run_with_shutdown<F>(cli: ArchiveOptions, shutdown: F) -> Result<(), ArchiveError>
 where
     F: Future<Output = ()> + Send,
@@ -1398,6 +1461,7 @@ where
         term: status.term,
         rebootstrap: Arc::new(Notify::new()),
         base_request: Arc::new(Mutex::new(None)),
+        gate: Arc::new(CaptureGate::default()),
     };
     if resume_rebase {
         // A new leadership term is a distinct WAL history. Re-root it
@@ -1441,6 +1505,7 @@ where
                 policy,
                 retention_interval,
                 metrics.clone(),
+                runtime.gate.clone(),
             ));
         }
 

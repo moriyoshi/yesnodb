@@ -101,9 +101,12 @@ impl ArchiveMetrics {
         self.failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one pass that never started — the writer lease was not renewed,
-    /// so deleting would have been deleting from an archive another writer may
-    /// already own. Distinct from a failure because nothing was attempted.
+    /// Record one pass that never started, for either of the two reasons a
+    /// pass declines to run: the writer lease was not renewed, so deleting
+    /// would have been deleting from an archive another writer may already
+    /// own; or a base capture was in progress, whose objects no published
+    /// manifest names yet. Distinct from a failure because nothing was
+    /// attempted, and in both cases the next tick simply tries again.
     pub fn pass_skipped(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
     }
@@ -136,7 +139,8 @@ impl ArchiveMetrics {
         counter(
             &mut s,
             "archive_reclamation_skipped_total",
-            "Passes skipped because the writer lease was not renewed.",
+            "Passes skipped before anything was attempted: the writer lease was \
+             not renewed, or a base capture was in progress.",
             self.skipped.load(Ordering::Relaxed),
         );
         counter(
@@ -328,6 +332,7 @@ mod tests {
             },
             1,
             metrics.clone(),
+            Arc::new(crate::sidecar::CaptureGate::default()),
         ));
 
         let mut rendered = metrics.render();
@@ -349,6 +354,83 @@ mod tests {
             value_of(&rendered, "archive_unrecognized_keys"),
             Some(1),
             "{rendered}"
+        );
+    }
+
+    /// The gate, end to end, over the same object: a slab no manifest names
+    /// is deletable, and must survive anyway while a base capture holds the
+    /// gate -- because a capture in progress is exactly the case where "no
+    /// manifest names it" does not mean "nothing wants it".
+    ///
+    /// Releasing the gate and watching the same object go is what makes this a
+    /// test of exclusion rather than of a loop that never ticked.
+    #[tokio::test]
+    async fn a_capture_in_progress_keeps_a_pass_off_an_orphan_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        archive(dir.path(), &[]);
+        let slab_key = format!("db/{HEX}/slabs/{}", "ab".repeat(32));
+        write(
+            dir.path(),
+            &slab_key,
+            b"a slab this capture is about to name",
+        );
+        let slab = dir.path().join(&slab_key);
+
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let lease = Arc::new(
+            store
+                .acquire_writer(crate::lease::new_writer_id().unwrap(), 30)
+                .await
+                .unwrap(),
+        );
+        let metrics = Arc::new(ArchiveMetrics::new());
+        let gate = Arc::new(crate::sidecar::CaptureGate::default());
+        let capturing = gate.capturing().await;
+        let task = tokio::spawn(crate::sidecar::retention_loop(
+            store.clone(),
+            lease,
+            30,
+            RetentionPolicy {
+                window_micros: 86_400 * 1_000_000,
+                min_bases: 1,
+            },
+            1,
+            metrics.clone(),
+            gate.clone(),
+        ));
+
+        let mut rendered = metrics.render();
+        for _ in 0..200 {
+            if value_of(&rendered, "archive_reclamation_skipped_total") == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            rendered = metrics.render();
+        }
+        assert_eq!(
+            value_of(&rendered, "archive_reclamation_skipped_total"),
+            Some(1),
+            "the gated loop never reported a skip: {rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_reclamation_passes_total"),
+            Some(0),
+            "a pass ran while a capture held the gate: {rendered}"
+        );
+        assert!(slab.exists(), "the gated pass deleted the capture's slab");
+
+        drop(capturing);
+        for _ in 0..200 {
+            if !slab.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+        assert!(
+            !slab.exists(),
+            "the slab outlived the gate: {}",
+            metrics.render()
         );
     }
 

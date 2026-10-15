@@ -538,6 +538,14 @@ impl ArchiveStore {
     ///   content, so a slab unchanged since the last generation already exists
     ///   under exactly this key. That is where a base generation stops costing
     ///   a whole database.
+    ///
+    /// The last of those three is why a capture may not overlap a reclamation
+    /// pass. Naming an object this capture did not write makes the capture
+    /// depend on whichever older generation did, and that generation may be
+    /// the one a concurrent pass is dropping. The sidecar's `CaptureGate`
+    /// holds the two apart; the set `known` carries is safe on its own terms,
+    /// because the active base is never deletable, but the `head` below is
+    /// not, because it will happily find an object nothing retained names.
     async fn put_slab_file(
         &self,
         source: &Path,

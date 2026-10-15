@@ -261,9 +261,14 @@ The counters accumulate over the sidecar's lifetime and reset when it restarts:
 - `yesnod_archive_reclamation_failures_total`: passes that ran and failed. A
   failed pass is retried on the next interval and never stops archiving, so
   this counter is the signal that reclamation is not keeping up.
-- `yesnod_archive_reclamation_skipped_total`: passes skipped because the writer
-  lease was not renewed. Nothing was attempted, which is why it is not counted
-  as a failure.
+- `yesnod_archive_reclamation_skipped_total`: passes skipped before anything
+  was attempted, which is why they are not counted as failures. Two causes: the
+  writer lease was not renewed, or a base capture was in progress. The second
+  is routine on a database whose base copy takes longer than the reclamation
+  interval -- reclamation and capture are deliberately never run at the same
+  time, because a capture's objects are not yet named by any published
+  manifest. A steady climb with no completed pass between the skips means the
+  interval is shorter than the capture, and the interval should be raised.
 - `yesnod_archive_objects_deleted_total`: archive objects deleted.
 
 The gauges report the last completed pass. They are absent until one completes,

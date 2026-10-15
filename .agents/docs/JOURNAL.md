@@ -1882,3 +1882,81 @@ The manifest is still written whole per generation -- 13 MB at 500 GiB, measured
 downloads one per retained base on every reclamation pass. That is now the largest remaining
 per-capture and per-pass cost in this path, and the listing round trips behind it are larger still.
 Neither blocks anything; both are recorded under the measurement entry above.
+
+## 2026-10-15 — A capture and a reclamation pass could not safely overlap, and phase 0 is what made that true
+
+Found by asking what phase 0 changed about reclamation rather than about bandwidth. The answer is
+a hazard that did not exist a day ago, and it is the kind that produces a published base nobody
+can restore.
+
+### The mechanism
+
+`put_base` uploads every slab object and publishes the manifest **last**, so while a capture runs
+its objects are named by no published manifest. `gc::plan` is reachability over the manifests the
+survey found. A pass that overlaps a capture therefore plans to delete exactly the objects that
+capture is about to reference -- and the plan is *right* about every manifest it can see.
+
+**This was not reachable while a base file was one object per generation.** Each generation wrote
+under its own `base/<gen>/` prefix, so a capture depended on nothing but its own uploads, and an
+interrupted one left orphans the next pass was supposed to collect. Content-addressed slabs made a
+capture depend on objects an **older generation owns**: an unchanged slab is proven present with a
+`head` and then named without being re-sent. Drop the base that first stored it and the manifest
+published seconds later is a dangling reference.
+
+The two skip paths are not equally exposed, and the difference is worth stating because it is the
+whole of the argument:
+
+- **The increment-2 skip set is safe on its own terms.** It is built from the *active* base, and
+  the active base is never deletable -- `the_active_base_is_never_deleted`.
+- **The increment-1 `head` is not.** It asks the store whether an object exists, and the store
+  answers yes for an object that only an about-to-be-dropped generation retains.
+
+`collect`'s existing re-read of `state.pb` does not help: `state.pb` does not move until the
+capture finishes, so the check sees nothing and the deletes proceed.
+
+### The fix is a gate, not a marker
+
+`CaptureGate` in `sidecar.rs`: one `tokio::sync::Mutex` shared by the capture path and
+`retention_loop`, which are sibling tasks in the same `JoinSet` and were previously uncoordinated.
+A capture holds it from the first upload until the manifest exists -- from that moment the base is
+the newest, is therefore always retained, and its slabs are reachable again.
+
+**The asymmetry is deliberate: a capture waits for a pass, a pass skips rather than waits.** The
+capture is the work; reclamation is a periodic sweep that loses nothing by running one interval
+later. The gate is taken *before* the lease renewal, because a pass that will not run needs no
+fence and `writer_lease_loop` owns liveness, and it is held across the survey and the plan rather
+than only across the deletes -- a pass that planned before the capture and deleted after it would
+be the same bug.
+
+**One in-process gate is the whole of what this needs**, because the writer lease already fences a
+second writer. No marker object, no new durable state, no format change. A crash mid-capture is
+unaffected: the objects it leaves are named by no manifest at all, which is the unreachability the
+next pass exists for.
+
+### The test, and the mutation that proves it is a test
+
+`a_capture_in_progress_keeps_a_pass_off_an_orphan_slab` puts a slab object no manifest names into
+a real `file://` archive, holds the gate the way `publish_captured_base` holds it, drives the real
+`retention_loop`, and asserts the skip was reported, no pass completed, and **the object is still
+there**. Then it releases the gate and waits for the same object to go. Without that second half
+it would pass against a loop that never ticked.
+
+Neutering the gate check makes it fail at `passes_total` 1 against 0, which is the confirmation
+worth having: an orphan slab really is deletable, so the first half is not asserting a tautology.
+
+### What else came out of it
+
+Two things, both small and both in the same path.
+
+- **`run_with_shutdown`'s doc comment was sitting on `retention_loop`.** The same mis-stitch class
+  as `33e9670`, one line this time: "Run until `shutdown` resolves or an archive task fails."
+  described a function three hundred lines further down. Returned to it.
+- **`archive_reclamation_skipped_total` now has two causes and documented one.** The counter, its
+  `pass_skipped` doc and `docs/operations/backup.md` all said "the writer lease was not renewed".
+  The operator-facing text now names the second cause and says what a steady climb with no
+  completed pass between the skips means: the reclamation interval is shorter than the capture,
+  and the interval should be raised. That is a real reading on a 500 GiB database, where the first
+  capture is long.
+
+`gate.sh` passed. `gate-pg.sh` was not run and does not apply: `yesno-server-utils` has no Bazel
+target and nothing here reaches `yesno-e2e`.
