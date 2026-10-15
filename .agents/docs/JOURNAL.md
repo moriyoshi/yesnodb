@@ -1960,3 +1960,75 @@ Two things, both small and both in the same path.
 
 `gate.sh` passed. `gate-pg.sh` was not run and does not apply: `yesno-server-utils` has no Bazel
 target and nothing here reaches `yesno-e2e`.
+
+## 2026-10-15 — Measured: what a generation re-sends tracks the database, not the change
+
+Phase 0's economics were argued from a churn rate and never measured against a running archive.
+Measuring them produced a number that does not refute the plan and does narrow it sharply, and a
+scenario that covers a dependency nothing else in the suite touches.
+
+### The instrument
+
+`inspect_archive` gained `slab_objects` and `slab_object_bytes` -- every object under
+`db/<uuid>/slabs/`, whichever generation wrote it. The pair with `base_object_bytes` is what makes
+sharing observable at all: the manifest says what a base **names**, these say what the store was
+made to **hold**, and the difference between two readings is what a generation cost.
+
+Construction: one shard, N single-ordinal keys through Flight, checkpoint, base generation 1; stop
+the sidecar, write `CHURN` more keys, exceed the leader's 64 KiB hard WAL cap so the reconnect
+must re-root, checkpoint, base generation 2. Probe at `.agents-workspace/tmp/dedup-probe/`.
+
+### The numbers
+
+All bytes; "pieces" are the 2 MiB content-addressed objects a base file is cut into.
+
+| keys    | churn  | gen 1 pieces | gen 1 bytes | gen 2 names | gen 2 stored | shared        |
+| ------- | ------ | ------------ | ----------- | ----------- | ------------ | ------------- |
+| 50 000  | 2 000  | 3            | 4 202 496   | 4 202 496   | 4 194 304    | 8 192 ( 0.2% )|
+| 300 000 | 2 000  | 5            | 8 396 800   | 8 396 800   | 6 291 456    | 2 105 344 ( 25% ) |
+| 900 000 | 2 000  | 11           | 20 979 712  | 20 979 712  | 10 485 760   | 10 493 952 ( 50% ) |
+| 900 000 | 20 000 | 11           | 20 979 712  | 20 979 712  | 10 485 760   | 10 493 952 ( 50% ) |
+
+**The last two rows are the finding.** A tenfold increase in churn -- 2 000 keys to 20 000 -- moved
+the stored bytes by **zero**. The dirty set is a property of the database's layout, not of how much
+changed. Two further controls came out identical: churn as *fresh* keys rather than overwrites
+( ruling out the freed-chunk and slab-metadata explanations ), and churn at the low end of the key
+space rather than the high.
+
+So in this shape a generation costs a roughly constant **fraction** of the database -- 67%, 60%,
+45% re-sent as the database grows -- and content addressing buys about 2x rather than the 20x the
+pricing entry derived from a 5% churn rate.
+
+### Why this does not refute phase 0, and what it does do
+
+**The regime that was priced is not the regime that was measured.** These databases are *index*:
+single-ordinal keys, payload negligible, so a checkpoint's shadow-paged index rewrite touches a
+large fraction of the file. The consumer's shape is the opposite and the plan said so on 2026-10-14
+-- "the index is about 0.25% of the key's bytes" at 60 MiB per key -- so there the frontier a
+checkpoint advances through is small and payload pieces are untouched. The 20x may well hold there.
+
+What has changed is the standing of the claim. **It was general and is now shape-dependent, and the
+shape it was argued for remains unmeasured.** Phase 0 is still correct work and still ships; the
+bandwidth figure in the pricing entry should be read as conditional on a payload-dominated
+database, which no test here constructs. Filed as `base-dedup-unmeasured-in-the-payload-regime`.
+
+### The scenario, and what it is actually for
+
+`e2e/scenarios/base_dedup.py`, 22 s standalone, and bought by the restore at the end rather than
+by the ratio. The suite total moves more than that between runs on this machine -- 251 s before
+the fixture, 206 s on the gate that includes it -- so the honest statement of the cost is the
+scenario's own time, not a delta against a total that will not hold still.
+
+**A generation whose manifest names objects an earlier capture wrote is a new kind of dependency**,
+and nothing in the suite exercised it. The unit tests cover the uploader on synthetic files;
+`pitr_retention.py` restores after a sweep without asking where the bytes came from. The way this
+fails is a base that verifies, lists and plans correctly and then cannot be read back -- so the
+load-bearing assertion is a restore of generation 2 that reads a key the churn never touched.
+
+The ratio is printed and **deliberately not asserted**, with the measurement above recorded in the
+file's header as the reason. Pinning a number from the one shape that cannot represent the
+workload would be pinning the wrong one. Two things are asserted besides the restore: that
+generation 1's stored bytes equal exactly what its manifest names -- a capture that left an
+unnamed object would show up here as an orphan before reclamation had to find it -- and that
+generation 2 stored strictly less than it named, which is the mechanism and fails only if sharing
+stops entirely.

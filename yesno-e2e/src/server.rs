@@ -123,6 +123,14 @@ pub(crate) struct ArchiveStats {
     /// The base's length with its holes counted, and without.
     base_apparent_bytes: u64,
     base_object_bytes: u64,
+    /// Every slab object in the store, not only the active base's.
+    ///
+    /// The pair with `base_object_bytes` is what makes sharing between
+    /// generations observable: a base names what it needs, this is what the
+    /// store is billed for, and a second generation that reuses its
+    /// predecessor's slabs moves the first number without moving the second.
+    slab_objects: usize,
+    slab_object_bytes: u64,
     pub(crate) wal_objects: usize,
     pub(crate) wal_bytes: u64,
     cursor_total: u64,
@@ -135,6 +143,8 @@ impl ArchiveStats {
             "event_sequence" => Some(self.event_sequence),
             "base_apparent_bytes" => Some(self.base_apparent_bytes),
             "base_object_bytes" => Some(self.base_object_bytes),
+            "slab_objects" => Some(self.slab_objects as u64),
+            "slab_object_bytes" => Some(self.slab_object_bytes),
             "wal_objects" => Some(self.wal_objects as u64),
             "wal_bytes" => Some(self.wal_bytes),
             "cursor_total" => Some(self.cursor_total),
@@ -150,6 +160,8 @@ impl ArchiveStats {
             ("base_files", whole_obj(self.base_files)),
             ("base_apparent_bytes", int_obj(self.base_apparent_bytes)),
             ("base_object_bytes", int_obj(self.base_object_bytes)),
+            ("slab_objects", whole_obj(self.slab_objects)),
+            ("slab_object_bytes", int_obj(self.slab_object_bytes)),
             ("wal_objects", whole_obj(self.wal_objects)),
             ("wal_bytes", int_obj(self.wal_bytes)),
             ("cursor_total", int_obj(self.cursor_total)),
@@ -264,6 +276,31 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
         base_object_bytes = base_object_bytes.saturating_add(size);
     }
 
+    // Every slab object under the database prefix, whichever generation put
+    // it there. A base that reuses its predecessor's slabs is only visible
+    // against this: the manifest says what the base needs, and the difference
+    // between two readings says what the store was made to hold for it.
+    //
+    // Absent is zero, not an error. A database small enough to fit the
+    // writer's older whole-file encoding has no `slabs/` directory at all.
+    let mut slab_objects = 0usize;
+    let mut slab_object_bytes = 0u64;
+    let slab_dir = object_dir.join(format!("db/{uuid}/slabs"));
+    if slab_dir.is_dir() {
+        let mut slabs = Vec::new();
+        files_below(&slab_dir, &mut slabs)
+            .map_err(|error| format!("slab objects are not readable: {error}"))?;
+        for path in &slabs {
+            let size = std::fs::metadata(path)
+                .map_err(|error| {
+                    format!("slab object '{}' is not readable: {error}", path.display())
+                })?
+                .len();
+            slab_objects += 1;
+            slab_object_bytes = slab_object_bytes.saturating_add(size);
+        }
+    }
+
     let mut files = Vec::new();
     files_below(object_dir, &mut files)
         .map_err(|error| format!("archive objects are not readable: {error}"))?;
@@ -316,6 +353,8 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
         base_files: manifest.files.len(),
         base_apparent_bytes,
         base_object_bytes,
+        slab_objects,
+        slab_object_bytes,
         wal_objects,
         wal_bytes,
         cursor_total: state.wal_cursors.iter().fold(0u64, |total, cursor| {
