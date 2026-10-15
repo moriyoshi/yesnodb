@@ -2032,3 +2032,61 @@ generation 1's stored bytes equal exactly what its manifest names -- a capture t
 unnamed object would show up here as an orphan before reclamation had to find it -- and that
 generation 2 stored strictly less than it named, which is the mechanism and fails only if sharing
 stops entirely.
+
+## 2026-10-15 — The payload regime, measured: a generation costs what changed plus one piece
+
+Closes `base-dedup-unmeasured-in-the-payload-regime`, filed hours earlier in the entry above. The
+answer is the one phase 0 was argued from, and it is sharper than the argument was.
+
+### Getting at the regime at all
+
+The filed item said this needed a widened `flight_put` or a route through `db_insert_range`,
+because the Flight write wire carries one row per set bit and a payload-dominated body cannot go
+through it. **Neither was needed.** `db_open` and `srv_config` both resolve their name through
+`World::scenario_path`, so a body built through the library sits in exactly the directory the
+daemon then opens. Build, checkpoint, close, launch.
+
+**The first attempt measured nothing, for a reason worth keeping.** A body of twenty contiguous
+`db_insert_range` keys spanning 335 million ordinals came to **6 MB** -- a contiguous range is a
+run container, four bytes an interval, so the densest-looking construction available is also the
+cheapest. Stride 16 is what produces payload: 4096 ordinals in every 65 536-wide chunk, which is
+`ARRAY_MAX`, so 8192 bytes of payload against about 20 bytes of index.
+
+### The numbers
+
+Body of 10 keys, stride 16. `added` is what generation 2's manifest names beyond generation 1's;
+`grew` is what the store actually had to hold for it.
+
+| body    | gen 1 pieces | gen 1 bytes | churn   | added     | grew      | overhead  |
+| ------- | ------------ | ----------- | ------- | --------- | --------- | --------- |
+| 25 MB   | 14           | 25 174 064  | 12 000  | 2 097 104 | 4 194 304 | 2 097 200 |
+| 46 MB   | 24           | 46 145 584  | 12 000  | 2 097 104 | 4 194 304 | 2 097 200 |
+| 25 MB   | 14           | 25 174 064  | 120 000 | 4 194 256 | 6 291 456 | 2 097 200 |
+
+**The overhead is identical to the byte across all three** -- 2 097 200, which is `SLAB_SIZE` plus
+48. Double the database: unchanged. Multiply the churn by ten: unchanged, and `grew` rises by
+exactly the data that was added. So in this regime a generation costs **what changed plus one
+2 MiB piece**, and the saving improves with database size without bound.
+
+Set against the previous entry's index-dominated measurements, where generation 2 named *nothing*
+new -- `added` of zero -- and still stored 3 pieces at 300 000 keys and 5 at 900 000, the
+distinction is clean and is about one thing: **the region a checkpoint rewrites tracks the index.**
+Payload pieces are not touched, so they are named rather than sent; index pieces are rewritten
+wholesale, and in a database of single-ordinal keys that is most of the file.
+
+That is the mechanism the plan asserted on 2026-10-14 from the 0.25% index ratio at 60 MiB per key,
+now measured rather than inferred. **The 20x bandwidth figure stands for the consumer's shape**,
+and the qualification the previous entry attached to it is answered rather than left open.
+
+### The fixture now builds the regime that matters
+
+`base_dedup.py` was rewritten rather than duplicated -- a second archive scenario would have cost
+another 27 s for a worse question. It builds the payload body, captures two generations, and
+asserts the bound this entry measured: `grew - added <= 2 * SLAB_SIZE`, which has 2x headroom over
+the 2 097 200 observed and fails if the per-generation rewrite starts growing with the database.
+The index-regime figures stay here, with their construction, which is where a number that is not
+asserted belongs.
+
+The restore at the end is unchanged and is still the load-bearing part: generation 2's manifest
+names pieces the *first* capture uploaded, and a key the churn never touched comes back only if
+those are fetched. 27.9 s, both gates green.
