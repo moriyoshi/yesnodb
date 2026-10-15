@@ -1366,6 +1366,18 @@ pub(crate) async fn retention_loop(
         match crate::gc::collect(&store, policy).await {
             Ok(plan) => {
                 tracing::info!("{}", plan.summary_line());
+                // Louder than the summary line it is already counted in,
+                // because unlike every other number there it does not clear
+                // itself: no later pass restores an object, and the operator
+                // finds out at a restore otherwise. One example key, because
+                // the count says how bad and the key says where to look.
+                if let Some(first) = plan.missing.first() {
+                    tracing::warn!(
+                        missing = plan.missing.len(),
+                        %first,
+                        "a retained base names objects this archive does not hold"
+                    );
+                }
                 metrics.pass_completed(&plan);
             }
             Err(error) => {

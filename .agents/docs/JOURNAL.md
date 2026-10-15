@@ -2090,3 +2090,69 @@ asserted belongs.
 The restore at the end is unchanged and is still the load-bearing part: generation 2's manifest
 names pieces the *first* capture uploaded, and a key the churn never touched comes back only if
 those are fetched. 27.9 s, both gates green.
+
+## 2026-10-15 — A reclamation pass already holds the listing, so it can say what the archive has lost
+
+Phase 0 made a base file a set of content-addressed pieces, and the three increments since then
+have been about what that buys and what it costs. This one is about what it **breaks that nothing
+was watching**: an object's age stopped being evidence that anything still needs it.
+
+### The hazard, stated precisely
+
+A slab is named by every later generation whose checkpoint did not rewrite it, and is deliberately
+not re-uploaded when that happens -- that is the saving the last two entries measured. The
+consequence nobody had written down is that **its last-modified time stops advancing while it stays
+live**. Last-modified is exactly what an object-store lifecycle rule keys on. So a rule expiring
+objects after 90 days now deletes pieces of the base being written today, and `backup.md`'s existing
+warning -- which argued from WAL being anchored to an older base -- was arguing the weak version of
+the case.
+
+Before phase 0 that could not happen. A base owned its files under its own prefix, every one of them
+uploaded when the base was captured, so the whole base aged together and an age rule that spared the
+base spared its files.
+
+### The check costs nothing, which is why it belongs in the pass
+
+`gc::plan` already receives a complete listing of the database prefix and already computes what the
+retained bases name -- `keep_files` and `keep_slabs` exist so it can decide what to delete. Asking
+the opposite question is a set difference over data in hand: **no round trip, no second survey, no
+new configuration**. It is now `GcPlan::missing`, reported in the pass summary line, published as
+`yesnod_archive_missing_objects`, and logged at warning level with one example key beside the count.
+
+The metric is the mirror of `yesnod_archive_unrecognized_keys` and the more urgent of the two. That
+one says the archive is too big and will grow without bound; this one says the archive is
+*incomplete*, does not heal, and that no later pass repairs it. Without the gauge the condition
+surfaces at a restore, which is the one moment nobody wants to discover it.
+
+Scope is deliberate: only what a base names directly, its file objects and their slabs. WAL
+reachability is a chain walk rather than a set membership, and `restore` already refuses a chain
+with a hole in it before it fetches anything.
+
+### A bug fell out of writing the check
+
+`plan` inserted `file.object_key` into `keep_files` unconditionally, and a slab-addressed file
+carries the **empty string** there -- its bytes are under `slabs/`, named by content, so it has no
+object of its own. That was harmless while the set was only ever consulted ( no listed key is the
+empty string, so it matched nothing ). Searching the other way round it is not harmless: every
+slab-addressed file in every retained base would have been reported as an object the store had lost,
+which is a loud false alarm on exactly the deployments phase 0 was built for. Guarded, and the guard
+is mutation-checked -- reverting it makes `a_slab_object_survives_while_any_retained_base_names_it`
+fail with `missing: [""]`.
+
+### What the end-to-end suite gained, and what it does not claim
+
+`base_dedup.py` built two generations and restored the second; it never swept. It now runs one real
+reclamation pass between the two, with a window of zero and `min_bases` of 1, so the **first
+generation is pruned** -- and then restores. Measured: 14 pieces in generation 1, generation 2 names
+13 of them, the sweep deletes 3 objects ( the old manifest and the 2 pieces only it named ), and the
+restore reads back a payload key the churn never touched. Those bytes were uploaded by the
+generation that no longer exists. That is the cross-generation dependency, exercised through the
+shipped reclaimer rather than a unit test's synthetic manifests.
+
+Be clear about what the new `missing == 0` assertion there does and does not do. The plan is
+computed before the pass's own deletes, so a zero is a statement that the archive was whole when the
+sweep surveyed it -- a precondition, not a verdict on the sweep. **The restore is still the thing
+that would catch a wrong deletion**, and it is placed after the sweep for that reason.
+
+Cost: the scenario runs in 4.1 s. Gates: `gate.sh` and `gate-pg.sh`, both, because the diff reaches
+`yesno-e2e`, which Bazel builds.

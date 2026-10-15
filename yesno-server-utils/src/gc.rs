@@ -53,6 +53,14 @@
 //! and found unchanged. That last check is what stops a pass that began
 //! before a rebase from deleting the root the rebase just published — the lease
 //! fences a *different writer*, not this writer's own stale plan.
+//!
+//! # The other thing a complete listing is good for
+//!
+//! A pass surveys the whole database prefix, so once it knows what the retained
+//! bases name it can also check that those objects are *there*, for a set
+//! difference and no extra round trip. That check is [`GcPlan::missing`], and
+//! it is made here because content addressing changed what can make an object
+//! vanish from under a base that still needs it.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,6 +98,27 @@ pub struct GcPlan {
     /// objects this build does not understand, and reclamation is conservative
     /// rather than complete until that is explained.
     pub unrecognized: Vec<String>,
+    /// Objects a retained base names that the survey's listing did not hold.
+    ///
+    /// Empty is the only healthy reading. Non-zero means a base this pass is
+    /// keeping cannot be restored: the manifest is there and the bytes are
+    /// not, and a restore selecting that base will fail on a fetch after it
+    /// has already committed to the recovery point.
+    ///
+    /// **Content addressing is why this is worth watching rather than
+    /// assuming.** While a base owned its files under its own prefix, the only
+    /// way to lose one was to delete that base's own objects. A slab is named
+    /// by every later generation whose checkpoint did not rewrite it, and is
+    /// deliberately *not re-uploaded* when that happens -- so its
+    /// last-modified time stops advancing while it stays live, which is
+    /// exactly the input an object-store lifecycle rule keys on. A rule that
+    /// expires objects by age now deletes bytes of the **active** base.
+    ///
+    /// Only what a base names directly: its file objects and their slabs. WAL
+    /// reachability is a chain walk rather than a set membership, and a
+    /// restore already refuses a chain with a hole in it before fetching
+    /// anything.
+    pub missing: Vec<String>,
     /// The horizon this plan was computed against, in epoch microseconds.
     pub horizon_micros: u64,
 }
@@ -98,10 +127,11 @@ impl GcPlan {
     /// Stable human-facing summary.
     pub fn summary_line(&self) -> String {
         format!(
-            "archive gc: delete={} retained_bases={} unrecognized={} horizon={}",
+            "archive gc: delete={} retained_bases={} unrecognized={} missing={} horizon={}",
             self.delete.len(),
             self.retained_bases.len(),
             self.unrecognized.len(),
+            self.missing.len(),
             crate::restore::format_micros(self.horizon_micros),
         )
     }
@@ -257,7 +287,13 @@ pub fn plan(
         // safe direction.
         let uuid = crate::archive::hex(&manifest.database_uuid);
         for file in &manifest.files {
-            keep_files.insert(file.object_key.as_str());
+            // A slab-addressed file names no object of its own, and the empty
+            // string is not a key. It matched nothing while this set was only
+            // consulted, but `missing` searches the other way round and would
+            // report it as an object the store had lost.
+            if !file.object_key.is_empty() {
+                keep_files.insert(file.object_key.as_str());
+            }
             for extent in &file.extents {
                 if !extent.content_hash.is_empty() {
                     keep_slabs.insert(crate::archive::slab_key(&uuid, &extent.content_hash));
@@ -340,8 +376,27 @@ pub fn plan(
             }
         }
     }
+    // What the retained bases name, against what the store actually holds.
+    // The listing is the same one every decision above was made from, so this
+    // is a set difference and costs no round trip. See [`GcPlan::missing`].
+    let listed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+    plan.missing.extend(
+        keep_files
+            .iter()
+            .copied()
+            .filter(|key| !listed.contains(key))
+            .map(str::to_string),
+    );
+    plan.missing.extend(
+        keep_slabs
+            .iter()
+            .filter(|key| !listed.contains(key.as_str()))
+            .cloned(),
+    );
+
     plan.delete.sort();
     plan.unrecognized.sort();
+    plan.missing.sort();
     Ok(plan)
 }
 
@@ -579,6 +634,80 @@ mod tests {
         assert!(
             plan.delete.contains(&orphan),
             "no manifest names it: {plan:?}"
+        );
+        // Also the guard on the empty string a slab-addressed file carries
+        // where another file carries an object key. It is not a key, and
+        // searching the listing for it would report every such file as lost.
+        assert!(plan.missing.is_empty(), "nothing is absent here: {plan:?}");
+    }
+
+    /// A slab a retained base names and the store does not hold is reported
+    /// by the pass that noticed, not left for a restore to discover.
+    ///
+    /// This is the shape an object-store lifecycle rule produces: the slab was
+    /// uploaded by the first generation, named without being re-sent by every
+    /// generation since -- so its last-modified time never advanced -- and
+    /// then expired on its age while the base that needs it is the active one.
+    #[test]
+    fn a_slab_the_store_lost_is_reported_rather_than_waiting_for_a_restore() {
+        let old = slab_base(1, NOW - 100 * HOUR, 0x11);
+        let kept = slab_base(2, NOW - HOUR, 0x22);
+        let bases = vec![old.clone(), kept.clone()];
+        let uuid = crate::archive::hex(&kept.1.database_uuid);
+        let shared = crate::archive::slab_key(&uuid, &[0xee; 32]);
+        let only_kept = crate::archive::slab_key(&uuid, &[0x22; 32]);
+
+        // Everything the two bases name except `shared`.
+        let mut keys = keys(&bases, &[]);
+        keys.push(only_kept);
+        keys.sort();
+
+        let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
+
+        assert_eq!(plan.missing, vec![shared], "{plan:?}");
+    }
+
+    /// Only the bases the pass is keeping. An object a pruned base named is
+    /// unreachable by the very decision being reported, and counting it would
+    /// make every ordinary reclamation look like damage.
+    #[test]
+    fn an_object_only_a_pruned_base_named_is_not_reported_missing() {
+        let old = slab_base(1, NOW - 100 * HOUR, 0x11);
+        let kept = slab_base(2, NOW - HOUR, 0x22);
+        let bases = vec![old.clone(), kept.clone()];
+        let uuid = crate::archive::hex(&kept.1.database_uuid);
+
+        // `only_old` -- the pruned generation's own slab -- is absent.
+        let mut keys = keys(&bases, &[]);
+        keys.extend([
+            crate::archive::slab_key(&uuid, &[0xee; 32]),
+            crate::archive::slab_key(&uuid, &[0x22; 32]),
+        ]);
+        keys.sort();
+
+        let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
+
+        assert!(plan.missing.is_empty(), "{plan:?}");
+    }
+
+    /// The same check reaches a whole-file base object, which is what an
+    /// archive written before slabs holds.
+    #[test]
+    fn a_whole_file_base_object_the_store_lost_is_reported_too() {
+        let only = base(1, NOW - HOUR, 100);
+        let bases = vec![only.clone()];
+        let keys = vec![
+            STATE_OBJECT.to_string(),
+            WRITER_OBJECT.to_string(),
+            only.0.clone(),
+        ];
+
+        let plan = plan(&state_with(&only.0), &bases, &keys, policy(24, 1), NOW).unwrap();
+
+        assert_eq!(
+            plan.missing,
+            vec![only.1.files[0].object_key.clone()],
+            "{plan:?}"
         );
     }
 

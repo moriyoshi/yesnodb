@@ -4,12 +4,20 @@
 //!
 //! A reclamation pass decides what an archive keeps and what it destroys, and
 //! until this module existed the only record of that decision was a log line.
-//! One field of it is not a log line's business: **the unrecognized-key
-//! count**. An unrecognized key is an object the pass could not classify, so it
-//! was neither retained deliberately nor deleted — a non-zero count means the
-//! archive is accumulating objects nothing will ever reclaim, and the bucket
-//! grows without bound while every other signal looks healthy. That is an
-//! alerting condition, and an alerting condition has to be a metric.
+//! Two fields of it are not a log line's business, and they are the two
+//! directions the same survey can be wrong in:
+//!
+//! - **The unrecognized-key count.** An unrecognized key is an object the pass
+//!   could not classify, so it was neither retained deliberately nor deleted —
+//!   a non-zero count means the archive is accumulating objects nothing will
+//!   ever reclaim, and the bucket grows without bound while every other signal
+//!   looks healthy.
+//! - **The missing-object count.** Its mirror image, and the more urgent of
+//!   the two: an object a retained base names and the store does not hold. The
+//!   bucket is not too big, it is incomplete, and the symptom surfaces at a
+//!   restore — which is the one moment nobody wants to discover it.
+//!
+//! Both are alerting conditions, and an alerting condition has to be a metric.
 //!
 //! # It borrows the daemon's listener rather than inventing one
 //!
@@ -67,6 +75,7 @@ pub struct ArchiveMetrics {
     /// withheld rather than reported as zero.
     surveyed: AtomicBool,
     unrecognized: AtomicU64,
+    missing: AtomicU64,
     retained_bases: AtomicU64,
     last_success_unix: AtomicU64,
 }
@@ -88,6 +97,8 @@ impl ArchiveMetrics {
             .fetch_add(plan.delete.len() as u64, Ordering::Relaxed);
         self.unrecognized
             .store(plan.unrecognized.len() as u64, Ordering::Relaxed);
+        self.missing
+            .store(plan.missing.len() as u64, Ordering::Relaxed);
         self.retained_bases
             .store(plan.retained_bases.len() as u64, Ordering::Relaxed);
         self.last_success_unix
@@ -163,6 +174,15 @@ impl ArchiveMetrics {
                  archive holds objects this build does not understand and \
                  reclamation is incomplete until that is explained.",
                 self.unrecognized.load(Ordering::Relaxed).to_string(),
+            );
+            gauge(
+                &mut s,
+                "archive_missing_objects",
+                "Objects a base the last completed pass retained names, and \
+                 the store does not hold. Non-zero means a retained recovery \
+                 point cannot be restored; it is not self-healing and no later \
+                 pass repairs it.",
+                self.missing.load(Ordering::Relaxed).to_string(),
             );
             gauge(
                 &mut s,
@@ -300,6 +320,34 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// An object the active base names and the store does not hold is
+    /// reported by the pass that surveyed, and reaches the gauge.
+    ///
+    /// Deleting the object by hand is what an object-store lifecycle rule
+    /// does, and the reason that is now worth a metric is in
+    /// [`crate::gc::GcPlan::missing`]: a content-addressed slab stops being
+    /// re-uploaded once a generation can name it instead, so age is no longer
+    /// any evidence at all about whether something is still in use.
+    #[tokio::test]
+    async fn an_object_the_store_lost_reaches_the_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        archive(dir.path(), &[]);
+        let file_key = format!("db/{HEX}/term/0000000000/base/{:020}/MANIFEST", 1);
+        std::fs::remove_file(dir.path().join(&file_key)).unwrap();
+
+        let plan = pass(dir.path()).await;
+        assert_eq!(plan.missing, vec![file_key], "{plan:?}");
+
+        let metrics = ArchiveMetrics::new();
+        metrics.pass_completed(&plan);
+        let rendered = metrics.render();
+        assert_eq!(
+            value_of(&rendered, "archive_missing_objects"),
+            Some(1),
+            "{rendered}"
+        );
     }
 
     /// The wiring test: the sidecar's own retention loop, over a real store
@@ -477,12 +525,18 @@ mod tests {
         archive(dir.path(), &[]);
         let plan = pass(dir.path()).await;
         assert!(plan.unrecognized.is_empty(), "{plan:?}");
+        assert!(plan.missing.is_empty(), "{plan:?}");
 
         let metrics = ArchiveMetrics::new();
         metrics.pass_completed(&plan);
         let rendered = metrics.render();
         assert_eq!(
             value_of(&rendered, "archive_unrecognized_keys"),
+            Some(0),
+            "{rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_missing_objects"),
             Some(0),
             "{rendered}"
         );

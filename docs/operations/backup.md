@@ -223,11 +223,19 @@ Every reference is removed before the thing it names, so an interrupted pass
 leaves unreferenced objects that the next pass finishes off, never a manifest
 pointing at files that are gone.
 
-**Object-store lifecycle rules are not a substitute.** A rule that expires
-objects by age does not know that a WAL object from last week is anchored to a
-base from last month, and will delete the base while keeping WAL that can no
-longer be replayed. Use lifecycle rules only to expire incomplete multipart
-uploads.
+**Object-store lifecycle rules are not a substitute, and since base files are
+stored as content-named pieces they are actively dangerous.** A rule that
+expires objects by age does not know that a WAL object from last week is
+anchored to a base from last month, and will delete the base while keeping WAL
+that can no longer be replayed. Worse, a piece of a base file is named by its
+contents, so a later base that still contains that piece **names it instead of
+uploading it again** -- which is the whole point, and it means the object's
+last-modified time stops advancing while the object stays in use. Age is
+therefore no evidence at all about whether a piece is still needed, and a rule
+expiring objects after 90 days will delete live pieces of the base being
+written today. Use lifecycle rules only to expire incomplete multipart uploads.
+`yesnod_archive_missing_objects` is what reports the damage if one has already
+run.
 
 Reclamation runs under the same writer lease as publication, renewed immediately
 before each pass, and is abandoned if the archive state moves while it is
@@ -283,10 +291,21 @@ than a reassuring zero:
   objects under the same prefix and hand-placed files. Identify them before
   assuming reclamation is complete, and do not delete them by hand until you
   know what wrote them.
+- `yesnod_archive_missing_objects`: objects a base the last pass retained
+  names, and the store does not hold. Alert on any non-zero value, more
+  urgently than on the one above: that one says the archive is too big, this
+  one says it is incomplete. A retained recovery point cannot be restored, the
+  condition does not heal, and no later pass repairs it -- so without this
+  gauge it surfaces at a restore, which is the one moment nobody wants to
+  discover it. The check costs the pass nothing, because it is a comparison
+  against the listing the pass already took. The sidecar also logs one example
+  key next to the count. The usual causes are an object-store lifecycle rule
+  (see below), a deletion by hand, and a bucket policy or replication rule
+  that never applied to every prefix.
 - `yesnod_archive_retained_bases`: base images the last pass kept. Read it
   against `--retention-min-bases` and the window.
 - `yesnod_archive_reclamation_last_success_timestamp_seconds`: Unix time of the
-  last completed pass, and therefore how old the two gauges above are.
+  last completed pass, and therefore how old the three gauges above are.
 
 A failed pass deliberately leaves the gauges at their last completed reading. A
 pass that fails learns nothing, and zeroing the unrecognized count because the

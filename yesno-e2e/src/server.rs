@@ -1215,6 +1215,12 @@ impl World {
                     ("deleted", whole_obj(plan.delete.len())),
                     ("retained_bases", whole_obj(plan.retained_bases.len())),
                     ("unrecognized", whole_obj(plan.unrecognized.len())),
+                    // What a retained base names and the store does not hold.
+                    // Costs the pass nothing -- it is a comparison against the
+                    // listing it already took -- and it is the only reading
+                    // here that a scenario can use to assert a base is still
+                    // whole without restoring it.
+                    ("missing", whole_obj(plan.missing.len())),
                 ]))
             }
 

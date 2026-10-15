@@ -88,11 +88,29 @@ assert grew - added <= 2 * SLAB, (first, second)
 flight_stop(flight)
 assert srv_stop(leader)["clean"] is True
 
-# The restore is the load-bearing assertion. A generation whose manifest names
-# objects an *earlier* capture wrote is a new kind of dependency, and the way
-# it fails is a base that verifies, lists and plans fine and then cannot be
+# Now drop the first generation and keep the second. The shared pieces must
+# survive the pruning of the generation that uploaded them, which the restore
+# below is what proves. `missing` is the other half and a different question:
+# the pass checks every object the base it is keeping names against the
+# listing it already took, so a zero says the archive was whole when this
+# sweep surveyed it -- the reading is from before its own deletes, which is
+# why it is a precondition here rather than a verdict on the sweep.
+#
+# A window of zero roots retention at the newest base; `min_bases` of 1 lets
+# the older one go.
+gc = srv_archive_gc("objects", 0, 1)
+assert gc["retained_bases"] == 1, gc
+assert gc["deleted"] > 0, gc
+assert gc["missing"] == 0, gc
+assert gc["unrecognized"] == 0, gc
+print("gc deleted=" + str(gc["deleted"]) + " retained_bases=" + str(gc["retained_bases"]))
+
+# The restore is the load-bearing assertion, and it now runs against an archive
+# the first generation has been reclaimed out of. A generation whose manifest
+# names objects an *earlier* capture wrote is a new kind of dependency, and the
+# way it fails is a base that verifies, lists and plans fine and then cannot be
 # read back. A key the churn never touched comes back only from a piece the
-# first capture uploaded.
+# first capture uploaded and the sweep above decided to keep.
 report = srv_restore("objects", "restore-dedup", version)
 assert report["recovered"] >= version, report
 restored = db_open("restore-dedup", shards=1)
