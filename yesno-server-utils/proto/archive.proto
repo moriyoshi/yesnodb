@@ -23,15 +23,39 @@ message WalCursor {
   bytes history_fingerprint = 3;
 }
 
-// A run of bytes a sparse base object carries. Offsets are into the file, not
-// into the object; the object is the runs concatenated in this order.
+// A run of bytes of a base file that is actually present.
+//
+// Two shapes, distinguished by `content_hash`:
+//
+//   empty -- the run lives inside the file's single `ArchiveFile.object_key`,
+//   which is the runs concatenated in this order. Offsets are into the file,
+//   not into the object. Every archive written before slab objects existed
+//   reads as this and still restores.
+//
+//   set -- the run is its own object, named by the SHA-256 below rather than
+//   by a path the manifest spells out, and `ArchiveFile.object_key` is empty.
+//   Identical bytes therefore land on one object however many files and
+//   generations contain them, which is what makes a base generation
+//   incremental.
 message FileExtent {
   uint64 offset = 1;
   uint64 length = 2;
+  // SHA-256 of exactly this run's bytes. The object's name, not a checksum:
+  // truncating it would weaken the namespace, so it is stored whole and the
+  // key is derived from it rather than stored beside it.
+  bytes content_hash = 3;
+  // A transport check over the same bytes, verified as the object arrives.
+  // Cheaper than rehashing, and the whole file's CRC still has to agree
+  // afterwards, so this exists to localize a bad fetch rather than to catch
+  // one the file-level check would miss.
+  uint32 crc32c = 4;
 }
 
 message ArchiveFile {
   string name = 1;
+  // The one object holding this file, and empty when every extent names its
+  // own. A reader that does not understand self-addressing extents fails to
+  // fetch rather than reconstructing a file from the wrong bytes.
   string object_key = 2;
   // The file's length and CRC32C, holes included. These keep their meaning
   // whether or not the object carries the holes, which is what lets a restore
@@ -39,15 +63,18 @@ message ArchiveFile {
   // what keeps `BaseManifest.history_anchor` a commitment to content.
   uint64 size = 3;
   uint32 crc32c = 4;
-  // False when the object is the file, byte for byte, and `extents` is empty.
+  // False when one object is the file, byte for byte, and `extents` is empty.
   // Every archive written before sparse objects existed reads as this, and a
-  // file with no holes is still written as this, so a dense base produces the
-  // same manifest it always did.
+  // file with no holes stored whole is still written as this.
   //
-  // True when the object holds only `extents`, concatenated in offset order,
-  // and every byte of the file outside them is zero. An empty `extents` under
-  // a true flag is a file that is entirely zero, which is why the flag exists
-  // rather than being inferred from the list being non-empty.
+  // True when the file is reconstructed from `extents` and every byte outside
+  // them is zero. An empty `extents` under a true flag is a file that is
+  // entirely zero, which is why the flag exists rather than being inferred
+  // from the list being non-empty.
+  //
+  // Where those extents' bytes come from is `FileExtent.content_hash`'s
+  // question, not this one: a sparse file in one object and a file cut into
+  // content-addressed slabs are both `sparse = true`.
   //
   // Deliberately NOT part of `history_anchor`, for the reason
   // `checkpoint_time` gives below: adding a field to that hash would change

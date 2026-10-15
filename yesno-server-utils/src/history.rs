@@ -16,6 +16,17 @@ fn finish(hasher: Sha256) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// SHA-256 over the immutable base identity, file catalogue and cursor
+/// positions.
+///
+/// **`object_key` is hashed and is empty for a slab-addressed file**, so the
+/// anchor commits to *what* each file is -- name, length, CRC32C -- and no
+/// longer to where its bytes were put. That is the right division: the
+/// locations of a content-addressed file's objects are a function of its
+/// content, so hashing them would commit to the same information twice, and
+/// per-extent addresses deliberately stay outside this hash for the reason
+/// `checkpoint_time` gives. Adding a field here changes the fingerprint of
+/// every history already written.
 pub(crate) fn base_anchor(manifest: &pb::BaseManifest) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN);

@@ -31,7 +31,6 @@ use crate::ctx;
 
 /// Archive metadata schema emitted by this version of the sidecar.
 pub const SCHEMA_VERSION: u32 = 2;
-const MULTIPART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Bytes of a base file weighed for emptiness at a time, on both sides.
 ///
@@ -63,6 +62,33 @@ const MULTIPART_BYTES: usize = 8 * 1024 * 1024;
 /// needs a `libc` call and the unsafe rules that come with it to save a scan
 /// whose cost is memory bandwidth on a one-off operation.
 pub(crate) const SPARSE_WINDOW: usize = 1 << 20;
+
+/// Bytes of a base file per content-addressed object.
+///
+/// **The store's own slab**, taken from `yesno-core` rather than restated, so
+/// the cut cannot drift from the unit the allocator writes. That alignment is
+/// the whole reason dedup works: a checkpoint that rewrites one key dirties
+/// the slabs it touched and leaves the rest byte-identical, so generation
+/// `N+1` renames almost every object generation `N` already stored.
+/// `Slab::new` stamping the generation at creation and `alloc.rs` keeping one
+/// checkpoint's allocations in a contiguous run are what make that true; cut
+/// at any other boundary and an unrelated write shifts every later object.
+///
+/// **It coarsens hole detection from [`SPARSE_WINDOW`] to this**, because an
+/// object is addressed by its whole contents and so cannot be half present. A
+/// one-megabyte hole inside a two-megabyte slab is now stored. That is the
+/// price of dedup and it is small against it: measured at 500 GiB over 16
+/// shards, slab granularity uploads 25 GiB per generation at 5% churn where
+/// one object per shard file uploads 500 GiB.
+const SLAB_OBJECT_BYTES: usize = yesno_core::store::SLAB_SIZE as usize;
+
+/// Slab objects uploaded at once.
+///
+/// A 500 GiB base is 256 000 objects, so this is the difference between a
+/// capture that finishes and one that does not. Bounded rather than unbounded
+/// because each task holds its slab in memory: this many times
+/// [`SLAB_OBJECT_BYTES`] is the upload's working set.
+const SLAB_UPLOAD_CONCURRENCY: usize = 16;
 pub(crate) const STATE_OBJECT: &str = "state.pb";
 pub(crate) const WRITER_OBJECT: &str = "writer.pb";
 
@@ -406,19 +432,19 @@ impl ArchiveStore {
             cursor.history_fingerprint.clear();
         }
 
+        let uuid = uuid_hex(&manifest.database_uuid)?;
         let base = format!(
-            "db/{}/term/{:010}/base/{:020}",
-            uuid_hex(&manifest.database_uuid)?,
-            manifest.term,
-            manifest.archive_generation
+            "db/{uuid}/term/{:010}/base/{:020}",
+            manifest.term, manifest.archive_generation
         );
-        let writer = uuid_hex(&owner)?;
         for (name, path) in database_files(source_dir)? {
-            let key = format!("{base}/writers/{writer}/files/{name}");
-            let file = self.put_file(&path, &key).await?;
+            let file = self.put_slab_file(&path, &uuid).await?;
             manifest.files.push(pb::ArchiveFile {
                 name,
-                object_key: key,
+                // Empty: every extent names its own object. The per-writer
+                // path this used to take is what made two generations of the
+                // same bytes two objects.
+                object_key: String::new(),
                 size: file.size,
                 crc32c: file.crc32c,
                 sparse: file.sparse,
@@ -446,116 +472,89 @@ impl ArchiveStore {
         Ok((manifest_key, manifest))
     }
 
-    /// Upload one base file, leaving its holes behind.
+    /// Upload one base file as slab-sized, content-addressed objects.
     ///
-    /// Reads the file a [`SPARSE_WINDOW`] at a time and uploads only the
-    /// windows that carry something, recording the runs they form as extents
-    /// on the manifest. The returned `size` and `crc32c` are still the
-    /// **file's**, holes included, so the manifest commits to the content and
-    /// a restore verifies what it reconstructs rather than what it received.
+    /// Three properties the caller depends on, in the order they are
+    /// established:
     ///
-    /// Holes are still *read* here: a page of a sparse file reads as zeros
-    /// without touching a disk, so the cost is memory bandwidth on the leader
-    /// and the saving is the object store's.
-    ///
-    /// A file with no holes at all is reported as **not sparse** with no
-    /// extents, which is byte for byte the manifest this function has always
-    /// produced.
-    ///
-    /// Parts are accumulated to [`MULTIPART_BYTES`] before being sent, because
-    /// skipping windows would otherwise produce parts below the five-mebibyte
-    /// floor S3 imposes on all but the last one. They are still *exactly* that
-    /// size, as they were before windows could be skipped, because
-    /// `MULTIPART_BYTES` is a whole number of windows and only the window at
-    /// end-of-file can be short -- keep that divisibility if either constant
-    /// moves. A file that fits in a single part is sent with `put` rather than
-    /// a multipart upload, which is also what makes an entirely empty file
-    /// expressible, since a multipart upload with no parts is not.
-    async fn put_file(&self, source: &Path, key: &str) -> Result<UploadedFile, ArchiveError> {
+    /// - **An all-zero slab produces no object and no extent.** The file's
+    ///   holes survive the round trip, exactly as they did when a sparse file
+    ///   was one object, and a restore writes only what it receives.
+    /// - **`size` and `crc32c` are the whole file's, holes included**, so the
+    ///   history anchor keeps committing to content rather than to a layout,
+    ///   and a restore verifies the file it reconstructs rather than the bytes
+    ///   it was sent.
+    /// - **An object already in the store is not sent again.** The name is the
+    ///   content, so a slab unchanged since the last generation already exists
+    ///   under exactly this key. That is where a base generation stops costing
+    ///   a whole database.
+    async fn put_slab_file(&self, source: &Path, uuid: &str) -> Result<UploadedFile, ArchiveError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         let size = tokio::fs::metadata(source)
             .await
             .map_err(|e| ctx("stat the upload source", source, e))?
             .len();
-        if size == 0 {
-            self.inner
-                .put(&self.path(key), PutPayload::from(Vec::<u8>::new()))
-                .await?;
-            return Ok(UploadedFile {
-                size,
-                crc32c: 0,
-                sparse: false,
-                extents: Vec::new(),
-            });
-        }
-
         let mut source_file = tokio::fs::File::open(source)
             .await
             .map_err(|e| ctx("open the upload source", source, e))?;
-        let mut upload: Option<Box<dyn object_store::MultipartUpload>> = None;
+
         let mut checksum = 0u32;
         let mut read_total = 0u64;
         let mut extents: Vec<pb::FileExtent> = Vec::new();
-        let mut part: Vec<u8> = Vec::with_capacity(MULTIPART_BYTES);
-        let mut window = vec![0u8; SPARSE_WINDOW];
+        let mut sent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut inflight = FuturesUnordered::new();
+        let mut slab = vec![0u8; SLAB_OBJECT_BYTES];
+
         loop {
-            // Whole windows, so an extent boundary is a window boundary. A
-            // short read in the middle of a file is not end-of-file, and one
-            // taken for a window would shift every later extent.
-            let count = match fill(&mut source_file, &mut window).await {
-                Ok(count) => count,
-                Err(error) => return abort_with(upload, error.into()).await,
-            };
+            // Whole slabs, so an object boundary is a slab boundary. A short
+            // read mid-file is not end-of-file, and one taken for a slab would
+            // shift every later object and defeat the dedup this is for.
+            let count = fill(&mut source_file, &mut slab).await?;
             if count == 0 {
                 break;
             }
-            let filled = &window[..count];
+            let filled = &slab[..count];
             checksum = crc32c::crc32c_append(checksum, filled);
             let at = read_total;
             read_total = read_total.saturating_add(count as u64);
             if filled.iter().all(|byte| *byte == 0) {
                 continue;
             }
-            match extents.last_mut() {
-                Some(last) if last.offset.saturating_add(last.length) == at => {
-                    last.length = last.length.saturating_add(count as u64);
-                }
-                _ => extents.push(pb::FileExtent {
-                    offset: at,
-                    length: count as u64,
-                }),
+
+            let hash = sha256(filled);
+            extents.push(pb::FileExtent {
+                offset: at,
+                length: count as u64,
+                content_hash: hash.to_vec(),
+                crc32c: crc32c::crc32c(filled),
+            });
+            // A file may hold the same slab twice; one upload serves both.
+            if !sent.insert(hash) {
+                continue;
             }
-            part.extend_from_slice(filled);
-            if part.len() >= MULTIPART_BYTES {
-                if upload.is_none() {
-                    upload = Some(self.inner.put_multipart(&self.path(key)).await?);
+
+            let body = Bytes::copy_from_slice(filled);
+            let path = self.path(&slab_key(uuid, &hash));
+            let store = Arc::clone(&self.inner);
+            inflight.push(async move {
+                // The name is the content, so an object that is already there
+                // is already right. `head` costs one round trip against the
+                // slab's worth of body it saves.
+                if store.head(&path).await.is_ok() {
+                    return Ok::<(), ArchiveError>(());
                 }
-                let body = std::mem::replace(&mut part, Vec::with_capacity(MULTIPART_BYTES));
-                let writer = upload.as_mut().expect("just opened");
-                if let Err(error) = writer.put_part(Bytes::from(body).into()).await {
-                    return abort_with(upload, error.into()).await;
-                }
+                store.put(&path, PutPayload::from(body)).await?;
+                Ok(())
+            });
+            while inflight.len() >= SLAB_UPLOAD_CONCURRENCY {
+                inflight.next().await.expect("non-empty")?;
             }
+        }
+        while let Some(done) = inflight.next().await {
+            done?;
         }
 
-        let uploaded = extents.iter().map(|extent| extent.length).sum::<u64>();
-        match upload.as_mut() {
-            None => {
-                self.inner
-                    .put(&self.path(key), PutPayload::from(part))
-                    .await?;
-            }
-            Some(writer) => {
-                if !part.is_empty() {
-                    if let Err(error) = writer.put_part(Bytes::from(part).into()).await {
-                        return abort_with(upload, error.into()).await;
-                    }
-                }
-                let writer = upload.as_mut().expect("matched Some");
-                if let Err(error) = writer.complete().await {
-                    return abort_with(upload, error.into()).await;
-                }
-            }
-        }
         if read_total != size {
             return Err(format!(
                 "'{}' changed size while being uploaded: expected {size}, read {read_total}",
@@ -563,14 +562,37 @@ impl ArchiveStore {
             )
             .into());
         }
-        let sparse = uploaded != size;
         Ok(UploadedFile {
             size,
             crc32c: checksum,
-            sparse,
-            extents: if sparse { extents } else { Vec::new() },
+            // Always, even for a file with no holes: the file is reconstructed
+            // from its extents either way, and `sparse` is what tells a reader
+            // not to look for one whole object.
+            sparse: true,
+            extents,
         })
     }
+}
+
+/// `db/<uuid>/slabs/<address>`, the object a content address names.
+///
+/// **Outside the term tree on purpose.** Every other key in this archive is
+/// scoped by leadership term so a promoted timeline cannot overwrite an older
+/// one's identically numbered object. A content address needs no such fence --
+/// two writers producing this key produced the same bytes -- and scoping it by
+/// term would defeat the sharing across generations that it exists for. It
+/// stays inside the database prefix: dedup across tenants would mean one
+/// database's bytes served out of another's object, which is a decision about
+/// identity rather than about storage. See `tenant-and-identity-namespace-model`.
+pub(crate) fn slab_key(uuid: &str, hash: &[u8]) -> String {
+    format!("db/{uuid}/slabs/{}", hex(hash))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 /// Read until `buf` is full or the file ends, reporting how much was filled.
@@ -583,17 +605,6 @@ async fn fill(file: &mut tokio::fs::File, buf: &mut [u8]) -> std::io::Result<usi
         }
     }
     Ok(filled)
-}
-
-/// Abandon a multipart upload that has already sent parts, then report why.
-async fn abort_with<T>(
-    upload: Option<Box<dyn object_store::MultipartUpload>>,
-    error: ArchiveError,
-) -> Result<T, ArchiveError> {
-    if let Some(mut upload) = upload {
-        let _ = upload.abort().await;
-    }
-    Err(error)
 }
 
 struct UploadedFile {
@@ -852,10 +863,14 @@ pub fn validate_base_manifest(manifest: &pb::BaseManifest) -> Result<(), Archive
 
 /// Check that one file's extent list describes a reconstructible file.
 ///
-/// The encoding is canonical: runs ascend, carry bytes, stay inside the file
-/// and are separated by a real hole. Adjacent runs are a writer that failed to
-/// merge them, and are refused rather than accepted, so one file has exactly
-/// one valid extent list and a restore's arithmetic has one shape to handle.
+/// The encoding is canonical, so one file has exactly one valid extent list
+/// and a restore's arithmetic has one shape to handle. Runs ascend, carry
+/// bytes and stay inside the file in both shapes; what differs is where their
+/// bytes live and therefore what adjacency means.
+///
+/// **A file is one shape or the other, never both.** A mixed list would make
+/// a reader decide per extent whether to trust the file's object key or the
+/// extent's address, and the two cannot be checked against each other.
 fn validate_extents(file: &pb::ArchiveFile) -> Result<(), ArchiveError> {
     let name = &file.name;
     if !file.sparse {
@@ -864,12 +879,63 @@ fn validate_extents(file: &pb::ArchiveFile) -> Result<(), ArchiveError> {
         }
         return Err(format!("base file '{name}' carries extents without the sparse flag").into());
     }
+    if file.extents.is_empty() {
+        // Entirely zero. There is nothing to address and nothing to fetch, so
+        // neither shape applies and the object key is merely history: a writer
+        // that cut the file into slabs produced none, an older one produced an
+        // empty object.
+        return Ok(());
+    }
+    let addressed = !file.extents[0].content_hash.is_empty();
+    if addressed == !file.object_key.is_empty() {
+        return Err(format!(
+            "base file '{name}' must name one object or give every extent an address, not {}",
+            if addressed { "both" } else { "neither" }
+        )
+        .into());
+    }
     let mut end = 0u64;
     for (index, extent) in file.extents.iter().enumerate() {
         if extent.length == 0 {
             return Err(format!("base file '{name}' extent {index} is empty").into());
         }
-        if index > 0 && extent.offset <= end {
+        if extent.content_hash.is_empty() != !addressed {
+            return Err(
+                format!("base file '{name}' extent {index} mixes the two extent shapes").into(),
+            );
+        }
+        if addressed {
+            if extent.content_hash.len() != 32 {
+                return Err(format!(
+                    "base file '{name}' extent {index} has a {}-byte address, expected 32",
+                    extent.content_hash.len()
+                )
+                .into());
+            }
+            // Slab-aligned, so an object is the same bytes wherever it
+            // appears. An unaligned cut would still restore, and would
+            // silently never dedup against anything.
+            if extent.offset % SLAB_OBJECT_BYTES as u64 != 0 {
+                return Err(
+                    format!("base file '{name}' extent {index} does not start a slab").into(),
+                );
+            }
+            if extent.length > SLAB_OBJECT_BYTES as u64 {
+                return Err(
+                    format!("base file '{name}' extent {index} spans several slabs").into(),
+                );
+            }
+            // Adjacent runs are *expected* here -- two consecutive slabs that
+            // both carry data are two objects at touching offsets -- so only
+            // overlap is refused.
+            if index > 0 && extent.offset < end {
+                return Err(
+                    format!("base file '{name}' extent {index} overlaps its predecessor").into(),
+                );
+            }
+        } else if index > 0 && extent.offset <= end {
+            // One object, so a boundary that is not a hole means the writer
+            // failed to merge two runs and the list is not canonical.
             return Err(format!("base file '{name}' extent {index} does not follow a hole").into());
         }
         end = match extent.offset.checked_add(extent.length) {
@@ -926,9 +992,19 @@ fn validate_uuid(uuid: &[u8]) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-fn uuid_hex(uuid: &[u8]) -> Result<String, ArchiveError> {
+pub(crate) fn uuid_hex(uuid: &[u8]) -> Result<String, ArchiveError> {
     validate_uuid(uuid)?;
-    Ok(uuid.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(uuid))
+}
+
+/// Lowercase hex, which is how every key in this archive spells bytes.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn database_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, ArchiveError> {
@@ -1197,18 +1273,19 @@ mod tests {
         );
     }
 
-    /// Build a file of `windows` whole [`SPARSE_WINDOW`]s, filling only the
-    /// indices named and leaving the rest as holes.
-    fn sparse_file(dir: &Path, name: &str, windows: usize, filled: &[usize]) -> PathBuf {
+    /// Build a file of `slabs` whole [`SLAB_OBJECT_BYTES`], filling only the
+    /// indices named and leaving the rest as holes. A filled slab's contents
+    /// are a function of `content`, so two indices sharing one are byte-equal.
+    fn slab_file(dir: &Path, name: &str, slabs: usize, filled: &[(usize, u8)]) -> PathBuf {
         use std::io::{Seek, SeekFrom, Write};
         let path = dir.join(name);
         let mut file = std::fs::File::create(&path).unwrap();
-        file.set_len((windows * SPARSE_WINDOW) as u64).unwrap();
-        for index in filled {
-            file.seek(SeekFrom::Start((index * SPARSE_WINDOW) as u64))
+        file.set_len((slabs * SLAB_OBJECT_BYTES) as u64).unwrap();
+        for (index, content) in filled {
+            file.seek(SeekFrom::Start((index * SLAB_OBJECT_BYTES) as u64))
                 .unwrap();
-            let body: Vec<u8> = (0..SPARSE_WINDOW)
-                .map(|i| (i.wrapping_add(*index) % 251) as u8 | 1)
+            let body: Vec<u8> = (0..SLAB_OBJECT_BYTES)
+                .map(|i| (i.wrapping_add(*content as usize) % 251) as u8 | 1)
                 .collect();
             file.write_all(&body).unwrap();
         }
@@ -1216,20 +1293,26 @@ mod tests {
         path
     }
 
-    /// Only the windows that carry something are uploaded, and the runs they
-    /// form are what the manifest records.
+    /// Only the slabs that carry something become objects, and the manifest
+    /// records where each one belongs.
     ///
-    /// The two filled windows are adjacent on purpose: they must merge into
-    /// one extent, because `validate_extents` refuses a list whose runs touch.
+    /// Slabs 1 and 2 are adjacent on purpose. Under one object per file that
+    /// was a non-canonical list; under one object per slab it is the ordinary
+    /// case, and `validate_extents` has to accept it.
     #[tokio::test]
-    async fn a_sparse_file_uploads_only_its_runs() {
+    async fn a_sparse_file_uploads_only_its_slabs() {
         let dir = tempfile::tempdir().unwrap();
-        let path = sparse_file(dir.path(), "shard-0000.yno", 8, &[1, 2, 5]);
+        let path = slab_file(dir.path(), "shard-0000.yno", 8, &[(1, 1), (2, 2), (5, 3)]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
-        let uploaded = store.put_file(&path, "base/shard").await.unwrap();
+        let uuid = "ab".repeat(16);
+        let uploaded = store.put_slab_file(&path, &uuid).await.unwrap();
 
         assert!(uploaded.sparse);
-        assert_eq!(uploaded.size, 8 * SPARSE_WINDOW as u64, "the file's length");
+        assert_eq!(
+            uploaded.size,
+            8 * SLAB_OBJECT_BYTES as u64,
+            "the file's length"
+        );
         assert_eq!(
             uploaded.crc32c,
             crc32c::crc32c(&std::fs::read(&path).unwrap()),
@@ -1239,98 +1322,90 @@ mod tests {
             uploaded
                 .extents
                 .iter()
-                .map(|extent| (extent.offset, extent.length))
+                .map(|e| e.offset / SLAB_OBJECT_BYTES as u64)
                 .collect::<Vec<_>>(),
-            vec![
-                (SPARSE_WINDOW as u64, 2 * SPARSE_WINDOW as u64),
-                (5 * SPARSE_WINDOW as u64, SPARSE_WINDOW as u64),
-            ]
+            vec![1, 2, 5],
+            "one extent per filled slab, holes absent"
         );
-        let object = store.get_bytes("base/shard").await.unwrap();
-        assert_eq!(
-            object.len(),
-            3 * SPARSE_WINDOW,
-            "five of eight windows never left the host"
-        );
+        for extent in &uploaded.extents {
+            assert_eq!(extent.length, SLAB_OBJECT_BYTES as u64);
+            assert_eq!(extent.content_hash.len(), 32);
+            let key = slab_key(&uuid, &extent.content_hash);
+            let object = store.get_bytes(&key).await.unwrap();
+            assert_eq!(object.len(), SLAB_OBJECT_BYTES, "the object is the slab");
+            assert_eq!(crc32c::crc32c(&object), extent.crc32c);
+        }
         validate_extents(&pb::ArchiveFile {
             name: "shard-0000.yno".into(),
-            object_key: "base/shard".into(),
+            object_key: String::new(),
             size: uploaded.size,
             crc32c: uploaded.crc32c,
-            sparse: uploaded.sparse,
+            sparse: true,
             extents: uploaded.extents,
         })
         .unwrap();
     }
 
-    /// A file with no holes is uploaded exactly as it always was, so a dense
-    /// base produces the manifest it produced before extents existed.
-    #[tokio::test]
-    async fn a_dense_file_is_reported_as_the_object_it_has_always_been() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = sparse_file(dir.path(), "MANIFEST", 2, &[0, 1]);
-        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
-        let uploaded = store.put_file(&path, "base/manifest").await.unwrap();
-        assert!(!uploaded.sparse);
-        assert!(uploaded.extents.is_empty());
-        assert_eq!(
-            store.get_bytes("base/manifest").await.unwrap().len() as u64,
-            uploaded.size
-        );
-    }
-
     /// A file that is entirely holes transfers nothing at all, which is the
     /// case an empty extent list has to be able to mean.
     #[tokio::test]
-    async fn an_entirely_empty_file_uploads_no_bytes_and_still_has_a_length() {
+    async fn an_entirely_empty_file_uploads_no_objects_and_still_has_a_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = sparse_file(dir.path(), "blank.yno", 4, &[]);
+        let path = slab_file(dir.path(), "blank.yno", 4, &[]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
-        let uploaded = store.put_file(&path, "base/blank").await.unwrap();
+        let uploaded = store.put_slab_file(&path, &"cd".repeat(16)).await.unwrap();
         assert!(uploaded.sparse);
         assert!(uploaded.extents.is_empty());
-        assert_eq!(uploaded.size, 4 * SPARSE_WINDOW as u64);
+        assert_eq!(uploaded.size, 4 * SLAB_OBJECT_BYTES as u64);
         assert_eq!(
             uploaded.crc32c,
             crc32c::crc32c(&vec![0u8; uploaded.size as usize])
         );
-        assert_eq!(store.get_bytes("base/blank").await.unwrap().len(), 0);
+        assert!(store.list_relative("db/").await.unwrap().is_empty());
     }
 
-    /// Runs spanning more than one multipart part still arrive whole.
+    /// Equal bytes are one object, which is the whole of why slabs are
+    /// addressed by content.
     ///
-    /// Skipping windows makes the parts no longer a fixed slice of the file,
-    /// and a part below five mebibytes is refused by S3 unless it is the last
-    /// one -- so the accumulation is the part of this that can be wrong.
+    /// Within one file, and then across a second capture of an unchanged
+    /// file: the second finds every object already present and sends none of
+    /// them, which is what makes a base generation incremental.
     #[tokio::test]
-    async fn runs_are_accumulated_into_whole_multipart_parts() {
+    async fn identical_slabs_are_stored_and_sent_once() {
         let dir = tempfile::tempdir().unwrap();
-        let filled: Vec<usize> = (0..20).filter(|i| i % 2 == 1).collect();
-        let path = sparse_file(dir.path(), "wide.yno", 40, &filled);
+        // Slabs 0 and 3 share content; 1 differs.
+        let path = slab_file(dir.path(), "shard-0000.yno", 4, &[(0, 7), (1, 9), (3, 7)]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
-        let uploaded = store.put_file(&path, "base/wide").await.unwrap();
+        let uuid = "ef".repeat(16);
+        let first = store.put_slab_file(&path, &uuid).await.unwrap();
 
+        assert_eq!(first.extents.len(), 3, "three slabs carry bytes");
         assert_eq!(
-            uploaded.extents.len(),
-            filled.len(),
-            "no run touches another"
+            first.extents[0].content_hash, first.extents[2].content_hash,
+            "equal bytes, equal address"
         );
-        let object = store.get_bytes("base/wide").await.unwrap();
-        assert_eq!(object.len(), filled.len() * SPARSE_WINDOW);
-        let file = std::fs::read(&path).unwrap();
-        let expected: Vec<u8> = filled
-            .iter()
-            .flat_map(|i| file[i * SPARSE_WINDOW..(i + 1) * SPARSE_WINDOW].to_vec())
-            .collect();
-        assert_eq!(object.as_ref(), expected.as_slice(), "the runs, in order");
-        assert_eq!(uploaded.crc32c, crc32c::crc32c(&file));
+        let objects = store.list_relative("db/").await.unwrap();
+        assert_eq!(objects.len(), 2, "two distinct slabs, two objects");
+
+        let again = store.put_slab_file(&path, &uuid).await.unwrap();
+        assert_eq!(again.extents, first.extents, "the same manifest");
+        assert_eq!(
+            store.list_relative("db/").await.unwrap(),
+            objects,
+            "an unchanged file adds nothing"
+        );
     }
 
-    /// The extent encoding is canonical: each refusal is one way a writer
-    /// could produce a list a restore would have to guess at.
+    /// The extent encoding is canonical in both shapes, and each refusal is
+    /// one way a writer could produce a list a restore would have to guess at.
+    ///
+    /// The shapes disagree about adjacency and the disagreement is the point:
+    /// under one object per file, touching runs mean the writer failed to
+    /// merge them; under one object per slab, touching runs are two slabs that
+    /// both carry data.
     #[test]
     fn a_non_canonical_extent_list_is_refused() {
-        let file = |sparse: bool, extents: Vec<(u64, u64)>| pb::ArchiveFile {
+        let whole = |sparse: bool, extents: Vec<(u64, u64)>| pb::ArchiveFile {
             name: "shard-0000.yno".into(),
             object_key: "k".into(),
             size: 4096,
@@ -1338,22 +1413,73 @@ mod tests {
             sparse,
             extents: extents
                 .into_iter()
-                .map(|(offset, length)| pb::FileExtent { offset, length })
+                .map(|(offset, length)| pb::FileExtent {
+                    offset,
+                    length,
+                    content_hash: Vec::new(),
+                    crc32c: 0,
+                })
                 .collect(),
         };
-        validate_extents(&file(false, vec![])).unwrap();
-        validate_extents(&file(true, vec![])).unwrap();
-        validate_extents(&file(true, vec![(0, 1024), (2048, 1024)])).unwrap();
+        let slab = SLAB_OBJECT_BYTES as u64;
+        let addressed = |extents: Vec<(u64, u64, usize)>| pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: String::new(),
+            size: slab * 8,
+            crc32c: 0,
+            sparse: true,
+            extents: extents
+                .into_iter()
+                .map(|(offset, length, hash_len)| pb::FileExtent {
+                    offset,
+                    length,
+                    content_hash: vec![7u8; hash_len],
+                    crc32c: 0,
+                })
+                .collect(),
+        };
+
+        validate_extents(&whole(false, vec![])).unwrap();
+        validate_extents(&whole(true, vec![])).unwrap();
+        validate_extents(&whole(true, vec![(0, 1024), (2048, 1024)])).unwrap();
+        validate_extents(&addressed(vec![(0, slab, 32), (slab, slab, 32)]))
+            .expect("touching slabs are the ordinary case");
+        validate_extents(&addressed(vec![(slab * 3, 16, 32)])).expect("a short last slab is legal");
+
         for (why, bad) in [
-            ("extents without the flag", file(false, vec![(0, 16)])),
-            ("an empty run", file(true, vec![(0, 0)])),
-            ("runs that touch", file(true, vec![(0, 1024), (1024, 16)])),
-            ("runs that overlap", file(true, vec![(0, 1024), (512, 16)])),
-            ("runs out of order", file(true, vec![(2048, 16), (16, 16)])),
-            ("a run past the end", file(true, vec![(4000, 1024)])),
-            ("a run that overflows", file(true, vec![(u64::MAX, 2)])),
+            ("extents without the flag", whole(false, vec![(0, 16)])),
+            ("an empty run", whole(true, vec![(0, 0)])),
+            (
+                "runs that touch in one object",
+                whole(true, vec![(0, 1024), (1024, 16)]),
+            ),
+            ("runs that overlap", whole(true, vec![(0, 1024), (512, 16)])),
+            ("runs out of order", whole(true, vec![(2048, 16), (16, 16)])),
+            ("a run past the end", whole(true, vec![(4000, 1024)])),
+            ("a run that overflows", whole(true, vec![(u64::MAX, 2)])),
+            ("a short address", addressed(vec![(0, slab, 16)])),
+            ("an unaligned slab", addressed(vec![(64, slab, 32)])),
+            ("a run spanning slabs", addressed(vec![(0, slab * 2, 32)])),
+            (
+                "addressed slabs that overlap",
+                addressed(vec![(0, slab, 32), (0, slab, 32)]),
+            ),
         ] {
             assert!(validate_extents(&bad).is_err(), "{why}");
         }
+
+        // Naming one object *and* addressing every extent is the ambiguity
+        // the shapes exist to avoid, as is doing neither.
+        let mut both = addressed(vec![(0, slab, 32)]);
+        both.object_key = "k".into();
+        assert!(validate_extents(&both).is_err(), "both shapes at once");
+        let mut neither = addressed(vec![(0, slab, 32)]);
+        neither.extents[0].content_hash.clear();
+        neither.object_key.clear();
+        assert!(validate_extents(&neither).is_err(), "neither shape");
+        // A list that starts addressed and stops is refused per extent.
+        let mut mixed = addressed(vec![(0, slab, 32), (slab, slab, 0)]);
+        mixed.object_key.clear();
+        assert!(validate_extents(&mixed).is_err(), "a mixed list");
     }
 }

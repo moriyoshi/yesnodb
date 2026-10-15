@@ -38,11 +38,18 @@ filesystem that does not support sparse files will allocate the whole apparent
 length instead, which is correct but needs the space.
 
 Archive objects carry the same holes, and carry them the same way: an upload
-weighs a base file a megabyte at a time and stores only the parts that are not
-empty, so a restore neither transfers nor writes the rest. Budget object-store
-capacity and transfer from `du` as well, not from the apparent length -- and
-keep the retention window in mind, because each retained base generation pays
-whatever its own data occupies again.
+cuts a base file into fixed-size pieces, stores only the pieces that are not
+empty, and names each by a hash of its contents, so a restore neither transfers
+nor writes the rest. Budget object-store capacity and transfer from `du` as
+well, not from the apparent length.
+
+Because a piece is named by its contents, generations share every piece that
+did not change, so a retention window costs roughly one full copy plus what
+changed between generations rather than one full copy per generation. A restore
+fetches those pieces in parallel and verifies each as it arrives, then verifies
+the reassembled file against the whole file's checksum -- holes included -- so a
+piece that arrives wrong is caught before the file is used, and one that never
+arrives leaves the restore failed rather than short.
 
 A restore still verifies the whole file, holes included, against the checksum
 its manifest commits to, so an object missing a region that was not in fact

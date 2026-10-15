@@ -552,6 +552,69 @@ where
 /// Where a base object's bytes belong, and how many of them there are.
 ///
 /// A file that is not sparse is the single extent covering it, which is how
+/// Rebuild one base file from its content-addressed slab objects.
+///
+/// **Fetched concurrently but consumed in order**, which is what `buffered`
+/// buys over `buffer_unordered`: the file's CRC covers the holes as well as
+/// the runs, so it has to be accumulated from offset zero upward. Out-of-order
+/// completion would mean either holding the whole file or composing CRCs,
+/// and neither is worth the concurrency it would add.
+///
+/// Each object is checked three times over, cheapest first: its length against
+/// the extent, its CRC32C against the extent, and finally the whole file's
+/// CRC32C against the manifest -- the last of which is the one that proves the
+/// *file*, since the first two only prove each object is the object its own
+/// extent described.
+async fn download_slab_file(
+    store: &ArchiveStore,
+    file: &pb::ArchiveFile,
+    target: &Path,
+    uuid: &str,
+) -> Result<(), ArchiveError> {
+    let mut output = tokio::fs::File::create(target.join(&file.name)).await?;
+    output.set_len(file.size).await?;
+
+    let mut fetches = futures::stream::iter(file.extents.iter().map(|extent| async move {
+        let key = crate::archive::slab_key(uuid, &extent.content_hash);
+        let bytes = store.inner.get(&store.path(&key)).await?.bytes().await?;
+        Ok::<_, ArchiveError>((extent, key, bytes))
+    }))
+    .buffered(ARCHIVE_FETCH_CONCURRENCY);
+
+    let mut checksum = 0u32;
+    let mut hashed = 0u64;
+    while let Some(fetched) = futures::StreamExt::next(&mut fetches).await {
+        let (extent, key, bytes) = fetched?;
+        if bytes.len() as u64 != extent.length {
+            return Err(format!(
+                "slab object '{key}' is {} bytes, manifest says {}",
+                bytes.len(),
+                extent.length
+            )
+            .into());
+        }
+        let crc = crc32c::crc32c(&bytes);
+        if crc != extent.crc32c {
+            return Err(format!("slab object '{key}' fails its stored checksum").into());
+        }
+        checksum = crc_hole(checksum, extent.offset.saturating_sub(hashed));
+        checksum = crc32c::crc32c_append(checksum, &bytes);
+        hashed = extent.offset.saturating_add(extent.length);
+        write_window(&mut output, extent.offset, &bytes).await?;
+    }
+    checksum = crc_hole(checksum, file.size.saturating_sub(hashed));
+    output.sync_all().await?;
+    if checksum != file.crc32c {
+        return Err(format!(
+            "base file '{}' fails its CRC after reassembly from {} slab objects",
+            file.name,
+            file.extents.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// every archive written before sparse objects existed reads.
 fn object_layout(file: &pb::ArchiveFile) -> (Vec<pb::FileExtent>, u64) {
     if !file.sparse {
@@ -559,6 +622,8 @@ fn object_layout(file: &pb::ArchiveFile) -> (Vec<pb::FileExtent>, u64) {
             vec![pb::FileExtent {
                 offset: 0,
                 length: file.size,
+                content_hash: Vec::new(),
+                crc32c: 0,
             }],
             file.size,
         );
@@ -571,6 +636,7 @@ async fn download_base_file(
     store: &ArchiveStore,
     file: &pb::ArchiveFile,
     target: &Path,
+    uuid: &str,
 ) -> Result<(), ArchiveError> {
     let relative = Path::new(&file.name);
     if relative.components().count() != 1
@@ -579,6 +645,12 @@ async fn download_base_file(
             .is_none_or(|name| name != file.name.as_str())
     {
         return Err(format!("base manifest file name '{}' is not flat", file.name).into());
+    }
+    // Naming no object means the bytes are elsewhere: under `slabs/`, or --
+    // for a file that is entirely zero -- nowhere at all. Both are the same
+    // reassembly with a different number of fetches, so they take one path.
+    if file.object_key.is_empty() {
+        return download_slab_file(store, file, target, uuid).await;
     }
     let (extents, object_len) = object_layout(file);
     let result = store.inner.get(&store.path(&file.object_key)).await?;
@@ -608,11 +680,12 @@ async fn materialize_base(
     manifest: &pb::BaseManifest,
     target: &Path,
 ) -> Result<(), ArchiveError> {
+    let uuid = crate::archive::uuid_hex(&manifest.database_uuid)?;
     futures::stream::iter(
         manifest
             .files
             .iter()
-            .map(|file| download_base_file(store, file, target)),
+            .map(|file| download_base_file(store, file, target, &uuid)),
     )
     .buffered(ARCHIVE_FETCH_CONCURRENCY)
     .try_collect::<Vec<()>>()
@@ -1705,6 +1778,8 @@ mod tests {
         vec![pb::FileExtent {
             offset: 0,
             length: length as u64,
+            content_hash: Vec::new(),
+            crc32c: 0,
         }]
     }
 
@@ -1733,10 +1808,14 @@ mod tests {
             pb::FileExtent {
                 offset: window as u64,
                 length: window as u64,
+                content_hash: Vec::new(),
+                crc32c: 0,
             },
             pb::FileExtent {
                 offset: 3 * window as u64,
                 length: window as u64,
+                content_hash: Vec::new(),
+                crc32c: 0,
             },
         ];
         // The object is the runs concatenated, and its chunks deliberately do
@@ -1786,6 +1865,8 @@ mod tests {
         let extents = vec![pb::FileExtent {
             offset: 0,
             length: 64,
+            content_hash: Vec::new(),
+            crc32c: 0,
         }];
         let mut stream = futures::stream::iter(vec![Ok::<_, ArchiveError>(
             bytes::Bytes::from_static(&[7u8; 8]),
@@ -1806,6 +1887,8 @@ mod tests {
         let extents = vec![pb::FileExtent {
             offset: 0,
             length: 8,
+            content_hash: Vec::new(),
+            crc32c: 0,
         }];
         let mut stream = futures::stream::iter(vec![
             Ok::<_, ArchiveError>(bytes::Bytes::from_static(&[7u8; 12])),

@@ -108,10 +108,23 @@ impl GcPlan {
 }
 
 /// A key under `db/<uuid>/term/<term>/`, classified.
+#[derive(Debug, PartialEq, Eq)]
 enum Kind {
     BaseManifest,
     BaseFile,
-    Wal { shard: u32, last_lsn: u64 },
+    /// A content-addressed slab object, which is **not** term-scoped.
+    ///
+    /// Every other key here carries a term so a promoted timeline cannot
+    /// overwrite an older one's identically numbered object. This one carries
+    /// none, deliberately: two writers that produce this key produced the same
+    /// bytes, and scoping it would defeat the sharing between generations that
+    /// it exists for. So it is reclaimed purely by reachability, and the
+    /// retained-terms test every other base object goes through does not apply.
+    Slab,
+    Wal {
+        shard: u32,
+        last_lsn: u64,
+    },
     Unrecognized,
 }
 
@@ -120,8 +133,18 @@ enum Kind {
 /// Structural only. It answers "what shape is this", never "is this needed";
 /// a key it cannot parse is [`Kind::Unrecognized`] and is therefore kept.
 fn classify(key: &str) -> (Option<u32>, Kind) {
-    // db/<uuid>/term/<term>/{base|wal}/...
+    // db/<uuid>/term/<term>/{base|wal}/... , or db/<uuid>/slabs/<address>
     let parts: Vec<&str> = key.split('/').collect();
+    if parts.len() == 4 && parts[0] == "db" && parts[2] == "slabs" {
+        // 64 hex characters of SHA-256 and nothing else. A name that is not
+        // one was not written by this scheme, so it stays unrecognized rather
+        // than being swept by a prefix match.
+        let address = parts[3];
+        if address.len() == 64 && address.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return (None, Kind::Slab);
+        }
+        return (None, Kind::Unrecognized);
+    }
     if parts.len() < 6 || parts[0] != "db" || parts[2] != "term" {
         return (None, Kind::Unrecognized);
     }
@@ -219,12 +242,27 @@ pub fn plan(
     // within a database, so this should never fire; it is here because the
     // failure if it did would be deleting a needed WAL interval, not an error.
     let mut keep_files: BTreeSet<&str> = BTreeSet::new();
+    // Slab objects are named by content rather than spelled out in the
+    // manifest, so this one is owned: the key is derived, not borrowed.
+    let mut keep_slabs: BTreeSet<String> = BTreeSet::new();
     let mut wal_floor: std::collections::BTreeMap<(u32, u32), u64> = Default::default();
     let mut uncut: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut shards_by_term: std::collections::BTreeMap<u32, BTreeSet<u32>> = Default::default();
     for (_, manifest) in &retained {
+        // Hex-encoded without the length check `uuid_hex` makes. This is a
+        // planner, not a validator: a manifest that reached here came through
+        // `validate_base_manifest`, and refusing one here would turn a bad
+        // identity into a failed reclamation pass rather than a rejected
+        // manifest. A prefix that matches no key keeps objects, which is the
+        // safe direction.
+        let uuid = crate::archive::hex(&manifest.database_uuid);
         for file in &manifest.files {
             keep_files.insert(file.object_key.as_str());
+            for extent in &file.extents {
+                if !extent.content_hash.is_empty() {
+                    keep_slabs.insert(crate::archive::slab_key(&uuid, &extent.content_hash));
+                }
+            }
         }
         shards_by_term
             .entry(manifest.term)
@@ -270,6 +308,14 @@ pub fn plan(
             }
             Kind::BaseFile => {
                 if !keep_files.contains(key.as_str()) {
+                    plan.delete.push(key.clone());
+                }
+            }
+            // Reachability alone: a slab object two retained manifests name
+            // survives the pruning of either, and one no retained manifest
+            // names is unreachable whatever term wrote it.
+            Kind::Slab => {
+                if !keep_slabs.contains(key.as_str()) {
                     plan.delete.push(key.clone());
                 }
             }
@@ -446,7 +492,12 @@ mod tests {
         for (key, manifest) in bases {
             out.push(key.clone());
             for f in &manifest.files {
-                out.push(f.object_key.clone());
+                // A slab-addressed file names no object of its own, so it
+                // contributes nothing to the listing -- its bytes are under
+                // `slabs/`, which the caller adds.
+                if !f.object_key.is_empty() {
+                    out.push(f.object_key.clone());
+                }
             }
         }
         for (first, last) in wal {
@@ -455,6 +506,96 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// A base whose files are content-addressed slabs.
+    ///
+    /// `shared` is in every generation; `own` is only in this one.
+    fn slab_base(generation: u64, checkpoint_time: u64, own: u8) -> (String, pb::BaseManifest) {
+        let (key, mut manifest) = base(generation, checkpoint_time, 100);
+        let slab = |byte: u8, offset: u64| pb::FileExtent {
+            offset,
+            length: 1 << 21,
+            content_hash: vec![byte; 32],
+            crc32c: 0,
+        };
+        manifest.files = vec![pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: String::new(),
+            size: 1 << 22,
+            crc32c: 0,
+            sparse: true,
+            extents: vec![slab(0xee, 0), slab(own, 1 << 21)],
+        }];
+        (key, manifest)
+    }
+
+    /// Slab objects are reclaimed by reachability, and shared ones survive the
+    /// pruning of any single generation that names them.
+    ///
+    /// Without this, `classify` would leave every slab object `Unrecognized`
+    /// -- kept and reported, so the archive would grow without bound while
+    /// every other signal looked healthy.
+    #[test]
+    fn a_slab_object_survives_while_any_retained_base_names_it() {
+        let old = slab_base(1, NOW - 100 * HOUR, 0x11);
+        let kept = slab_base(2, NOW - HOUR, 0x22);
+        let bases = vec![old.clone(), kept.clone()];
+        let uuid = crate::archive::hex(&kept.1.database_uuid);
+        let shared = crate::archive::slab_key(&uuid, &[0xee; 32]);
+        let only_old = crate::archive::slab_key(&uuid, &[0x11; 32]);
+        let only_kept = crate::archive::slab_key(&uuid, &[0x22; 32]);
+        let orphan = crate::archive::slab_key(&uuid, &[0x99; 32]);
+
+        let mut keys = keys(&bases, &[]);
+        keys.extend([
+            shared.clone(),
+            only_old.clone(),
+            only_kept.clone(),
+            orphan.clone(),
+        ]);
+        keys.sort();
+
+        // A window of zero roots the retention at the newest base, so `old`
+        // is dropped and only what `kept` still names should survive.
+        let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
+
+        assert!(
+            plan.unrecognized.is_empty(),
+            "slabs must classify: {plan:?}"
+        );
+        assert!(
+            !plan.delete.contains(&shared),
+            "named by the retained base: {plan:?}"
+        );
+        assert!(
+            !plan.delete.contains(&only_kept),
+            "named by the retained base: {plan:?}"
+        );
+        assert!(
+            plan.delete.contains(&only_old),
+            "the dropped generation's own slab is unreachable: {plan:?}"
+        );
+        assert!(
+            plan.delete.contains(&orphan),
+            "no manifest names it: {plan:?}"
+        );
+    }
+
+    /// A key under `slabs/` that is not an address is not swept by the prefix.
+    #[test]
+    fn a_slab_prefix_key_that_is_not_an_address_is_kept_and_reported() {
+        for key in [
+            "db/aa/slabs/not-a-hash",
+            "db/aa/slabs/00112233",
+            "db/aa/slabs/deadbeef/extra",
+        ] {
+            assert_eq!(classify(key).1, Kind::Unrecognized, "{key}");
+        }
+        assert_eq!(
+            classify(&format!("db/aa/slabs/{}", "ab".repeat(32))).1,
+            Kind::Slab
+        );
     }
 
     /// The load-bearing case: the newest base at or below the horizon is kept,

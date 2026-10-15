@@ -1719,3 +1719,107 @@ not depend on the bytes. No network and no object store: every figure above is l
 and allocation. The round-trip estimate is arithmetic over a page size, not a measurement. Decode
 times are one host, release profile, and are reported to show an order of magnitude rather than to
 be compared against a budget.
+
+## 2026-10-15 — Phase 0 lands: a base file is now content-addressed slabs, and three bugs were the same omission
+
+The first phase of the external-slab plan, which the verdict entry marked go and the measurement
+entry settled the shape of. **No `yesno-core` change, no feature bit, no schema-version bump.**
+
+### What changed
+
+`FileExtent` gained `content_hash` ( SHA-256, whole, never truncated ) and a per-object `crc32c`.
+A base file is now one of two shapes and never both:
+
+- `ArchiveFile.object_key` names one object and the extents are runs inside it -- every archive
+  written before this, unchanged;
+- `object_key` is empty and **every extent names its own object** at `db/<uuid>/slabs/<address>`.
+
+`SCHEMA_VERSION` stays at 2 for the reason the sparse work established: added fields, not changed
+meanings, so every archive already in a store still restores. The direction that does not hold is
+an older release reading a base this one writes, and it fails to find an object rather than
+reconstructing from the wrong bytes.
+
+**The cut is `yesno_core::store::SLAB_SIZE`, imported rather than restated.** That alignment is the
+whole reason dedup works: a checkpoint dirties the slabs it touched and leaves the rest
+byte-identical, so generation `N+1` renames almost every object `N` already stored. Cut anywhere
+else and an unrelated write shifts every later object. The cost is that hole detection coarsens
+from `SPARSE_WINDOW` to the slab, because an object cannot be half present -- a one-megabyte hole
+inside a two-megabyte slab is now stored. `archive.py`'s 64x assertion still passes, so the sparse
+saving survives the coarsening.
+
+Uploads run 16-wide and each checks `head` before `put`, so **a slab unchanged since the last
+generation is not sent**. That is the 20x of the measurement entry, obtained without threading the
+previous manifest anywhere.
+
+### Two decisions inside the change
+
+**`validate_extents` had to stop refusing adjacent extents.** Under one object per file, touching
+runs meant the writer failed to merge them and the list was not canonical. Under one object per
+slab, two consecutive slabs that both carry data are touching runs and are the ordinary case. The
+rule is now per shape: adjacency is a defect in the first and expected in the second, and only
+overlap is refused in both. This is the kind of invariant that looks like it transfers and does
+not.
+
+**The restore fetches with `buffered`, not `buffer_unordered`.** The file's CRC32C covers the holes
+as well as the runs, so it has to accumulate from offset zero upward; out-of-order completion would
+mean either holding the whole file or composing CRCs. Ordered concurrency costs nothing here and
+keeps the verification sequential. Each object is checked by length, then by its own CRC, then the
+reassembled file against the manifest's whole-file CRC -- the last being the one that proves the
+*file*, since the first two only prove each object is what its own extent described.
+
+### `gc.rs` was mandatory, and the self-review was right about why
+
+`classify` requires `db/<uuid>/term/<term>/...`, so without a change every slab object would have
+fallen to `Kind::Unrecognized` -- **kept and reported**, never deleted. The archive would have
+grown without bound while every other signal looked healthy. `Kind::Slab` is now matched on a
+64-character hex name under `db/<uuid>/slabs/` and reclaimed purely by reachability.
+
+**It is deliberately not term-scoped**, which is a reasoned exception to a stated invariant and is
+written down where the invariant is. Every other key here carries a term so a promoted timeline
+cannot overwrite an older one's identically numbered object; two writers that produce a content
+address produced the same bytes, so there is nothing to fence, and scoping it by term would defeat
+the sharing between generations it exists for.
+
+One thing the fix surfaced: `keep_slabs` has to be an owned `BTreeSet<String>` where `keep_files`
+borrows, because a slab key is *derived* rather than spelled out in the manifest. And `plan` must
+hex-encode the UUID **without** `uuid_hex`'s length check -- it is a planner, not a validator, and
+refusing there would turn a bad identity into a failed reclamation pass rather than a rejected
+manifest. A prefix matching no key keeps objects, which is the safe direction.
+
+### Three bugs, one omission: the file that is entirely zero
+
+It broke validation, then the e2e harness, then restore, and each time I fixed the symptom before
+seeing the cause. **A file with no bytes at all has no extents, so it names neither an object nor
+an address -- and needs neither.** The shape check read that as "neither", the harness joined an
+empty key onto the object directory and measured the directory, and the restore asked the store for
+an object at the empty path.
+
+The fix that generalizes, rather than the three that did not: **the restore dispatches on
+`object_key.is_empty()`, not on whether any extent is addressed.** A file whose bytes are elsewhere
+and a file whose bytes are nowhere are the same reassembly with a different number of fetches, so
+they take one path -- `set_len`, fetch nothing, hash the holes, verify. The empty case stopped
+being special.
+
+Worth recording as a pattern: all three failures were a *degenerate* input to a new encoding, and
+the encoding's own tests did not have one until the harness supplied it. `archive.py` found two of
+the three, which is the argument for running it before claiming the change works.
+
+### `base_anchor` now commits to less, on purpose
+
+It hashes `file.object_key`, which is empty for a slab-addressed file, so the anchor commits to
+what each file *is* -- name, length, CRC32C -- and no longer to where its bytes were put. That is
+the right division: the locations of a content-addressed file's objects are a function of its
+content, so hashing them would commit to the same information twice. Per-extent addresses stay
+outside the hash for the reason `checkpoint_time` gives. Noted in `history.rs` beside the function.
+
+### Gates and what is not done
+
+`scripts/gate.sh` passed. `gate-pg.sh` was run as well -- not because `yesno-server-utils` has a
+Bazel target, it has none, but because this change touches `yesno-e2e`, whose image that gate
+builds. `archive.py`, `archive_seed.py`, `pitr.py`, `pitr_retention.py` and `basebackup.py` all
+pass.
+
+Not in this increment, and both are the same follow-up: the `head` round trip per slab is how an
+unchanged object is skipped, and the previous generation's manifest would answer that for free --
+256 000 head requests per capture at the consumer's scale is the term to remove next. The manifest
+itself is still written whole per generation.

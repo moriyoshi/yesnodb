@@ -186,12 +186,66 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
     let manifest = BaseManifest::decode(manifest_bytes.as_slice())
         .map_err(|error| format!("base manifest is not valid Protobuf: {error}"))?;
     // What the base costs in the store, against what it would cost if its
-    // holes were shipped. A sparse object holds only the runs the manifest
-    // names; a dense one is the file, which is the `extents`-free encoding
-    // every archive written before sparse objects used.
+    // holes were shipped. Three encodings reach here and each is checked
+    // against the objects actually on disk:
+    //
+    //   - content-addressed slabs: one object per extent, named by its hash,
+    //     each exactly the extent's length;
+    //   - one sparse object: the runs the manifest names, concatenated;
+    //   - one dense object: the file, which is the `extents`-free encoding
+    //     every archive written before sparse objects used.
+    //
+    // A slab object shared by two files is counted once, which is the point
+    // of addressing it by content.
+    let uuid: String = manifest
+        .database_uuid
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let mut base_apparent_bytes = 0u64;
     let mut base_object_bytes = 0u64;
+    let mut counted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for file in &manifest.files {
+        base_apparent_bytes = base_apparent_bytes.saturating_add(file.size);
+        if file.extents.iter().any(|e| !e.content_hash.is_empty()) {
+            for extent in &file.extents {
+                let hex: String = extent
+                    .content_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let key = format!("db/{uuid}/slabs/{hex}");
+                let path = object_dir.join(&key);
+                let size = std::fs::metadata(&path)
+                    .map_err(|error| {
+                        format!("slab object '{}' is not readable: {error}", path.display())
+                    })?
+                    .len();
+                if size != extent.length {
+                    return Err(format!(
+                        "slab object '{}' is {size} bytes, manifest says {}",
+                        path.display(),
+                        extent.length
+                    ));
+                }
+                if counted.insert(key) {
+                    base_object_bytes = base_object_bytes.saturating_add(size);
+                }
+            }
+            continue;
+        }
+        if file.object_key.is_empty() {
+            // Entirely zero and cut into slabs, so it produced no object at
+            // all -- not even the empty one an older writer would have left.
+            if !file.extents.is_empty() {
+                return Err(format!(
+                    "base file '{}' names no object but carries {} extents",
+                    file.name,
+                    file.extents.len()
+                ));
+            }
+            continue;
+        }
         let path = object_dir.join(&file.object_key);
         let size = std::fs::metadata(&path)
             .map_err(|error| format!("base object '{}' is not readable: {error}", path.display()))?
@@ -207,7 +261,6 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
                 path.display(),
             ));
         }
-        base_apparent_bytes = base_apparent_bytes.saturating_add(file.size);
         base_object_bytes = base_object_bytes.saturating_add(size);
     }
 
