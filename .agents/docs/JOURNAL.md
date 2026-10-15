@@ -1823,3 +1823,62 @@ Not in this increment, and both are the same follow-up: the `head` round trip pe
 unchanged object is skipped, and the previous generation's manifest would answer that for free --
 256 000 head requests per capture at the consumer's scale is the term to remove next. The manifest
 itself is still written whole per generation.
+
+## 2026-10-15 — The skip set: a capture now costs the churn, with no round trip for what did not change
+
+Phase 0's follow-up, and the term the previous entry named as the only thing the 20x bandwidth
+saving still cost. Increment 1 skipped an unchanged slab by asking the store whether the object was
+there -- correct, and 256 000 `head` requests per capture at the consumer's scale.
+
+**The previous generation's manifest answers the same question for free.** `slabs_of_active_base`
+reads `state.pb`, follows `latest_base_manifest`, and collects the content addresses it names. A
+slab in that set is skipped outright: no upload, and no request of any kind. At 500 GiB and 5%
+churn that is 256 000 requests becoming about 12 800, and those remaining ones still `head` before
+putting, which is what makes a *resumed* capture cheap -- an interrupted run's objects are found
+rather than sent twice.
+
+### Why the set can be trusted, which is the whole of the correctness argument
+
+Reclamation keeps every object named by a retained manifest, and **the active base is never
+deletable** -- `the_active_base_is_never_deleted` is the test. The active base is exactly what
+`state.pb` points at. So every object this set names is in the store.
+
+The part worth stating plainly: **this adds no failure mode a restore does not already have.** If
+the active base's objects could vanish, restoring from it was already broken, and the skip is
+trusting precisely what the restore path trusts. That is the argument that makes skipping the
+`head` safe rather than merely cheap.
+
+### Every failure returns the empty set, and one of them was mine
+
+No `state.pb`, no active base, a state that will not load, a manifest that will not decode, a
+manifest written before slab objects existed -- each yields an empty set. An empty set costs a
+`head` per slab and is **always correct**, so every one of those degrades to increment 1's
+behaviour rather than skipping an upload that was needed. The asymmetry is the design: a set that
+is too small wastes a round trip, a set that is too large loses data.
+
+I wrote `self.load_state().await?` first, which propagated. `load_state` validates the schema
+version, so a `state.pb` this build could not read would have **failed the entire base capture** --
+and in the same function whose doc comment promised to degrade. The test caught it. It now
+degrades, and the reasoning is recorded beside it: `put_base` publishes `state.pb` immediately
+afterwards, so a bad state is still reported, by the code whose job that is rather than by an
+optimisation that happened to read it first.
+
+### The test is about the assumption, not the code
+
+`a_slab_the_active_base_already_holds_is_never_sent` runs against an **empty** store with a
+populated skip set. Increment 1's behaviour -- `head`, miss, upload -- would have written every
+object; this writes nothing and still produces a complete manifest, because a skipped upload must
+never mean a skipped extent. It passes only because the set is taken on trust, which is exactly
+what makes it worth having as a test: it will fail the day someone makes the skip conditional on
+something the store says.
+
+`gate.sh` passed. `gate-pg.sh` was not run and does not apply: this touches `yesno-server-utils`
+alone, which has no Bazel target, and unlike the previous increment it does not reach `yesno-e2e`.
+`archive.py`, `archive_seed.py` and `pitr_retention.py` pass.
+
+### What is left of phase 0
+
+The manifest is still written whole per generation -- 13 MB at 500 GiB, measured -- and `survey`
+downloads one per retained base on every reclamation pass. That is now the largest remaining
+per-capture and per-pass cost in this path, and the listing round trips behind it are larger still.
+Neither blocks anything; both are recorded under the measurement entry above.

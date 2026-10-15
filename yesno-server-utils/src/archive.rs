@@ -6,6 +6,7 @@
 //! WAL bytes from the replication stream and acknowledges an LSN only after the
 //! corresponding object and protobuf cursor are durable.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -437,8 +438,9 @@ impl ArchiveStore {
             "db/{uuid}/term/{:010}/base/{:020}",
             manifest.term, manifest.archive_generation
         );
+        let known = self.slabs_of_active_base().await?;
         for (name, path) in database_files(source_dir)? {
-            let file = self.put_slab_file(&path, &uuid).await?;
+            let file = self.put_slab_file(&path, &uuid, &known).await?;
             manifest.files.push(pb::ArchiveFile {
                 name,
                 // Empty: every extent names its own object. The per-writer
@@ -472,6 +474,54 @@ impl ArchiveStore {
         Ok((manifest_key, manifest))
     }
 
+    /// Content addresses the active base already stores.
+    ///
+    /// A slab in this set needs neither an upload nor a `head` to prove it is
+    /// there, which is what makes a capture cost the churn rather than the
+    /// database. At 500 GiB that is the difference between 256 000 requests
+    /// per capture and the twelve thousand or so that actually changed.
+    ///
+    /// **Why this set can be trusted.** Reclamation keeps every object named
+    /// by a retained manifest, and the active base -- the one `state.pb`
+    /// points at -- is never deletable; `the_active_base_is_never_deleted` is
+    /// the test. So its objects exist. This adds no failure mode a restore
+    /// does not already have: if the active base's objects could vanish,
+    /// restoring from it was already broken.
+    ///
+    /// **Empty whenever anything is unknown rather than guessed** -- no state,
+    /// no active base, a manifest that will not decode, or one written before
+    /// slab objects existed. An empty set costs a `head` per slab and is
+    /// always correct, so every failure here degrades to the previous
+    /// behaviour instead of skipping an upload that was needed.
+    async fn slabs_of_active_base(&self) -> Result<HashSet<[u8; 32]>, ArchiveError> {
+        let mut known = HashSet::new();
+        // Every failure below returns the empty set rather than propagating.
+        // A capture must not fail because an optimisation could not read its
+        // input, and `put_base` publishes `state.pb` afterwards anyway -- so
+        // a state this cannot parse is reported there, by the code whose job
+        // it is, instead of here.
+        let Ok(Some(state)) = self.load_state().await else {
+            return Ok(known);
+        };
+        if state.latest_base_manifest.is_empty() {
+            return Ok(known);
+        }
+        let Ok(bytes) = self.get_bytes(&state.latest_base_manifest).await else {
+            return Ok(known);
+        };
+        let Ok(manifest) = pb::BaseManifest::decode(bytes) else {
+            return Ok(known);
+        };
+        for file in &manifest.files {
+            for extent in &file.extents {
+                if let Ok(hash) = <[u8; 32]>::try_from(extent.content_hash.as_slice()) {
+                    known.insert(hash);
+                }
+            }
+        }
+        Ok(known)
+    }
+
     /// Upload one base file as slab-sized, content-addressed objects.
     ///
     /// Three properties the caller depends on, in the order they are
@@ -488,7 +538,12 @@ impl ArchiveStore {
     ///   content, so a slab unchanged since the last generation already exists
     ///   under exactly this key. That is where a base generation stops costing
     ///   a whole database.
-    async fn put_slab_file(&self, source: &Path, uuid: &str) -> Result<UploadedFile, ArchiveError> {
+    async fn put_slab_file(
+        &self,
+        source: &Path,
+        uuid: &str,
+        known: &HashSet<[u8; 32]>,
+    ) -> Result<UploadedFile, ArchiveError> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         let size = tokio::fs::metadata(source)
@@ -502,7 +557,7 @@ impl ArchiveStore {
         let mut checksum = 0u32;
         let mut read_total = 0u64;
         let mut extents: Vec<pb::FileExtent> = Vec::new();
-        let mut sent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut sent: HashSet<[u8; 32]> = HashSet::new();
         let mut inflight = FuturesUnordered::new();
         let mut slab = vec![0u8; SLAB_OBJECT_BYTES];
 
@@ -531,6 +586,12 @@ impl ArchiveStore {
             });
             // A file may hold the same slab twice; one upload serves both.
             if !sent.insert(hash) {
+                continue;
+            }
+            // Already in the active base, so already in the store under this
+            // exact name. The common case at steady state, and the one that
+            // costs nothing at all -- not even a round trip.
+            if known.contains(&hash) {
                 continue;
             }
 
@@ -1305,7 +1366,10 @@ mod tests {
         let path = slab_file(dir.path(), "shard-0000.yno", 8, &[(1, 1), (2, 2), (5, 3)]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
         let uuid = "ab".repeat(16);
-        let uploaded = store.put_slab_file(&path, &uuid).await.unwrap();
+        let uploaded = store
+            .put_slab_file(&path, &uuid, &HashSet::new())
+            .await
+            .unwrap();
 
         assert!(uploaded.sparse);
         assert_eq!(
@@ -1353,7 +1417,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = slab_file(dir.path(), "blank.yno", 4, &[]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
-        let uploaded = store.put_slab_file(&path, &"cd".repeat(16)).await.unwrap();
+        let uploaded = store
+            .put_slab_file(&path, &"cd".repeat(16), &HashSet::new())
+            .await
+            .unwrap();
         assert!(uploaded.sparse);
         assert!(uploaded.extents.is_empty());
         assert_eq!(uploaded.size, 4 * SLAB_OBJECT_BYTES as u64);
@@ -1377,7 +1444,10 @@ mod tests {
         let path = slab_file(dir.path(), "shard-0000.yno", 4, &[(0, 7), (1, 9), (3, 7)]);
         let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
         let uuid = "ef".repeat(16);
-        let first = store.put_slab_file(&path, &uuid).await.unwrap();
+        let first = store
+            .put_slab_file(&path, &uuid, &HashSet::new())
+            .await
+            .unwrap();
 
         assert_eq!(first.extents.len(), 3, "three slabs carry bytes");
         assert_eq!(
@@ -1387,12 +1457,107 @@ mod tests {
         let objects = store.list_relative("db/").await.unwrap();
         assert_eq!(objects.len(), 2, "two distinct slabs, two objects");
 
-        let again = store.put_slab_file(&path, &uuid).await.unwrap();
+        let again = store
+            .put_slab_file(&path, &uuid, &HashSet::new())
+            .await
+            .unwrap();
         assert_eq!(again.extents, first.extents, "the same manifest");
         assert_eq!(
             store.list_relative("db/").await.unwrap(),
             objects,
             "an unchanged file adds nothing"
+        );
+    }
+
+    /// A slab the active base already names is not sent, and not asked about.
+    ///
+    /// Run against an **empty** store, so the old behaviour -- `head`, miss,
+    /// upload -- would have written every object. Nothing is written, which
+    /// is only correct because the set is taken on trust: the active base is
+    /// never deletable, so an object it names is in the store. The manifest
+    /// is still complete, because a skipped upload must not mean a skipped
+    /// extent.
+    #[tokio::test]
+    async fn a_slab_the_active_base_already_holds_is_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = slab_file(dir.path(), "shard-0000.yno", 4, &[(0, 7), (1, 9)]);
+        let uuid = "ef".repeat(16);
+
+        let survey = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let full = survey
+            .put_slab_file(&path, &uuid, &HashSet::new())
+            .await
+            .unwrap();
+        let known: HashSet<[u8; 32]> = full
+            .extents
+            .iter()
+            .map(|e| <[u8; 32]>::try_from(e.content_hash.as_slice()).unwrap())
+            .collect();
+        assert_eq!(known.len(), 2);
+
+        let empty = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let again = empty.put_slab_file(&path, &uuid, &known).await.unwrap();
+        assert_eq!(again.extents, full.extents, "the manifest is unchanged");
+        assert!(
+            empty.list_relative("db/").await.unwrap().is_empty(),
+            "nothing was uploaded and nothing was asked about"
+        );
+    }
+
+    /// The skip set is empty whenever anything about the active base is
+    /// unknown, because an empty set only costs a round trip while a wrong
+    /// one loses data.
+    #[tokio::test]
+    async fn the_skip_set_is_empty_when_there_is_no_active_base() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ArchiveStore::new(Arc::clone(&inner), ObjectPath::ROOT);
+        let write = |key: &str, bytes: Vec<u8>| {
+            let inner = Arc::clone(&inner);
+            let path = ObjectPath::from(key);
+            async move { inner.put(&path, PutPayload::from(bytes)).await.unwrap() }
+        };
+
+        assert!(
+            store.slabs_of_active_base().await.unwrap().is_empty(),
+            "no state.pb at all"
+        );
+
+        write(STATE_OBJECT, b"not protobuf at all".to_vec()).await;
+        assert!(
+            store.slabs_of_active_base().await.unwrap().is_empty(),
+            "a state.pb that will not load"
+        );
+
+        write(
+            STATE_OBJECT,
+            pb::ArchiveState {
+                schema_version: SCHEMA_VERSION,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert!(
+            store.slabs_of_active_base().await.unwrap().is_empty(),
+            "a valid state naming no base"
+        );
+
+        let key = "db/ef/term/0000000000/base/0/manifest.pb";
+        let state = pb::ArchiveState {
+            schema_version: SCHEMA_VERSION,
+            latest_base_manifest: key.into(),
+            ..Default::default()
+        };
+        write(STATE_OBJECT, state.encode_to_vec()).await;
+        assert!(
+            store.slabs_of_active_base().await.unwrap().is_empty(),
+            "a base object that is not there"
+        );
+
+        write(key, b"not protobuf at all".to_vec()).await;
+        assert!(
+            store.slabs_of_active_base().await.unwrap().is_empty(),
+            "a manifest that will not decode"
         );
     }
 
