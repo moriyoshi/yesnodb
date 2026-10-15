@@ -1538,3 +1538,102 @@ At 60 MiB per key that is roughly **2 100 keys per shard** at the documented 128
    question to settle alongside it.
 
 Item 1 does not wait on items 2 and 3, and should not be bundled with them.
+
+## 2026-10-15 — The consumer's shape arrives: LARGE_SHARD is not needed, and phase 0 inherits a 16-44 MB manifest
+
+The two numbers the verdict entry asked for came back. **Item 3 of that entry closes rather than
+proceeds**, and item 1's cap work turns out to have been the right thing to build first for a
+reason the entry did not anticipate: the cap is not binding, so what the consumer needed from it
+was the *number*, not the refusal.
+
+### What was asked and what came back
+
+- **Total data per database: 500 GiB.**
+- **Size distribution: 70% of values within 100 MiB, 20% within 250 MiB, 8% within 500 MiB.** The
+  remaining 2% was not stated, and that gap is the only input that could still move the answer.
+
+Note that this revises the working figure. The plan above was written against "60 MiB and more per
+key"; the real distribution is heavier, with a mean around 115 MiB, so every per-key number in
+those entries reads low by roughly 2x. The conclusions do not change sign.
+
+### The derivation, so it can be re-derived rather than re-measured
+
+Bands treated as uniform within each, the unstated 2% priced twice -- once with the tail running to
+1 GiB, once to 4 GiB:
+
+| tail to | mean key | sd | keys at 500 GiB |
+| --- | --- | --- | --- |
+| 1 GiB | 115 MiB | 139 MiB | ~4 443 |
+| 4 GiB | 146 MiB | 355 MiB | ~3 508 |
+
+**This database is three to four thousand keys.** Worth stating plainly, because it changes which
+risk matters: at this object count the threat to a shard is routing variance, not volume.
+
+Per-shard load is then the live share, plus three standard deviations of routing imbalance over
+`keys / shards` draws, times 1.47 for space amplification, against the 256 GiB cap ( tail at
+1 GiB ):
+
+| shards | live/shard | +3 sigma | amplified | fraction of cap |
+| --- | --- | --- | --- | --- |
+| 4 | 125.0 GiB | 138.6 | 203.7 | 80% |
+| 8 | 62.5 | 72.1 | 106.0 | 41% |
+| 16 | 31.2 | 38.0 | 55.9 | 22% |
+| 32 | 15.6 | 20.4 | 30.0 | 12% |
+
+A 4 GiB tail costs about seven points of utilization at every shard count and changes no decision.
+
+### The recommendation: 16 shards
+
+Eight fits 500 GiB and is the configured default. **Sixteen is the advice**, because the shard
+count is creation-only and 500 GiB is a target rather than a ceiling -- 16 absorbs roughly a
+doubling before the cap is a conversation again. Four is refused: 80% of an unraisable cap on day
+one, before the tail is known.
+
+**`feat::LARGE_SHARD` is therefore not needed and should not be designed.** It stays declared and
+unimplemented. This removes the blocker the verdict entry placed in front of phase 1 -- the
+geometry question is settled by configuration rather than by a format change.
+
+### Three caveats the numbers above rest on
+
+- **The 1.47x amplification is measured, but not on this shape.** It is the consumer plateau
+  recorded under `the-fresh-process-half-of-punching-is-unverified`: 26.82 MB steady against an
+  18.24 MB fresh store. Small corpus, and *physical blocks* rather than address space. It is used
+  here because it is the only empirical anchor in the tree. The mechanism does transfer: `alloc`
+  never scavenges partially free slabs from older generations, so address space returns only when
+  a slab empties completely and is punched.
+- **That figure is conditional on compacting out of process.** The inherited-slab confinement
+  refuses reuse in a process that has already opened the directory, so a server that compacts
+  **in band sees none of the gain** and should budget worse than 1.47x. Same caveat as the one
+  already recorded for `haiiie`.
+- **The unstated 2% is the only live unknown.** It would have to reach tens of GiB per key to
+  threaten 16 shards.
+
+### Phase 0 inherits an object count and a manifest size nobody priced
+
+500 GiB at `SLAB_SIZE` is **256 000 slabs per base generation**. Phase 0 cuts one content-addressed
+object per slab, so a base manifest carries a quarter-million `FileExtent` records instead of a
+handful. Sizing it two ways, at protobuf field overhead:
+
+- extent carrying only the 32-byte SHA-256, the object key derived from it: ~64 B per extent,
+  **~16 MB** per manifest;
+- extent carrying the key as a hex path string as well: ~172 B, **~44 MB**.
+
+Today's manifest is kilobytes. **This does not sink phase 0**, and the dedup argument is untouched
+-- consecutive generations still share nearly every object. What changes is that the manifest stops
+being a small message:
+
+- store the address, derive the key, and never write both. The 2.7x between the two rows above is
+  entirely a redundant string.
+- `gc.rs::survey` **decodes every manifest it finds**, so a retention window holding several
+  generations decodes that size per generation per pass. The reclamation pass becomes the place
+  this cost lands, exactly as the BLAKE3 note predicted at a fifth of the scale.
+- a restore downloads and parses it before fetching a byte.
+
+**And this strengthens the alternative that note named.** One object per shard file with verified
+subrange reads -- which is what BLAKE3's internal Merkle tree buys and SHA-256 does not -- trades
+dedup for an object count four orders of magnitude lower. At 30 700 objects it was a contingency.
+At 256 000 per generation it deserves to be priced against phase 0 before phase 0 starts, rather
+than kept as the thing to reach for if the sweep becomes the bottleneck.
+
+That comparison is the one piece of new work these numbers create. It does not block phase 0; it
+decides what phase 0 should be.
