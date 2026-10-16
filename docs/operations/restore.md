@@ -36,6 +36,15 @@ That names one specific manifest, so if it cannot be read the restore fails:
 rooting at an older base would answer a different recovery point under the name
 you asked for.
 
+An unreadable WAL descriptor is dropped the same way and warned about the same
+way. The listing covers the whole leadership term's history, most of which a
+given restore neither replays nor reaches, so one unreadable object there used
+to fail restores it had nothing to do with. Dropping it is safe because the
+chain walk refuses a history with a hole in it: a descriptor the restore
+actually needs still stops it, now with the object named. Do not read a warning
+as harmless -- read it with the outcome. A restore that then succeeds did not
+need that object; one that fails on a broken chain probably did.
+
 ### How much space a restore needs
 
 A shard image is a sparse file. Its apparent length is a whole memory-mapping

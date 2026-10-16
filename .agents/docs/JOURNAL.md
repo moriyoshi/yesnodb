@@ -2320,3 +2320,47 @@ count is.
 
 `cargo doc -p yesno-server-utils --no-deps` was run locally this time, before the gate, which is
 the only change the previous entry's postscript asks for.
+
+## 2026-10-16 — Finishing the sweep: the WAL descriptor loops, and where fatal is still right
+
+Two entries today fixed the same shape in two places. Rather than stop at two, I swept every
+`BaseManifest::decode` and `WalObject::decode` in the crate. The remaining ones split cleanly, and
+the split is the content of this entry: **the question is never "is a decode failure fatal", it is
+"does this object have an alternative".**
+
+### Changed: both loops over the term's whole WAL history
+
+`load_wal_descriptors` fetches one descriptor per WAL object in the **entire** leadership term,
+then `chain_objects` selects the part a given restore replays. Most of that listing is history
+below the base's cursor or above the target -- neither replayed nor reachable -- and one
+undecodable object anywhere in it failed the restore.
+
+Dropping it is safe for a reason specific to this path and worth stating: **`chain_objects`
+refuses a chain with a hole in it.** A descriptor the restore actually needs therefore still stops
+the restore, now with the object named by a warning; a descriptor it would have walked past no
+longer costs it anything. The oracle was already there, failing closed; the `?` was pre-empting it.
+
+`inspect`'s own loop is the same change for a weaker reason -- it is advisory output, and one
+unreadable descriptor should not cost an operator the report of every window that is fine.
+
+### Unchanged, and each for a stated reason
+
+- **The durable tip** ( `load_base` with no target ) and **the sidecar's active base**
+  ( `wal_loop` ). Both name *one specific manifest* through `state.pb`. There is no alternative to
+  fall back to, and rooting at an older base would answer a different recovery point under the
+  name the caller asked for. Both now put the object key in the message, which neither did.
+- **A manifest a base capture just built** ( `put_base` ). Validating our own output before
+  publishing it; a failure is a bug in this process, not damage in the store.
+- **Escaping the database or term prefix.** A well-formed object in the wrong place is a different
+  claim from bytes that will not parse, and it stays fatal on the replay path.
+- **Every fetch failure, everywhere.** Transient, and the retry is the next pass or the next
+  invocation.
+- **WAL bodies in `assemble_wal`.** Those are the objects being replayed, checked against their
+  descriptors. By then there is no "this one is not needed" left to say.
+
+### The rule the three entries add up to
+
+An object that *is* a candidate -- a recovery root, a descriptor in a listing -- can be skipped
+when it cannot be read, provided the skip is reported and some later check still fails closed on
+the ones that mattered. An object that *justifies* other objects, or that the caller named
+specifically, cannot be: there is nothing for the operation to mean without it.

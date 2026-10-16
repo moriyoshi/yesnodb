@@ -403,6 +403,19 @@ async fn load_base(
 /// reason about completion order.
 const ARCHIVE_FETCH_CONCURRENCY: usize = 8;
 
+/// Report an archive object this build cannot read, where it is found.
+///
+/// **Skipping one is safe only because of this line.** Every skip on this path
+/// changes what a restore or an inspection sees without changing what either
+/// of them says, so an operator reading a recovery window has no way to know
+/// the listing was not the whole archive. The alternative -- which is what
+/// this path used to do -- is to fail the whole operation over one object,
+/// which on a recovery path is a worse answer than a partial one with a
+/// warning on it.
+fn skipping(reason: &str) {
+    eprintln!("warning: skipping an archive object this build cannot read -- {reason}");
+}
+
 /// Every base manifest under this database's prefix, sorted into the ones
 /// this build can use and the ones it cannot.
 ///
@@ -468,10 +481,9 @@ async fn list_bases(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Bases,
         }
     }
     // Here rather than at each caller: this is the one place that learns of
-    // them, and an operator reading a recovery window or a restore's output
-    // has to be told the listing is not the whole archive.
+    // them.
     for reason in &bases.unreadable {
-        eprintln!("warning: skipping a base manifest this build cannot read -- {reason}");
+        skipping(reason);
     }
     Ok(bases)
 }
@@ -790,9 +802,26 @@ async fn load_wal_descriptors(
         .collect();
     // The widest loop on the restore path: one descriptor per WAL object in the
     // whole retained history, each a few hundred bytes and a full round trip.
-    let descriptors: Vec<pb::WalObject> =
+    // A descriptor this build cannot decode is dropped rather than fatal,
+    // and the chain walk is what makes that safe: `chain_objects` refuses a
+    // chain with a hole in it, so a dropped descriptor the restore actually
+    // needs still stops the restore -- while one from history below the
+    // base's cursor, or above the target, no longer costs it anything. This
+    // listing is the whole term's history and most of it is usually neither.
+    //
+    // Escaping the database or term prefix stays fatal. That is a
+    // well-formed object in the wrong place, which is a different claim from
+    // bytes that will not parse.
+    let descriptors: Vec<Option<pb::WalObject>> =
         futures::stream::iter(keys.into_iter().map(|key| async move {
-            let descriptor = pb::WalObject::decode(store.get_bytes(&key).await?)?;
+            let bytes = store.get_bytes(&key).await?;
+            let descriptor = match pb::WalObject::decode(bytes) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    skipping(&format!("{key}: {error}"));
+                    return Ok(None);
+                }
+            };
             if descriptor.database_uuid != manifest.database_uuid
                 || descriptor.term != manifest.term
             {
@@ -800,12 +829,12 @@ async fn load_wal_descriptors(
                     "WAL descriptor '{key}' escaped its database or term prefix"
                 )));
             }
-            Ok(descriptor)
+            Ok(Some(descriptor))
         }))
         .buffered(ARCHIVE_FETCH_CONCURRENCY)
         .try_collect()
         .await?;
-    for descriptor in descriptors {
+    for descriptor in descriptors.into_iter().flatten() {
         by_shard
             .entry(descriptor.shard)
             .or_default()
@@ -1263,7 +1292,15 @@ pub async fn inspect(store: &ArchiveStore) -> Result<Vec<RecoveryWindow>, Archiv
             if !key.ends_with(".wal.pb") {
                 continue;
             }
-            let object = pb::WalObject::decode(store.get_bytes(&key).await?)?;
+            // Advisory output: one unreadable descriptor must not cost the
+            // operator the report of every window that is fine.
+            let object = match pb::WalObject::decode(store.get_bytes(&key).await?) {
+                Ok(object) => object,
+                Err(error) => {
+                    skipping(&format!("{key}: {error}"));
+                    continue;
+                }
+            };
             if object.database_uuid != manifest.database_uuid || object.term != manifest.term {
                 continue;
             }
@@ -1490,6 +1527,47 @@ mod tests {
 
         assert_eq!(key, state.latest_base_manifest);
         assert_eq!(manifest.checkpoint_version, 10);
+        assert_eq!(inspect(&store).await.unwrap().len(), 1);
+    }
+
+    /// A WAL descriptor this build cannot decode is dropped, not fatal.
+    ///
+    /// The listing is the whole term's history, and most of it is neither
+    /// replayed nor reachable from the target -- so before this, one corrupt
+    /// descriptor from history the restore would walk straight past failed
+    /// the restore. What makes dropping safe is that `chain_objects` refuses
+    /// a chain with a hole in it, so a descriptor that is actually needed
+    /// still stops the restore, with the warning naming the object.
+    #[tokio::test]
+    async fn an_unreadable_wal_descriptor_is_dropped_rather_than_failing_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::fixture::archive(dir.path(), &[]);
+        // Field number zero: never a valid protobuf tag, so this is a decode
+        // failure rather than a lucky parse of arbitrary bytes.
+        crate::fixture::write(
+            dir.path(),
+            &format!(
+                "db/{}/term/0000000000/wal/0000/{:020}-{:020}.wal.pb",
+                crate::fixture::HEX,
+                1,
+                2
+            ),
+            &[0x00],
+        );
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let state = store.load_state().await.unwrap().unwrap();
+        let (_, manifest) = load_base(&store, &state, RecoveryTarget::Tip)
+            .await
+            .unwrap();
+
+        assert!(
+            load_wal_descriptors(&store, &manifest)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the only descriptor was unreadable, so the history is empty rather than an error"
+        );
+        // And the advisory listing still reports the window it can see.
         assert_eq!(inspect(&store).await.unwrap().len(), 1);
     }
 

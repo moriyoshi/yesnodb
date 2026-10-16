@@ -982,8 +982,13 @@ async fn wal_loop(runtime: Runtime, shard: u32) -> Result<(), ArchiveError> {
                 state.latest_base_manifest.clone(),
             )
         };
-        let base = BaseManifest::decode(runtime.store.get_bytes(&base_key).await?)?;
-        validate_base_manifest(&base)?;
+        // Fatal, and named. This is the base the stream is anchored to, so
+        // there is nothing to fall back to -- but the message has to say
+        // which object, for the reason `lib.rs::ctx` records for paths.
+        let base = BaseManifest::decode(runtime.store.get_bytes(&base_key).await?)
+            .map_err(ArchiveError::from)
+            .and_then(|base| validate_base_manifest(&base).map(|()| base))
+            .map_err(|error| -> ArchiveError { format!("{base_key}: {error}").into() })?;
         if base.database_uuid != database_uuid || base.term != runtime.term {
             return Err("current archive base does not match the active database timeline".into());
         }
