@@ -2850,3 +2850,24 @@ has falsified something written down: **a test that passes because the code unde
 a test with a hidden parameter**, and the parameter is not in the file. The two assertions either
 side of this one -- a wide window keeps both roots, a narrow one keeps the newest -- are the
 properties, and neither needed a clock.
+
+## 2026-10-17 -- Putting the profile on the line that carries the number
+
+Yesterday's correction was four measurements recorded as release numbers that were debug ones,
+three to six times too slow. The entry explains what happened and the fix for those numbers. This
+is the fix for the next four.
+
+The runner printed `ok  base_dedup.py ( 13436 ms, 73 verb calls )`. Everything needed to
+misread that is in the line, and everything needed to read it correctly is not. So the profile
+now sits inside it: `ok  base_dedup.py ( 13436 ms debug, 73 verb calls )`, from
+`cfg!( debug_assertions )`, on the failing line as well as the passing one.
+
+**Not a banner at the top of the run, which was my first instinct and is the wrong shape.** What
+travels out of a terminal into a journal entry is one line, cut from the middle of forty-four.
+A banner is correct and absent exactly when it is needed. The rule generalizes: a label belongs
+on the smallest thing someone will copy, not on the context they will leave behind.
+
+Nothing parses this format -- `yesno-e2e/tests/scenarios.rs` prints its own line and deliberately
+carries no duration, since a timing taken under `cargo test` is a timing of the gate's own
+parallelism. `TESTING.md` now says to treat a `debug` figure as a ratio at best and never to
+record one without saying so.

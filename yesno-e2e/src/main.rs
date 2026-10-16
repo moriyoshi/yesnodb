@@ -92,13 +92,28 @@ fn main() -> ExitCode {
         }
     }
 
+    // **Printed beside every duration, not once at the top of the run.** On
+    // 2026-10-16 four measurements taken from this runner were written into
+    // the journal as if they were release numbers and were between 3x and 6x
+    // too slow, because the line they were copied from said how many
+    // milliseconds and not under which profile. A banner would not have
+    // helped: what travels is the line with the number on it, so the profile
+    // has to be on that line.
+    let profile = match cfg!(debug_assertions) {
+        true => "debug",
+        false => "release",
+    };
+
     let mut failed = 0usize;
     for path in &paths {
         let out = run_file_with(path, limit, &knobs);
         let ms = out.elapsed.as_millis();
         if let Some(err) = &out.error {
             failed += 1;
-            println!("FAIL {} ({ms} ms, {} verb calls)", out.name, out.calls);
+            println!(
+                "FAIL {} ({ms} ms {profile}, {} verb calls)",
+                out.name, out.calls
+            );
             if !out.output.is_empty() {
                 for line in out.output.lines() {
                     println!("     | {line}");
@@ -108,7 +123,10 @@ fn main() -> ExitCode {
                 println!("     {line}");
             }
         } else {
-            println!("ok   {} ({ms} ms, {} verb calls)", out.name, out.calls);
+            println!(
+                "ok   {} ({ms} ms {profile}, {} verb calls)",
+                out.name, out.calls
+            );
             if show_output && !out.output.is_empty() {
                 for line in out.output.lines() {
                     println!("     | {line}");

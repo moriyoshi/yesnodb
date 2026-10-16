@@ -489,6 +489,15 @@ cargo run --release -p yesno-e2e -- --show-output \
 
 ### Timing
 
+**Every duration the runner prints carries the build profile**, as
+`ok  name.py ( 289 ms debug, 22 verb calls )`. Measurement fixtures are meant
+to be run with `--release`, and on 2026-10-16 four numbers taken from a debug
+run were written into `JOURNAL.md` as if they were release ones and were
+between three and six times too slow. A banner at the top of the run would not
+have caught it: what gets copied out is the line with the number on it, so the
+profile is on that line. Treat a figure labelled `debug` as a ratio at best,
+and never record one without saying so.
+
 **A repetition loop written in Python times monty.** Measured: ~1 µs per host
 call and ~100 ns per VM instruction in release ( 6.7 µs and 650 ns in debug ),
 against the tens of nanoseconds a planner measurement is about.
