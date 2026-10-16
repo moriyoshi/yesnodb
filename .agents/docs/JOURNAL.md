@@ -2270,3 +2270,53 @@ comment to want to point at, so this is reachable any time a `pub` item's docume
 itself by naming the function that implements the rule. The fix is to state the rule in the doc
 comment instead of linking to where it lives, which is better writing anyway -- the field now
 carries the reasoning rather than a pointer to it.
+
+## 2026-10-16 — The same defect on the restore path, where it costs the recovery rather than the sweep
+
+Having found it in `gc::survey` by reading, I looked for the shape elsewhere: a `?` on a per-object
+property inside a loop over every manifest. `restore::list_bases` had it, through `try_collect`:
+
+```rust
+let manifest = pb::BaseManifest::decode(store.get_bytes(&key).await?)?;
+validate_base_manifest(&manifest)?;
+```
+
+**This one is worse than the reclamation case.** There, one unreadable manifest halts the sweep and
+the bucket grows. Here, one unreadable manifest anywhere under `db/<uuid>/term/` failed **every
+restore and every `--inspect`** -- including a target that manifest has nothing to do with, and
+including bases this build wrote and can read perfectly. It is a failure discovered during a
+recovery, which is the worst moment there is to discover anything.
+
+### The fix is easier here, and the reason is worth stating
+
+Reclamation could not simply skip: a manifest there *justifies keeping* other objects, so one that
+will not decode may name any slab and there is no safe subset. On the restore path a manifest is a
+**candidate recovery root and nothing else**. One that will not decode is simply not a candidate,
+and skipping it costs nothing it could have offered.
+
+Skipping is safe only because it is reported. A quiet skip changes which base a restore roots at
+without saying so, which is why the warning is emitted from `list_bases` itself -- the one place
+that learns of them -- and why the "no base at or below target version V" error now says how many
+were skipped. Without that, the message reads as "this archive never held one" while the base that
+answers it sits there unread.
+
+### Two asymmetries, both deliberate
+
+**A fetch failure is still fatal**, here as in `gc`. A restore that quietly rooted at an older base
+because one GET timed out would answer a different recovery point than it was asked for. Only the
+bytes being wrong is a property of the object, and that will not resolve on a retry.
+
+**The tip is still fatal.** `--target-version` omitted asks for the durable tip, which names one
+specific manifest through `state.pb`. If that one cannot be read, rooting at an older base would
+answer a different recovery point under the name the operator asked for -- worse than refusing. The
+message now carries the key, which it did not.
+
+### Mutation-checked
+
+Both tests fail under a sabotage that restores the old behaviour ( `list_bases` returning `Err` on
+the first unreadable manifest ), with the good base present and selectable. The second test is the
+one that matters for the error text: it asserts both that the target is named and that the skipped
+count is.
+
+`cargo doc -p yesno-server-utils --no-deps` was run locally this time, before the gate, which is
+the only change the previous entry's postscript asks for.

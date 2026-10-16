@@ -317,15 +317,22 @@ async fn load_base(
         if state.latest_base_manifest.is_empty() {
             return Err("archive has no completed base manifest".into());
         }
-        let manifest =
-            pb::BaseManifest::decode(store.get_bytes(&state.latest_base_manifest).await?)?;
-        validate_base_manifest(&manifest)?;
-        return Ok((state.latest_base_manifest.clone(), manifest));
+        // Unreadable here is fatal and deliberately so, where below it is
+        // skipped: this is the base the tip *is*. Rooting at an older one
+        // would answer a different recovery point under the name the
+        // operator asked for, which is worse than refusing.
+        let key = &state.latest_base_manifest;
+        let manifest = pb::BaseManifest::decode(store.get_bytes(key).await?)
+            .map_err(ArchiveError::from)
+            .and_then(|manifest| validate_base_manifest(&manifest).map(|()| manifest))
+            .map_err(|error| -> ArchiveError { format!("{key}: {error}").into() })?;
+        return Ok((key.clone(), manifest));
     }
 
     let mut unstamped = 0usize;
     let mut selected: Option<(String, pb::BaseManifest)> = None;
-    for (key, manifest) in list_bases(store, &state.database_uuid).await? {
+    let bases = list_bases(store, &state.database_uuid).await?;
+    for (key, manifest) in bases.readable {
         if target.is_time() && manifest.checkpoint_time == 0 {
             unstamped += 1;
         }
@@ -339,19 +346,26 @@ async fn load_base(
             selected = Some((key, manifest));
         }
     }
+    // Without this the message is actively misleading: "no base at or below
+    // version V" reads as "this archive never held one", when the base that
+    // answers it may be sitting there unread.
+    let skipped = match bases.unreadable.len() {
+        0 => String::new(),
+        n => format!("; {n} base manifest(s) were skipped because this build cannot read them"),
+    };
     selected.ok_or_else(|| match target {
         RecoveryTarget::Version(v) => {
-            format!("archive has no base checkpoint at or below target version {v}").into()
+            format!("archive has no base checkpoint at or below target version {v}{skipped}").into()
         }
         RecoveryTarget::Time { micros, .. } if unstamped > 0 => format!(
-            "archive has no base checkpoint at or below {}; {unstamped} base(s) publish no \
-             commit time, so they predate commit-time stamping and cannot answer a wall-clock \
+            "archive has no base checkpoint at or below {}{skipped}; {unstamped} base(s) publish \
+             no commit time, so they predate commit-time stamping and cannot answer a wall-clock \
              target. Use --target-version against those.",
             format_micros(micros as u64)
         )
         .into(),
         RecoveryTarget::Time { micros, .. } => format!(
-            "archive has no base checkpoint at or below {}",
+            "archive has no base checkpoint at or below {}{skipped}",
             format_micros(micros as u64)
         )
         .into(),
@@ -389,10 +403,28 @@ async fn load_base(
 /// reason about completion order.
 const ARCHIVE_FETCH_CONCURRENCY: usize = 8;
 
-async fn list_bases(
-    store: &ArchiveStore,
-    database_uuid: &[u8],
-) -> Result<Vec<(String, pb::BaseManifest)>, ArchiveError> {
+/// Every base manifest under this database's prefix, sorted into the ones
+/// this build can use and the ones it cannot.
+///
+/// **One manifest it cannot read must not cost the archive its restores.** A
+/// manifest here is a candidate recovery root and nothing else, so one that
+/// will not decode is simply not a candidate -- unlike reclamation, where a
+/// manifest justifies keeping other objects and an unreadable one therefore
+/// has to stop the whole pass. The realistic way to meet one is a writer from
+/// a newer release sharing the prefix, and before this a single such object
+/// made **every** restore fail, including `--inspect`, including targets the
+/// bad manifest has nothing to do with. That is a failure discovered during a
+/// recovery, which is the worst moment there is.
+///
+/// Skipping is only safe because it is reported. A quiet skip changes which
+/// base a restore roots at without saying so.
+struct Bases {
+    readable: Vec<(String, pb::BaseManifest)>,
+    /// Each entry is the object key and the reason, together.
+    unreadable: Vec<String>,
+}
+
+async fn list_bases(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Bases, ArchiveError> {
     let prefix = format!("db/{}/term/", uuid_hex(database_uuid));
     let keys: Vec<String> = store
         .list_relative(&prefix)
@@ -400,19 +432,48 @@ async fn list_bases(
         .into_iter()
         .filter(|key| key.ends_with("/manifest.pb") && key.contains("/base/"))
         .collect();
-    let fetched: Vec<(String, pb::BaseManifest)> =
+    let fetched: Vec<Result<(String, pb::BaseManifest), String>> =
         futures::stream::iter(keys.into_iter().map(|key| async move {
-            let manifest = pb::BaseManifest::decode(store.get_bytes(&key).await?)?;
-            validate_base_manifest(&manifest)?;
-            Ok::<_, ArchiveError>((key, manifest))
+            // The fetch failing is still fatal, and the bytes being wrong is
+            // not. A restore that quietly rooted at an older base because one
+            // GET timed out would answer a different recovery point than it
+            // was asked for; a manifest this build cannot parse is a property
+            // of the object and will not resolve on a retry.
+            let bytes = store.get_bytes(&key).await?;
+            Ok::<_, ArchiveError>(
+                match pb::BaseManifest::decode(bytes)
+                    .map_err(ArchiveError::from)
+                    .and_then(|manifest| validate_base_manifest(&manifest).map(|()| manifest))
+                {
+                    Ok(manifest) => Ok((key, manifest)),
+                    Err(error) => Err(format!("{key}: {error}")),
+                },
+            )
         }))
         .buffered(ARCHIVE_FETCH_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(fetched
-        .into_iter()
-        .filter(|(_, manifest)| manifest.database_uuid == database_uuid)
-        .collect())
+
+    let mut bases = Bases {
+        readable: Vec::new(),
+        unreadable: Vec::new(),
+    };
+    for one in fetched {
+        match one {
+            Ok((key, manifest)) if manifest.database_uuid == database_uuid => {
+                bases.readable.push((key, manifest))
+            }
+            Ok(_) => {}
+            Err(reason) => bases.unreadable.push(reason),
+        }
+    }
+    // Here rather than at each caller: this is the one place that learns of
+    // them, and an operator reading a recovery window or a restore's output
+    // has to be told the listing is not the whole archive.
+    for reason in &bases.unreadable {
+        eprintln!("warning: skipping a base manifest this build cannot read -- {reason}");
+    }
+    Ok(bases)
 }
 
 /// CRC32C of a hole, over the zeros it stands for.
@@ -1177,7 +1238,7 @@ pub struct RecoveryWindow {
 pub async fn inspect(store: &ArchiveStore) -> Result<Vec<RecoveryWindow>, ArchiveError> {
     let state = store.load_state().await?.ok_or("archive has no state.pb")?;
     let mut windows = Vec::new();
-    for (manifest_key, manifest) in list_bases(store, &state.database_uuid).await? {
+    for (manifest_key, manifest) in list_bases(store, &state.database_uuid).await?.readable {
         let prefix = format!(
             "db/{}/term/{:010}/wal/",
             uuid_hex(&manifest.database_uuid),
@@ -1389,6 +1450,69 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A manifest from a writer this build does not know, written straight
+    /// into the archive beside a good one.
+    fn unreadable_base(root: &std::path::Path, generation: u64) -> String {
+        let key = format!(
+            "db/{}/term/0000000000/base/{generation:020}/manifest.pb",
+            crate::fixture::HEX
+        );
+        crate::fixture::write(
+            root,
+            &key,
+            &pb::BaseManifest {
+                schema_version: 99,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+        key
+    }
+
+    /// One manifest this build cannot read must not cost the archive every
+    /// restore it could still serve.
+    ///
+    /// Before this, `list_bases` collected the decode failure through `?`, so
+    /// a single such object failed every restore and every `--inspect` --
+    /// including, as here, a target the bad manifest has nothing to do with.
+    #[tokio::test]
+    async fn an_unreadable_base_is_skipped_rather_than_failing_every_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::fixture::archive(dir.path(), &[]);
+        unreadable_base(dir.path(), 2);
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let state = store.load_state().await.unwrap().unwrap();
+
+        let (key, manifest) = load_base(&store, &state, RecoveryTarget::Version(u64::MAX))
+            .await
+            .unwrap();
+
+        assert_eq!(key, state.latest_base_manifest);
+        assert_eq!(manifest.checkpoint_version, 10);
+        assert_eq!(inspect(&store).await.unwrap().len(), 1);
+    }
+
+    /// And when nothing matches, the message has to say the archive was not
+    /// read in full. "No base at or below version 1" otherwise reads as "this
+    /// archive never held one", while the base that answers it may be sitting
+    /// there unread.
+    #[tokio::test]
+    async fn a_target_no_readable_base_answers_says_which_were_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::fixture::archive(dir.path(), &[]);
+        unreadable_base(dir.path(), 2);
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let state = store.load_state().await.unwrap().unwrap();
+
+        let error = load_base(&store, &state, RecoveryTarget::Version(1))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("at or below target version 1"), "{error}");
+        assert!(error.contains("1 base manifest(s) were skipped"), "{error}");
+    }
 
     /// A plan with the given stamped versions above `checkpoint`.
     fn plan_with(checkpoint: u64, stamps: &[(u64, u64)]) -> yesno_core::wal::RecoveryPlan {

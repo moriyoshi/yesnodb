@@ -23,6 +23,19 @@ ordinary replica recovery before publishing it with one rename. Omit
 `--target-version` to restore the durable archive tip. A requested version that
 is not present as a complete commit fails rather than rounding silently.
 
+A base manifest this version cannot read is **skipped rather than fatal**, with
+a warning naming the object and the reason. It is a candidate recovery root and
+nothing else, so one that will not decode is simply not a candidate, and one
+such object must not cost the archive every restore it could still serve. If no
+readable base answers the target, the error says how many were skipped -- read
+that as "the base you want may be one of them", not as "this archive never held
+one". The realistic cause is a writer from a newer release sharing the prefix.
+
+The exception is `--target-version` omitted, which asks for the durable tip.
+That names one specific manifest, so if it cannot be read the restore fails:
+rooting at an older base would answer a different recovery point under the name
+you asked for.
+
 ### How much space a restore needs
 
 A shard image is a sparse file. Its apparent length is a whole memory-mapping
