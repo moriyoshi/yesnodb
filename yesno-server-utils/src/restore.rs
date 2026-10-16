@@ -622,9 +622,6 @@ where
     Ok((seen, checksum))
 }
 
-/// Where a base object's bytes belong, and how many of them there are.
-///
-/// A file that is not sparse is the single extent covering it, which is how
 /// Rebuild one base file from its content-addressed slab objects.
 ///
 /// **Fetched concurrently but consumed in order**, which is what `buffered`
@@ -688,6 +685,9 @@ async fn download_slab_file(
     Ok(())
 }
 
+/// Where a base object's bytes belong, and how many of them there are.
+///
+/// A file that is not sparse is the single extent covering it, which is how
 /// every archive written before sparse objects existed reads.
 fn object_layout(file: &pb::ArchiveFile) -> (Vec<pb::FileExtent>, u64) {
     if !file.sparse {

@@ -92,6 +92,26 @@ pub struct RetentionPolicy {
     pub min_bases: usize,
 }
 
+impl RetentionPolicy {
+    /// The policy that proposes nothing, for a pass that is asking the other
+    /// question.
+    ///
+    /// Both axes are opened as far as they go, so neither can drop a base: the
+    /// window reaches past the start of the archive and the floor on base
+    /// count is every base there is. A plan made with it therefore retains the
+    /// whole archive, which makes its [`GcPlan::missing`] the strongest form
+    /// of the integrity check -- not "can the bases this policy would keep be
+    /// restored" but "can every base here be restored".
+    ///
+    /// It still proposes deleting WAL below the oldest base's cursor, because
+    /// that is unreachable however many bases are kept. A caller that is only
+    /// surveying has to disregard that list rather than assume it is empty.
+    pub const SURVEY: Self = Self {
+        window_micros: u64::MAX,
+        min_bases: usize::MAX,
+    };
+}
+
 /// What one reclamation pass decided.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcPlan {

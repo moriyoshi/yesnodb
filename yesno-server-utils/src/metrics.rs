@@ -56,9 +56,15 @@
 //! 1. `yesnod_archive_reclamation_last_success_timestamp_seconds` publishes
 //!    exactly how old the gauges are, so an alert can require freshness.
 //! 2. The gauges are **not emitted at all** until a pass has completed. A
-//!    sidecar that has never reclaimed anything reports no reading rather than
-//!    a reassuring zero, which is the same reason the standby does not publish
-//!    the leader's gauges filled with zeros.
+//!    sidecar that has not surveyed the archive yet reports no reading rather
+//!    than a reassuring zero, which is the same reason the standby does not
+//!    publish the leader's gauges filled with zeros.
+//!
+//! A pass that completes is not necessarily a pass that deleted: with no
+//! retention policy the sidecar surveys on the same interval and deletes
+//! nothing, so every gauge here is published by deployments with reclamation
+//! off -- which are the ones for which the two integrity families matter
+//! most. Only `archive_objects_deleted_total` tells the two modes apart.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -148,7 +154,10 @@ impl ArchiveMetrics {
         counter(
             &mut s,
             "archive_reclamation_passes_total",
-            "Reclamation passes that completed and produced a plan.",
+            "Passes that completed and produced a plan. A deployment with \
+             reclamation off surveys on the same interval and counts here too, \
+             which is what keeps the gauges below fresh; it deletes nothing, so \
+             archive_objects_deleted_total stays flat.",
             self.passes.load(Ordering::Relaxed),
         );
         counter(
@@ -321,10 +330,10 @@ mod tests {
             store.clone(),
             lease,
             30,
-            RetentionPolicy {
+            Some(RetentionPolicy {
                 window_micros: 86_400 * 1_000_000,
                 min_bases: 1,
-            },
+            }),
             1,
             metrics.clone(),
             Arc::new(crate::sidecar::CaptureGate::default()),
@@ -349,6 +358,76 @@ mod tests {
             value_of(&rendered, "archive_unrecognized_keys"),
             Some(1),
             "{rendered}"
+        );
+    }
+
+    /// With no retention policy the same loop still surveys, and still
+    /// deletes nothing.
+    ///
+    /// Both halves matter and neither is vacuous. The archive here is missing
+    /// an object a live base names, so a deployment that never configured
+    /// retention -- the default, and the one most likely to be leaning on a
+    /// bucket lifecycle rule -- learns about it from the gauge rather than
+    /// from a restore. It also holds a WAL object wholly below the only
+    /// base's cursor, which is what a reclaiming pass is for and what this one
+    /// must leave alone; `archive_objects_deleted_total` has to agree with the
+    /// disk, because a counter that moves while nothing is deleted is worse
+    /// than no counter.
+    #[tokio::test]
+    async fn a_sidecar_with_reclamation_off_still_surveys() {
+        let dir = tempfile::tempdir().unwrap();
+        archive(dir.path(), &[]);
+        let lost = format!("db/{HEX}/term/0000000000/base/{:020}/MANIFEST", 1);
+        std::fs::remove_file(dir.path().join(&lost)).unwrap();
+        let spent = format!("db/{HEX}/term/0000000000/wal/0000/{:020}-{:020}.wal", 0, 0);
+        write(dir.path(), &spent, b"spent");
+
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let lease = Arc::new(
+            store
+                .acquire_writer(crate::lease::new_writer_id().unwrap(), 30)
+                .await
+                .unwrap(),
+        );
+        let metrics = Arc::new(ArchiveMetrics::new());
+        let task = tokio::spawn(crate::sidecar::retention_loop(
+            store.clone(),
+            lease,
+            30,
+            None,
+            1,
+            metrics.clone(),
+            Arc::new(crate::sidecar::CaptureGate::default()),
+        ));
+
+        let mut rendered = metrics.render();
+        for _ in 0..200 {
+            if value_of(&rendered, "archive_reclamation_passes_total") == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            rendered = metrics.render();
+        }
+        task.abort();
+
+        assert_eq!(
+            value_of(&rendered, "archive_reclamation_passes_total"),
+            Some(1),
+            "the loop never surveyed without a policy: {rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_missing_objects"),
+            Some(1),
+            "{rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_objects_deleted_total"),
+            Some(0),
+            "a survey counted deletions: {rendered}"
+        );
+        assert!(
+            dir.path().join(&spent).exists(),
+            "a survey deleted the WAL a reclaiming pass would have"
         );
     }
 
@@ -385,10 +464,10 @@ mod tests {
             store.clone(),
             lease,
             30,
-            RetentionPolicy {
+            Some(RetentionPolicy {
                 window_micros: 86_400 * 1_000_000,
                 min_bases: 1,
-            },
+            }),
             1,
             metrics.clone(),
             gate.clone(),

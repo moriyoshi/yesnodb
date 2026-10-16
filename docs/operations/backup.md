@@ -208,9 +208,10 @@ Accepted units are `s`, `m`, `h` and `d`; a bare number is refused, because ever
 wrong guess about the unit deletes recoverable history.
 
 Omitting `--retention-window` disables reclamation entirely, which is the
-default. `--retention-min-bases` (default 2) keeps that many newest bases
-regardless, so a database quiet for longer than its window still has a root.
-`--retention-interval-secs` (default 3600) sets the pass interval.
+default. It does not switch the pass off: see the survey below.
+`--retention-min-bases` (default 2) keeps that many newest bases regardless, so
+a database quiet for longer than its window still has a root.
+`--retention-interval-secs` (default 3600) sets the interval for both.
 
 A pass never deletes the active base, a base whose commit time is unknown
 (published before commit times were recorded, so it cannot be placed in the
@@ -245,6 +246,16 @@ expiring objects after 90 days will delete live pieces of the base being
 written today. Use lifecycle rules only to expire incomplete multipart uploads.
 `yesnod_archive_missing_objects` reports the damage if one has already run, and
 `yesnoctl archive-plan` answers the same question on demand.
+
+**The sidecar surveys the archive whether or not reclamation is configured.**
+A sidecar with no `--retention-window` runs the same pass on the same interval,
+reports what it found and deletes nothing, so an archive that is only ever
+written to still publishes whether it is still whole. This is deliberate: the
+deployments with reclamation off are the ones most likely to be leaning on a
+bucket lifecycle rule, and before this they were the ones with no reading to
+alert on. A survey costs one listing and one GET per base manifest per
+interval. `yesnod_archive_objects_deleted_total` stays flat, which is how a
+dashboard tells the two modes apart.
 
 Reclamation runs under the same writer lease as publication, renewed immediately
 before each pass, and is abandoned if the archive state moves while it is
@@ -302,7 +313,8 @@ nothing sends traffic to a sidecar, so there is no readiness question to answer.
 The counters accumulate over the sidecar's lifetime and reset when it restarts:
 
 - `yesnod_archive_reclamation_passes_total`: passes that completed and produced
-  a plan.
+  a plan. A sidecar with reclamation off counts its surveys here too; they are
+  what keeps the gauges below fresh.
 - `yesnod_archive_reclamation_failures_total`: passes that ran and failed. A
   failed pass is retried on the next interval and never stops archiving, so
   this counter is the signal that reclamation is not keeping up.
@@ -314,11 +326,12 @@ The counters accumulate over the sidecar's lifetime and reset when it restarts:
   time, because a capture's objects are not yet named by any published
   manifest. A steady climb with no completed pass between the skips means the
   interval is shorter than the capture, and the interval should be raised.
-- `yesnod_archive_objects_deleted_total`: archive objects deleted.
+- `yesnod_archive_objects_deleted_total`: archive objects deleted. Flat at zero
+  on a sidecar with no `--retention-window`, which surveys and deletes nothing.
 
-The gauges report the last completed pass. They are absent until one completes,
-so a sidecar that has never surveyed the archive publishes no reading rather
-than a reassuring zero:
+The gauges report the last completed pass, reclaiming or surveying. They are
+absent until one completes, so a sidecar that has never surveyed the archive
+publishes no reading rather than a reassuring zero:
 
 - `yesnod_archive_unrecognized_keys`: objects the last pass could not classify,
   and so neither retained deliberately nor deleted. Alert on any non-zero

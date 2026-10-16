@@ -194,7 +194,10 @@ pub struct ArchiveOptions {
     ///
     /// Omitting it disables reclamation entirely, which is the default: an
     /// archive that has never been told what to keep is not one to start
-    /// deleting from.
+    /// deleting from. It does not disable the pass -- a sidecar with no window
+    /// surveys on the same interval and deletes nothing, which is what keeps
+    /// the integrity gauges published for the deployments that never enabled
+    /// reclamation.
     #[arg(long, value_name = "DURATION")]
     retention_window: Option<String>,
 
@@ -203,7 +206,8 @@ pub struct ArchiveOptions {
     #[arg(long, default_value_t = 2)]
     retention_min_bases: usize,
 
-    /// Seconds between reclamation passes. Ignored without --retention-window.
+    /// Seconds between reclamation passes, and between the surveys that run in
+    /// their place when --retention-window is omitted.
     #[arg(long, default_value_t = 3600)]
     retention_interval_secs: u64,
 
@@ -211,7 +215,9 @@ pub struct ArchiveOptions {
     ///
     /// Reclamation decides what an archive destroys, and the unrecognized-key
     /// count it reports is an alerting condition rather than a log line — so a
-    /// deployment that reclaims should scrape this.
+    /// deployment that reclaims should scrape this. So should one that does
+    /// not: the pass runs either way, and without a policy its whole report is
+    /// whether the archive still holds what its bases name.
     ///
     /// Off by default, unlike the daemon's own listener, which defaults to a
     /// loopback address. The daemon is one process per data directory; sidecars
@@ -1321,11 +1327,35 @@ async fn refresh_base(
     capture_base(runtime, request.sequence, true).await
 }
 
-/// Reclaim unreachable archive objects on an interval.
+/// Reclaim unreachable archive objects on an interval, or, without a policy,
+/// survey the archive on the same interval and delete nothing.
 ///
-/// Renews the writer lease immediately before each pass rather than relying
-/// on `writer_lease_loop`'s schedule. A pass that deletes under an expired lease
-/// is deleting from an archive another writer may already own.
+/// # Why it runs with reclamation off
+///
+/// Reclamation is off by default, and the gauges a pass publishes include the
+/// two that say whether the archive is *whole*. So the deployments most
+/// exposed to an object-store lifecycle rule eating a live content-addressed
+/// slab -- the ones that never configured retention and assumed lifecycle
+/// rules would handle expiry -- were exactly the ones for which no pass ever
+/// ran and no reading was ever published. A survey costs one listing and one
+/// GET per base manifest per interval, and it answers the question the
+/// operator cannot otherwise ask without running `yesnoctl archive-plan` by
+/// hand.
+///
+/// A survey takes the [`CaptureGate`] even though it deletes nothing, and for
+/// a different reason than reclamation does. A listing is served in key order
+/// and `slabs/` sorts before `term/`, so a capture running alongside an
+/// ungated survey can have its slabs uploaded after that part of the listing
+/// was served and its manifest published before the manifests were read --
+/// which reports objects as missing that are sitting in the store. The
+/// command-line preview accepts that narrow race because it has no gate to
+/// take; a loop that feeds an alert must not.
+///
+/// Renews the writer lease immediately before each reclaiming pass rather than
+/// relying on `writer_lease_loop`'s schedule. A pass that deletes under an
+/// expired lease is deleting from an archive another writer may already own. A
+/// survey does not renew, and does not decline when renewal would have failed:
+/// nothing it does needs the archive to be ours.
 ///
 /// Skips the pass entirely while a base capture holds the [`CaptureGate`],
 /// which is the other way a pass could delete something that is still wanted.
@@ -1346,7 +1376,7 @@ pub(crate) async fn retention_loop(
     store: ArchiveStore,
     lease: Arc<WriterLease>,
     lease_ttl: u64,
-    policy: crate::gc::RetentionPolicy,
+    policy: Option<crate::gc::RetentionPolicy>,
     interval_secs: u64,
     metrics: Arc<crate::metrics::ArchiveMetrics>,
     gate: Arc<CaptureGate>,
@@ -1363,27 +1393,50 @@ pub(crate) async fn retention_loop(
             metrics.pass_skipped();
             continue;
         };
-        if let Err(error) = lease.renew(lease_ttl).await {
-            tracing::warn!(%error, "archive reclamation skipped: writer lease not renewed");
-            metrics.pass_skipped();
-            continue;
-        }
-        match crate::gc::collect(&store, policy).await {
-            Ok(plan) => {
-                tracing::info!("{}", plan.summary_line());
-                // Louder than the summary line it is already counted in,
-                // because unlike every other number there it does not clear
-                // itself: no later pass restores an object, and the operator
-                // finds out at a restore otherwise. One example key, because
-                // the count says how bad and the key says where to look.
-                // Ahead of `missing`, because this one says the pass did
-                // not do its job at all rather than that the archive has a
-                // hole in it.
+        let outcome = match policy {
+            Some(policy) => {
+                if let Err(error) = lease.renew(lease_ttl).await {
+                    tracing::warn!(%error, "archive reclamation skipped: writer lease not renewed");
+                    metrics.pass_skipped();
+                    continue;
+                }
+                crate::gc::collect(&store, policy).await
+            }
+            None => crate::gc::plan_for(&store, crate::gc::RetentionPolicy::SURVEY).await,
+        };
+        match outcome {
+            Ok(mut plan) => {
+                match policy {
+                    Some(_) => tracing::info!("{}", plan.summary_line()),
+                    None => {
+                        // The survey's plan still lists the WAL that full
+                        // retention leaves unreachable, and none of it is
+                        // going anywhere. Cleared before the plan is counted
+                        // so `archive_objects_deleted_total` keeps meaning
+                        // objects that were deleted.
+                        plan.delete.clear();
+                        tracing::info!(
+                            bases = plan.retained_bases.len(),
+                            missing = plan.missing.len(),
+                            unrecognized = plan.unrecognized.len(),
+                            unreadable = plan.unreadable_bases.len(),
+                            "archive surveyed; reclamation is off, so nothing was deleted"
+                        );
+                    }
+                }
+                // Louder than the line above, which already counts both,
+                // because unlike every other number there they do not clear
+                // themselves: no later pass restores an object, and the
+                // operator finds out at a restore otherwise. One example key,
+                // because the count says how bad and the key says where to
+                // look. Unreadable first, because that one says reachability
+                // could not be computed at all rather than that the archive
+                // has a hole in it.
                 if let Some(first) = plan.unreadable_bases.first() {
                     tracing::warn!(
                         unreadable = plan.unreadable_bases.len(),
                         %first,
-                        "archive reclamation deleted nothing: a base manifest could not be read"
+                        "a base manifest could not be read; reclamation will delete nothing until it is explained"
                     );
                 }
                 if let Some(first) = plan.missing.first() {
@@ -1524,17 +1577,18 @@ where
         tasks.spawn(event_loop(runtime.clone()));
         tasks.spawn(term_loop(runtime.clone()));
         tasks.spawn(writer_lease_loop(writer_lease.clone(), lease_ttl));
-        if let Some(policy) = retention {
-            tasks.spawn(retention_loop(
-                runtime.store.clone(),
-                writer_lease.clone(),
-                lease_ttl,
-                policy,
-                retention_interval,
-                metrics.clone(),
-                runtime.gate.clone(),
-            ));
-        }
+        // Spawned whether or not retention is configured. Without a policy it
+        // surveys and deletes nothing, which is the only way an archive with
+        // reclamation off ever publishes whether it is still whole.
+        tasks.spawn(retention_loop(
+            runtime.store.clone(),
+            writer_lease.clone(),
+            lease_ttl,
+            retention,
+            retention_interval,
+            metrics.clone(),
+            runtime.gate.clone(),
+        ));
 
         tokio::select! {
             _ = &mut shutdown => {

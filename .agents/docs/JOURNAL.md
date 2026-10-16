@@ -2364,3 +2364,83 @@ An object that *is* a candidate -- a recovery root, a descriptor in a listing --
 when it cannot be read, provided the skip is reported and some later check still fails closed on
 the ones that mattered. An object that *justifies* other objects, or that the caller named
 specifically, cannot be: there is nothing for the operation to mean without it.
+
+## 2026-10-16 -- The archives that needed the integrity gauge were the ones that never published it
+
+Three days of work put an integrity check into the reclamation pass: `GcPlan::missing`, the set
+difference between what the retained bases name and what the listing holds, published as
+`yesnod_archive_missing_objects`. Yesterday's entry on `yesnoctl archive-plan` noticed the gap and
+left it open:
+
+> reclamation is off by default ... exactly the deployments most exposed to a lifecycle rule
+> eating their content-addressed slabs -- the ones that never enabled reclamation and assumed
+> lifecycle rules would handle it -- were the ones with no way to learn.
+
+The command closed it for an operator who runs a command. It did not close it for a dashboard, and
+a hazard whose whole character is that nobody notices until a restore is not one to leave to
+someone remembering to ask.
+
+### The pass was already the right shape; only its spawn condition was wrong
+
+`run_with_shutdown` spawned `retention_loop` inside `if let Some(policy) = retention`. Everything
+inside the loop that is worth having with reclamation off -- the listing, the manifest reads, the
+reachability computation, the three gauges, the capture exclusion -- was gated on the one decision
+that is about *deleting*. So the loop now runs unconditionally and takes `Option<RetentionPolicy>`,
+and the two places the modes differ are the two places they should: a survey calls `gc::plan_for`
+rather than `gc::collect`, and it does not renew the writer lease first, because nothing it does
+needs the archive to still be ours.
+
+The survey's policy is a new `RetentionPolicy::SURVEY`, which opens both axes as far as they go --
+`window_micros: u64::MAX` and `min_bases: usize::MAX`. Either alone would retain every base; both
+are set so that no later change to how the floor is computed can quietly make a survey drop one.
+What the plan then reports is the strongest form of the check: not "can the bases this policy
+would keep be restored" but "can every base in this archive be restored".
+
+### The one thing a survey must throw away
+
+A plan made with `SURVEY` still proposes deleting WAL below the oldest base's cursor, because that
+is unreachable however many bases are kept. The loop clears `plan.delete` before counting the pass.
+This is not cosmetic. `pass_completed` adds `plan.delete.len()` to `archive_objects_deleted_total`,
+and a counter of deletions that moves while nothing is deleted is worse than no counter -- it is
+the metric an operator would use to confirm that a survey-only sidecar is behaving. Clearing
+`delete` to mean "this pass will remove nothing" is the same idiom `gc::planned` already uses for
+an unreadable manifest.
+
+`a_sidecar_with_reclamation_off_still_surveys` is built so neither half is vacuous: the fixture is
+missing an object a live base names *and* holds a spent WAL object below the only cursor. Removing
+the `plan.delete.clear()` line makes the deleted counter read 1 while the file is still on disk,
+which is exactly the lie the clear exists to prevent.
+
+### Why a survey takes the capture gate, and the preview does not
+
+Yesterday I wrote that a concurrent capture "cannot produce a false `missing`, because a manifest
+is published after every object it names". That is true of the publication order and not quite true
+of the survey, and the loop is where the difference starts to matter.
+
+A listing is served in key order, and `slabs/` sorts before `term/`. A capture running alongside an
+ungated survey can therefore upload its slabs *after* that part of the listing was served and
+publish its manifest *before* the manifest keys were read -- and the survey reports objects as
+missing that are sitting in the store. The window is narrow and the next pass clears it. But
+`archive_missing_objects` is documented as a condition that does not heal, which is the whole
+argument for alerting on any non-zero value, so a transient false reading costs more here than the
+listing it would save. The loop takes `CaptureGate::reclaiming()` for a survey exactly as it does
+for a reclaiming pass. `yesnoctl archive-plan` keeps the race: it has no gate to take, it is run by
+someone who is watching the output, and a preview that fenced the sidecar out of its own archive
+would be a worse trade.
+
+### What was deliberately not renamed
+
+`archive_reclamation_passes_total` now counts surveys as well, and its help text says so. Renaming
+a published family to `archive_passes_total` would be more accurate and would break every dashboard
+and alert already written against it, for an accuracy nobody is confused by once the help string is
+read. The family name stays; the help string carries the correction, and points at
+`archive_objects_deleted_total` as the one that tells the two modes apart.
+
+### A split doc comment, found on the way past
+
+`download_slab_file` in `restore.rs` had been inserted into the middle of `object_layout`'s doc
+comment, so the slab downloader's documentation opened with "Where a base object's bytes belong,
+and how many of them there are" and `object_layout` was left carrying the sentence fragment "every
+archive written before sparse objects existed reads." Both halves rejoined their own functions.
+Nothing catches this: each comment is well-formed, `cargo doc` renders both without complaint, and
+only reading them in order shows the seam.
