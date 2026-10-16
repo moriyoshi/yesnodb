@@ -108,16 +108,81 @@ const SNAPSHOT_CHUNK: usize = 1 << 20;
 /// reads as zero. The copy is content-identical; only its allocation differs,
 /// and the follower's is the better one.
 ///
-/// `SEEK_DATA` would let the leader skip *reading* the holes as well, and is
-/// not used: it needs a `libc` call and the unsafe rules that come with it, to
-/// save a scan whose cost is memory bandwidth on a one-off operation. Revisit
-/// only if a leader's CPU during bootstrap is ever shown to matter.
+/// # And it skips reading them too, which it did not until 2026-10-16
+///
+/// This comment used to say that `SEEK_DATA` was considered and declined,
+/// because it needs a `libc` call "to save a scan whose cost is memory
+/// bandwidth on a one-off operation", and to revisit "only if a leader's CPU
+/// during bootstrap is ever shown to matter". It was then shown to matter, by
+/// a wide margin: a four-shard follower bootstrap of a database holding
+/// **twenty-four ordinals** took 15.5 seconds, 3.8 of them per shard, and
+/// raising the payload to 8.19 million ordinals changed that by nothing
+/// measurable. The scan *was* the operation. A shard image is grown to a
+/// whole 1 GiB mapping segment at creation, so every bootstrap read a
+/// gigabyte per shard to discover that almost none of it was there.
+///
+/// So the allocated runs are located with `SEEK_DATA` / `SEEK_HOLE` and only
+/// those are read. The all-zero test below is kept rather than replaced: a
+/// filesystem may report allocated runs that are nevertheless zero, and the
+/// two filters compose -- one skips what was never written, the other what
+/// was written and is zero. A filesystem that does not support the seeks
+/// reports the whole file as one run, which is exactly the old behaviour.
+/// The next allocated run at or after `from`, as `(start, end)`.
+///
+/// `None` when the filesystem says nothing past `from` is allocated, which is
+/// the answer that makes the caller stop rather than read a gigabyte of
+/// holes.
+///
+/// **Degrades to the whole remainder on any refusal.** A filesystem without
+/// hole support answers `EINVAL`, an old kernel `ENOSYS`; reporting one run
+/// covering everything left is then both correct and exactly what this
+/// function replaced. The only answer treated as "nothing left" is the one
+/// that means it: `ENXIO` from `SEEK_DATA`.
+fn next_allocated(file: &std::fs::File, from: u64, total_len: u64) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+
+    if from >= total_len {
+        return None;
+    }
+    let whole = Some((from, total_len));
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is borrowed from a `File` the caller holds open for the
+    // whole call, and `lseek` reads and writes no memory -- it moves that one
+    // descriptor's offset, which nothing else uses. The descriptor exists for
+    // this probing and is never read from.
+    let start = unsafe { libc::lseek(fd, from as libc::off_t, libc::SEEK_DATA) };
+    if start < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENXIO) => None,
+            _ => whole,
+        };
+    }
+    // SAFETY: as above. The end of the file counts as a hole, so this call
+    // terminates every run.
+    let end = unsafe { libc::lseek(fd, start, libc::SEEK_HOLE) };
+    if end < 0 {
+        return whole;
+    }
+    // The kernel is not supposed to answer outside the file or behind the
+    // offset asked for. Clamped rather than trusted, because the whole point
+    // of the pair is to decide which bytes are read, and an answer past the
+    // end would read past it.
+    let start = (start as u64).clamp(from, total_len);
+    let end = (end as u64).clamp(start, total_len);
+    match start < end {
+        true => Some((start, end)),
+        false => None,
+    }
+}
+
 async fn stream_base_snapshot(
     shard: u32,
     path: &std::path::Path,
     tx: &mpsc::Sender<Result<pb::SnapshotChunk, Status>>,
 ) -> Result<(), Status> {
-    use tokio::io::AsyncReadExt;
+    use std::io::SeekFrom;
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     // The image is consistent by construction ( I4 ): a checkpoint persists
     // only state at or below the visible watermark, so there is no hot-backup
@@ -131,12 +196,39 @@ async fn stream_base_snapshot(
         .map_err(|e| Status::unavailable(e.to_string()))?
         .len();
 
+    // A second, synchronous handle, used for nothing but the extent probing.
+    // `tokio::fs::File` tracks its own position and does its reads on the
+    // blocking pool, so moving its descriptor's offset from underneath it
+    // with a raw `lseek` would be interfering with it rather than using it.
+    let probe = std::fs::File::open(path).map_err(|e| Status::unavailable(e.to_string()))?;
+
     let mut buffer = vec![0u8; SNAPSHOT_CHUNK];
     let mut offset = 0u64;
     let mut data_len = 0u64;
     let mut replay_off = None;
+    let mut run_end = 0u64;
     while offset < total_len {
-        let want = SNAPSHOT_CHUNK.min((total_len - offset) as usize);
+        if offset >= run_end {
+            // Nothing allocated from here on, so the rest of the image is
+            // holes and the follower's `set_len` already accounts for them.
+            let Some((start, end)) = next_allocated(&probe, offset, total_len) else {
+                break;
+            };
+            if start != offset {
+                offset = start;
+                // The reader has to follow the jump; every read below is
+                // positioned rather than sequential from here on.
+                file.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
+            run_end = end;
+        }
+        // Never past the end of the run: reading into the hole that follows
+        // would put back the cost this is here to remove, and on an image
+        // that alternates small runs and holes it would read more than the
+        // old loop did.
+        let want = SNAPSHOT_CHUNK.min((run_end - offset) as usize);
         // `read_exact`, because a short read in the middle of a file is not
         // end-of-file and a chunk assembled from one would ship a shortened
         // image at a truncated offset.
@@ -645,5 +737,90 @@ impl Replication for LeaderService {
                 ))
             })?;
         Ok(Response::new(pb::ManifestResponse { manifest }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+
+    use super::next_allocated;
+
+    /// The runs `next_allocated` reports, walked to the end of the file.
+    fn runs(file: &std::fs::File, total_len: u64) -> Vec<(u64, u64)> {
+        let mut found = Vec::new();
+        let mut at = 0u64;
+        while let Some((start, end)) = next_allocated(file, at, total_len) {
+            assert!(
+                start >= at,
+                "a run behind the offset asked for: {start} < {at}"
+            );
+            assert!(end <= total_len, "a run past the end: {end} > {total_len}");
+            assert!(start < end, "an empty run at {start}");
+            found.push((start, end));
+            at = end;
+        }
+        found
+    }
+
+    /// The property the whole optimization rests on: **nothing written may be
+    /// left out of a run.** A run that is missed is a region the leader never
+    /// reads and never ships, and the follower's image is then quietly short
+    /// in the middle -- the failure this file's comments record paying for
+    /// twice already.
+    ///
+    /// Deliberately not asserted here: that the holes are *excluded*. A
+    /// filesystem without hole support answers that the whole file is one
+    /// run, which is correct and is the behaviour this replaced, so an
+    /// assertion about exclusion would be an assertion about the filesystem
+    /// the gate happens to run on. What exclusion buys was measured instead,
+    /// end to end: see the journal for 2026-10-16.
+    #[test]
+    fn every_written_byte_falls_inside_a_reported_run() {
+        const MIB: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.bin");
+        let written = [(0u64, 4096u64), (MIB, MIB + 4096), (3 * MIB, 3 * MIB + 17)];
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(4 * MIB).unwrap();
+        for (start, end) in written {
+            file.seek(SeekFrom::Start(start)).unwrap();
+            file.write_all(&vec![0xab; (end - start) as usize]).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let file = std::fs::File::open(&path).unwrap();
+        let found = runs(&file, 4 * MIB);
+        assert!(!found.is_empty(), "a file with data reported no runs");
+        for (start, end) in written {
+            assert!(
+                found.iter().any(|(a, b)| *a <= start && end <= *b),
+                "{start}..{end} is in no run of {found:?}"
+            );
+        }
+    }
+
+    /// A file with nothing in it must terminate the walk rather than report a
+    /// run the caller would then read.
+    #[test]
+    fn a_file_of_nothing_but_holes_reports_at_most_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1 << 20).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let file = std::fs::File::open(&path).unwrap();
+        // Either none -- the filesystem knows it is all hole -- or the one
+        // run the fallback reports. Never more, and never past the end.
+        assert!(runs(&file, 1 << 20).len() <= 1);
+        assert_eq!(
+            next_allocated(&file, 1 << 20, 1 << 20),
+            None,
+            "past the end"
+        );
     }
 }

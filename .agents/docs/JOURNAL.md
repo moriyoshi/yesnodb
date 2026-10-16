@@ -2606,3 +2606,78 @@ names. Here it appears because the attribution walk and the collection walk disa
 precisely the drift. It is left as an observation rather than an assertion in `src/` -- the
 scenario covers the case, and a runtime check for a structurally impossible state is not worth the
 line.
+
+## 2026-10-16 -- A four-shard bootstrap of an empty database took 15 seconds, and none of it was the data
+
+`follower-bootstrap-from-the-leader-is-serial-across-shards` has been open since 2026-10-14,
+blocked on a judgement about the failover contract: parallelising the loop means hoisting
+`check_leader` out of it, and that turns a per-shard fence into a per-bootstrap one. Before
+spending that, I measured what the serial loop actually costs.
+
+A four-shard leader, `repl_bootstrap` per shard, timed from the harness:
+
+| database | per shard | four shards |
+| --- | --- | --- |
+| 24 ordinals | 3723, 3856, 4067, 3804 ms | 15 453 ms |
+| 8 192 000 ordinals | 3756, 3675, 3677, 3645 ms | 14 755 ms |
+
+**Raising the payload by a factor of three hundred and forty thousand changed nothing
+measurable.** The transfer was never the cost, so parallelising transfers was never the fix. A
+shard image is grown to a whole 1 GiB mapping segment at creation, and `stream_base_snapshot`
+read every byte of it to find out which parts were holes.
+
+### The comment that said not to do this also said when to
+
+`stream_base_snapshot`'s own documentation had considered the fix and declined it:
+
+> `SEEK_DATA` would let the leader skip *reading* the holes as well, and is not used: it needs a
+> `libc` call and the unsafe rules that come with it, to save a scan whose cost is memory
+> bandwidth on a one-off operation. **Revisit only if a leader's CPU during bootstrap is ever
+> shown to matter.**
+
+That is a well-formed decision -- it names its own falsifier -- and the falsifier had arrived. The
+reasoning was sound and the premise was wrong in one specific way: "a one-off operation" is true,
+and "whose cost is memory bandwidth" quietly assumed the cost scaled with the data. It scaled with
+the *apparent* size, which for this file is a constant gigabyte whatever the database holds.
+
+### What changed
+
+`next_allocated` walks the file with `SEEK_DATA` / `SEEK_HOLE` and the loop reads only the runs it
+reports, never past the end of the current run -- an image alternating small runs and holes would
+otherwise read more than the old loop did. The all-zero test is kept rather than replaced: the two
+filters compose, one skipping what was never written and the other what was written and is zero.
+Any refusal from the kernel degrades to one run covering the whole remainder, which is exactly the
+old behaviour, so a filesystem without hole support loses nothing. Only `ENXIO` from `SEEK_DATA`
+means "nothing left".
+
+| database | per shard, after | four shards, after |
+| --- | --- | --- |
+| 24 ordinals | 60, 60, 59, 58 ms | 239 ms |
+| 8 192 000 ordinals | 57, 27, 22, 27 ms | 136 ms |
+
+**15.5 seconds to 0.24.** The payload case is now faster than the empty one, which is the right
+way round and was not true before.
+
+### The unsafe, and what is tested
+
+Two `libc::lseek` calls, which read and write no memory and move only the offset of a descriptor
+this code opens for the probing and never reads from. The file is opened a second time
+deliberately: `tokio::fs::File` tracks its own position and does its reads on the blocking pool,
+so moving its descriptor's offset from underneath it would be interfering with it rather than
+using it.
+
+`every_written_byte_falls_inside_a_reported_run` asserts the property the whole thing rests on --
+a run that is missed is a region the leader never reads and never ships, and the follower's image
+is then quietly short in the middle. It deliberately does **not** assert that holes are excluded,
+because a filesystem without hole support correctly reports one run covering everything, and that
+assertion would be about the gate's filesystem rather than about this code. What exclusion buys is
+measured above instead. Adding 1 to the reported start makes the test fail.
+
+### Where the same cost still sits
+
+The archive capture reads each shard image the same way for the same reason, and the comment in
+`archive.rs` telling the reader not to reach for `SEEK_DATA` cited this decision -- so it has been
+corrected rather than left pointing at a conclusion that no longer holds. That change is not this
+one: the uploader also CRCs the whole file, holes included, so it would have to account for the
+runs it skipped the way the restore side already does. Filed as
+`archive-capture-reads-every-hole-it-does-not-upload`.

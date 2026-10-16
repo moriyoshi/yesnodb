@@ -58,10 +58,15 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// It is one constant and not two because it is one format decision: an extent
 /// boundary written by an upload is a window boundary a restore seeks to.
 ///
-/// **Do not reach for `SEEK_DATA`** to avoid *reading* the holes. The
-/// replication path considered and declined it for this exact job, because it
-/// needs a `libc` call and the unsafe rules that come with it to save a scan
-/// whose cost is memory bandwidth on a one-off operation.
+/// **The holes are still read here**, and that is now a known cost rather
+/// than a decision. The replication path declined `SEEK_DATA` for this exact
+/// job on the grounds that the scan was only memory bandwidth on a one-off
+/// operation, and on 2026-10-16 that was measured and overturned there: a
+/// shard image is grown to a whole 1 GiB mapping segment, so the scan was
+/// seconds per shard on a database holding nothing. A capture reads the same
+/// images the same way. It is not the same change, because this path also
+/// computes a CRC over the whole file and would have to account for the runs
+/// it skipped -- see `archive-capture-reads-every-hole-it-does-not-upload`.
 pub(crate) const SPARSE_WINDOW: usize = 1 << 20;
 
 /// Bytes of a base file per content-addressed object.
