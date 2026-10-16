@@ -311,6 +311,32 @@ impl ArchiveStore {
     }
 
     pub(crate) async fn list_relative(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
+        Ok(self
+            .list_relative_modified(prefix)
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    }
+
+    /// The same listing, with each object's last-modified time in epoch
+    /// microseconds, sorted by key.
+    ///
+    /// The time comes back from the listing that was happening anyway, which
+    /// is the only reason it is worth having: it is the field an object-store
+    /// lifecycle rule keys on, so it is the only thing in the archive that can
+    /// say an expiry rule is about to delete something live. See
+    /// [`crate::gc::oldest_live`].
+    ///
+    /// A store that reports a time before the epoch reads as zero rather than
+    /// as an error. The value is advisory -- it is compared against an
+    /// operator's lifecycle rule, not against anything this code decides -- and
+    /// failing a reclamation pass over a nonsensical timestamp would be the
+    /// worse outcome.
+    pub(crate) async fn list_relative_modified(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, u64)>, ArchiveError> {
         let objects = self
             .inner
             .list(Some(&self.path(prefix)))
@@ -327,7 +353,8 @@ impl ArchiveStore {
                     .and_then(|tail| tail.strip_prefix('/'))
                     .ok_or("object-store listing escaped the configured archive prefix")?
             };
-            relative.push(value.to_owned());
+            let modified = object.last_modified.timestamp_micros().max(0) as u64;
+            relative.push((value.to_owned(), modified));
         }
         relative.sort();
         Ok(relative)

@@ -23,7 +23,13 @@
 //!   flat, which is also what a healthy archive with nothing to reclaim looks
 //!   like.
 //!
-//! All three are alerting conditions, and an alerting condition has to be a
+//! - **The oldest live object's timestamp.** The only one of these that is
+//!   not damage. The three above say what has already gone wrong; this says
+//!   how long an object-store lifecycle rule has left before it takes
+//!   something the archive still needs, and it is alertable with arithmetic
+//!   an operator can write against their own retention setting.
+//!
+//! All four are alerting conditions, and an alerting condition has to be a
 //! metric.
 //!
 //! # It borrows the daemon's listener rather than inventing one
@@ -92,6 +98,12 @@ pub struct ArchiveMetrics {
     damaged_bases: AtomicU64,
     unreadable_bases: AtomicU64,
     retained_bases: AtomicU64,
+    /// Unix seconds of the oldest object the last pass kept, or zero when it
+    /// kept none. Zero is the sentinel rather than a reading: 1970 would read
+    /// as the most alarming value this gauge can take, so the family is
+    /// withheld instead, for the reason the module comment gives about a
+    /// reassuring zero.
+    oldest_live_unix: AtomicU64,
     last_success_unix: AtomicU64,
 }
 
@@ -120,6 +132,13 @@ impl ArchiveMetrics {
             .store(plan.unreadable_bases.len() as u64, Ordering::Relaxed);
         self.retained_bases
             .store(plan.retained_bases.len() as u64, Ordering::Relaxed);
+        self.oldest_live_unix.store(
+            plan.oldest_live_object
+                .as_ref()
+                .map(|(_, micros)| micros / 1_000_000)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
         self.last_success_unix
             .store(unix_seconds(), Ordering::Relaxed);
         self.surveyed.store(true, Ordering::Release);
@@ -231,6 +250,26 @@ impl ArchiveMetrics {
                 "Base images the last completed pass kept.",
                 self.retained_bases.load(Ordering::Relaxed).to_string(),
             );
+            // A timestamp rather than an age, so a scrape of a sidecar whose
+            // passes have stopped does not report a floor that keeps looking
+            // fresher than it is. The alert is `time() - <this>`, against the
+            // operator's own lifecycle setting, which is a number this
+            // process has no way to know.
+            let oldest_live = self.oldest_live_unix.load(Ordering::Relaxed);
+            if oldest_live != 0 {
+                gauge(
+                    &mut s,
+                    "archive_oldest_live_object_timestamp_seconds",
+                    "Last-modified time of the oldest object the last \
+                     completed pass kept. An object-store lifecycle rule that \
+                     expires objects older than time() minus this value \
+                     deletes live archive data. Content addressing is what \
+                     makes it necessary: a slab is named rather than \
+                     re-uploaded by every later base that still contains it, \
+                     so its age grows without bound while it stays live.",
+                    oldest_live.to_string(),
+                );
+            }
             gauge(
                 &mut s,
                 "archive_reclamation_last_success_timestamp_seconds",
@@ -321,6 +360,58 @@ mod tests {
             value_of(&rendered, "archive_damaged_bases"),
             Some(1),
             "the lost object was the only base's, so the base goes with it: {rendered}"
+        );
+    }
+
+    /// Set one object's last-modified time, which is what a store's listing
+    /// reports and what a lifecycle rule keys on.
+    fn backdate(path: &Path, when: SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    /// The floor a lifecycle rule has to clear, taken off a real listing and
+    /// published.
+    ///
+    /// Two objects here are a year old: one the pass keeps and one it is
+    /// about to delete, which is the ordinary shape of an archive -- the
+    /// oldest thing in the bucket is nearly always something superseded. A
+    /// gauge fed by the listing alone would report the spent WAL object and
+    /// tell an operator to lengthen a rule that was doing exactly its job.
+    #[tokio::test]
+    async fn the_oldest_object_the_archive_still_needs_reaches_the_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        archive(dir.path(), &[]);
+        let spent = format!("db/{HEX}/term/0000000000/wal/0000/{:020}-{:020}.wal", 0, 0);
+        write(dir.path(), &spent, b"spent");
+        let live = format!("db/{HEX}/term/0000000000/base/{:020}/MANIFEST", 1);
+
+        let year = SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+        backdate(&dir.path().join(&live), year);
+        backdate(
+            &dir.path().join(&spent),
+            year - std::time::Duration::from_secs(86_400),
+        );
+
+        let plan = pass(dir.path()).await;
+        assert!(
+            plan.delete.contains(&spent),
+            "the older of the two is reclaimable, which is the point: {plan:?}"
+        );
+        assert_eq!(
+            plan.oldest_live_object.as_ref().map(|(key, _)| key.clone()),
+            Some(live),
+            "{plan:?}"
+        );
+
+        let metrics = ArchiveMetrics::new();
+        metrics.pass_completed(&plan);
+        let rendered = metrics.render();
+        assert_eq!(
+            value_of(&rendered, "archive_oldest_live_object_timestamp_seconds"),
+            Some(year.duration_since(UNIX_EPOCH).unwrap().as_secs()),
+            "{rendered}"
         );
     }
 

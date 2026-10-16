@@ -2871,3 +2871,84 @@ Nothing parses this format -- `yesno-e2e/tests/scenarios.rs` prints its own line
 carries no duration, since a timing taken under `cargo test` is a timing of the gate's own
 parallelism. `TESTING.md` now says to treat a `debug` figure as a ratio at best and never to
 record one without saying so.
+
+## 2026-10-17 -- The archive can say how long it has left before a lifecycle rule takes something live
+
+Everything this week's integrity work added reports damage that has already
+happened. `missing` is objects a retained base names and the store does not
+hold; `damaged_bases` is what that cost in recovery points; the survey runs
+with reclamation off so an archive nobody prunes still publishes both; the
+exit code makes it a nightly check. All four fire **after** the object is
+gone, and none of them is self-healing.
+
+The hazard every one of them was built for is a bucket lifecycle rule keyed on
+last-modified time, and content addressing is what makes that rule dangerous:
+a slab a later base still contains is *named* rather than re-uploaded, so its
+last-modified stops advancing while it stays live. That is written down in
+`backup.md` and in the `missing` doc comment, and both of them then tell the
+operator to watch for the aftermath.
+
+### The reading that was already in hand
+
+A pass takes one listing of the database prefix, and reachability from the
+retained manifests already says which of those objects the archive needs. The
+listing also carries each object's last-modified time, because an object-store
+listing does. So the pass can report **the oldest object it is keeping**, and
+that is exactly the number an expiry rule has to be set longer than.
+
+It is free in the same sense `missing` is free: no extra round trip, one extra
+field off a listing that was happening anyway. `GcPlan::oldest_live_object`,
+the `oldest object still needed` line of `yesnoctl archive-plan`, the
+`oldest_live=` field of the summary line the sidecar logs, and
+`yesnod_archive_oldest_live_object_timestamp_seconds`.
+
+### Four decisions in it, none of them obvious from the name
+
+**It is not the oldest object in the bucket.** A healthy archive always holds
+objects older than anything it needs -- superseded bases, spent WAL -- and
+those are precisely what an expiry rule is welcome to take. A gauge read off
+the listing alone would report one of them and tell an operator to lengthen a
+rule that was doing its job. The test that pins this is
+`the_oldest_object_kept_is_not_the_oldest_object_listed`: two objects older
+than the answer, one about to be deleted and one unclassifiable, and deleting
+the filter makes both it and the metrics test fail.
+
+**Unrecognized keys are excluded although the pass does keep them.** It keeps
+them out of caution rather than need. Somebody else's file lying in the prefix
+since last year is not the archive's floor, and counting it would make the
+number describe a thing no lifecycle rule on this data could damage.
+
+**A timestamp, not an age.** An age gauge from a sidecar whose passes have
+stopped keeps looking fresher than it is; a timestamp cannot. The alert is
+`time()` minus the gauge against the operator's own retention setting, which
+is a number this process has no way to know.
+
+**Zero is withheld rather than published.** The gauge family is absent when
+the pass kept nothing, for the same reason the other gauges are withheld until
+a pass completes: a zero here reads as 1970, which is the most alarming value
+the gauge can take, and it would page on an empty prefix.
+
+### What it cannot see, and that is fine
+
+Copying an archive resets every object's last-modified time, so a fresh
+`rsync` or `aws s3 sync` reports a recent floor for slabs whose content has
+not been rewritten in a year. That is not an error in the reading -- the
+copy's objects really are young, and a rule on the destination really will
+leave them alone for another window. It is worth stating in the doc comment
+because the instinct is to read the number as the age of the *content*.
+
+A pass halted by an unreadable manifest has an empty `delete`, so every
+recognized object counts as kept and the floor it reports is as conservative
+as the pass is. That is the right direction: a halted pass is not the moment
+to claim a later floor than reachability can justify.
+
+### The shape worth carrying
+
+This is the third thing in a row that the same listing turned out to already
+answer -- what is retained, what is absent, and now how long the absent one
+has before it arrives. The general form: **a check that needs no new I/O is a
+check whose cost argument is already settled**, so the only question left is
+whether the answer is worth reporting. The reason to look for one is that the
+expensive version of this reading -- a crawl that asks the store for every
+object's age -- would have been declined on cost, and the question would have
+stayed unanswered rather than being asked a cheaper way.

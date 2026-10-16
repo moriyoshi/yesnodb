@@ -67,6 +67,13 @@
 //! difference and no extra round trip. That check is [`GcPlan::missing`], and
 //! it is made here because content addressing changed what can make an object
 //! vanish from under a base that still needs it.
+//!
+//! The same listing carries each object's last-modified time, and reachability
+//! says which objects the archive still needs, so the pass can also report
+//! **the oldest object it is keeping** -- [`GcPlan::oldest_live_object`]. That
+//! is the one number here that warns *before* the damage: `missing` reports an
+//! object a lifecycle rule has already taken, and this says how long is left
+//! until it takes one.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -183,6 +190,33 @@ pub struct GcPlan {
     /// is not thereby proven restorable. Only what the base names directly is
     /// checked.
     pub damaged_bases: Vec<String>,
+    /// The object this pass is keeping whose last-modified time is oldest,
+    /// with that time in epoch microseconds.
+    ///
+    /// **The number to compare an object-store lifecycle rule against.** An
+    /// expiry rule set to delete objects older than thirty days destroys live
+    /// data the moment this value passes thirty days ago, and it is the only
+    /// reading here that says so in advance: [`GcPlan::missing`] counts
+    /// objects such a rule has already taken.
+    ///
+    /// It is deliberately not the oldest object in the bucket. An archive
+    /// always holds objects older than anything it needs -- superseded bases,
+    /// spent WAL -- and those are exactly what an expiry rule is welcome to
+    /// take. The candidates are what this pass is *keeping*, which is why the
+    /// value is computed here rather than read off a listing.
+    ///
+    /// **Copying an archive resets it.** Every object an `rsync` or an
+    /// `aws s3 sync` writes is new, so a fresh copy reports a recent time for
+    /// a slab whose content has not been rewritten in a year. That is not an
+    /// error in the reading: the copy's objects really are young, and a rule
+    /// on the destination really will leave them alone for another window.
+    ///
+    /// `None` when nothing under the database prefix is being kept. The
+    /// active base's manifest is always retained and always lives there, so
+    /// for a live archive this means the prefix listed empty. `state.pb` is
+    /// no help: it sits at the archive root rather than under the prefix the
+    /// pass surveys.
+    pub oldest_live_object: Option<(String, u64)>,
     /// The horizon this plan was computed against, in epoch microseconds.
     pub horizon_micros: u64,
 }
@@ -204,13 +238,17 @@ impl GcPlan {
     pub fn summary_line(&self) -> String {
         format!(
             "archive gc: delete={} retained_bases={} unrecognized={} missing={} \
-             damaged_bases={} unreadable_bases={} horizon={}",
+             damaged_bases={} unreadable_bases={} oldest_live={} horizon={}",
             self.delete.len(),
             self.retained_bases.len(),
             self.unrecognized.len(),
             self.missing.len(),
             self.damaged_bases.len(),
             self.unreadable_bases.len(),
+            match &self.oldest_live_object {
+                Some((_, micros)) => crate::restore::format_micros(*micros),
+                None => "none".to_string(),
+            },
             crate::restore::format_micros(self.horizon_micros),
         )
     }
@@ -502,6 +540,39 @@ pub fn plan(
     Ok(plan)
 }
 
+/// The oldest object `plan` is keeping, by the listing's last-modified time.
+///
+/// Pure, and separate from [`plan`] because it asks a different question:
+/// `plan` decides what may go, and this reads what the store said about what
+/// stays. See [`GcPlan::oldest_live_object`] for what the answer is for.
+///
+/// Kept means neither proposed for deletion nor unrecognized. Unrecognized
+/// objects are excluded although the pass does keep them, because it keeps
+/// them out of caution rather than need -- they are somebody else's file, and
+/// one of them lying in the prefix since last year would otherwise be
+/// reported as the thing holding the archive's floor down.
+///
+/// A pass halted by an unreadable manifest has an empty `delete`, so every
+/// recognized object counts as kept and the reading is as conservative as the
+/// pass is. That is the right direction: a halted pass is not the moment to
+/// report a later floor than the archive can justify.
+///
+/// Ties break on the key, so the answer does not depend on listing order --
+/// an object store with second-granularity timestamps makes ties ordinary.
+pub fn oldest_live(listing: &[(String, u64)], plan: &GcPlan) -> Option<(String, u64)> {
+    let going: BTreeSet<&str> = plan
+        .delete
+        .iter()
+        .chain(plan.unrecognized.iter())
+        .map(String::as_str)
+        .collect();
+    listing
+        .iter()
+        .filter(|(key, _)| !going.contains(key.as_str()))
+        .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .cloned()
+}
+
 /// Command-line options for one reclamation preview.
 #[derive(Args, Debug)]
 pub struct PlanOptions {
@@ -590,6 +661,16 @@ pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
     report("missing", &plan.missing, options.list);
     report("unrecognized", &plan.unrecognized, options.list);
     report("would delete", &plan.delete, options.list);
+    // Always, including on a healthy archive, because this is the line the
+    // command exists to be read for: it is what an expiry rule has to be set
+    // longer than. The lists above are all empty on the archive an operator
+    // is about to put a lifecycle rule on.
+    if let Some((key, micros)) = &plan.oldest_live_object {
+        println!(
+            "oldest object still needed: {} ({key})",
+            crate::restore::format_micros(*micros)
+        );
+    }
     Ok(plan)
 }
 
@@ -626,10 +707,10 @@ fn now_micros() -> u64 {
 /// List every base manifest under the database prefix, and every object key.
 async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, ArchiveError> {
     let hex: String = database_uuid.iter().map(|b| format!("{b:02x}")).collect();
-    let keys = store.list_relative(&format!("db/{hex}/")).await?;
+    let listing = store.list_relative_modified(&format!("db/{hex}/")).await?;
     let mut bases = Vec::new();
     let mut unreadable = Vec::new();
-    for key in &keys {
+    for (key, _) in &listing {
         if !key.ends_with("/manifest.pb") || !key.contains("/base/") {
             continue;
         }
@@ -654,7 +735,7 @@ async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, Ar
     }
     Ok(Survey {
         bases,
-        keys,
+        listing,
         unreadable,
     })
 }
@@ -662,7 +743,10 @@ async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, Ar
 /// What one listing of the database prefix found.
 struct Survey {
     bases: Vec<(String, pb::BaseManifest)>,
-    keys: Vec<String>,
+    /// Every object under the prefix with its last-modified time in epoch
+    /// microseconds, sorted by key. The time is carried because the listing
+    /// already had it; see [`oldest_live`].
+    listing: Vec<(String, u64)>,
     /// Base manifests under this prefix whose bytes this build cannot read,
     /// each with the reason, newest listing order.
     unreadable: Vec<String>,
@@ -692,11 +776,15 @@ fn planned(
     survey: Survey,
     policy: RetentionPolicy,
 ) -> Result<GcPlan, ArchiveError> {
-    let mut plan = plan(state, &survey.bases, &survey.keys, policy, now_micros())?;
+    let keys: Vec<String> = survey.listing.iter().map(|(key, _)| key.clone()).collect();
+    let mut plan = plan(state, &survey.bases, &keys, policy, now_micros())?;
     if !survey.unreadable.is_empty() {
         plan.delete.clear();
         plan.unreadable_bases = survey.unreadable;
     }
+    // After the clear, so a halted pass reports the floor it is actually
+    // holding rather than the one it would have held.
+    plan.oldest_live_object = oldest_live(&survey.listing, &plan);
     Ok(plan)
 }
 
@@ -978,6 +1066,83 @@ mod tests {
         let whole = plan(&state, &bases, &listing(""), RetentionPolicy::SURVEY, NOW).unwrap();
         assert!(whole.missing.is_empty(), "{whole:?}");
         assert!(whole.damaged_bases.is_empty(), "{whole:?}");
+    }
+
+    /// The oldest object an archive still needs is not the oldest object it
+    /// holds, and the difference is the whole reading.
+    ///
+    /// A healthy archive always holds objects older than anything it needs --
+    /// superseded bases, spent WAL -- and those are exactly what an expiry
+    /// rule is welcome to take. An operator who set a lifecycle rule from the
+    /// oldest key in the bucket would lengthen it for the one object that
+    /// does not matter, every time.
+    #[test]
+    fn the_oldest_object_kept_is_not_the_oldest_object_listed() {
+        let dropped = slab_base(1, NOW - 100 * HOUR, 0x11);
+        let kept = slab_base(2, NOW - HOUR, 0x22);
+        let bases = vec![dropped.clone(), kept.clone()];
+        let uuid = crate::archive::hex(&kept.1.database_uuid);
+        let shared = crate::archive::slab_key(&uuid, &[0xee; 32]);
+        let only_dropped = crate::archive::slab_key(&uuid, &[0x11; 32]);
+        let only_kept = crate::archive::slab_key(&uuid, &[0x22; 32]);
+        let stray = format!("db/{uuid}/notes-from-another-tool.txt");
+
+        let mut keys = keys(&bases, &[]);
+        keys.extend([
+            shared.clone(),
+            only_dropped.clone(),
+            only_kept.clone(),
+            stray.clone(),
+        ]);
+        keys.sort();
+
+        // A window of zero roots retention at the newest base, so generation
+        // 1 goes and the slab only it named goes with it.
+        let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
+        assert!(plan.delete.contains(&only_dropped), "{plan:?}");
+        assert_eq!(plan.unrecognized, vec![stray.clone()], "{plan:?}");
+
+        // Two objects are older than the shared slab: one this pass is about
+        // to delete, and one it keeps only because it cannot classify it.
+        let listing: Vec<(String, u64)> = keys
+            .iter()
+            .map(|key| {
+                let age = if *key == stray {
+                    1000 * HOUR
+                } else if *key == only_dropped {
+                    500 * HOUR
+                } else if *key == shared {
+                    300 * HOUR
+                } else {
+                    HOUR
+                };
+                (key.clone(), NOW - age)
+            })
+            .collect();
+
+        assert_eq!(
+            oldest_live(&listing, &plan),
+            Some((shared.clone(), NOW - 300 * HOUR)),
+            "the floor is the oldest object the archive still needs"
+        );
+
+        // And it does not depend on the order the listing arrived in: with
+        // every kept object the same age, the answer is the first key rather
+        // than whichever one was scanned first.
+        let flat: Vec<(String, u64)> = listing
+            .iter()
+            .rev()
+            .map(|(key, _)| (key.clone(), NOW - HOUR))
+            .collect();
+        let first_kept = keys
+            .iter()
+            .find(|key| !plan.delete.contains(key) && **key != stray)
+            .unwrap();
+        assert_eq!(
+            oldest_live(&flat, &plan),
+            Some((first_kept.clone(), NOW - HOUR)),
+            "ties break on the key"
+        );
     }
 
     /// The verdict a scheduled check exits on, and what it deliberately

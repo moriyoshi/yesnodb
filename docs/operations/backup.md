@@ -247,6 +247,19 @@ written today. Use lifecycle rules only to expire incomplete multipart uploads.
 `yesnod_archive_missing_objects` reports the damage if one has already run, and
 `yesnoctl archive-plan` answers the same question on demand.
 
+**One reading says how much time is left, rather than what has already gone.**
+A pass knows which objects the archive still needs, and the listing it decided
+that from carries each object's last-modified time, so it also reports the
+oldest object it is keeping: `yesnod_archive_oldest_live_object_timestamp_seconds`,
+and the `oldest object still needed` line of `yesnoctl archive-plan`. An expiry
+rule destroys live data the moment that value passes the rule's age, so alert on
+`time()` minus the gauge against whatever the rule is set to, with enough margin
+to act. It is deliberately not the age of the oldest object in the bucket: an
+archive always holds superseded bases and spent WAL older than anything it
+needs, and those are exactly what a rule is welcome to take. Copying an archive
+resets it, because every object an `rsync` or an `aws s3 sync` writes is new --
+that is the truth about the copy rather than an error in the reading.
+
 **The sidecar surveys the archive whether or not reclamation is configured.**
 A sidecar with no `--retention-window` runs the same pass on the same interval,
 reports what it found and deletes nothing, so an archive that is only ever
@@ -284,6 +297,11 @@ instead of uploading again, so one lost piece can cost every generation in the
 archive, while a hundred lost objects can all belong to one old base nobody
 would restore. The key of a lost piece is a hash and says nothing about which
 generations named it, so this is not an attribution to do by hand.
+
+The last line of the report is the oldest object the archive still needs, with
+its last-modified time. That is what a bucket lifecycle rule has to be set
+longer than, and it prints on a healthy archive too -- on the archive an
+operator is about to put a rule on, every list above it is empty.
 
 It exits **2** when the archive is not whole -- any missing object, or any
 base manifest this build cannot read -- and 0 otherwise, so a scheduled check
@@ -388,8 +406,13 @@ publishes no reading rather than a reassuring zero:
   gone flat is also what a healthy archive with nothing to reclaim looks like.
 - `yesnod_archive_retained_bases`: base images the last pass kept. Read it
   against `--retention-min-bases` and the window.
+- `yesnod_archive_oldest_live_object_timestamp_seconds`: last-modified time of
+  the oldest object the last pass kept. The only reading here that warns before
+  the damage instead of after it, and the one to compare a bucket lifecycle rule
+  against. Absent rather than zero when the pass kept nothing, because a zero
+  here would read as 1970 and page immediately.
 - `yesnod_archive_reclamation_last_success_timestamp_seconds`: Unix time of the
-  last completed pass, and therefore how old the five gauges above are.
+  last completed pass, and therefore how old the six gauges above are.
 
 A failed pass deliberately leaves the gauges at their last completed reading. A
 pass that fails learns nothing, and zeroing the unrecognized count because the

@@ -1420,6 +1420,17 @@ pub(crate) async fn retention_loop(
                             missing = plan.missing.len(),
                             unrecognized = plan.unrecognized.len(),
                             unreadable = plan.unreadable_bases.len(),
+                            // The reading a lifecycle rule has to be set
+                            // longer than. It belongs on this line in
+                            // particular: a deployment with reclamation off
+                            // is the one whose archive nothing else prunes,
+                            // and so the one most likely to have an expiry
+                            // rule standing in for a reclaimer.
+                            oldest_live = plan
+                                .oldest_live_object
+                                .as_ref()
+                                .map(|(_, micros)| crate::restore::format_micros(*micros))
+                                .unwrap_or_else(|| "none".into()),
                             "archive surveyed; reclamation is off, so nothing was deleted"
                         );
                     }
