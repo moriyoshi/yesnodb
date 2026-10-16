@@ -285,6 +285,13 @@ archive, while a hundred lost objects can all belong to one old base nobody
 would restore. The key of a lost piece is a hash and says nothing about which
 generations named it, so this is not an attribution to do by hand.
 
+It exits **2** when the archive is not whole -- any missing object, or any
+base manifest this build cannot read -- and 0 otherwise, so a scheduled check
+can act on the verdict without parsing the output. An exit of 1 means the
+command itself failed: an unreachable store, a bad endpoint, a typo. An
+unrecognized key is deliberately not part of the verdict; it is worth looking
+into and is not a reason for a nightly check to go red.
+
 Omit `--retention-window` and the plan is computed against a window no base
 falls out of. Nothing is then proposed for deletion and the report is purely
 about what the archive holds -- which is how to ask "is this archive still

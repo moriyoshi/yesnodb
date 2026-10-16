@@ -622,6 +622,26 @@ where
     Ok((seen, checksum))
 }
 
+/// The restore-side face of `GcPlan::missing`, which is the other end of the
+/// same condition.
+///
+/// A base being short an object is not a transient failure and not a bad
+/// recovery target -- it is damage that happened some time ago, and the
+/// restore is simply where it surfaces. So the message says what was wanted
+/// rather than only that a GET failed, and points at the command that
+/// enumerates the rest: stopping at the first absent object tells the
+/// operator about one object, and what they need under pressure is which
+/// recovery points still work.
+fn missing_object(file: &pb::ArchiveFile, from: u64, to: u64, key: &str) -> ArchiveError {
+    format!(
+        "base file '{}' needs an object this archive does not hold, for bytes {from}..{to} \
+         ('{key}'). Run 'yesnoctl archive-plan' for every object the bases name and the store \
+         lacks, and which bases are still restorable",
+        file.name
+    )
+    .into()
+}
+
 /// Rebuild one base file from its content-addressed slab objects.
 ///
 /// **Fetched concurrently but consumed in order**, which is what `buffered`
@@ -646,7 +666,31 @@ async fn download_slab_file(
 
     let mut fetches = futures::stream::iter(file.extents.iter().map(|extent| async move {
         let key = crate::archive::slab_key(uuid, &extent.content_hash);
-        let bytes = store.inner.get(&store.path(&key)).await?.bytes().await?;
+        let bytes = match store.inner.get(&store.path(&key)).await {
+            Ok(result) => result.bytes().await?,
+            // Named for its contents, so the key is a hash and the fetch
+            // error can say nothing about which file wanted it, where in
+            // that file it belongs, or what else is gone. Those are the
+            // three things the operator needs, and only this frame knows the
+            // first two.
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(missing_object(
+                    file,
+                    extent.offset,
+                    extent.offset.saturating_add(extent.length),
+                    &key,
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "base file '{}', bytes {}..{}: {error}",
+                    file.name,
+                    extent.offset,
+                    extent.offset.saturating_add(extent.length)
+                )
+                .into())
+            }
+        };
         Ok::<_, ArchiveError>((extent, key, bytes))
     }))
     .buffered(ARCHIVE_FETCH_CONCURRENCY);
@@ -726,7 +770,17 @@ async fn download_base_file(
         return download_slab_file(store, file, target, uuid).await;
     }
     let (extents, object_len) = object_layout(file);
-    let result = store.inner.get(&store.path(&file.object_key)).await?;
+    let result = match store.inner.get(&store.path(&file.object_key)).await {
+        Ok(result) => result,
+        // The same condition as an absent slab. This key does name its base
+        // and file, so only the pointer is new -- but an operator meeting
+        // either of these is in the same position and should be sent to the
+        // same place.
+        Err(object_store::Error::NotFound { .. }) => {
+            return Err(missing_object(file, 0, file.size, &file.object_key))
+        }
+        Err(error) => return Err(error.into()),
+    };
     if result.meta.size != object_len {
         return Err(format!(
             "base object '{}' is {} bytes, manifest says {}",
@@ -2058,6 +2112,59 @@ mod tests {
             "the holes must not be allocated: {} bytes allocated for {}",
             meta.blocks() * 512,
             file.len()
+        );
+    }
+
+    /// The moment the whole integrity story exists for: a restore reaching an
+    /// object the archive no longer holds.
+    ///
+    /// What the object store says on its own is that a key under `slabs/` was
+    /// not found, and a slab key is a SHA-256 -- so it names neither the file
+    /// that wanted it, nor where in that file, nor whether anything else is
+    /// gone. All three are what the operator needs, and the first two are
+    /// known only here.
+    #[tokio::test]
+    async fn a_restore_that_meets_a_lost_object_says_what_wanted_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex = crate::fixture::HEX;
+        let present = [0x11u8; 32];
+        let absent = [0x22u8; 32];
+        let body = [7u8; 64];
+        crate::fixture::write(dir.path(), &crate::archive::slab_key(hex, &present), &body);
+
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let file = pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: String::new(),
+            size: 128,
+            crc32c: 0,
+            sparse: true,
+            extents: vec![
+                pb::FileExtent {
+                    offset: 0,
+                    length: 64,
+                    content_hash: present.to_vec(),
+                    crc32c: crc32c::crc32c(&body),
+                },
+                pb::FileExtent {
+                    offset: 64,
+                    length: 64,
+                    content_hash: absent.to_vec(),
+                    crc32c: 0,
+                },
+            ],
+        };
+
+        let error = download_slab_file(&store, &file, dir.path(), hex)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("shard-0000.yno"), "{error}");
+        assert!(error.contains("64..128"), "{error}");
+        assert!(error.contains(&"22".repeat(32)), "{error}");
+        assert!(
+            error.contains("archive-plan"),
+            "one absent object is not the question; the rest of them are: {error}"
         );
     }
 

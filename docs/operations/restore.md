@@ -45,6 +45,16 @@ actually needs still stops it, now with the object named. Do not read a warning
 as harmless -- read it with the outcome. A restore that then succeeds did not
 need that object; one that fails on a broken chain probably did.
 
+A different failure, and one that is not about this version at all: a restore
+that reaches an object the archive no longer holds. The message names the base
+file that wanted it, where in that file it belongs, and the object key, because
+a base file is stored as content-named pieces whose keys are hashes -- the key
+alone says none of that. Treat it as damage that happened earlier rather than
+as a bad recovery target, and run `yesnoctl archive-plan` before trying
+another: a restore stops at the first absent object, so it tells you about one
+of them, while the plan lists every object the archive is short and which bases
+are still restorable.
+
 ### How much space a restore needs
 
 A shard image is a sparse file. Its apparent length is a whole memory-mapping

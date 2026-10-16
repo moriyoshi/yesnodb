@@ -2496,3 +2496,64 @@ still read the manifest that names them. The doc comment now states the race and
 accepts it while the sidecar's survey excludes it, and `backup.md` tells the reader to re-run the
 command if it reports a loss during a base copy. A wrong reassurance in a doc comment is worse than
 no comment, because the next person to touch the code will rely on it.
+
+## 2026-10-16 -- Closing the loop: what a restore says when it meets the hole, and what a check exits with
+
+Two ends of the integrity work were still loose, and both are about the moment the reporting leaves
+this process.
+
+### The restore said the least useful true thing
+
+A restore reaching an object the archive no longer holds produced, verbatim:
+
+```
+Object at location /.../db/1111.../slabs/2222... not found: No such file or directory (os error 2)
+```
+
+Every word of that is true and it is close to the least helpful form the truth could take. A slab
+is named by its SHA-256, so the key says nothing about **which file wanted it**, **where in that
+file it belongs**, or **whether anything else is gone** -- and the first two are known only in the
+frame that was fetching it. The third is known by `archive-plan` and nowhere else, which matters
+more than it looks: a restore stops at the first absent object, so it reports one, and an operator
+who fixes or works around that one simply meets the next. What they need is the set.
+
+So both fetch paths now match `object_store::Error::NotFound` specifically and build a message
+naming the base file, the byte range, the key, and the command that enumerates the rest. Other
+fetch failures are left alone beyond the file name and range: they are transient and a pointer at
+an integrity command would be a wrong diagnosis. `a_restore_that_meets_a_lost_object_says_what_wanted_it`
+pins all four parts.
+
+### A check that always exits zero is not a check
+
+`backup.md` has been telling operators to run `yesnoctl archive-plan` after any change to bucket
+lifecycle, replication or access policy. The obvious way to honour that is a cron or a CI step, and
+until now the command printed its verdict and exited 0 no matter what it found.
+
+It now exits **2** when the archive is not whole. Two is deliberate rather than one: a damaged
+archive and an unreachable store are entirely different nights, and collapsing them into a single
+non-zero code would make the check's only machine-readable output ambiguous in exactly the case it
+exists for. One stays what it has always meant -- the command itself failed.
+
+The verdict is `GcPlan::is_whole`, and what it leaves out is the interesting half.
+`unrecognized` is excluded: an archive sharing a prefix with a newer writer has objects this build
+does not classify, which deserves a look and must not turn a nightly check red, because a check
+that goes red for a known-benign reason stops being run. `delete` is excluded because a pass having
+work to do is the healthy case. `unreadable_bases` is included, even though it is not damage in the
+same sense, because a pass that cannot read a manifest has not actually checked anything -- exiting
+0 there would report "whole" on the strength of a survey that did not happen.
+
+The plumbing is a small `Done { line, code }` in `yesnoctl`, so the four commands that have nothing
+to say about exit codes say nothing: `Done::ran(line)`. Only the one command that answers a
+question rather than performing an action sets a code. `code` is a `u8` converted at the process
+boundary rather than an `ExitCode`, because `ExitCode` has no `PartialEq` -- a status nothing can
+assert on is not a contract, and the mapping is the part worth pinning.
+
+### A self-inflicted red gate, recorded because the cause is not obvious
+
+The first gate run after this work failed in `Doc-tests yesno_e2e` with `can't find crate for
+yesno_server_utils`. Nothing was wrong with the change. I had run a `cargo run -p yesno-server-utils`
+smoke test **while the gate was running**, which rebuilt the crate under a new metadata hash and
+left the doctest step linking against an rlib that no longer existed. The workspace has one shared
+target directory on purpose, so a concurrent cargo invocation is not isolated from the gate -- it
+waits on `.cargo-lock` for the build and then invalidates artifacts the gate has already resolved.
+Run nothing else under cargo while a gate is running.

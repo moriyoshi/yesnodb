@@ -188,6 +188,18 @@ pub struct GcPlan {
 }
 
 impl GcPlan {
+    /// True when nothing this pass surveyed is absent or unreadable.
+    ///
+    /// The verdict `yesnoctl archive-plan` exits on, and deliberately not a
+    /// summary of everything the plan reports. `unrecognized` is left out: an
+    /// archive written by a newer build has objects this one does not
+    /// classify, which is worth an operator's attention and is not a reason
+    /// for a scheduled check to fail. `delete` is left out because a pass
+    /// having work to do is the healthy case.
+    pub fn is_whole(&self) -> bool {
+        self.missing.is_empty() && self.unreadable_bases.is_empty()
+    }
+
     /// Stable human-facing summary.
     pub fn summary_line(&self) -> String {
         format!(
@@ -966,6 +978,40 @@ mod tests {
         let whole = plan(&state, &bases, &listing(""), RetentionPolicy::SURVEY, NOW).unwrap();
         assert!(whole.missing.is_empty(), "{whole:?}");
         assert!(whole.damaged_bases.is_empty(), "{whole:?}");
+    }
+
+    /// The verdict a scheduled check exits on, and what it deliberately
+    /// ignores.
+    ///
+    /// A pass with work to do is healthy, and an archive holding objects a
+    /// newer writer put there is a thing to look into rather than a nightly
+    /// failure. Neither may turn the check red, or it stops being run.
+    #[test]
+    fn the_verdict_is_damage_and_not_housekeeping() {
+        let whole = GcPlan::default();
+        assert!(whole.is_whole(), "{whole:?}");
+
+        let busy = GcPlan {
+            delete: vec!["spent".into()],
+            unrecognized: vec!["who put this here".into()],
+            ..Default::default()
+        };
+        assert!(busy.is_whole(), "neither is damage: {busy:?}");
+
+        let lost = GcPlan {
+            missing: vec!["gone".into()],
+            ..Default::default()
+        };
+        assert!(!lost.is_whole(), "{lost:?}");
+
+        let blind = GcPlan {
+            unreadable_bases: vec!["cannot decode".into()],
+            ..Default::default()
+        };
+        assert!(
+            !blind.is_whole(),
+            "a pass that cannot read a manifest has not checked anything: {blind:?}"
+        );
     }
 
     /// Every file under `root`, so a preview can be shown to have changed

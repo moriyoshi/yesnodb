@@ -11,7 +11,7 @@ use yesno_server::control::pb;
 use yesno_server_utils::basebackup::{
     completion_line as basebackup_completion, run as run_basebackup, BasebackupOptions,
 };
-use yesno_server_utils::gc::{run as run_archive_plan, PlanOptions};
+use yesno_server_utils::gc::{run as run_archive_plan, GcPlan, PlanOptions};
 use yesno_server_utils::restore::{
     completion_line as restore_completion, run as run_restore, RestoreOptions,
 };
@@ -19,6 +19,38 @@ use yesno_server_utils::seed::{seed_follower, SeedOptions};
 use yesno_server_utils::transport::{self, ClientTls};
 
 type Fail = Box<dyn std::error::Error + Send + Sync>;
+
+/// A command that ran, and what its answer is worth as an exit status.
+///
+/// Every command here exits 0 when it ran and 1 when it did not, and for all
+/// but one of them that is the whole story. `archive-plan` answers a question
+/// instead of performing an action, so "it ran" and "the news is good" are
+/// different facts: it exits **2** when the archive is not whole. A scheduled
+/// check can then act on the verdict without parsing stdout, and still tell a
+/// damaged archive apart from an unreachable store, a bad endpoint or a
+/// typo -- all of which stay 1.
+struct Done {
+    line: String,
+    /// Converted to an `ExitCode` only at the process boundary, because
+    /// `ExitCode` cannot be compared and a status nothing can assert on is
+    /// not a contract.
+    code: u8,
+}
+
+impl Done {
+    /// The command did what it was asked.
+    fn ran(line: String) -> Self {
+        Self { line, code: 0 }
+    }
+}
+
+/// The verdict `archive-plan` exits on. See [`Done`].
+fn plan_code(plan: &GcPlan) -> u8 {
+    match plan.is_whole() {
+        true => 0,
+        false => 2,
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,36 +130,45 @@ async fn checkpoint(options: CheckpointOptions) -> Result<u64, Fail> {
     Ok(client.checkpoint(request).await?.into_inner().watermark)
 }
 
-async fn run(cli: Cli) -> Result<String, Fail> {
+async fn run(cli: Cli) -> Result<Done, Fail> {
     match cli.command {
-        Command::Checkpoint(options) => Ok(format!(
+        Command::Checkpoint(options) => Ok(Done::ran(format!(
             "checkpoint at version {}",
             checkpoint(options).await?
-        )),
-        Command::Basebackup(options) => Ok(basebackup_completion(&run_basebackup(options).await?)),
+        ))),
+        Command::Basebackup(options) => Ok(Done::ran(basebackup_completion(
+            &run_basebackup(options).await?,
+        ))),
         // `--inspect` prints its windows itself and produces no report; the
         // command still succeeded, so it gets a summary line rather than a
         // placeholder that reads like a failure.
-        Command::Restore(options) => Ok(match run_restore(options).await? {
+        Command::Restore(options) => Ok(Done::ran(match run_restore(options).await? {
             Some(report) => restore_completion(&report),
             None => "inspect complete: no directory was created".to_string(),
-        }),
-        Command::SeedFollower(options) => Ok(format!(
+        })),
+        Command::SeedFollower(options) => Ok(Done::ran(format!(
             "follower archive seed: {:?}",
             seed_follower(&options).await?
-        )),
+        ))),
         // The lists are printed as they are produced; this is the same
-        // summary the sidecar logs for a pass it actually ran.
-        Command::ArchivePlan(options) => Ok(run_archive_plan(options).await?.summary_line()),
+        // summary the sidecar logs for a pass it actually ran. The exit code
+        // is the one place the verdict is machine-readable -- see `Done`.
+        Command::ArchivePlan(options) => {
+            let plan = run_archive_plan(options).await?;
+            Ok(Done {
+                line: plan.summary_line(),
+                code: plan_code(&plan),
+            })
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(line) => {
-            println!("{line}");
-            ExitCode::SUCCESS
+        Ok(done) => {
+            println!("{}", done.line);
+            ExitCode::from(done.code)
         }
         Err(error) => {
             eprint!("yesnoctl: {error}");
@@ -174,6 +215,29 @@ mod tests {
         .is_ok());
         assert!(
             Cli::try_parse_from(["yesnoctl", "archive-plan", "--store", "file:///archive"]).is_ok()
+        );
+    }
+
+    /// A scheduled integrity check needs the verdict in the exit status, and
+    /// needs a damaged archive to look different from a command that could
+    /// not run. Two, not one, for that second reason.
+    #[test]
+    fn a_damaged_archive_leaves_its_verdict_in_the_exit_status() {
+        assert_eq!(plan_code(&GcPlan::default()), 0);
+        assert_eq!(
+            plan_code(&GcPlan {
+                missing: vec!["db/aa/slabs/bb".into()],
+                ..Default::default()
+            }),
+            2
+        );
+        assert_eq!(
+            plan_code(&GcPlan {
+                unrecognized: vec!["db/aa/who-put-this-here".into()],
+                ..Default::default()
+            }),
+            0,
+            "an unexplained object must not turn a nightly check red"
         );
     }
 
