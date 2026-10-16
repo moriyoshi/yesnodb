@@ -219,6 +219,15 @@ does not recognize. Unrecognized objects are counted in the pass summary; a
 non-zero count means the archive holds objects this version does not understand
 and reclamation is incomplete until that is explained.
 
+A base manifest whose *contents* this version cannot read is a stronger case
+than an unrecognized key, and it stops the pass deleting anything at all. Every
+deletion is justified by what the manifests name, and one that will not decode
+could name any object in the store, so there is no safe subset to fall back on.
+The pass still runs and still reports; it names the object and the reason, and
+`yesnod_archive_unreadable_base_manifests` goes non-zero. The realistic cause is
+a writer from a newer release sharing the prefix, which is why a new archive
+schema version belongs in a new prefix.
+
 Every reference is removed before the thing it names, so an interrupted pass
 leaves unreferenced objects that the next pass finishes off, never a manifest
 pointing at files that are gone.
@@ -330,10 +339,16 @@ than a reassuring zero:
   key next to the count. The usual causes are an object-store lifecycle rule
   (see below), a deletion by hand, and a bucket policy or replication rule
   that never applied to every prefix.
+- `yesnod_archive_unreadable_base_manifests`: base manifests this version
+  cannot decode. Alert on any non-zero value. It is not a third kind of damage
+  but a change of state: while it is non-zero the pass deletes nothing and no
+  later pass will either, so the archive grows exactly as if reclamation were
+  switched off. That is worth its own alert because a deletion count that has
+  gone flat is also what a healthy archive with nothing to reclaim looks like.
 - `yesnod_archive_retained_bases`: base images the last pass kept. Read it
   against `--retention-min-bases` and the window.
 - `yesnod_archive_reclamation_last_success_timestamp_seconds`: Unix time of the
-  last completed pass, and therefore how old the three gauges above are.
+  last completed pass, and therefore how old the four gauges above are.
 
 A failed pass deliberately leaves the gauges at their last completed reading. A
 pass that fails learns nothing, and zeroing the unrecognized count because the

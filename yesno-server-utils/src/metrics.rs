@@ -16,8 +16,15 @@
 //!   the two: an object a retained base names and the store does not hold. The
 //!   bucket is not too big, it is incomplete, and the symptom surfaces at a
 //!   restore — which is the one moment nobody wants to discover it.
+//! - **The unreadable-manifest count.** Not a third kind of damage but a
+//!   change of *state*: a pass that meets one deletes nothing, and no later
+//!   one will either until the object is explained. Without its own family
+//!   that condition can only be inferred from a deletion count that has gone
+//!   flat, which is also what a healthy archive with nothing to reclaim looks
+//!   like.
 //!
-//! Both are alerting conditions, and an alerting condition has to be a metric.
+//! All three are alerting conditions, and an alerting condition has to be a
+//! metric.
 //!
 //! # It borrows the daemon's listener rather than inventing one
 //!
@@ -76,6 +83,7 @@ pub struct ArchiveMetrics {
     surveyed: AtomicBool,
     unrecognized: AtomicU64,
     missing: AtomicU64,
+    unreadable_bases: AtomicU64,
     retained_bases: AtomicU64,
     last_success_unix: AtomicU64,
 }
@@ -99,6 +107,8 @@ impl ArchiveMetrics {
             .store(plan.unrecognized.len() as u64, Ordering::Relaxed);
         self.missing
             .store(plan.missing.len() as u64, Ordering::Relaxed);
+        self.unreadable_bases
+            .store(plan.unreadable_bases.len() as u64, Ordering::Relaxed);
         self.retained_bases
             .store(plan.retained_bases.len() as u64, Ordering::Relaxed);
         self.last_success_unix
@@ -183,6 +193,15 @@ impl ArchiveMetrics {
                  point cannot be restored; it is not self-healing and no later \
                  pass repairs it.",
                 self.missing.load(Ordering::Relaxed).to_string(),
+            );
+            gauge(
+                &mut s,
+                "archive_unreadable_base_manifests",
+                "Base manifests under this prefix whose bytes this build \
+                 cannot decode. Non-zero means reclamation is halted: every \
+                 deletion is justified by reachability, and a manifest that \
+                 cannot be read may name any object in the store.",
+                self.unreadable_bases.load(Ordering::Relaxed).to_string(),
             );
             gauge(
                 &mut s,

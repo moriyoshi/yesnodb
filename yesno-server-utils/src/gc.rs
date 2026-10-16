@@ -45,6 +45,12 @@
 //! - Any object whose key this module does not recognize. An unrecognized key is
 //!   a newer writer's, or a hand-placed file, and either way guessing is how a
 //!   reclaimer becomes a data-loss incident. They are counted and reported.
+//! - **Everything, if any base manifest's contents cannot be read.** The other
+//!   entries on this list protect one object each; this one stops the pass
+//!   deleting anything at all, because reachability is computed from the
+//!   manifests and one that will not decode may name any object in the store.
+//!   It is counted, reported and named rather than returned as an error, in
+//!   [`GcPlan::unreadable_bases`].
 //!
 //! # Ordering
 //!
@@ -99,6 +105,18 @@ pub struct GcPlan {
     /// objects this build does not understand, and reclamation is conservative
     /// rather than complete until that is explained.
     pub unrecognized: Vec<String>,
+    /// Base manifests this build cannot read, each with the reason.
+    ///
+    /// Non-empty means **this pass deleted nothing and no later one will**
+    /// until the object is explained: reachability is computed from the
+    /// manifests, and one that cannot be decoded may name any slab in the
+    /// store, so there is no conservative subset to fall back on -- the
+    /// objects it protects are exactly the ones nothing else vouches for.
+    ///
+    /// Each entry is the object key and the reason, together: the message
+    /// alone does not say which of an archive's thousands of objects is
+    /// meant.
+    pub unreadable_bases: Vec<String>,
     /// Objects a retained base names that the survey's listing did not hold.
     ///
     /// Empty is the only healthy reading. Non-zero means a base this pass is
@@ -128,11 +146,13 @@ impl GcPlan {
     /// Stable human-facing summary.
     pub fn summary_line(&self) -> String {
         format!(
-            "archive gc: delete={} retained_bases={} unrecognized={} missing={} horizon={}",
+            "archive gc: delete={} retained_bases={} unrecognized={} missing={} \
+             unreadable_bases={} horizon={}",
             self.delete.len(),
             self.retained_bases.len(),
             self.unrecognized.len(),
             self.missing.len(),
+            self.unreadable_bases.len(),
             crate::restore::format_micros(self.horizon_micros),
         )
     }
@@ -468,6 +488,11 @@ pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
     // Printed in order of how much they should worry the reader. `missing` is
     // not a plan at all -- it is damage that has already happened -- so it
     // goes first even though it is the shortest list on a healthy archive.
+    report(
+        "unreadable base manifests",
+        &plan.unreadable_bases,
+        options.list,
+    );
     report("missing", &plan.missing, options.list);
     report("unrecognized", &plan.unrecognized, options.list);
     report("would delete", &plan.delete, options.list);
@@ -505,24 +530,80 @@ fn now_micros() -> u64 {
 }
 
 /// List every base manifest under the database prefix, and every object key.
-async fn survey(
-    store: &ArchiveStore,
-    database_uuid: &[u8],
-) -> Result<(Vec<(String, pb::BaseManifest)>, Vec<String>), ArchiveError> {
+async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, ArchiveError> {
     let hex: String = database_uuid.iter().map(|b| format!("{b:02x}")).collect();
     let keys = store.list_relative(&format!("db/{hex}/")).await?;
     let mut bases = Vec::new();
+    let mut unreadable = Vec::new();
     for key in &keys {
         if !key.ends_with("/manifest.pb") || !key.contains("/base/") {
             continue;
         }
-        let manifest = pb::BaseManifest::decode(store.get_bytes(key).await?)?;
-        validate_base_manifest(&manifest)?;
-        if manifest.database_uuid == database_uuid {
-            bases.push((key.clone(), manifest));
+        // The fetch failing is not the same event as the bytes being wrong.
+        // A fetch is transient and the next pass should simply try again, so
+        // it still ends the survey; what follows is a property of the object.
+        let bytes = store.get_bytes(key).await?;
+        match pb::BaseManifest::decode(bytes)
+            .map_err(ArchiveError::from)
+            .and_then(|manifest| validate_base_manifest(&manifest).map(|()| manifest))
+        {
+            Ok(manifest) if manifest.database_uuid == database_uuid => {
+                bases.push((key.clone(), manifest))
+            }
+            Ok(_) => {}
+            // Named, because the message alone does not say which object is
+            // wrong and an archive holds thousands. This is the same lesson
+            // `lib.rs::ctx` records for filesystem paths: the `?` that boxes
+            // the error is where the only identifying information is lost.
+            Err(error) => unreadable.push(format!("{key}: {error}")),
         }
     }
-    Ok((bases, keys))
+    Ok(Survey {
+        bases,
+        keys,
+        unreadable,
+    })
+}
+
+/// What one listing of the database prefix found.
+struct Survey {
+    bases: Vec<(String, pb::BaseManifest)>,
+    keys: Vec<String>,
+    /// Base manifests under this prefix whose bytes this build cannot read,
+    /// each with the reason, newest listing order.
+    unreadable: Vec<String>,
+}
+
+/// Build the plan a survey supports, and withhold deletes it does not.
+///
+/// **A manifest that cannot be read is not merely an object to keep.** Every
+/// deletion here is justified by reachability, reachability is computed from
+/// the manifests, and one this build cannot decode may name any slab in the
+/// store. There is no conservative subset to fall back on: the objects such a
+/// manifest protects are exactly the ones nothing else can vouch for.
+///
+/// So the pass runs, reports, and deletes nothing. That is better than the
+/// error it used to return in one way that matters -- the gauges are
+/// published and the offending key is named, where before the sidecar logged
+/// a bare decode message every interval and an operator had thousands of
+/// objects to search. It is not better in the other: reclamation is halted
+/// either way, and `yesnod_archive_unreadable_base_manifests` exists so that
+/// is alertable rather than inferred from a flat deletion count.
+///
+/// The realistic cause is a writer from a release this one does not know,
+/// which is why `backup.md` tells an operator to start a new schema version
+/// in a new prefix.
+fn planned(
+    state: &pb::ArchiveState,
+    survey: Survey,
+    policy: RetentionPolicy,
+) -> Result<GcPlan, ArchiveError> {
+    let mut plan = plan(state, &survey.bases, &survey.keys, policy, now_micros())?;
+    if !survey.unreadable.is_empty() {
+        plan.delete.clear();
+        plan.unreadable_bases = survey.unreadable;
+    }
+    Ok(plan)
 }
 
 /// Compute one reclamation plan without deleting anything.
@@ -534,8 +615,8 @@ pub async fn plan_for(
     policy: RetentionPolicy,
 ) -> Result<GcPlan, ArchiveError> {
     let state = store.load_state().await?.ok_or("archive has no state.pb")?;
-    let (bases, keys) = survey(store, &state.database_uuid).await?;
-    plan(&state, &bases, &keys, policy, now_micros())
+    let survey = survey(store, &state.database_uuid).await?;
+    planned(&state, survey, policy)
 }
 
 /// Run one reclamation pass.
@@ -549,8 +630,8 @@ pub async fn collect(
     policy: RetentionPolicy,
 ) -> Result<GcPlan, ArchiveError> {
     let state = store.load_state().await?.ok_or("archive has no state.pb")?;
-    let (bases, keys) = survey(store, &state.database_uuid).await?;
-    let plan = plan(&state, &bases, &keys, policy, now_micros())?;
+    let survey = survey(store, &state.database_uuid).await?;
+    let plan = planned(&state, survey, policy)?;
     if plan.delete.is_empty() {
         return Ok(plan);
     }
@@ -753,6 +834,58 @@ mod tests {
         let mut n = 0;
         walk(root, &mut n);
         n
+    }
+
+    /// One manifest this build cannot read must not end reclamation for the
+    /// whole archive, and must name itself when it stops it.
+    ///
+    /// Before this, `survey` propagated the decode failure, so the sidecar
+    /// logged a bare "unsupported base-manifest schema" every interval, no
+    /// pass ever completed, no gauge was ever published, and the operator had
+    /// an archive full of objects and no idea which one was meant. The
+    /// realistic way to get there is a writer from a release this one does
+    /// not know.
+    ///
+    /// The healthy plan is computed first so the second assertion is about
+    /// the manifest and not about there being nothing to delete.
+    #[tokio::test]
+    async fn a_manifest_this_build_cannot_read_halts_deletion_and_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex = crate::fixture::HEX;
+        crate::fixture::archive(dir.path(), &[]);
+        // Wholly at or below the only base's cursor, so no retained recovery
+        // point reaches it: what a healthy pass is supposed to remove.
+        let wal = format!("db/{hex}/term/0000000000/wal/0000/{:020}-{:020}.wal", 0, 0);
+        crate::fixture::write(dir.path(), &wal, b"spent");
+
+        let policy = RetentionPolicy {
+            window_micros: 0,
+            min_bases: 1,
+        };
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let healthy = plan_for(&store, policy).await.unwrap();
+        assert_eq!(healthy.delete, vec![wal], "{healthy:?}");
+        assert!(healthy.unreadable_bases.is_empty(), "{healthy:?}");
+
+        let bad = format!("db/{hex}/term/0000000000/base/{:020}/manifest.pb", 2);
+        crate::fixture::write(
+            dir.path(),
+            &bad,
+            &pb::BaseManifest {
+                schema_version: 99,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+
+        let blind = plan_for(&store, policy).await.unwrap();
+        assert!(blind.delete.is_empty(), "{blind:?}");
+        assert_eq!(blind.unreadable_bases.len(), 1, "{blind:?}");
+        assert!(blind.unreadable_bases[0].starts_with(&bad), "{blind:?}");
+        assert!(
+            blind.unreadable_bases[0].contains("schema"),
+            "the reason has to travel with the key: {blind:?}"
+        );
     }
 
     /// The preview over a real store: it reports, and it deletes nothing.

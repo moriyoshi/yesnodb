@@ -1371,6 +1371,16 @@ pub(crate) async fn retention_loop(
                 // itself: no later pass restores an object, and the operator
                 // finds out at a restore otherwise. One example key, because
                 // the count says how bad and the key says where to look.
+                // Ahead of `missing`, because this one says the pass did
+                // not do its job at all rather than that the archive has a
+                // hole in it.
+                if let Some(first) = plan.unreadable_bases.first() {
+                    tracing::warn!(
+                        unreadable = plan.unreadable_bases.len(),
+                        %first,
+                        "archive reclamation deleted nothing: a base manifest could not be read"
+                    );
+                }
                 if let Some(first) = plan.missing.first() {
                     tracing::warn!(
                         missing = plan.missing.len(),

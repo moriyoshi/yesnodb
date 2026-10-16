@@ -2204,3 +2204,69 @@ absent history anchor. `metrics` already had the smallest archive that passes. I
 `src/fixture.rs`, `#[cfg(test)]`, for the reason `lib.rs::ctx` gives for living where it does --
 neither module owns it. `metrics` asserts what a pass publishes, `gc` asserts what a pass decides,
 and both need the same archive on disk.
+
+## 2026-10-16 — One manifest this build could not read ended reclamation for the whole archive
+
+Found while reading `survey` for the preview command, not by a failure. The loop was:
+
+```rust
+let manifest = pb::BaseManifest::decode(store.get_bytes(key).await?)?;
+validate_base_manifest(&manifest)?;
+```
+
+Two `?`s on a per-object property, inside a loop over every manifest under the prefix. **One
+manifest this build cannot read therefore ended the pass**, and the next pass, and every pass after
+that -- no plan, no gauges, no deletions, the bucket growing without bound. The sidecar logged
+`unsupported base-manifest schema 3, expected 2` once an interval, and that message does not say
+which of an archive's thousands of objects it is about.
+
+That is precisely the failure the module's own design argues against everywhere else. `classify`
+returns `Unrecognized` rather than guessing, the doc says an unrecognized key is "a newer writer's,
+or a hand-placed file, and either way guessing is how a reclaimer becomes a data-loss incident",
+and such keys are counted and reported. The conservative treatment stopped at the *key* and never
+reached the *contents*.
+
+### Why it cannot simply skip the manifest, and what it does instead
+
+A manifest is not an object to be kept -- it is the thing that justifies keeping other objects.
+Every deletion is reachability from the manifests, and one that will not decode may name any slab
+in the store. There is no conservative subset: the objects such a manifest protects are exactly the
+ones nothing else vouches for.
+
+So the pass **runs, reports, and deletes nothing**. Be honest about what that buys, because
+reclamation is halted either way. What changes is that the gauges are published, the offending key
+is named with its reason, and the halt is a distinct alertable state rather than something an
+operator has to infer from a deletion count that has gone flat -- which is also what a healthy
+archive with nothing to reclaim looks like. Hence
+`yesnod_archive_unreadable_base_manifests` rather than folding it into `unrecognized`.
+
+**A fetch failure is deliberately not treated this way.** `store.get_bytes` failing is transient
+and the next pass should simply try again, so it still ends the survey. Only the bytes being wrong
+is a property of the object.
+
+### The test is a pair, because one half of it would pass vacuously
+
+`a_manifest_this_build_cannot_read_halts_deletion_and_names_itself` plans twice over the same real
+store. The first plan has a spent WAL object to remove and removes it; then a manifest with
+`schema_version: 99` is written and the second plan deletes nothing. Asserting only the second
+would hold just as well on an archive with nothing to reclaim.
+
+### The same lesson as the ENOENT entry, one layer out
+
+`lib.rs::ctx` exists because `std::io::Error` carries no path and the `?` that boxes it is where the
+only identifying information is lost. This is the same shape with an object key instead of a path,
+and it had the same consequence: a true message that could not be acted on. The unreadable list
+carries `"{key}: {error}"`, so the report names the object and the reason together.
+
+### Postscript: the gate caught what the local loop structurally cannot
+
+The first gate run on this change failed, and not on a test: `cargo doc` refused
+`public documentation for 'gc' links to private item 'planned'`. The local lint loop in CLAUDE.md
+is clippy, `fmt --check` and `cargo test -p yesno-core`, and **none of the three can see an
+intra-doc link**. Only `cargo doc` resolves them, and it runs in the gate rather than in the loop.
+
+Worth knowing rather than worth changing: a private helper is the natural thing for a public doc
+comment to want to point at, so this is reachable any time a `pub` item's documentation explains
+itself by naming the function that implements the rule. The fix is to state the rule in the doc
+comment instead of linking to where it lives, which is better writing anyway -- the field now
+carries the reasoning rather than a pointer to it.
