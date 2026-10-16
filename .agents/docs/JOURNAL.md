@@ -2753,3 +2753,100 @@ named its falsifier the same way the other two did: "Revisit if a restore's appa
 grows far past its real one." It is 4.29 GB against 12.6 MB. Filed as
 `hashing-a-hole-costs-what-hashing-its-bytes-costs`, with the note that 2 GB/s may be the build
 rather than the algorithm and is worth checking before anyone writes GF(2) matrix code.
+
+## 2026-10-16 -- The numbers in the last two entries were debug builds, and the correction changes one conclusion
+
+Before acting on `hashing-a-hole-costs-what-hashing-its-bytes-costs` I went to check its first
+question -- whether 2 GB/s was the algorithm or the build -- and found the answer by reading
+`crc_hole`'s own comment, which records **16.0 GiB/s on this host**. Eight times what I measured.
+The difference is the profile: I ran every measurement in the last two entries with
+`cargo run -p yesno-e2e`, and this repository's measurement fixtures use `--release`. TESTING.md
+even says so, and says a host call costs 6.7 us in debug against 1 us in release.
+
+So, re-measured in release, with the pre-change behaviour restored by pinning the run walk to the
+whole file:
+
+| | debug before | debug after | **release before** | **release after** |
+| --- | --- | --- | --- | --- |
+| four-shard bootstrap | 15 453 ms | 239 ms | **2 845 ms** | **239 ms** |
+| four-shard capture | 17 341 ms | 2 977 ms | **5 079 ms** | **544 ms** |
+
+Both changes stand, at 11.9x and 9.3x rather than 65x and 5.8x. The bootstrap's *after* figure is
+the same in both profiles, which is the tell that it is no longer doing any work worth measuring
+-- what is left is RPC and setup.
+
+**The correction that matters is not the ratios, it is that debug flattered one conclusion and
+would have misled the next.** `crc32c` was running at 2 GB/s because it was unoptimised, not
+because it was taking a software path: the crate does use the AArch64 CRC32 instructions here
+( `armsimd` is set for rustc >= 1.80, and the host advertises `crc` ). Had I not checked, the
+filed item's first instruction -- check the build before writing GF(2) code -- would have sent the
+next session to look for a missing target feature that was never missing.
+
+### And then the item was worth doing anyway, for the other reason
+
+In release, removing the `crc_hole` call entirely -- wrong, for measurement -- takes the capture
+from 544 ms to 325. So 219 ms of it is hashing 4.28 GB of zeros, at about 19.6 GB/s, which agrees
+with the recorded 16.0 GiB/s.
+
+A fifth of a second is not what justifies changing it. What justifies it is that after this week
+it is **the only term left that is proportional to what a database appears to hold** rather than
+what it holds, and the apparent size is a whole mapping segment per shard. Measured at sixteen
+shards, 17.2 GB apparent: **2 175 ms before, 1 194 ms after.** The saving is a second, and it
+grows with the shard count while nothing else in a capture does any more.
+
+### One line, and the oracle that makes it safe
+
+`crc32c_combine( c, d, n )` is `shift( c, n ) ^ d`, the n-zero-bytes operator over GF(2). It is
+already in this dependency, taken from zlib's reference implementation, so none of that arithmetic
+is mine. CRC32C reports `R ^ !0` for its internal register and it is `R` the operator is linear
+in, so the whole function is: take the inversion off, shift, put it back, with `d` zero because a
+run of zeros contributes no message bits.
+
+```rust
+crc32c::crc32c_combine(checksum ^ u32::MAX, 0, length as usize) ^ u32::MAX
+```
+
+The old loop is kept, in the test, as the reference. `hashing_a_hole_agrees_with_hashing_its_zeros`
+compares the two across twenty lengths chosen around where a shift-and-square walk goes wrong and
+six checksums including 0 and `!0` -- the two an implementation that dropped an inversion could
+still get right by accident. Dropping either `^ u32::MAX` makes it fail, along with the three
+existing hole tests.
+
+### A mistake worth recording about how I edited
+
+The first attempt at this replaced a slice of the file between two anchors, and the closing anchor
+-- a doc comment opening -- matched in the *test module* eight hundred lines below the intended
+one. It deleted 1 612 lines, most of the restore path, and `cargo test` reported it as an
+unbalanced delimiter in a test rather than as what it was.
+
+The repair was to write `git show HEAD:...restore.rs` over that one file and re-apply the two
+small edits by hand, which is a single-file write rather than `git checkout` or `git restore` --
+those are forbidden here precisely because they reach the whole tree. The lesson is narrower than
+"be careful": **a replacement bounded by two anchors is only as safe as the uniqueness of the
+second one**, and an anchor that is a doc-comment opening is a poor choice because doc comments
+repeat. Anchored single-string replacement with an asserted count of one, which is what the rest
+of this session used, does not have this failure mode.
+
+### Postscript, 2026-10-17 -- making a capture fast broke a scenario that was quietly timing it
+
+The gate failed on `pitr_retention.py`, at `assert swept["deleted"] > 0`.
+
+The scenario captures two base generations and then sweeps with a **one-second** retention
+window, expecting generation 1 to go. A one-second window roots retention at the newest base
+whose checkpoint is at least a second old -- so for generation 1 to be dropped, more than a
+second of wall clock had to have passed since it was captured. That was reliably true only
+because each capture was reading a gigabyte of holes per shard. With that gone the two
+generations landed 482 ms apart, both were inside the window, and the pass correctly kept both.
+
+Nothing was wrong with the reclamation. The scenario had an undeclared dependency on the
+implementation being slow, and it had been a race since it was written -- one that a faster
+machine would have found eventually. The sweep now uses a window of zero, which roots retention
+at the newest base whatever the clock has done; `base_dedup.py` already roots the same way. The
+alternative, waiting for generation 1 to age past a one-second window, means comparing the
+harness clock against the server's commit clock, which `TESTING.md` says not to do.
+
+Worth stating as a general thing, because this is the second time this week a performance change
+has falsified something written down: **a test that passes because the code under it is slow is
+a test with a hidden parameter**, and the parameter is not in the file. The two assertions either
+side of this one -- a wide window keeps both roots, a narrow one keeps the newest -- are the
+properties, and neither needed a clock.

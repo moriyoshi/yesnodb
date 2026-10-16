@@ -129,8 +129,23 @@ assert len(srv_restore_windows("objects")) == 2, srv_restore_windows("objects")
 print("commit_window=" + str(new))
 print("windows_before_sweep=" + str(srv_restore_windows("objects")))
 
-# Now a window of one second, declining to hold a second root open.
-swept = srv_archive_gc("objects", 1, 1)
+# Now a window narrow enough to decline holding a second root open.
+#
+# **This was one second until 2026-10-16, and it was a race the whole time.**
+# A window of one second roots retention at the newest base whose checkpoint
+# is at least that old, so dropping generation 1 required more than a second
+# of wall clock to have passed since it was captured. That was reliably true
+# only because a capture read every hole in a 1 GiB shard image; once it
+# stopped doing that, the two generations were captured about half a second
+# apart and the sweep kept both -- correctly, because a window that reaches
+# past the start of the archive does contain every base in it.
+#
+# Zero is the narrowest window and roots retention at the newest base
+# whatever the clock has done, which is the property this is about. The
+# alternative was to wait until generation 1 aged past the window, and that
+# means comparing the harness clock against the server's commit clock, which
+# TESTING.md says not to do. `base_dedup.py` roots the same way.
+swept = srv_archive_gc("objects", 0, 1)
 print("swept=" + str(swept))
 print("windows_after_sweep=" + str(srv_restore_windows("objects")))
 assert swept["deleted"] > 0, "reclamation removed nothing from a superseded base"

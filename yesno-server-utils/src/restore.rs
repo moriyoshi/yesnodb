@@ -495,26 +495,41 @@ async fn list_bases(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Bases,
 /// verifiable against the same number a dense one was. A restore therefore has
 /// to hash bytes it never received.
 ///
-/// Measured at 16.0 GiB/s on this host, so the 4 GiB of holes in the four-shard
-/// database this was built on costs 250 ms -- and the whole stage that used to
-/// take 3.11 s now takes 0.24 s, which is to say it is now *this*. Hashing the
-/// holes is a quarter of a second; receiving them was three seconds on a local
-/// store and would be minutes on a remote one.
+/// # Why this stopped being a loop over a zero buffer
 ///
-/// That is also why this is a loop over a zero buffer and not a GF(2) shift of
-/// the CRC polynomial. The clever version would make the stage O( what the
-/// database holds ) instead of O( what it appears to hold ), which is the
-/// right shape -- but it saves a quarter of a second off a one-off operation
-/// and has to be proved correct. Revisit if a restore's apparent size ever
-/// grows far past its real one.
-pub(crate) fn crc_hole(mut checksum: u32, mut length: u64) -> u32 {
-    static ZEROS: [u8; 1 << 16] = [0u8; 1 << 16];
-    while length > 0 {
-        let take = length.min(ZEROS.len() as u64) as usize;
-        checksum = crc32c::crc32c_append(checksum, &ZEROS[..take]);
-        length -= take as u64;
+/// It was one until 2026-10-16, and this comment said the clever version
+/// "saves a quarter of a second off a one-off operation and has to be proved
+/// correct. Revisit if a restore's apparent size ever grows far past its real
+/// one." Both halves moved on the same day.
+///
+/// The apparent size grew far past the real one -- a four-shard capture now
+/// reads 4.29 GB of apparent image to produce 12.6 MB of objects -- and the
+/// quarter of a second did not grow with it, because it never depended on
+/// the data. That is the point. Once the copies stopped *reading* the holes,
+/// this became the only term left that is proportional to what a database
+/// appears to hold, and what it appears to hold is a whole mapping segment
+/// per shard: measured in release at 219 ms of a 544 ms capture over four
+/// shards, and linear in the shard count from there.
+///
+/// It also no longer has to be proved correct here. Appending zeros is a
+/// linear map on the CRC register, and `crc32c_combine` -- zlib's `shift`,
+/// already in this dependency and taken from the reference implementation --
+/// is that map. The only thing added is undoing and redoing the final
+/// inversion. The old loop survives as the oracle the tests compare against,
+/// which is a better check than an argument.
+///
+/// # The one line
+///
+/// `crc32c_combine( c, d, n )` is `shift( c, n ) ^ d`, where `shift` applies
+/// the n-zero-bytes operator. CRC32C reports `R ^ !0` for an internal
+/// register `R`, and it is `R` the operator is linear in -- so the inversion
+/// comes off, the shift goes on, and the inversion goes back. `d` is zero
+/// because a run of zeros contributes no message bits of its own.
+pub(crate) fn crc_hole(checksum: u32, length: u64) -> u32 {
+    if length == 0 {
+        return checksum;
     }
-    checksum
+    crc32c::crc32c_combine(checksum ^ u32::MAX, 0, length as usize) ^ u32::MAX
 }
 
 /// Write one window unless it is entirely zero.
@@ -2256,6 +2271,68 @@ mod tests {
         let (extents, object_len) = object_layout(&file);
         assert_eq!(object_len, 8192);
         assert_eq!(extents, whole(8192));
+    }
+
+    /// The hole CRC against the loop it replaced, which is the only argument
+    /// for the replacement worth anything.
+    ///
+    /// `crc_hole` became a GF(2) shift on 2026-10-16. The shift itself is
+    /// `crc32c_combine`, which this dependency already carried and which came
+    /// from zlib's reference implementation, so what is genuinely new is the
+    /// handling of the final inversion -- and an error there is exactly what
+    /// a disagreement with the loop catches.
+    ///
+    /// The lengths sit around the places a shift-and-square walk goes wrong:
+    /// zero, one, powers of two and their neighbours, the old loop's own
+    /// 64 KiB cut, and a value with a long run of set bits so that nearly
+    /// every step of the walk contributes. The checksums include 0 and !0,
+    /// because the shift is applied to the checksum itself and an
+    /// implementation that dropped an inversion could still agree on one of
+    /// them.
+    #[test]
+    fn hashing_a_hole_agrees_with_hashing_its_zeros() {
+        fn by_hashing(mut checksum: u32, mut length: u64) -> u32 {
+            static ZEROS: [u8; 1 << 16] = [0u8; 1 << 16];
+            while length > 0 {
+                let take = length.min(ZEROS.len() as u64) as usize;
+                checksum = crc32c::crc32c_append(checksum, &ZEROS[..take]);
+                length -= take as u64;
+            }
+            checksum
+        }
+
+        let lengths = [
+            0u64,
+            1,
+            2,
+            3,
+            7,
+            8,
+            255,
+            256,
+            257,
+            4095,
+            4096,
+            4097,
+            (1 << 16) - 1,
+            1 << 16,
+            (1 << 16) + 1,
+            (1 << 21) - 1,
+            1 << 21,
+            (1 << 21) + 1,
+            0x00FF_FFFF,
+            3 * (1 << 20) + 12_345,
+        ];
+        let checksums = [0u32, 1, u32::MAX, 0x8000_0000, 0x1234_5678, 0xDEAD_BEEF];
+        for &length in &lengths {
+            for &checksum in &checksums {
+                assert_eq!(
+                    crc_hole(checksum, length),
+                    by_hashing(checksum, length),
+                    "crc_hole( {checksum:#010x}, {length} )"
+                );
+            }
+        }
     }
 
     /// A hole hashes as the zeros it stands for, at every length the loop
