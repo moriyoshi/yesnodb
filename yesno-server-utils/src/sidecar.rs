@@ -1442,8 +1442,25 @@ pub(crate) async fn retention_loop(
                 if let Some(first) = plan.missing.first() {
                     tracing::warn!(
                         missing = plan.missing.len(),
+                        damaged_bases = plan.damaged_bases.len(),
                         %first,
                         "a retained base names objects this archive does not hold"
+                    );
+                }
+                // The one distinction the counts above cannot draw, and the
+                // one that decides whether this is tonight's problem: holes in
+                // old history, or the recovery point a restore picks by
+                // default. Both lists are sorted by key, which for a base
+                // manifest is also oldest-first, so the newest of each is the
+                // last.
+                if let Some(newest) = plan
+                    .damaged_bases
+                    .last()
+                    .filter(|newest| plan.retained_bases.last() == Some(newest))
+                {
+                    tracing::error!(
+                        base = %newest,
+                        "the newest base in this archive cannot be restored"
                     );
                 }
                 metrics.pass_completed(&plan);

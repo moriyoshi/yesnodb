@@ -272,10 +272,18 @@ yesnoctl archive-plan \
 ```
 
 It reports what a pass with that policy would delete, what it would not
-recognize, and what a base it would keep names that the store does not hold. It
-**deletes nothing** and takes no writer lease, so it is safe to run against a
-live archive and alongside the sidecar that owns the prefix. Each list is
-sampled; `--list` prints every key.
+recognize, what a base it would keep names that the store does not hold, and
+which bases those losses cost. It **deletes nothing** and takes no writer
+lease, so it is safe to run against a live archive and alongside the sidecar
+that owns the prefix. Each list is sampled; `--list` prints every key.
+
+Read the damaged-base list before the missing-object list. They are the same
+damage in different units, and the object count does not give the severity: a
+base file is stored as content-named pieces that later generations name
+instead of uploading again, so one lost piece can cost every generation in the
+archive, while a hundred lost objects can all belong to one old base nobody
+would restore. The key of a lost piece is a hash and says nothing about which
+generations named it, so this is not an attribution to do by hand.
 
 Omit `--retention-window` and the plan is computed against a window no base
 falls out of. Nothing is then proposed for deletion and the report is purely
@@ -285,9 +293,14 @@ publishing the gauges below. Run it after any change to bucket lifecycle,
 replication or access policy.
 
 A capture running at the same time can make the deletion count optimistic,
-because objects uploaded after the listing are not in it. It cannot produce a
-false report of a missing object: a manifest is published after every object it
-names, so a listing holding the manifest holds them too.
+because objects uploaded after the listing are not in it. It can also, in one
+narrow case, report an object as missing that is in fact there: a listing is
+served in key order, and a capture can store a piece after that part of the
+listing was served and publish the manifest naming it before the manifests
+were read. Re-run the command if it reports a loss while a base copy is in
+progress. The sidecar's own survey excludes this by never running at the same
+time as a capture; the command does not, because waiting its turn would hold
+the sidecar off its own archive.
 
 ### Reclamation metrics
 
@@ -352,6 +365,14 @@ publishes no reading rather than a reassuring zero:
   key next to the count. The usual causes are an object-store lifecycle rule
   (see below), a deletion by hand, and a bucket policy or replication rule
   that never applied to every prefix.
+- `yesnod_archive_damaged_bases`: bases the last pass retained that name at
+  least one of those missing objects, and so cannot be restored. This is the
+  gauge to page on and the one to put on a dashboard: the object count above
+  says how much is gone, this says what it cost. Compare it with
+  `yesnod_archive_retained_bases` -- equal means no recovery point in the
+  archive is usable. The sidecar logs at error level, separately from the
+  warning above, when the loss reaches the newest base, which is the one a
+  restore selects by default.
 - `yesnod_archive_unreadable_base_manifests`: base manifests this version
   cannot decode. Alert on any non-zero value. It is not a third kind of damage
   but a change of state: while it is non-zero the pass deletes nothing and no
@@ -361,7 +382,7 @@ publishes no reading rather than a reassuring zero:
 - `yesnod_archive_retained_bases`: base images the last pass kept. Read it
   against `--retention-min-bases` and the window.
 - `yesnod_archive_reclamation_last_success_timestamp_seconds`: Unix time of the
-  last completed pass, and therefore how old the four gauges above are.
+  last completed pass, and therefore how old the five gauges above are.
 
 A failed pass deliberately leaves the gauges at their last completed reading. A
 pass that fails learns nothing, and zeroing the unrecognized count because the

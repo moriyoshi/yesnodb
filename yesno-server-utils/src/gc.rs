@@ -158,6 +158,31 @@ pub struct GcPlan {
     /// restore already refuses a chain with a hole in it before fetching
     /// anything.
     pub missing: Vec<String>,
+    /// Manifest keys of the retained bases that [`GcPlan::missing`] costs,
+    /// sorted.
+    ///
+    /// The same damage counted in the unit an operator acts in. `missing` says
+    /// how many objects are gone, which does not say how bad it is: one lost
+    /// slab can be named by every generation in the archive, and a hundred
+    /// lost objects can all belong to one old base nobody would restore.
+    /// **Content addressing is what makes the count and the consequence come
+    /// apart**, and it also makes the mapping impossible to do by hand -- a
+    /// slab key is a hash, so nothing about it says which generations named
+    /// it.
+    ///
+    /// Sorted by key, which for these keys is also oldest-first: the term and
+    /// generation are zero-padded to fixed width, so lexicographic order is
+    /// the retention order. The last entry is therefore the newest damaged
+    /// base, and comparing it against the last of
+    /// [`GcPlan::retained_bases`] distinguishes the two cases that matter --
+    /// old history has holes, or the recovery point a restore would pick by
+    /// default cannot be read.
+    ///
+    /// Carries the same limit as `missing`, and it is worth restating here
+    /// because the phrasing invites more: a base that is **not** on this list
+    /// is not thereby proven restorable. Only what the base names directly is
+    /// checked.
+    pub damaged_bases: Vec<String>,
     /// The horizon this plan was computed against, in epoch microseconds.
     pub horizon_micros: u64,
 }
@@ -167,11 +192,12 @@ impl GcPlan {
     pub fn summary_line(&self) -> String {
         format!(
             "archive gc: delete={} retained_bases={} unrecognized={} missing={} \
-             unreadable_bases={} horizon={}",
+             damaged_bases={} unreadable_bases={} horizon={}",
             self.delete.len(),
             self.retained_bases.len(),
             self.unrecognized.len(),
             self.missing.len(),
+            self.damaged_bases.len(),
             self.unreadable_bases.len(),
             crate::restore::format_micros(self.horizon_micros),
         )
@@ -435,9 +461,32 @@ pub fn plan(
             .cloned(),
     );
 
+    // Which recovery points those holes cost. A second walk over names the
+    // loop above already visited, run only when there is damage to attribute,
+    // because the healthy case is the one that runs every hour forever.
+    if !plan.missing.is_empty() {
+        let gone: BTreeSet<&str> = plan.missing.iter().map(String::as_str).collect();
+        for (key, manifest) in &retained {
+            let uuid = crate::archive::hex(&manifest.database_uuid);
+            let damaged = manifest.files.iter().any(|file| {
+                (!file.object_key.is_empty() && gone.contains(file.object_key.as_str()))
+                    || file.extents.iter().any(|extent| {
+                        !extent.content_hash.is_empty()
+                            && gone.contains(
+                                crate::archive::slab_key(&uuid, &extent.content_hash).as_str(),
+                            )
+                    })
+            });
+            if damaged {
+                plan.damaged_bases.push(key.clone());
+            }
+        }
+    }
+
     plan.delete.sort();
     plan.unrecognized.sort();
     plan.missing.sort();
+    plan.damaged_bases.sort();
     Ok(plan)
 }
 
@@ -495,11 +544,17 @@ const SAMPLE: usize = 20;
 /// sidecar that owns the prefix out of its own archive for the lease's term,
 /// and nothing here writes.
 ///
-/// A capture running concurrently is not a hazard for the same reason a
-/// restore is not: a manifest is published after every object it names, so a
-/// listing that holds the manifest holds the objects. It can make the *delete*
-/// count optimistic -- objects uploaded since the listing are not in it -- and
-/// that number is advisory here in any case.
+/// A capture running concurrently is a hazard only in one narrow way, and the
+/// command accepts it. A listing is served in key order and `slabs/` sorts
+/// before `term/`, so a capture can upload its slabs after that part of the
+/// listing was served and publish its manifest before the manifests were
+/// read, which would report live objects as missing. The window is narrow,
+/// the next run clears it, and the reader is watching the output -- whereas
+/// the sidecar's own survey, which feeds an alert, takes the capture gate to
+/// exclude it. Taking that gate here would fence the sidecar out of its own
+/// archive for the duration. A concurrent capture also makes the *delete*
+/// count optimistic, since objects uploaded since the listing are not in it,
+/// and that number is advisory here in any case.
 pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
     let policy = options.policy()?;
     let store = ArchiveStore::connect(&options.store)?;
@@ -511,6 +566,13 @@ pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
     report(
         "unreadable base manifests",
         &plan.unreadable_bases,
+        options.list,
+    );
+    // Before the objects, because it is the same damage in the unit the
+    // reader acts in: a recovery point they can no longer take.
+    report(
+        "bases that cannot be restored",
+        &plan.damaged_bases,
         options.list,
     );
     report("missing", &plan.missing, options.list);
@@ -836,6 +898,74 @@ mod tests {
         // where another file carries an object key. It is not a key, and
         // searching the listing for it would report every such file as lost.
         assert!(plan.missing.is_empty(), "nothing is absent here: {plan:?}");
+    }
+
+    /// One lost object, and the number of recovery points it costs is
+    /// anywhere from one to all of them.
+    ///
+    /// This is the whole reason `damaged_bases` exists beside `missing`.
+    /// Three generations here each name their own slab and one they share --
+    /// which is what content addressing is for, and it means a single lost
+    /// object can be the difference between losing one old base and losing
+    /// the archive. A hash-named key says nothing about who named it, so this
+    /// is not a mapping an operator can do by hand from the `missing` list.
+    #[test]
+    fn one_lost_slab_costs_every_generation_that_named_it() {
+        let bases = vec![
+            slab_base(1, NOW - 100 * HOUR, 0x11),
+            slab_base(2, NOW - 50 * HOUR, 0x22),
+            slab_base(3, NOW - HOUR, 0x33),
+        ];
+        let newest = bases[2].0.clone();
+        let oldest = bases[0].0.clone();
+        let uuid = crate::archive::hex(&bases[0].1.database_uuid);
+        let slab = |byte: u8| crate::archive::slab_key(&uuid, &[byte; 32]);
+        let all_slabs = [slab(0xee), slab(0x11), slab(0x22), slab(0x33)];
+
+        let listing = |absent: &str| {
+            let mut keys = keys(&bases, &[]);
+            keys.extend(all_slabs.iter().filter(|k| *k != absent).cloned());
+            keys.sort();
+            keys
+        };
+        // Everything retained, so what is reported is what the archive holds
+        // rather than what this policy would have kept.
+        let state = state_with(&newest);
+        let shared = slab(0xee);
+        let spread = plan(
+            &state,
+            &bases,
+            &listing(&shared),
+            RetentionPolicy::SURVEY,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(spread.missing, vec![shared], "{spread:?}");
+        assert_eq!(
+            spread.damaged_bases.len(),
+            3,
+            "every generation named it: {spread:?}"
+        );
+        assert_eq!(
+            spread.damaged_bases.last(),
+            spread.retained_bases.last(),
+            "the newest base is among them, which is the loud case: {spread:?}"
+        );
+
+        // The same count of missing objects, one generation's worth of damage.
+        let own = slab(0x11);
+        let confined = plan(&state, &bases, &listing(&own), RetentionPolicy::SURVEY, NOW).unwrap();
+        assert_eq!(confined.missing, vec![own], "{confined:?}");
+        assert_eq!(confined.damaged_bases, vec![oldest], "{confined:?}");
+        assert_ne!(
+            confined.damaged_bases.last(),
+            confined.retained_bases.last(),
+            "only old history is gone, and the counts cannot say so: {confined:?}"
+        );
+
+        let whole = plan(&state, &bases, &listing(""), RetentionPolicy::SURVEY, NOW).unwrap();
+        assert!(whole.missing.is_empty(), "{whole:?}");
+        assert!(whole.damaged_bases.is_empty(), "{whole:?}");
     }
 
     /// Every file under `root`, so a preview can be shown to have changed

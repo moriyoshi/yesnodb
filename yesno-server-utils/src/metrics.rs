@@ -89,6 +89,7 @@ pub struct ArchiveMetrics {
     surveyed: AtomicBool,
     unrecognized: AtomicU64,
     missing: AtomicU64,
+    damaged_bases: AtomicU64,
     unreadable_bases: AtomicU64,
     retained_bases: AtomicU64,
     last_success_unix: AtomicU64,
@@ -113,6 +114,8 @@ impl ArchiveMetrics {
             .store(plan.unrecognized.len() as u64, Ordering::Relaxed);
         self.missing
             .store(plan.missing.len() as u64, Ordering::Relaxed);
+        self.damaged_bases
+            .store(plan.damaged_bases.len() as u64, Ordering::Relaxed);
         self.unreadable_bases
             .store(plan.unreadable_bases.len() as u64, Ordering::Relaxed);
         self.retained_bases
@@ -202,6 +205,16 @@ impl ArchiveMetrics {
                  point cannot be restored; it is not self-healing and no later \
                  pass repairs it.",
                 self.missing.load(Ordering::Relaxed).to_string(),
+            );
+            gauge(
+                &mut s,
+                "archive_damaged_bases",
+                "Bases the last completed pass retained that name at least one \
+                 object the store does not hold, and so cannot be restored. The \
+                 same damage as archive_missing_objects, counted in recovery \
+                 points: one lost shared slab can cost every generation, and \
+                 many lost objects can cost only one old base.",
+                self.damaged_bases.load(Ordering::Relaxed).to_string(),
             );
             gauge(
                 &mut s,
@@ -303,6 +316,11 @@ mod tests {
             value_of(&rendered, "archive_missing_objects"),
             Some(1),
             "{rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_damaged_bases"),
+            Some(1),
+            "the lost object was the only base's, so the base goes with it: {rendered}"
         );
     }
 
@@ -552,6 +570,7 @@ mod tests {
         let plan = pass(dir.path()).await;
         assert!(plan.unrecognized.is_empty(), "{plan:?}");
         assert!(plan.missing.is_empty(), "{plan:?}");
+        assert!(plan.damaged_bases.is_empty(), "{plan:?}");
 
         let metrics = ArchiveMetrics::new();
         metrics.pass_completed(&plan);
@@ -563,6 +582,11 @@ mod tests {
         );
         assert_eq!(
             value_of(&rendered, "archive_missing_objects"),
+            Some(0),
+            "{rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_damaged_bases"),
             Some(0),
             "{rendered}"
         );

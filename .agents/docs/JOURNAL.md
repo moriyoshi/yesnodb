@@ -2444,3 +2444,55 @@ and how many of them there are" and `object_layout` was left carrying the senten
 archive written before sparse objects existed reads." Both halves rejoined their own functions.
 Nothing catches this: each comment is well-formed, `cargo doc` renders both without complaint, and
 only reading them in order shows the seam.
+
+## 2026-10-16 -- One lost object, and no way to say what it cost
+
+`yesnod_archive_missing_objects` has been published for two days and the operator guide tells
+people to page on any non-zero value. Reading the page it would produce, the number does not
+answer the first question anyone asks next: **how bad is it.** The count is in objects, and the
+unit the operator acts in is recovery points.
+
+Those two units came apart the day base files became content-addressed pieces. A slab that three
+generations left unchanged is named by all three and stored once, which is the whole point of
+phase 0 -- and it means **one** missing object can cost every generation in the archive, while a
+hundred missing objects can all belong to one old base nobody would ever restore. The counts are
+identical in the first case and the second; the decisions are opposite.
+
+Worse, it is not an attribution an operator can do by hand. A slab's key is its SHA-256, so the
+key says nothing about who named it. Working out which generations are affected means fetching
+every base manifest and expanding its extents -- which is exactly what the pass just did.
+
+### `GcPlan::damaged_bases`
+
+So the same walk that produces `missing` now also attributes it. A second pass over the retained
+manifests, run only when `missing` is non-empty, collects the manifest key of every base naming at
+least one absent object. The healthy case -- the one that runs every hour forever -- does no extra
+work at all.
+
+`one_lost_slab_costs_every_generation_that_named_it` builds the shape the feature exists for: three
+generations, each with its own slab and one they share. Dropping the shared slab gives
+`missing.len() == 1` and `damaged_bases.len() == 3`; dropping the oldest generation's own slab
+gives `missing.len() == 1` and one damaged base. The two halves differ in no other number, which is
+the argument for the field.
+
+### The distinction the counts still cannot draw
+
+Even `damaged_bases=2` does not say whether tonight's restore works. Holes in old history and a
+hole in the base a restore picks by default are different emergencies. Both lists are sorted by
+key, and for a base manifest key the term and generation are zero-padded to fixed width, so
+lexicographic order *is* retention order and the last entry of each is the newest. When
+`damaged_bases.last() == retained_bases.last()` the sidecar logs at error level, separately from
+the warning that carries the counts. That comparison is the cheapest useful thing in this commit.
+
+The gauge is `yesnod_archive_damaged_bases`, and the guide now says to compare it against
+`yesnod_archive_retained_bases`: equal means no recovery point in the archive is usable.
+
+### A correction carried into the code
+
+Yesterday's entry recorded that a concurrent capture cannot produce a false `missing`. The
+`gc::run` doc comment said the same thing, and it is wrong for the key-order reason set out in the
+survey entry above: `slabs/` sorts before `term/`, so a listing can miss a capture's slabs and
+still read the manifest that names them. The doc comment now states the race and why the command
+accepts it while the sidecar's survey excludes it, and `backup.md` tells the reader to re-run the
+command if it reports a loss during a base copy. A wrong reassurance in a doc comment is worse than
+no comment, because the next person to touch the code will rely on it.
