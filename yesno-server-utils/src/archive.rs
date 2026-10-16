@@ -58,15 +58,18 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// It is one constant and not two because it is one format decision: an extent
 /// boundary written by an upload is a window boundary a restore seeks to.
 ///
-/// **The holes are still read here**, and that is now a known cost rather
-/// than a decision. The replication path declined `SEEK_DATA` for this exact
-/// job on the grounds that the scan was only memory bandwidth on a one-off
-/// operation, and on 2026-10-16 that was measured and overturned there: a
-/// shard image is grown to a whole 1 GiB mapping segment, so the scan was
-/// seconds per shard on a database holding nothing. A capture reads the same
-/// images the same way. It is not the same change, because this path also
-/// computes a CRC over the whole file and would have to account for the runs
-/// it skipped -- see `archive-capture-reads-every-hole-it-does-not-upload`.
+/// **The holes here are no longer read**, as of 2026-10-16. Both this comment
+/// and the replication path's used to say that `SEEK_DATA` was considered and
+/// declined, on the grounds that the scan cost only memory bandwidth on a
+/// one-off operation. That was measured and overturned: a shard image is
+/// grown to a whole 1 GiB mapping segment at creation, so a four-shard
+/// capture of a database holding three ordinals read 4.29 GB and took 17.3
+/// seconds, none of it on account of anything the database contained.
+///
+/// What this constant decides is unchanged by that. The cut is still whole
+/// windows measured from offset zero, because an extent boundary is a
+/// boundary a restore seeks to; all the filesystem is asked is whether a
+/// window is worth reading.
 pub(crate) const SPARSE_WINDOW: usize = 1 << 20;
 
 /// Bytes of a base file per content-addressed object.
@@ -566,6 +569,18 @@ impl ArchiveStore {
         let mut source_file = tokio::fs::File::open(source)
             .await
             .map_err(|e| ctx("open the upload source", source, e))?;
+        // A second, synchronous handle for nothing but asking the filesystem
+        // which parts of the image are there. `tokio::fs::File` keeps its own
+        // position and does its reads on the blocking pool, so moving its
+        // descriptor's offset from underneath it would be interfering with it
+        // rather than using it.
+        let probe =
+            std::fs::File::open(source).map_err(|e| ctx("open the upload source", source, e))?;
+        let mut run = yesno_server::sparse::next_allocated(&probe, 0, size);
+        // Where the reader's cursor is. Skipping a window leaves it behind,
+        // and a read after a skip has to be positioned rather than
+        // sequential.
+        let mut positioned = 0u64;
 
         let mut checksum = 0u32;
         let mut read_total = 0u64;
@@ -574,18 +589,55 @@ impl ArchiveStore {
         let mut inflight = FuturesUnordered::new();
         let mut slab = vec![0u8; SLAB_OBJECT_BYTES];
 
-        loop {
+        while read_total < size {
+            let at = read_total;
+            let want = SLAB_OBJECT_BYTES.min((size - at) as usize);
+            // Past the window, so look for the next run. The walk only ever
+            // moves forward, which is what makes one probe per run rather
+            // than one per window.
+            while matches!(run, Some((_, end)) if end <= at) {
+                let from = run.expect("matched above").1;
+                run = yesno_server::sparse::next_allocated(&probe, from, size);
+            }
+            // **The cut does not move.** Slabs are whole windows measured
+            // from offset zero, because an extent boundary written here is a
+            // window boundary a restore seeks to, and because the dedup rests
+            // on the boundary matching the allocator's. So an unallocated
+            // window is skipped and every other window is read in full --
+            // what the filesystem is asked is only whether to read it.
+            if !matches!(run, Some((start, _)) if start < at + want as u64) {
+                // Not read, and still hashed: the file's CRC covers its whole
+                // length, and a hole is zeros for that purpose.
+                checksum = crate::restore::crc_hole(checksum, want as u64);
+                read_total = at + want as u64;
+                continue;
+            }
+            if positioned != at {
+                use tokio::io::AsyncSeekExt;
+                source_file
+                    .seek(std::io::SeekFrom::Start(at))
+                    .await
+                    .map_err(|e| ctx("seek the upload source", source, e))?;
+            }
             // Whole slabs, so an object boundary is a slab boundary. A short
             // read mid-file is not end-of-file, and one taken for a slab would
             // shift every later object and defeat the dedup this is for.
-            let count = fill(&mut source_file, &mut slab).await?;
-            if count == 0 {
-                break;
+            let count = fill(&mut source_file, &mut slab[..want]).await?;
+            if count != want {
+                return Err(format!(
+                    "'{}' ended at {} while {size} bytes were expected",
+                    source.display(),
+                    at + count as u64
+                )
+                .into());
             }
             let filled = &slab[..count];
             checksum = crc32c::crc32c_append(checksum, filled);
-            let at = read_total;
-            read_total = read_total.saturating_add(count as u64);
+            read_total = at + count as u64;
+            positioned = read_total;
+            // A run the filesystem has allocated may still be zeros. The two
+            // filters compose: this one skips what was written and is zero,
+            // the one above what was never written at all.
             if filled.iter().all(|byte| *byte == 0) {
                 continue;
             }
@@ -1365,6 +1417,54 @@ mod tests {
         }
         file.sync_all().unwrap();
         path
+    }
+
+    /// A file whose length is not a whole number of slabs, with its only
+    /// contents in the short window at the end.
+    ///
+    /// The uploader no longer reads what the filesystem says is not there, so
+    /// the last window is now both the first one read and a partial one. Two
+    /// things could go wrong only here: a read sized to the slab rather than
+    /// to what is left, which would run past the end; and the holes before it
+    /// going unaccounted, which the CRC catches because it covers the file's
+    /// whole length.
+    #[tokio::test]
+    async fn a_short_final_window_after_nothing_but_holes_is_uploaded_whole() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard-0000.yno");
+        let tail = 4096usize;
+        let size = 2 * SLAB_OBJECT_BYTES + tail;
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(size as u64).unwrap();
+        file.seek(SeekFrom::Start(2 * SLAB_OBJECT_BYTES as u64))
+            .unwrap();
+        file.write_all(&vec![0x5au8; tail]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let store = ArchiveStore::new(Arc::new(InMemory::new()), ObjectPath::ROOT);
+        let uuid = "cd".repeat(16);
+        let uploaded = store
+            .put_slab_file(&path, &uuid, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(uploaded.size, size as u64);
+        assert_eq!(
+            uploaded.crc32c,
+            crc32c::crc32c(&std::fs::read(&path).unwrap()),
+            "the file's CRC, the two leading holes included"
+        );
+        assert_eq!(uploaded.extents.len(), 1, "{:?}", uploaded.extents);
+        assert_eq!(uploaded.extents[0].offset, 2 * SLAB_OBJECT_BYTES as u64);
+        assert_eq!(
+            uploaded.extents[0].length, tail as u64,
+            "the object is what is left of the file, not a whole slab"
+        );
+        let key = slab_key(&uuid, &uploaded.extents[0].content_hash);
+        assert_eq!(store.get_bytes(&key).await.unwrap().len(), tail);
     }
 
     /// Only the slabs that carry something become objects, and the manifest

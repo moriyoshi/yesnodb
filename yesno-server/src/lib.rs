@@ -56,6 +56,7 @@ pub mod metrics;
 pub mod plugin;
 pub mod replication;
 pub mod snapshot;
+pub mod sparse;
 pub mod tls;
 
 pub use config::{Config, ConfigError};

@@ -2681,3 +2681,75 @@ corrected rather than left pointing at a conclusion that no longer holds. That c
 one: the uploader also CRCs the whole file, holes included, so it would have to account for the
 runs it skipped the way the restore side already does. Filed as
 `archive-capture-reads-every-hole-it-does-not-upload`.
+
+## 2026-10-16 -- The same gigabyte, read a second time by the capture
+
+The entry above ends by filing `archive-capture-reads-every-hole-it-does-not-upload`. Measuring it
+first, as before, because the point of the replication finding was that the shape of the cost was
+not what the name suggested.
+
+A four-shard leader holding **three ordinals**, timed from `srv_checkpoint` to the sidecar
+publishing base generation 1:
+
+```
+capture ms 17341  files=9  object_bytes=12591104  apparent=4294975488
+```
+
+**17.3 seconds, 4.29 GB of apparent size, 12.6 MB of actual objects.** Worse than the bootstrap it
+was split off from, for the same reason and in the same proportion.
+
+### One helper, two callers, and where it lives
+
+`next_allocated` moved out of `replication/mod.rs` into `yesno-server::sparse`, public. The
+alternative was a second copy of two `libc` calls and their safety argument in
+`yesno-server-utils`, which is one too many. `yesno-server-utils` already depends on this crate
+and already takes the daemon's metric writers rather than restating them, so the direction is
+established; nothing about "which parts of this file are there" is specific to replication.
+`yesno-core` would be the other candidate and is the wrong one -- it owns the image *format*, and
+this is about copying images.
+
+### The cut does not move, only the reading
+
+The uploader's loop is still whole `SLAB_OBJECT_BYTES` windows measured from offset zero, because
+an extent boundary written by a capture is a window boundary a restore seeks to, and because the
+dedup rests on that boundary matching the allocator's. Changing the cut to follow the filesystem's
+runs would have been the natural-looking move and would have broken both. All the filesystem is
+asked is whether a window is worth reading.
+
+Two filters now compose where there was one: a window no run overlaps is never read, and a window
+that is read is still dropped if its bytes are zero. They are not the same test -- a run of
+*allocated* zeros passes the first and fails the second -- and keeping both is what makes the set
+of uploaded objects identical to before. The measurement confirms it: `object_bytes=12591104`
+before and after, to the byte.
+
+A skipped window is still hashed, because the file's CRC covers its whole length.
+`restore::crc_hole` already existed for the other end of exactly this and is now `pub(crate)`.
+
+| | capture |
+| --- | --- |
+| before | 17 341 ms |
+| after | 2 977 ms |
+
+The existing tests turned out to be the right oracles and needed nothing added:
+`a_sparse_file_uploads_only_its_slabs` already asserts the uploaded CRC equals the CRC of the
+whole file read back, holes included, and its fixture builds genuine holes with `set_len` and a
+seek. Removing the `crc_hole` call makes `an_entirely_empty_file_uploads_no_objects_and_still_has_a_length`
+fail. One case was missing and is now covered: a file whose length is not a whole number of slabs,
+with its only contents in the short final window -- which after this change is both the first
+window read and a partial one.
+
+### What is left, and a number that nearly misled me
+
+`base_dedup.py` runs in 13.4 s, and I had it in mind as a 4-second scenario, so the first reading
+looked like a regression. Rather than guess, I forced the old read-everything behaviour back in
+place by pinning the run to the whole file and re-ran: **20.5 s**. The change made that scenario
+35% faster too; the 4-second figure was simply wrong. Reaching for the measurement rather than the
+explanation took two minutes and would have cost an afternoon the other way round.
+
+What remains of a capture is mostly not I/O any more. With the `crc_hole` call removed entirely --
+wrong, and for measurement only -- the same capture takes **899 ms**, so 2.1 of the remaining 3.0
+seconds is hashing 4.28 GB of zeros at about 2 GB/s. `crc_hole`'s own comment predicted this and
+named its falsifier the same way the other two did: "Revisit if a restore's apparent size ever
+grows far past its real one." It is 4.29 GB against 12.6 MB. Filed as
+`hashing-a-hole-costs-what-hashing-its-bytes-costs`, with the note that 2 GB/s may be the build
+rather than the algorithm and is worth checking before anyone writes GF(2) matrix code.

@@ -507,7 +507,7 @@ async fn list_bases(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Bases,
 /// right shape -- but it saves a quarter of a second off a one-off operation
 /// and has to be proved correct. Revisit if a restore's apparent size ever
 /// grows far past its real one.
-fn crc_hole(mut checksum: u32, mut length: u64) -> u32 {
+pub(crate) fn crc_hole(mut checksum: u32, mut length: u64) -> u32 {
     static ZEROS: [u8; 1 << 16] = [0u8; 1 << 16];
     while length > 0 {
         let take = length.min(ZEROS.len() as u64) as usize;
