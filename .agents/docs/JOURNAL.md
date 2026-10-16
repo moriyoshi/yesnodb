@@ -2557,3 +2557,52 @@ left the doctest step linking against an rlib that no longer existed. The worksp
 target directory on purpose, so a concurrent cargo invocation is not isolated from the gate -- it
 waits on `.cargo-lock` for the build and then invalidates artifacts the gate has already resolved.
 Run nothing else under cargo while a gate is running.
+
+## 2026-10-16 -- A check whose two sides are both derived by code has to be tested against neither
+
+`missing` compares what the retained manifests name against what the store holds. Both sides of
+that comparison are produced by code in this repository: the uploader writes a slab to
+`db/<uuid>/slabs/<sha256 of the contents>`, and the planner recomputes that key from the
+manifest's extents. **Nothing forces the two derivations to agree**, and every test written so far
+shares one of them.
+
+The consequence is the kind of hole that outlives a release. If the derivations drift, `missing`
+reports nothing for ever -- and every assertion in the suite still passes, because the only
+end-to-end assertion about it is `base_dedup.py`'s `missing == 0` on a whole archive, which is
+exactly what a check that can never fire also reports. The unit tests are no help either: they
+build their archives from the same `slab_key` the planner calls.
+
+So `archive_integrity.py` takes an object away from an archive the shipped sidecar actually wrote,
+and requires the pass to notice. Two new harness verbs, both narrow:
+
+- `srv_archive_lose_slab(dir)` deletes the lexicographically first slab object and returns its key.
+  Deterministic, and it is the specific damage the whole feature exists for -- a lifecycle rule
+  removing an object while the manifests that name it stay exactly as they were. Truncating a file
+  or removing a manifest is a different failure.
+- `srv_restore_error(dir, target, version)` returns the restore's error instead of raising it,
+  following `srv_archive_second_error`. What is under test is what the operator is told.
+
+The scenario asserts the archive is whole *before* taking anything, which turned out to be the
+assertion that caught the mutation.
+
+### What the sabotage showed
+
+Flipping one bit of the hash in `plan`'s `keep_slabs` derivation does not make the holed archive
+report two losses instead of one. It makes the **whole** archive report three, and the scenario
+stops at the first check:
+
+```
+AssertionError: {'deleted': 3, 'retained_bases': 1, 'unrecognized': 0, 'missing': 3, 'damaged_bases': 0}
+```
+
+That is the drift failing loudly in the direction nobody would have predicted -- a false alarm on
+a healthy archive rather than silence on a broken one -- and it is only visible because the
+scenario establishes the healthy reading first. A test that went straight to the damaged case
+would have seen `missing: 3` and passed its `>= 1`.
+
+The same output shows an invariant worth naming: `missing` non-empty with `damaged_bases` zero is
+unreachable in correct code, because every entry in `missing` came from some retained base's own
+names. Here it appears because the attribution walk and the collection walk disagreed, which is
+precisely the drift. It is left as an observation rather than an assertion in `src/` -- the
+scenario covers the case, and a runtime check for a structurally impossible state is not worth the
+line.

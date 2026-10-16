@@ -62,9 +62,11 @@ pub const OWNS: &[&str] = &[
     "srv_basebackup",
     "srv_restore",
     "srv_restore_at",
+    "srv_restore_error",
     "srv_restore_windows",
     "srv_seed_follower",
     "srv_archive_gc",
+    "srv_archive_lose_slab",
     "srv_archive_second_error",
     "srv_archive_start",
     "srv_archive_wait_unactivated",
@@ -1096,6 +1098,36 @@ impl World {
                 ]))
             }
 
+            // The same restore, for a target that is expected to fail: the
+            // message is returned instead of raised, as `srv_archive_second_error`
+            // does, because what is under test is what the operator is told.
+            "srv_restore_error" => {
+                a.exact(3)?;
+                a.no_kwargs()?;
+                let object_dir = self.scenario_path(a.str_at(0)?, verb)?;
+                let target = self.scenario_path(a.str_at(1)?, verb)?;
+                let target_version = a.u64(2)?;
+                let store = yesno_server_utils::archive::ArchiveStore::connect(&format!(
+                    "file://{}",
+                    object_dir.display()
+                ))
+                .map_err(|error| db_err(verb, error))?;
+                let rt = self.rt_handle(verb)?;
+                let result = rt.block_on(yesno_server_utils::restore::restore_to(
+                    store,
+                    target,
+                    yesno_server_utils::restore::RecoveryTarget::Version(target_version),
+                    yesno_server_utils::restore::TargetAction::Publish,
+                ));
+                match result {
+                    Err(error) => Ok(MontyObject::String(error.to_string())),
+                    Ok(report) => Err(value_err(format!(
+                        "{verb}(): the restore succeeded, recovering version {}",
+                        report.recovered_version
+                    ))),
+                }
+            }
+
             // Restore to a wall clock, through the same shipped entry point.
             //
             // The time is microseconds, not a formatted string, and a
@@ -1221,7 +1253,55 @@ impl World {
                     // here that a scenario can use to assert a base is still
                     // whole without restoring it.
                     ("missing", whole_obj(plan.missing.len())),
+                    // The same damage counted in recovery points. One lost
+                    // slab can be named by every generation, so the two
+                    // numbers are independent and a scenario needs both.
+                    ("damaged_bases", whole_obj(plan.damaged_bases.len())),
                 ]))
+            }
+
+            // Delete one content-addressed slab object, the way an
+            // object-store lifecycle rule does: the object goes and nothing
+            // else changes -- no manifest is rewritten, no state is touched.
+            //
+            // A scenario cannot do this itself. Every other way of producing
+            // a hole in an archive ( truncating a file, removing a manifest )
+            // is a different failure, and this is the one the integrity check
+            // exists for, because a slab's last-modified time stops advancing
+            // while later generations keep naming it.
+            //
+            // Deletes the lexicographically first slab so the choice is
+            // deterministic, and returns its key so the scenario can assert
+            // the report names that object rather than merely counting one.
+            "srv_archive_lose_slab" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let object_dir = self.scenario_path(a.str_at(0)?, verb)?;
+                let db = object_dir.join("db");
+                let mut found: Option<(String, std::path::PathBuf)> = None;
+                for uuid in std::fs::read_dir(&db).map_err(|error| db_err(verb, error))? {
+                    let uuid = uuid.map_err(|error| db_err(verb, error))?;
+                    let slabs = uuid.path().join("slabs");
+                    if !slabs.is_dir() {
+                        continue;
+                    }
+                    for slab in std::fs::read_dir(&slabs).map_err(|error| db_err(verb, error))? {
+                        let slab = slab.map_err(|error| db_err(verb, error))?;
+                        let key = format!(
+                            "db/{}/slabs/{}",
+                            uuid.file_name().to_string_lossy(),
+                            slab.file_name().to_string_lossy()
+                        );
+                        if found.as_ref().is_none_or(|(seen, _)| key < *seen) {
+                            found = Some((key, slab.path()));
+                        }
+                    }
+                }
+                let (key, path) = found.ok_or_else(|| {
+                    value_err(format!("{verb}(): this archive holds no slab objects"))
+                })?;
+                std::fs::remove_file(&path).map_err(|error| db_err(verb, error))?;
+                Ok(MontyObject::String(key))
             }
 
             // A second shipped sidecar must be rejected by the archive prefix,
