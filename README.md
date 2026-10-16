@@ -561,6 +561,9 @@ Important operational properties:
   out of `yesnod`.
 - `yesnoctl restore` verifies an archived base and immutable WAL history, then
   reconstructs an exact committed logical version or the durable archive tip.
+- `yesnoctl archive-plan` reports what a retention policy would delete, and
+  what a base it would keep names that the store does not hold. It deletes
+  nothing and takes no writer lease.
 
 The [operations guide](docs/operations/index.md) gives the backup, restore,
 promotion, fencing, and rejoin procedures. The two-node demonstration exercises

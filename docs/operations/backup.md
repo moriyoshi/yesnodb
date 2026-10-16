@@ -234,12 +234,40 @@ last-modified time stops advancing while the object stays in use. Age is
 therefore no evidence at all about whether a piece is still needed, and a rule
 expiring objects after 90 days will delete live pieces of the base being
 written today. Use lifecycle rules only to expire incomplete multipart uploads.
-`yesnod_archive_missing_objects` is what reports the damage if one has already
-run.
+`yesnod_archive_missing_objects` reports the damage if one has already run, and
+`yesnoctl archive-plan` answers the same question on demand.
 
 Reclamation runs under the same writer lease as publication, renewed immediately
 before each pass, and is abandoned if the archive state moves while it is
 planning. Run it from the same single sidecar that owns the prefix.
+
+### Previewing a pass, and checking an archive is whole
+
+`--retention-window` is irreversible in effect, so look before setting it:
+
+```console
+yesnoctl archive-plan \
+  --store s3://yesno-backups/production \
+  --retention-window 7d
+```
+
+It reports what a pass with that policy would delete, what it would not
+recognize, and what a base it would keep names that the store does not hold. It
+**deletes nothing** and takes no writer lease, so it is safe to run against a
+live archive and alongside the sidecar that owns the prefix. Each list is
+sampled; `--list` prints every key.
+
+Omit `--retention-window` and the plan is computed against a window no base
+falls out of. Nothing is then proposed for deletion and the report is purely
+about what the archive holds -- which is how to ask "is this archive still
+whole" on the default configuration, where reclamation is off and no pass is
+publishing the gauges below. Run it after any change to bucket lifecycle,
+replication or access policy.
+
+A capture running at the same time can make the deletion count optimistic,
+because objects uploaded after the listing are not in it. It cannot produce a
+false report of a missing object: a manifest is published after every object it
+names, so a listing holding the manifest holds them too.
 
 ### Reclamation metrics
 

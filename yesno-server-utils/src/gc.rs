@@ -65,6 +65,7 @@
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::Args;
 use prost::Message;
 
 use crate::archive::{
@@ -400,6 +401,101 @@ pub fn plan(
     Ok(plan)
 }
 
+/// Command-line options for one reclamation preview.
+#[derive(Args, Debug)]
+pub struct PlanOptions {
+    /// Object-store URL: file:///path, s3://bucket/prefix, or compatible S3.
+    #[arg(long, env = "YESNO_ARCHIVE_STORE")]
+    store: String,
+
+    /// Retention window to plan against, as a number and a unit ( 7d, 72h ).
+    ///
+    /// Omit it to plan against a window nothing falls out of. The report then
+    /// says nothing about what reclamation would take and everything about
+    /// whether the archive is whole, which is the useful question on the
+    /// default configuration -- where reclamation is off and no pass is
+    /// publishing `yesnod_archive_missing_objects`.
+    #[arg(long)]
+    retention_window: Option<String>,
+
+    /// Newest bases to keep regardless of the window.
+    #[arg(long, default_value_t = 2)]
+    retention_min_bases: usize,
+
+    /// Print every key rather than a capped sample of each list.
+    #[arg(long)]
+    list: bool,
+}
+
+impl PlanOptions {
+    /// The policy to plan against.
+    ///
+    /// No window is not "no retention": it is a window no base falls out of,
+    /// so the horizon lands at the epoch and every base is retained. The
+    /// report is then purely about what the archive holds.
+    fn policy(&self) -> Result<RetentionPolicy, ArchiveError> {
+        Ok(RetentionPolicy {
+            window_micros: match self.retention_window.as_deref() {
+                Some(text) => crate::sidecar::parse_duration_micros(text)?,
+                None => u64::MAX,
+            },
+            min_bases: self.retention_min_bases.max(1),
+        })
+    }
+}
+
+/// How many keys of a list to print without `--list`.
+const SAMPLE: usize = 20;
+
+/// Plan one pass and report it. **Deletes nothing, ever.**
+///
+/// This is the command behind the advice to look before enabling reclamation:
+/// `--retention-window` is irreversible in effect and, until this existed,
+/// unpreviewable. It takes no writer lease, because taking one would fence the
+/// sidecar that owns the prefix out of its own archive for the lease's term,
+/// and nothing here writes.
+///
+/// A capture running concurrently is not a hazard for the same reason a
+/// restore is not: a manifest is published after every object it names, so a
+/// listing that holds the manifest holds the objects. It can make the *delete*
+/// count optimistic -- objects uploaded since the listing are not in it -- and
+/// that number is advisory here in any case.
+pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
+    let policy = options.policy()?;
+    let store = ArchiveStore::connect(&options.store)?;
+    let plan = plan_for(&store, policy).await?;
+
+    // Printed in order of how much they should worry the reader. `missing` is
+    // not a plan at all -- it is damage that has already happened -- so it
+    // goes first even though it is the shortest list on a healthy archive.
+    report("missing", &plan.missing, options.list);
+    report("unrecognized", &plan.unrecognized, options.list);
+    report("would delete", &plan.delete, options.list);
+    Ok(plan)
+}
+
+/// One titled list, whole or sampled.
+fn report(title: &str, keys: &[String], list: bool) {
+    if keys.is_empty() {
+        return;
+    }
+    let shown = if list {
+        keys.len()
+    } else {
+        keys.len().min(SAMPLE)
+    };
+    println!("{title} ({}):", keys.len());
+    for key in &keys[..shown] {
+        println!("  {key}");
+    }
+    if shown < keys.len() {
+        println!(
+            "  ... and {} more; --list prints them all",
+            keys.len() - shown
+        );
+    }
+}
+
 /// Wall clock, in epoch microseconds.
 fn now_micros() -> u64 {
     SystemTime::now()
@@ -639,6 +735,98 @@ mod tests {
         // where another file carries an object key. It is not a key, and
         // searching the listing for it would report every such file as lost.
         assert!(plan.missing.is_empty(), "nothing is absent here: {plan:?}");
+    }
+
+    /// Every file under `root`, so a preview can be shown to have changed
+    /// nothing.
+    fn object_count(root: &std::path::Path) -> usize {
+        fn walk(dir: &std::path::Path, n: &mut usize) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, n);
+                } else {
+                    *n += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        walk(root, &mut n);
+        n
+    }
+
+    /// The preview over a real store: it reports, and it deletes nothing.
+    ///
+    /// The second half is the whole reason the command exists. An operator
+    /// reaches for it precisely when they are not yet willing to let anything
+    /// be deleted, so a test that only checked the numbers would miss the
+    /// property they are relying on.
+    #[tokio::test]
+    async fn a_preview_reports_a_lost_object_and_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex = crate::fixture::HEX;
+        crate::fixture::archive(dir.path(), &[&format!("db/{hex}/stray.txt")]);
+        let file_key = format!("db/{hex}/term/0000000000/base/{:020}/MANIFEST", 1);
+        std::fs::remove_file(dir.path().join(&file_key)).unwrap();
+        let before = object_count(dir.path());
+
+        let plan = run(PlanOptions {
+            store: format!("file://{}", dir.path().display()),
+            retention_window: None,
+            retention_min_bases: 2,
+            list: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(plan.missing, vec![file_key], "{plan:?}");
+        assert_eq!(plan.unrecognized.len(), 1, "{plan:?}");
+        assert!(plan.delete.is_empty(), "{plan:?}");
+        assert_eq!(
+            object_count(dir.path()),
+            before,
+            "a preview must not touch the store"
+        );
+    }
+
+    /// The preview's default: a window nothing falls out of, so the report is
+    /// about what the archive holds rather than about what a policy would
+    /// take. Without this, an operator asking "is my archive whole" would be
+    /// shown the answer for a seven-day window they never asked for.
+    #[test]
+    fn a_preview_with_no_window_retains_every_base() {
+        let options = PlanOptions {
+            store: "file:///archive".into(),
+            retention_window: None,
+            retention_min_bases: 2,
+            list: false,
+        };
+        let policy = options.policy().unwrap();
+        assert_eq!(policy.window_micros, u64::MAX);
+
+        let bases = vec![
+            base(1, NOW - 1_000 * HOUR, 100),
+            base(2, NOW - 500 * HOUR, 200),
+            base(3, NOW - HOUR, 300),
+        ];
+        let keys = keys(&bases, &[]);
+        let plan = plan(&state_with(&bases[2].0), &bases, &keys, policy, NOW).unwrap();
+
+        assert_eq!(plan.retained_bases.len(), 3, "{plan:?}");
+        assert!(plan.delete.is_empty(), "{plan:?}");
+    }
+
+    /// Zero would keep nothing regardless of the window, which is the one
+    /// setting a preview must not be able to produce.
+    #[test]
+    fn a_preview_floors_min_bases_at_one() {
+        let options = PlanOptions {
+            store: "file:///archive".into(),
+            retention_window: Some("7d".into()),
+            retention_min_bases: 0,
+            list: false,
+        };
+        assert_eq!(options.policy().unwrap().min_bases, 1);
     }
 
     /// A slab a retained base names and the store does not hold is reported

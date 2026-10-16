@@ -11,6 +11,7 @@ use yesno_server::control::pb;
 use yesno_server_utils::basebackup::{
     completion_line as basebackup_completion, run as run_basebackup, BasebackupOptions,
 };
+use yesno_server_utils::gc::{run as run_archive_plan, PlanOptions};
 use yesno_server_utils::restore::{
     completion_line as restore_completion, run as run_restore, RestoreOptions,
 };
@@ -40,6 +41,9 @@ enum Command {
     Restore(RestoreOptions),
     /// Seed an empty follower from an object archive before it starts.
     SeedFollower(SeedOptions),
+    /// Report what reclamation would delete, and what a retained base names
+    /// that the store does not hold. Deletes nothing.
+    ArchivePlan(PlanOptions),
 }
 
 #[derive(Args, Debug)]
@@ -112,6 +116,9 @@ async fn run(cli: Cli) -> Result<String, Fail> {
             "follower archive seed: {:?}",
             seed_follower(&options).await?
         )),
+        // The lists are printed as they are produced; this is the same
+        // summary the sidecar logs for a pass it actually ran.
+        Command::ArchivePlan(options) => Ok(run_archive_plan(options).await?.summary_line()),
     }
 }
 
@@ -163,6 +170,33 @@ mod tests {
             "follower/control",
             "--leader",
             "http://127.0.0.1:50052",
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["yesnoctl", "archive-plan", "--store", "file:///archive"]).is_ok()
+        );
+    }
+
+    /// The preview must not require the window it previews. Without one it is
+    /// the integrity check, which is the question an archive with reclamation
+    /// off -- the default -- cannot otherwise ask.
+    ///
+    /// Not asserted here: that the store is required. `--store` carries an
+    /// environment fallback, so that assertion would pass or fail on the
+    /// shell the gate happens to run in.
+    #[test]
+    fn the_reclamation_preview_runs_without_a_window() {
+        assert!(Cli::try_parse_from(["yesnoctl", "archive-plan", "--store", "file:///a"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "yesnoctl",
+            "archive-plan",
+            "--store",
+            "file:///a",
+            "--retention-window",
+            "7d",
+            "--retention-min-bases",
+            "3",
+            "--list",
         ])
         .is_ok());
     }

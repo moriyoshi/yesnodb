@@ -11,6 +11,9 @@
 pub mod archive;
 pub mod basebackup;
 mod deferred;
+/// One archive on disk, shared by the tests that need a real store.
+#[cfg(test)]
+mod fixture;
 pub mod gc;
 mod history;
 pub mod lease;

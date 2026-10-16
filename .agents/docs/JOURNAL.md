@@ -2156,3 +2156,51 @@ that would catch a wrong deletion**, and it is placed after the sweep for that r
 
 Cost: the scenario runs in 4.1 s. Gates: `gate.sh` and `gate-pg.sh`, both, because the diff reaches
 `yesno-e2e`, which Bazel builds.
+
+## 2026-10-16 — The reclamation preview had been written and never wired to anything
+
+`gc::plan_for` has carried the doc comment "Safe to run against a live archive, and what an
+operator should look at before enabling reclamation" since it was written. It had **zero callers**
+anywhere in the workspace. `yesnoctl` offers `checkpoint`, `basebackup`, `restore` and
+`seed-follower`, and nothing else; `backup.md` tells an operator to weigh a retention window and
+then hands them no way to see what one would do.
+
+So `--retention-window 7d` was a flag whose effect is irreversible and whose consequences were
+unpreviewable, and the dry run that would have fixed that existed, compiled, and was unreachable.
+It is now `yesnoctl archive-plan`.
+
+### Two questions, one pass, and the window is optional
+
+The obvious use is the preview: what would a pass with this policy delete. The one I did not expect
+to be the more valuable is what happens when `--retention-window` is **omitted**. The policy then
+has a window no base can fall out of, the horizon lands at the epoch, every base is retained, and
+nothing is proposed for deletion -- so the whole report is `missing`: what the bases name and the
+store does not hold.
+
+That matters because **reclamation is off by default**. Yesterday's
+`yesnod_archive_missing_objects` is published by a reclamation pass, so exactly the deployments
+most exposed to a lifecycle rule eating their content-addressed slabs -- the ones that never
+enabled reclamation and assumed lifecycle rules would handle it -- were the ones with no way to
+learn. Without a window the command is an integrity check, and it is the right thing to run after
+any change to bucket lifecycle, replication or access policy.
+
+It takes **no writer lease**. Taking one would fence the sidecar that owns the prefix out of its
+own archive for the lease's term, and nothing here writes. A concurrent capture can make the
+delete count optimistic, because objects uploaded after the listing are not in it; it cannot
+produce a false `missing`, because a manifest is published after every object it names.
+
+### What the test asserts that the numbers do not
+
+`a_preview_reports_a_lost_object_and_removes_nothing` counts the files under the store before and
+after. The counts are the point. An operator reaches for this command precisely when they are not
+yet willing to let anything be deleted, so a test that checked only the reported numbers would miss
+the single property they are relying on.
+
+### A fixture moved, and the reason is worth recording
+
+The test needs a real `ArchiveStore`, and `gc`'s own test manifests cannot be fed to one: they are
+built for `plan`, which is pure, and they fail `validate_base_manifest` on a one-byte uuid and an
+absent history anchor. `metrics` already had the smallest archive that passes. It is now
+`src/fixture.rs`, `#[cfg(test)]`, for the reason `lib.rs::ctx` gives for living where it does --
+neither module owns it. `metrics` asserts what a pass publishes, `gc` asserts what a pass decides,
+and both need the same archive on disk.
