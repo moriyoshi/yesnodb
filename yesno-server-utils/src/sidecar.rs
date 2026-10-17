@@ -16,7 +16,7 @@ use crate::archive::{
 use crate::ctx;
 use clap::{Parser, ValueEnum};
 use prost::Message;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 use tonic::transport::Channel;
 use tonic::Code;
@@ -767,6 +767,10 @@ async fn materialize_snapshot(
                 lease_id: lease.lease_id.clone(),
                 name: expected.name.clone(),
                 allow_direct_path: runtime.direct_snapshot_path,
+                // The loop below places chunks at their own offsets, so the
+                // holes need not be sent. This is the path a sidecar that is
+                // not co-located with the daemon takes for every capture.
+                allow_sparse: true,
             })
             .await?
             .into_inner();
@@ -824,25 +828,42 @@ async fn materialize_snapshot(
                 let mut file = tokio::fs::File::create(&path)
                     .await
                     .map_err(|e| ctx("create the snapshot file", &path, e))?;
-                let mut offset = 0u64;
+                // The length first, so a range no chunk covers is a hole and
+                // not a short file. See the same two lines in `basebackup`.
+                file.set_len(expected.size)
+                    .await
+                    .map_err(|e| ctx("size the snapshot file", &path, e))?;
+                // The end of the last chunk applied: a floor, since chunks
+                // may now skip forward, and they must still arrive in order
+                // and must not overlap.
+                let mut end = 0u64;
                 let mut chunk = first;
                 let mut data = data;
                 loop {
-                    if chunk.offset != offset || chunk.total_size != expected.size {
+                    let reach = chunk.offset.saturating_add(data.len() as u64);
+                    if chunk.offset < end
+                        || reach > expected.size
+                        || chunk.total_size != expected.size
+                    {
                         return Err(format!(
-                            "snapshot file '{}' has a discontinuous or inconsistent chunk",
+                            "snapshot file '{}' has a misplaced or inconsistent chunk",
                             expected.name
                         )
                         .into());
                     }
-                    file.write_all(&data)
-                        .await
-                        .map_err(|e| ctx("write the snapshot file", &path, e))?;
-                    offset = offset.saturating_add(data.len() as u64);
+                    if !data.is_empty() {
+                        file.seek(std::io::SeekFrom::Start(chunk.offset))
+                            .await
+                            .map_err(|e| ctx("position the snapshot file", &path, e))?;
+                        file.write_all(&data)
+                            .await
+                            .map_err(|e| ctx("write the snapshot file", &path, e))?;
+                    }
+                    end = reach;
                     if chunk.last {
-                        if offset != expected.size {
+                        if end != expected.size {
                             return Err(format!(
-                                "snapshot file '{}' ended at {offset}, expected {}",
+                                "snapshot file '{}' ended at {end}, expected {}",
                                 expected.name, expected.size
                             )
                             .into());

@@ -727,6 +727,9 @@ impl AwsState {
                     .fetch_snapshot_file(pb::FetchSnapshotFileRequest {
                         lease_id: lease.lease_id.clone(),
                         name: file.name.clone(),
+                        // This caller wants the path, never the bytes, so it
+                        // has no chunks to place.
+                        allow_sparse: false,
                         allow_direct_path: true,
                     })
                     .await?

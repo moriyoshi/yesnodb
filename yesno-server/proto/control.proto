@@ -73,6 +73,15 @@ message FetchSnapshotFileRequest {
   // An optimization request, never an entitlement. The server returns a path
   // only when its operator explicitly enabled the co-located escape hatch.
   bool allow_direct_path = 3;
+  // The client can place chunks at the offsets they carry, so the server may
+  // leave out the ranges a shard image never allocated. A client that does
+  // not set it is served every byte, including the holes, which is what every
+  // client did before this field existed.
+  //
+  // A capability the caller declares, like the field above, rather than
+  // something the server decides: both receivers in this tree set it, and one
+  // from an older release does not and must keep working.
+  bool allow_sparse = 4;
 }
 
 message SnapshotFileChunk {

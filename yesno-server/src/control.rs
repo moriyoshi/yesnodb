@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -42,6 +42,12 @@ const FRAME_HEADER: usize = 12;
 const MAX_EVENT_BYTES: usize = 1 << 20;
 const MAX_JOURNAL_BYTES: usize = 64 << 20;
 const SUBSCRIBER_BUFFER: usize = 64;
+/// How much of a snapshot file one `FetchSnapshotFile` chunk carries.
+///
+/// Was written inline as `1024 * 1024` and is now named because the sparse
+/// path bounds it by the remaining allocated run, so the two have to be the
+/// same number.
+const SNAPSHOT_FILE_CHUNK: usize = 1 << 20;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -1134,6 +1140,13 @@ impl pb::control_plane_server::ControlPlane for ControlService {
         let (tx, rx) = mpsc::channel(4);
         let manager = manager.clone();
         let lease_id = request.lease_id;
+        // Only when the caller said it can place chunks by offset. A shard
+        // image is grown to a whole mapping segment at creation, so a
+        // database holding kilobytes is served as gigabytes without this --
+        // read off the leader's disk and put on the wire. The same measured
+        // cost as the replication bootstrap's, and worse, because these bytes
+        // leave the machine.
+        let sparse = request.allow_sparse;
         tokio::spawn(async move {
             match access {
                 crate::snapshot::SnapshotFileAccess::Direct { path, size } => {
@@ -1156,10 +1169,47 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                         }))
                         .await;
                 }
-                crate::snapshot::SnapshotFileAccess::Stream { mut file, size } => {
+                crate::snapshot::SnapshotFileAccess::Stream {
+                    mut file,
+                    probe,
+                    size,
+                } => {
                     let mut offset = 0u64;
+                    // The end of the allocated run `offset` is inside, and
+                    // zero while no run has been located. Only consulted on
+                    // the sparse path.
+                    let mut run_end = 0u64;
                     loop {
-                        let mut bytes = vec![0u8; 1024 * 1024];
+                        if sparse && offset >= run_end {
+                            match crate::sparse::next_allocated(&probe, offset, size) {
+                                // Nothing allocated from here on, so the rest
+                                // of the file is holes. The receiver sized
+                                // the file first, so they are already there.
+                                None => break,
+                                Some((start, end)) => {
+                                    if start != offset {
+                                        offset = start;
+                                        if let Err(error) =
+                                            file.seek(std::io::SeekFrom::Start(offset)).await
+                                        {
+                                            let _ = tx
+                                                .send(Err(Status::unavailable(error.to_string())))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                    run_end = end;
+                                }
+                            }
+                        }
+                        // Never past the end of the run: reading into the
+                        // hole after it would put back the cost this is here
+                        // to remove.
+                        let want = match sparse {
+                            true => SNAPSHOT_FILE_CHUNK.min((run_end - offset) as usize),
+                            false => SNAPSHOT_FILE_CHUNK,
+                        };
+                        let mut bytes = vec![0u8; want];
                         let count = match file.read(&mut bytes).await {
                             Ok(count) => count,
                             Err(error) => {
@@ -1176,7 +1226,10 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                             return;
                         }
                         bytes.truncate(count);
-                        let last = offset.saturating_add(count as u64) == size;
+                        // On the sparse path the stream ends with its own
+                        // marker rather than on the last byte, because the
+                        // last byte may be inside a hole nothing sends.
+                        let last = !sparse && offset.saturating_add(count as u64) == size;
                         if manager.keep_alive(&lease_id).is_err() {
                             let _ = tx
                                 .send(Err(Status::not_found("snapshot lease expired")))
@@ -1196,9 +1249,25 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                             return;
                         }
                         offset = offset.saturating_add(count as u64);
-                        if last {
-                            return;
+                        if last || offset >= size {
+                            break;
                         }
+                    }
+                    // One empty chunk at the end of the file closes the
+                    // sparse stream. A data chunk cannot carry the marker
+                    // when the file ends in a hole, and a file that is
+                    // nothing but holes sends no data chunk at all -- so the
+                    // marker is unconditional rather than a special case,
+                    // and the receiver has one rule for both paths.
+                    if sparse {
+                        let _ = tx
+                            .send(Ok(pb::SnapshotFileChunk {
+                                offset: size,
+                                payload: Some(pb::snapshot_file_chunk::Payload::Data(Vec::new())),
+                                last: true,
+                                total_size: size,
+                            }))
+                            .await;
                     }
                 }
             }
@@ -2193,6 +2262,113 @@ mod tests {
         assert_eq!(bound_mode(None).await & 0o600, 0o600);
     }
 
+    /// A client that can place chunks is served the file without its holes,
+    /// and reassembles it byte for byte.
+    ///
+    /// The round trip is the assertion that holds on every filesystem. Where
+    /// `SEEK_HOLE` works the server sends less than the file's length, and
+    /// where it does not it sends the whole thing as one run -- which is the
+    /// pre-existing behaviour and still correct, so the saving is asserted
+    /// only once the probe agrees there is a hole to skip.
+    #[tokio::test]
+    async fn a_client_that_places_chunks_is_not_sent_the_holes() {
+        use tokio_stream::StreamExt as _;
+
+        const SIZE: u64 = 4 << 20;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("shard-0000.yno");
+        {
+            use std::io::{Seek, Write};
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.set_len(SIZE).unwrap();
+            // One run at the start and one near the end, with a hole of
+            // megabytes between them: a shard image holding a little data in
+            // a whole mapping segment.
+            file.write_all(b"head").unwrap();
+            file.seek(std::io::SeekFrom::Start(SIZE - 8)).unwrap();
+            file.write_all(b"tailtail").unwrap();
+            file.sync_all().unwrap();
+        }
+        let source = std::fs::read(&path).unwrap();
+        let holed = crate::sparse::next_allocated(&std::fs::File::open(&path).unwrap(), 0, SIZE)
+            .is_some_and(|(_, end)| end < SIZE);
+
+        let (snapshots, _cleanups) = crate::snapshot::SnapshotManager::for_test(
+            root.path(),
+            std::time::Duration::from_secs(5),
+            false,
+        );
+        let database = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(database.path()).unwrap());
+        let replication = ReplicationSlot::default();
+        replication.install_with_db(
+            crate::replication::LeaderService::with_retention(
+                database.path(),
+                db.shard_count(),
+                db.retention_floor(),
+            ),
+            db,
+        );
+        let journal = tempfile::tempdir().unwrap();
+        let hub = EventHub::open(journal.path()).unwrap();
+        let (commands, _received) = mpsc::channel(1);
+        let service = ControlService {
+            hub,
+            commands,
+            authorizer: test_authorizer(),
+            replication,
+            snapshots: Some(snapshots),
+            snapshot_agent: crate::snapshot::agent::SnapshotAgentBroker::new(),
+        };
+
+        let lease = service
+            .begin_base_snapshot(authorized(pb::BeginBaseSnapshotRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut stream = service
+            .fetch_snapshot_file(authorized(pb::FetchSnapshotFileRequest {
+                lease_id: lease.lease_id.clone(),
+                name: "shard-0000.yno".into(),
+                allow_sparse: true,
+                allow_direct_path: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Reassembled the way the two shipped receivers do it: size the file
+        // first, then place every chunk at the offset it carries.
+        let mut rebuilt = vec![0u8; SIZE as usize];
+        let mut sent = 0u64;
+        let mut end = 0u64;
+        let mut finished = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            let Some(pb::snapshot_file_chunk::Payload::Data(data)) = chunk.payload else {
+                panic!("a streaming fetch returned a direct path");
+            };
+            assert!(chunk.offset >= end, "chunks must not go backwards");
+            assert_eq!(chunk.total_size, SIZE);
+            let at = chunk.offset as usize;
+            rebuilt[at..at + data.len()].copy_from_slice(&data);
+            sent += data.len() as u64;
+            end = chunk.offset + data.len() as u64;
+            if chunk.last {
+                assert_eq!(end, SIZE, "the marker lands at the end of the file");
+                finished = true;
+            }
+        }
+        assert!(finished, "the stream ended without its last marker");
+        assert_eq!(rebuilt, source, "the copy is not the original");
+        if holed {
+            assert!(
+                sent < SIZE,
+                "the hole was sent anyway: {sent} bytes for a {SIZE}-byte file"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_rpc_streams_by_default_and_direct_path_needs_client_opt_in() {
         use std::sync::atomic::Ordering;
@@ -2239,6 +2415,9 @@ mod tests {
         let request = pb::FetchSnapshotFileRequest {
             lease_id: lease.lease_id.clone(),
             name: "MANIFEST".into(),
+            // Dense, which is what a client from before the field asks for
+            // and what this test is about. The sparse path has its own.
+            allow_sparse: false,
             allow_direct_path: false,
         };
         let mut streamed = service
@@ -2259,6 +2438,7 @@ mod tests {
         let request = pb::FetchSnapshotFileRequest {
             lease_id: lease.lease_id.clone(),
             name: "MANIFEST".into(),
+            allow_sparse: false,
             allow_direct_path: true,
         };
         let mut direct = service

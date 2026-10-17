@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::time::Duration;
 use tonic::transport::Channel;
 use yesno_core::{Db, DbOptions};
@@ -467,6 +467,11 @@ async fn stream_snapshot_file(
             lease_id: lease.lease_id.clone(),
             name: file.name.clone(),
             allow_direct_path: false,
+            // This loop places every chunk at the offset it carries, so the
+            // server may leave the holes out. A base backup of a database
+            // holding kilobytes otherwise pulls a whole mapping segment per
+            // shard across the wire.
+            allow_sparse: true,
         })
         .await?
         .into_inner();
@@ -474,19 +479,23 @@ async fn stream_snapshot_file(
     let mut output = tokio::fs::File::create(&path)
         .await
         .map_err(|e| io_ctx("create the snapshot file", &path, e))?;
-    let mut offset = 0u64;
+    // The length first, so every byte no chunk covers is a hole rather than
+    // a short file. On the dense path this changes nothing; on the sparse
+    // one it is what makes the holes legal.
+    output
+        .set_len(file.size)
+        .await
+        .map_err(|e| io_ctx("size the snapshot file", &path, e))?;
+    // The end of the last chunk applied. Chunks may now skip forward, so
+    // this is a floor rather than the next offset: they must still arrive in
+    // order and must not overlap, which is what a server rewriting history
+    // mid-stream would do.
+    let mut end = 0u64;
     loop {
         let mut chunk = stream
             .message()
             .await?
             .ok_or("snapshot file stream ended before its last marker")?;
-        if chunk.offset != offset || chunk.total_size != file.size {
-            return Err(format!(
-                "snapshot file '{}' has a discontinuous or inconsistent chunk",
-                file.name
-            )
-            .into());
-        }
         let data = match chunk.payload.take() {
             Some(snapshot_file_chunk::Payload::Data(data)) => data,
             Some(snapshot_file_chunk::Payload::DirectPath(_)) => {
@@ -494,15 +503,33 @@ async fn stream_snapshot_file(
             }
             None => return Err("snapshot file chunk has no payload".into()),
         };
-        output
-            .write_all(&data)
-            .await
-            .map_err(|e| io_ctx("write the snapshot file", &path, e))?;
-        offset = offset.saturating_add(data.len() as u64);
+        let reach = chunk.offset.saturating_add(data.len() as u64);
+        if chunk.offset < end || reach > file.size || chunk.total_size != file.size {
+            return Err(format!(
+                "snapshot file '{}' has a misplaced or inconsistent chunk",
+                file.name
+            )
+            .into());
+        }
+        if !data.is_empty() {
+            output
+                .seek(std::io::SeekFrom::Start(chunk.offset))
+                .await
+                .map_err(|e| io_ctx("position the snapshot file", &path, e))?;
+            output
+                .write_all(&data)
+                .await
+                .map_err(|e| io_ctx("write the snapshot file", &path, e))?;
+        }
+        end = reach;
         if chunk.last {
-            if offset != file.size {
+            // The marker lands at the end of the file whichever path served
+            // it: on the dense one it rides the final data chunk, and on the
+            // sparse one it is an empty chunk at `size`, because the last
+            // byte of the file may be inside a hole nothing sent.
+            if end != file.size {
                 return Err(format!(
-                    "snapshot file '{}' ended at {offset}, expected {}",
+                    "snapshot file '{}' ended at {end}, expected {}",
                     file.name, file.size
                 )
                 .into());

@@ -3078,3 +3078,87 @@ invariant when the block you are walking back through is itself a run of
 `///` lines. Reading the inserted region rather than trusting the green test
 run is what caught it; the repair moved the test whole to after the function
 that owned the comment.
+
+## 2026-10-18 -- The third and fourth places that moved a gigabyte of holes, and why fixing one of them did nothing
+
+Two sites were fixed on 2026-10-16: the replication snapshot sender and the
+archive capture's uploader. Both read every byte of a 1 GiB-per-shard sparse
+image to find out which parts were holes. The sweep stopped there, and it
+should not have: the control plane's `FetchSnapshotFile` does the same thing,
+and it is worse, because those bytes go on the wire. It serves
+`yesnoctl basebackup` always, and the archive sidecar whenever the co-located
+direct path is unavailable -- which is every remote sidecar.
+
+Underneath it, the portable snapshot provider was copying each database file
+with `tokio::io::copy`. That cost the apparent size **three** times: read
+here, written there, and then kept, because what it produced was a fully
+allocated file that every later reader of the snapshot paid for again.
+
+### The measurement that makes the entry worth writing
+
+Four shards, `basebackup.py`, release, three runs each:
+
+| copy | wire | ms |
+| --- | --- | --- |
+| dense | dense | 11 979 / 13 581 / 13 946 |
+| dense | **sparse** | 14 108 / 14 809 / 15 073 |
+| **sparse** | dense | 3 294 |
+| **sparse** | **sparse** | 796 / 804 / 805 |
+
+**The second row is the finding.** Teaching the wire to skip holes, on its
+own, changed nothing -- and not because the change was wrong. There were no
+holes left to skip. The provider had filled them in one step earlier, so by
+the time the file reached the streamer it really was four gigabytes of
+allocated zeros and the streamer was right to send them all.
+
+Measured one at a time, in the order they were written, the first change
+looks like a mistake. It is not: it is half of one, and the half that cannot
+be measured until the other half lands. Worth keeping as a general caution --
+**an optimization that depends on an upstream property is unfalsifiable until
+that property holds**, and the measurement will say "no effect" rather than
+"not yet".
+
+Together they are 13 500 ms to 800 ms, about seventeen times, on a database
+holding sixty-four keys.
+
+### The negotiation, because this one is a wire format
+
+The replication change needed no negotiation: leader and follower ship
+together. This one does not have that, since `yesnoctl` is a command an
+operator runs and may be older than the daemon. So the hole-skipping is a
+capability the **caller** declares -- `allow_sparse` on the request, beside
+the `allow_direct_path` that was already there for the same kind of reason.
+A client that does not set it is served every byte, exactly as before.
+
+It also changes what a chunk means: offsets may now jump, so a receiver has
+to place chunks rather than append them. Both receivers in this tree size the
+file first and seek, and their continuity check became an ordering check --
+chunks must not go backwards and must not overrun the file, which still
+catches a server rewriting history mid-stream. The stream ends with an empty
+marker chunk at the file's length, because the last byte of a sparse file can
+be inside a hole that nothing sends, and a file that is nothing but holes
+sends no data chunk at all.
+
+### The guard that had to be rebuilt rather than kept
+
+The old copy verified the byte count afterwards: `copied != source.size` was
+how a file that had shrunk since its size was recorded got caught. A walk
+that skips holes cannot use that test, and the failure is silent in the worst
+direction -- a file that has lost its tail reports no further allocated runs,
+which is indistinguishable from a file that ends in a hole, so the walk just
+stops and publishes a snapshot quietly short of what its lease promises.
+`read_exact` catches a file that shrank *inside* a reported run; a length
+check after the loop catches the rest. Both are tested.
+
+### Where the sweep stands now
+
+Four sites found, four fixed: the replication sender, the archive uploader,
+the control plane's file stream, and the portable provider's copy. The
+remaining consumer of a whole image is the restore path, which already writes
+holes as holes.
+
+One thing measured and not improved: a capture-heavy scenario
+( `base_dedup.py`, 1 600 ms ) is unchanged by the copy walk, because its cost
+was never the reading. The all-zero filter already kept the *writes* sparse;
+it was `tokio::io::copy` materializing the destination that cost, and that
+scenario's captures do not go through it.

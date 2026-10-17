@@ -92,8 +92,24 @@ pub(crate) struct DeferredEbsSnapshot {
 }
 
 pub(crate) enum SnapshotFileAccess {
-    Stream { file: tokio::fs::File, size: u64 },
-    Direct { path: PathBuf, size: u64 },
+    Stream {
+        file: tokio::fs::File,
+        /// A second handle onto the same file, for `SEEK_DATA` / `SEEK_HOLE`
+        /// and nothing else.
+        ///
+        /// Separate because `lseek` moves the position of the open file
+        /// description, and `tokio::fs::File` tracks its own position and
+        /// does its reads on the blocking pool -- moving its descriptor's
+        /// offset underneath it would be interfering with it rather than
+        /// using it. Opened here beside the other so the pair cannot come
+        /// apart, and so a caller that never probes pays one `open`.
+        probe: std::fs::File,
+        size: u64,
+    },
+    Direct {
+        path: PathBuf,
+        size: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -219,6 +235,98 @@ enum FilesystemBackend {
     Btrfs { snapshot_dir: PathBuf },
 }
 
+/// How much of a file one copy step moves.
+const COPY_CHUNK: usize = 1 << 20;
+
+/// Copy `size` bytes of `from` to `to`, leaving the holes as holes.
+///
+/// **A shard image is a sparse file.** The store grows it to a whole
+/// [`yesno_core::store::segment::SEGMENT_SIZE`] mapping segment with
+/// `set_len`, so a database holding kilobytes reports gigabytes and occupies
+/// almost nothing. This used to be `tokio::io::copy`, which cost the
+/// *apparent* size three times: read on this side, written on the other, and
+/// then kept, because what it produced was a fully allocated file that every
+/// later reader of the snapshot paid for again.
+///
+/// The destination is sized first, so a range no write covers reads as zero
+/// and the copy is content-identical. Only its allocation differs, and the
+/// destination's is the better one.
+///
+/// Two filters compose, as they do on the replication path: `SEEK_DATA` skips
+/// what was never written, and the all-zero test skips what was written and
+/// is zero. A filesystem that does not implement the seeks reports the file
+/// as one run, which is the old behaviour exactly.
+async fn copy_sparse(from: &Path, to: &Path, size: u64, name: &str) -> Result<(), SnapshotError> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let mut input = tokio::fs::File::open(from).await?;
+    // A second, synchronous handle for the extent probing and nothing else:
+    // `lseek` moves the position of the open file description, and
+    // `tokio::fs::File` tracks its own.
+    let probe = std::fs::File::open(from)?;
+    let mut output = tokio::fs::File::create(to).await?;
+    output.set_len(size).await?;
+
+    let mut buffer = vec![0u8; COPY_CHUNK];
+    let mut offset = 0u64;
+    let mut run_end = 0u64;
+    let mut positioned = 0u64;
+    while offset < size {
+        if offset >= run_end {
+            // Nothing allocated from here on, so the rest is holes and the
+            // `set_len` above already accounts for them.
+            let Some((start, end)) = crate::sparse::next_allocated(&probe, offset, size) else {
+                break;
+            };
+            if start != offset {
+                offset = start;
+                input.seek(std::io::SeekFrom::Start(offset)).await?;
+            }
+            run_end = end;
+        }
+        let want = COPY_CHUNK.min((run_end - offset) as usize);
+        // `read_exact` rather than `read`: a short read inside a file is not
+        // end of file, and the one case where it legitimately is -- the file
+        // having shrunk since its size was recorded -- is the case this used
+        // to catch by comparing the byte count afterwards.
+        input
+            .read_exact(&mut buffer[..want])
+            .await
+            .map_err(|error| {
+                SnapshotError::from(format!(
+                    "database file '{name}' ended inside bytes {offset}..{} while its snapshot \
+                 size was {size}: {error}",
+                    offset + want as u64
+                ))
+            })?;
+        let chunk = &buffer[..want];
+        offset += want as u64;
+        if chunk.iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        let at = offset - want as u64;
+        if positioned != at {
+            output.seek(std::io::SeekFrom::Start(at)).await?;
+        }
+        output.write_all(chunk).await?;
+        positioned = offset;
+    }
+    // The guard the byte count used to be. A file that shrank is caught by
+    // the `read_exact` above only if it shrank inside a run the probe had
+    // already reported; a file that lost its tail outright reports no
+    // further runs and the walk simply ends, which would publish a snapshot
+    // quietly short of what its lease promises.
+    let actual = input.metadata().await?.len();
+    if actual < size {
+        return Err(format!(
+            "database file '{name}' is {actual} bytes while its snapshot size was {size}"
+        )
+        .into());
+    }
+    output.sync_all().await?;
+    Ok(())
+}
+
 #[async_trait]
 impl SnapshotProvider for PortableProvider {
     async fn capture(
@@ -242,18 +350,13 @@ impl SnapshotProvider for PortableProvider {
                 tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).await?;
             }
             for source in database_files(&self.data_dir)? {
-                let destination = root.join(&source.name);
-                let input = tokio::fs::File::open(self.data_dir.join(&source.name)).await?;
-                let mut output = tokio::fs::File::create(&destination).await?;
-                let copied = tokio::io::copy(&mut input.take(source.size), &mut output).await?;
-                if copied != source.size {
-                    return Err(format!(
-                        "database file '{}' ended at {copied} bytes while its snapshot size was {}",
-                        source.name, source.size
-                    )
-                    .into());
-                }
-                output.sync_all().await?;
+                copy_sparse(
+                    &self.data_dir.join(&source.name),
+                    &root.join(&source.name),
+                    source.size,
+                    &source.name,
+                )
+                .await?;
             }
             tokio::fs::File::open(&root).await?.sync_all().await?;
             Ok::<(), SnapshotError>(())
@@ -669,7 +772,8 @@ impl SnapshotManager {
             return Ok(SnapshotFileAccess::Direct { path, size });
         }
         Ok(SnapshotFileAccess::Stream {
-            file: tokio::fs::File::open(path).await?,
+            file: tokio::fs::File::open(&path).await?,
+            probe: std::fs::File::open(&path)?,
             size,
         })
     }
@@ -1053,6 +1157,71 @@ mod tests {
 
         manager.release(&lease.id).await.unwrap();
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    /// A portable snapshot is the database byte for byte, and not its
+    /// allocation.
+    ///
+    /// A shard image is grown to a whole mapping segment, so copying one with
+    /// `tokio::io::copy` wrote gigabytes of zeros for a database holding
+    /// kilobytes -- and left a fully allocated file that every later reader
+    /// of the snapshot paid for again. The content assertion is the one that
+    /// has to hold everywhere; the allocation assertion needs a filesystem
+    /// that reports holes, which the ones this suite runs on do.
+    #[tokio::test]
+    async fn a_portable_copy_keeps_the_content_and_drops_the_holes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        const SIZE: u64 = 4 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("shard-0000.yno");
+        {
+            use std::io::{Seek, Write};
+            let mut file = std::fs::File::create(&from).unwrap();
+            file.set_len(SIZE).unwrap();
+            file.write_all(b"head").unwrap();
+            file.seek(std::io::SeekFrom::Start(SIZE - 8)).unwrap();
+            file.write_all(b"tailtail").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let to = dir.path().join("copy.yno");
+        copy_sparse(&from, &to, SIZE, "shard-0000.yno")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            std::fs::read(&from).unwrap(),
+            "the copy is not the original"
+        );
+        let meta = std::fs::metadata(&to).unwrap();
+        assert_eq!(meta.len(), SIZE, "the trailing hole counts toward length");
+        assert!(
+            meta.blocks() * 512 < SIZE,
+            "the holes were allocated: {} bytes for {SIZE}",
+            meta.blocks() * 512
+        );
+    }
+
+    /// A file shorter than the lease promised is refused, named.
+    ///
+    /// The old copy caught this by comparing the byte count afterwards. A
+    /// walk that skips holes cannot: a file that has lost its tail reports
+    /// no further allocated runs, which is indistinguishable from a file
+    /// that ends in a hole.
+    #[tokio::test]
+    async fn a_database_file_shorter_than_its_lease_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("MANIFEST");
+        std::fs::write(&from, b"eighteen bytes...").unwrap();
+
+        let error = copy_sparse(&from, &dir.path().join("copy"), 1 << 20, "MANIFEST")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MANIFEST"), "{error}");
+        assert!(error.contains("1048576"), "{error}");
     }
 
     #[tokio::test]
