@@ -647,6 +647,24 @@ where
 /// enumerates the rest: stopping at the first absent object tells the
 /// operator about one object, and what they need under pressure is which
 /// recovery points still work.
+/// An object that is there and is not the length the manifest claims.
+///
+/// Pointed at the same command as an absent one, for the same reason: a
+/// restore stops at the first object it cannot use, so the message says
+/// nothing about how much else is wrong or which recovery points survive,
+/// and those are the two things the operator needs next. The damage is a
+/// different one -- this object is usually an interrupted copy that can be
+/// re-run, where an absent one has to be found somewhere else -- so the
+/// sentence says which it met.
+fn wrong_length(key: &str, have: u64, want: u64) -> ArchiveError {
+    format!(
+        "archive object '{key}' is {have} bytes and its manifest says {want}. Run \
+         'yesnoctl archive-plan' for every object this archive holds at the wrong length, \
+         and which bases are still restorable"
+    )
+    .into()
+}
+
 fn missing_object(file: &pb::ArchiveFile, from: u64, to: u64, key: &str) -> ArchiveError {
     format!(
         "base file '{}' needs an object this archive does not hold, for bytes {from}..{to} \
@@ -715,12 +733,7 @@ async fn download_slab_file(
     while let Some(fetched) = futures::StreamExt::next(&mut fetches).await {
         let (extent, key, bytes) = fetched?;
         if bytes.len() as u64 != extent.length {
-            return Err(format!(
-                "slab object '{key}' is {} bytes, manifest says {}",
-                bytes.len(),
-                extent.length
-            )
-            .into());
+            return Err(wrong_length(&key, bytes.len() as u64, extent.length));
         }
         let crc = crc32c::crc32c(&bytes);
         if crc != extent.crc32c {
@@ -812,11 +825,7 @@ async fn download_base_file(
         Err(error) => return Err(error.into()),
     };
     if result.meta.size != object_len {
-        return Err(format!(
-            "base object '{}' is {} bytes, manifest says {}",
-            file.object_key, result.meta.size, object_len
-        )
-        .into());
+        return Err(wrong_length(&file.object_key, result.meta.size, object_len));
     }
     let mut stream = result.into_stream();
     let mut output = tokio::fs::File::create(target.join(&file.name)).await?;
@@ -2195,6 +2204,47 @@ mod tests {
         assert!(
             error.contains("archive-plan"),
             "one absent object is not the question; the rest of them are: {error}"
+        );
+    }
+
+    /// The other way an object fails a restore, and the same pointer.
+    ///
+    /// Taking one byte off is what an interrupted copy of an archive leaves,
+    /// and it has to be caught: the key is listed, so nothing before this
+    /// check notices. Both numbers go in the message because neither alone
+    /// says whether the object is short, long, or somebody else's.
+    #[tokio::test]
+    async fn a_restore_that_meets_a_short_object_says_both_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex = crate::fixture::HEX;
+        let hash = [0x11u8; 32];
+        let body = [7u8; 63];
+        crate::fixture::write(dir.path(), &crate::archive::slab_key(hex, &hash), &body);
+
+        let store = ArchiveStore::connect(&format!("file://{}", dir.path().display())).unwrap();
+        let file = pb::ArchiveFile {
+            name: "shard-0000.yno".into(),
+            object_key: String::new(),
+            size: 64,
+            crc32c: 0,
+            sparse: true,
+            extents: vec![pb::FileExtent {
+                offset: 0,
+                length: 64,
+                content_hash: hash.to_vec(),
+                crc32c: 0,
+            }],
+        };
+
+        let error = download_slab_file(&store, &file, dir.path(), hex)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&"11".repeat(32)), "{error}");
+        assert!(error.contains("63") && error.contains("64"), "{error}");
+        assert!(
+            error.contains("archive-plan"),
+            "one short object is not the question; the rest of them are: {error}"
         );
     }
 

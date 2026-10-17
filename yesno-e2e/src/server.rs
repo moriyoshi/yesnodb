@@ -68,6 +68,7 @@ pub const OWNS: &[&str] = &[
     "srv_archive_gc",
     "srv_archive_lose_slab",
     "srv_archive_second_error",
+    "srv_archive_shorten_slab",
     "srv_archive_start",
     "srv_archive_wait_unactivated",
     "srv_archive_wait",
@@ -363,6 +364,37 @@ pub(crate) fn inspect_archive(object_dir: &Path) -> Result<ArchiveStats, String>
             total.saturating_add(cursor.archived_lsn)
         }),
     })
+}
+
+/// The lexicographically first slab object under an archive's prefix, and
+/// where it is on disk.
+///
+/// Shared by the two verbs that damage one. Lexicographic rather than
+/// arbitrary so a scenario that damages a slab and then asserts the key
+/// appears in a report gets the same object on every run, and on every
+/// filesystem: `read_dir` order is not defined.
+fn first_slab(object_dir: &Path, verb: &str) -> Result<(String, PathBuf), MontyException> {
+    let db = object_dir.join("db");
+    let mut found: Option<(String, PathBuf)> = None;
+    for uuid in std::fs::read_dir(&db).map_err(|error| db_err(verb, error))? {
+        let uuid = uuid.map_err(|error| db_err(verb, error))?;
+        let slabs = uuid.path().join("slabs");
+        if !slabs.is_dir() {
+            continue;
+        }
+        for slab in std::fs::read_dir(&slabs).map_err(|error| db_err(verb, error))? {
+            let slab = slab.map_err(|error| db_err(verb, error))?;
+            let key = format!(
+                "db/{}/slabs/{}",
+                uuid.file_name().to_string_lossy(),
+                slab.file_name().to_string_lossy()
+            );
+            if found.as_ref().is_none_or(|(seen, _)| key < *seen) {
+                found = Some((key, slab.path()));
+            }
+        }
+    }
+    found.ok_or_else(|| value_err(format!("{verb}(): this archive holds no slab objects")))
 }
 
 fn read_archive_state(
@@ -1253,6 +1285,11 @@ impl World {
                     // here that a scenario can use to assert a base is still
                     // whole without restoring it.
                     ("missing", whole_obj(plan.missing.len())),
+                    // The other half of the same comparison, and the half a
+                    // presence check cannot make: an object that is there and
+                    // is not the length its manifest claims. It fails a
+                    // restore as completely as an absent one.
+                    ("wrong_length", whole_obj(plan.wrong_length.len())),
                     // The same damage counted in recovery points. One lost
                     // slab can be named by every generation, so the two
                     // numbers are independent and a scenario needs both.
@@ -1264,43 +1301,51 @@ impl World {
             // object-store lifecycle rule does: the object goes and nothing
             // else changes -- no manifest is rewritten, no state is touched.
             //
-            // A scenario cannot do this itself. Every other way of producing
-            // a hole in an archive ( truncating a file, removing a manifest )
-            // is a different failure, and this is the one the integrity check
-            // exists for, because a slab's last-modified time stops advancing
-            // while later generations keep naming it.
+            // A scenario cannot do this itself. This is the damage the
+            // integrity check exists for, because a slab's last-modified time
+            // stops advancing while later generations keep naming it, which
+            // is exactly what such a rule keys on.
             //
-            // Deletes the lexicographically first slab so the choice is
+            // Takes the lexicographically first slab so the choice is
             // deterministic, and returns its key so the scenario can assert
             // the report names that object rather than merely counting one.
             "srv_archive_lose_slab" => {
                 a.exact(1)?;
                 a.no_kwargs()?;
-                let object_dir = self.scenario_path(a.str_at(0)?, verb)?;
-                let db = object_dir.join("db");
-                let mut found: Option<(String, std::path::PathBuf)> = None;
-                for uuid in std::fs::read_dir(&db).map_err(|error| db_err(verb, error))? {
-                    let uuid = uuid.map_err(|error| db_err(verb, error))?;
-                    let slabs = uuid.path().join("slabs");
-                    if !slabs.is_dir() {
-                        continue;
-                    }
-                    for slab in std::fs::read_dir(&slabs).map_err(|error| db_err(verb, error))? {
-                        let slab = slab.map_err(|error| db_err(verb, error))?;
-                        let key = format!(
-                            "db/{}/slabs/{}",
-                            uuid.file_name().to_string_lossy(),
-                            slab.file_name().to_string_lossy()
-                        );
-                        if found.as_ref().is_none_or(|(seen, _)| key < *seen) {
-                            found = Some((key, slab.path()));
-                        }
-                    }
-                }
-                let (key, path) = found.ok_or_else(|| {
-                    value_err(format!("{verb}(): this archive holds no slab objects"))
-                })?;
+                let (key, path) = first_slab(&self.scenario_path(a.str_at(0)?, verb)?, verb)?;
                 std::fs::remove_file(&path).map_err(|error| db_err(verb, error))?;
+                Ok(MontyObject::String(key))
+            }
+
+            // Take one byte off the same slab, which is the other damage the
+            // survey reports and the one a presence check cannot see: the key
+            // is still listed and the object is no longer what the manifest
+            // says it is.
+            //
+            // One byte rather than half the object, deliberately. A check
+            // comparing against anything rounded -- a slab count, a count of
+            // whole windows -- would pass a half-sized object about as often
+            // as it failed one, and would pass this never.
+            //
+            // The realistic cause is an interrupted copy of an archive rather
+            // than the store that wrote it, since a PUT is atomic. A scenario
+            // cannot do it itself for the same reason it cannot delete one:
+            // it has no way to name a slab.
+            "srv_archive_shorten_slab" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let (key, path) = first_slab(&self.scenario_path(a.str_at(0)?, verb)?, verb)?;
+                let len = std::fs::metadata(&path)
+                    .map_err(|error| db_err(verb, error))?
+                    .len();
+                if len == 0 {
+                    return Err(value_err(format!("{verb}(): '{key}' is already empty")));
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(len - 1))
+                    .map_err(|error| db_err(verb, error))?;
                 Ok(MontyObject::String(key))
             }
 

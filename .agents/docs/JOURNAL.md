@@ -3031,3 +3031,50 @@ yet report this. Filed as `e2e-does-not-exercise-a-wrong-length-object`; the
 premise is covered here by a test over a real `file://` store and the shipped
 pass, and adding the verb means both gates, which is its own increment rather
 than a tail on this one.
+
+## 2026-10-18 -- Following the length check out to the end of the chain
+
+The library half landed earlier today and left the end-to-end surface
+reporting only presence. This finishes it, and the shape is the one
+`archive_integrity.py` already argues for: both sides of the comparison are
+derived by code, nothing forces the two derivations to agree, and an archive
+the shipped uploader wrote is the only thing that can catch them drifting.
+
+`srv_archive_shorten_slab` takes **one byte** off the lexicographically first
+slab object. One byte rather than half of it, deliberately: a check comparing
+against anything rounded -- a slab count, a count of whole windows -- would
+pass a half-sized object about as often as it failed one, and would pass this
+never. It is the same object `srv_archive_lose_slab` deletes, which is what
+lets the scenario assert `lost == short` and makes the two reports comparable
+rather than two unrelated runs. The scenario now walks whole, then short,
+then absent, asserting `wrong_length` and `missing` move independently --
+`"an absent object has no length"` is an assertion, not a comment.
+
+### One thing the library change had left asymmetric
+
+A restore meeting an absent object says what wanted it and points at
+`yesnoctl archive-plan` for the rest of the damage. A restore meeting a short
+one said two numbers and stopped. The operator is in the same position in
+both cases -- a restore stops at the first object it cannot use, so the
+message says nothing about how much else is wrong or which recovery points
+survive -- so the pointer belongs in both, and `restore::wrong_length` now
+carries it. The sentence still says which damage it met, because the next
+move differs: a short object is usually an interrupted copy that can be
+re-run, and an absent one has to be found somewhere else.
+
+### A repeat of the editing mistake from 2026-10-16, caught the same way
+
+Inserting the new restore test, I anchored on "the last doc-comment line
+before the test function" and the walk stopped in the middle of an existing
+doc comment, splicing the new test between "and the first two are" and
+"known only here." It compiled and all thirty-one tests passed, because a
+doc comment split across an inserted item is still two valid doc comments.
+
+The October 16 entry's lesson was that a replacement bounded by two anchors
+is only as safe as the uniqueness of the second. This is the adjacent one:
+**a computed anchor is only as safe as the invariant it computes against**,
+and "the doc comment ends where a line stops starting with `///`" is not an
+invariant when the block you are walking back through is itself a run of
+`///` lines. Reading the inserted region rather than trusting the green test
+run is what caught it; the repair moved the test whole to after the function
+that owned the comment.
