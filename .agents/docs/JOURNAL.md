@@ -2952,3 +2952,82 @@ whether the answer is worth reporting. The reason to look for one is that the
 expensive version of this reading -- a crawl that asks the store for every
 object's age -- would have been declined on cost, and the question would have
 stayed unanswered rather than being asked a cheaper way.
+
+## 2026-10-18 -- "Is it there" was only half of the question the listing could answer
+
+The integrity check asks whether every object a retained base names is in the
+store. It has never asked whether what is there is the right length, and an
+object that is present and short fails a restore exactly as completely as an
+absent one -- later, in fact: the recovery point has been chosen and
+everything before the short object fetched by the time the length disagrees.
+
+The restore path has always known the rule. `download_slab_file` refuses a
+slab whose bytes are not `extent.length`, and `download_base_file` refuses an
+object that is not the length `object_layout` computes. Both messages were
+already written. The survey had the other side of the comparison in hand and
+was not making it: an object-store listing reports sizes, and a pass takes one
+listing of the whole prefix.
+
+So `GcPlan::wrong_length` is the same rule applied a day earlier, for nothing.
+`yesnod_archive_wrong_length_objects`, a line in `yesnoctl archive-plan`, the
+exit-code verdict, and the `damaged_bases` attribution, which now counts a
+base that names a short object exactly as it counts one that names an absent
+object -- the recovery point is gone either way.
+
+### One rule, in one place
+
+`restore::object_len` was extracted rather than reimplemented. Two spellings
+of a length rule would be worse than either one: the survey would promise an
+archive whole that the restore then refused, or the other way round, and the
+disagreement would surface at the worst moment either way.
+
+There really are two shapes to get right. A slab is `extent.length`. A file
+stored whole is its own length when the object carries the holes, and its
+extents' total when it does not, which is `sparse` deciding. Reading one
+against the other would report every sparse archive as damaged or miss damage
+in every pre-slab one. `a_sparse_object_is_measured_by_its_runs_and_not_by_
+the_file` writes both numbers out as literals rather than deriving them from
+the same helper the production path uses, because a shared derivation cannot
+catch itself being wrong -- swapping `object_len` for `file.size` fails only
+that test.
+
+### The failure this actually catches
+
+A PUT is atomic, so the store that wrote the archive does not serve half an
+object it accepted. An interrupted `rsync` or `aws s3 sync` of the archive to
+somewhere else does exactly that, and leaves an archive whose listing is
+complete and whose keys are all where they should be.
+
+Which is the same operation yesterday's entry had to carve an exception for:
+copying an archive resets every object's last-modified time, so the floor
+reported by `oldest_live_object` describes the copy. Both entries are about
+the same event seen from two sides, and it is worth saying once: **a copied
+archive is a different archive**, and the two readings that come free off a
+listing are precisely the two a copy can falsify.
+
+What this does not do is check the bytes. A length that agrees is not a
+checksum, and the CRC the restore verifies is the authority there. It is not
+free, so it is not here.
+
+### The signature change, and what it bought in the fixtures
+
+`gc::plan` took `&[String]` and now takes `&[Listed]` -- key, size and
+last-modified, which is what a listing is. Eighteen call sites in the tests
+moved with it, and the fixtures now have to state a size for every object they
+list. That is stricter than it sounds in a useful way: a fixture that lists the
+wrong number reports damage it did not mean to build, and the first run after
+the change said so twice.
+
+`oldest_live_object` also moved inside `plan`, which now has the listing it
+needs. It had been filled in by the wrapper, so a caller of the pure function
+got a half-populated plan back; `planned` still recomputes it after an
+unreadable manifest clears the deletions, because clearing them widens what
+the pass is keeping.
+
+### Left for the next increment
+
+The end-to-end verb surface reports `missing` and `damaged_bases` and does not
+yet report this. Filed as `e2e-does-not-exercise-a-wrong-length-object`; the
+premise is covered here by a test over a real `file://` store and the shipped
+pass, and adding the verb means both gates, which is its own increment rather
+than a tail on this one.

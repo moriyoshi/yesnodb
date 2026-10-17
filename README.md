@@ -562,8 +562,8 @@ Important operational properties:
 - `yesnoctl restore` verifies an archived base and immutable WAL history, then
   reconstructs an exact committed logical version or the durable archive tip.
 - `yesnoctl archive-plan` reports what a retention policy would delete, what a
-  base it would keep names that the store does not hold, and which recovery
-  points those losses cost. It deletes nothing and takes no writer lease. The
+  base it would keep names that the store does not hold or holds at the wrong
+  length, and which recovery points those losses cost. It deletes nothing and takes no writer lease. The
   sidecar runs the same survey on an interval whether or not reclamation is
   configured.
 

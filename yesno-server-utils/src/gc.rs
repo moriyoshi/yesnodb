@@ -82,7 +82,7 @@ use clap::Args;
 use prost::Message;
 
 use crate::archive::{
-    pb, validate_base_manifest, ArchiveError, ArchiveStore, STATE_OBJECT, WRITER_OBJECT,
+    pb, validate_base_manifest, ArchiveError, ArchiveStore, Listed, STATE_OBJECT, WRITER_OBJECT,
 };
 
 /// How much history to keep restorable.
@@ -165,8 +165,37 @@ pub struct GcPlan {
     /// restore already refuses a chain with a hole in it before fetching
     /// anything.
     pub missing: Vec<String>,
+    /// Objects a retained base names that are there and are the wrong
+    /// length, each with both numbers.
+    ///
+    /// The other half of [`GcPlan::missing`], and the half a presence check
+    /// cannot see. An object that is present but short fails a restore just
+    /// as completely as one that is absent, and it fails later: the restore
+    /// has already selected the recovery point and fetched everything before
+    /// it when the length disagrees.
+    ///
+    /// The rule is the one a restore applies on arrival, not a second
+    /// spelling of it -- the manifest says how long each object must be, and
+    /// for a file stored whole that is the file's length or its extents'
+    /// total depending on whether the holes are in the object. Checking it
+    /// here costs nothing extra, because an object-store listing reports
+    /// sizes and the pass has already taken one.
+    ///
+    /// **The realistic cause is a copy rather than a store.** A PUT is
+    /// atomic, so a store does not serve half an object it accepted; an
+    /// interrupted `rsync` or `aws s3 sync` of the archive to somewhere else
+    /// does exactly that, and leaves an archive that lists complete.
+    ///
+    /// Carries the same limit as `missing`: only what a base names directly.
+    /// A length that agrees is not a checksum, and this says nothing about
+    /// the bytes inside an object of the right size -- the CRC a restore
+    /// verifies is the authority there, and it is not free.
+    pub wrong_length: Vec<String>,
     /// Manifest keys of the retained bases that [`GcPlan::missing`] costs,
     /// sorted.
+    ///
+    /// Counts [`GcPlan::wrong_length`] too: an object of the wrong length costs
+    /// the bases that name it exactly what an absent one costs them.
     ///
     /// The same damage counted in the unit an operator acts in. `missing` says
     /// how many objects are gone, which does not say how bad it is: one lost
@@ -224,6 +253,10 @@ pub struct GcPlan {
 impl GcPlan {
     /// True when nothing this pass surveyed is absent or unreadable.
     ///
+    /// True when nothing it names is absent, short, or undecodable -- the
+    /// three ways an archive stops being restorable without anyone asking it
+    /// to.
+    ///
     /// The verdict `yesnoctl archive-plan` exits on, and deliberately not a
     /// summary of everything the plan reports. `unrecognized` is left out: an
     /// archive written by a newer build has objects this one does not
@@ -231,18 +264,19 @@ impl GcPlan {
     /// for a scheduled check to fail. `delete` is left out because a pass
     /// having work to do is the healthy case.
     pub fn is_whole(&self) -> bool {
-        self.missing.is_empty() && self.unreadable_bases.is_empty()
+        self.missing.is_empty() && self.wrong_length.is_empty() && self.unreadable_bases.is_empty()
     }
 
     /// Stable human-facing summary.
     pub fn summary_line(&self) -> String {
         format!(
             "archive gc: delete={} retained_bases={} unrecognized={} missing={} \
-             damaged_bases={} unreadable_bases={} oldest_live={} horizon={}",
+             wrong_length={} damaged_bases={} unreadable_bases={} oldest_live={} horizon={}",
             self.delete.len(),
             self.retained_bases.len(),
             self.unrecognized.len(),
             self.missing.len(),
+            self.wrong_length.len(),
             self.damaged_bases.len(),
             self.unreadable_bases.len(),
             match &self.oldest_live_object {
@@ -337,7 +371,7 @@ fn base_order(m: &pb::BaseManifest) -> (u32, u64) {
 pub fn plan(
     state: &pb::ArchiveState,
     bases: &[(String, pb::BaseManifest)],
-    keys: &[String],
+    listing: &[Listed],
     policy: RetentionPolicy,
     now_micros: u64,
 ) -> Result<GcPlan, ArchiveError> {
@@ -388,10 +422,13 @@ pub fn plan(
     // would cut WAL the silent base still needs. Shard topology does not change
     // within a database, so this should never fire; it is here because the
     // failure if it did would be deleting a needed WAL interval, not an error.
-    let mut keep_files: BTreeSet<&str> = BTreeSet::new();
+    // Each maps a key to the length the manifests say the object has, so one
+    // walk answers both "is it there" and "is it whole". A key present in
+    // neither map is unreachable; see `missing` and `wrong_length`.
+    let mut keep_files: std::collections::BTreeMap<&str, u64> = Default::default();
     // Slab objects are named by content rather than spelled out in the
     // manifest, so this one is owned: the key is derived, not borrowed.
-    let mut keep_slabs: BTreeSet<String> = BTreeSet::new();
+    let mut keep_slabs: std::collections::BTreeMap<String, u64> = Default::default();
     let mut wal_floor: std::collections::BTreeMap<(u32, u32), u64> = Default::default();
     let mut uncut: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut shards_by_term: std::collections::BTreeMap<u32, BTreeSet<u32>> = Default::default();
@@ -409,11 +446,19 @@ pub fn plan(
             // consulted, but `missing` searches the other way round and would
             // report it as an object the store had lost.
             if !file.object_key.is_empty() {
-                keep_files.insert(file.object_key.as_str());
+                keep_files.insert(file.object_key.as_str(), crate::restore::object_len(file));
             }
             for extent in &file.extents {
                 if !extent.content_hash.is_empty() {
-                    keep_slabs.insert(crate::archive::slab_key(&uuid, &extent.content_hash));
+                    // First writer wins, and there is no second opinion worth
+                    // having: two manifests naming one content hash with
+                    // different lengths cannot both be right, since the hash
+                    // is over exactly those bytes. Whichever is wrong fails
+                    // its CRC at a restore, and reporting against either
+                    // length here points at the same object.
+                    keep_slabs
+                        .entry(crate::archive::slab_key(&uuid, &extent.content_hash))
+                        .or_insert(extent.length);
                 }
             }
         }
@@ -447,7 +492,7 @@ pub fn plan(
         ..Default::default()
     };
 
-    for key in keys {
+    for Listed { key, .. } in listing {
         if key == STATE_OBJECT || key == WRITER_OBJECT {
             continue;
         }
@@ -460,7 +505,7 @@ pub fn plan(
                 }
             }
             Kind::BaseFile => {
-                if !keep_files.contains(key.as_str()) {
+                if !keep_files.contains_key(key.as_str()) {
                     plan.delete.push(key.clone());
                 }
             }
@@ -468,7 +513,7 @@ pub fn plan(
             // survives the pruning of either, and one no retained manifest
             // names is unreachable whatever term wrote it.
             Kind::Slab => {
-                if !keep_slabs.contains(key.as_str()) {
+                if !keep_slabs.contains_key(key.as_str()) {
                     plan.delete.push(key.clone());
                 }
             }
@@ -494,28 +539,42 @@ pub fn plan(
         }
     }
     // What the retained bases name, against what the store actually holds.
-    // The listing is the same one every decision above was made from, so this
-    // is a set difference and costs no round trip. See [`GcPlan::missing`].
-    let listed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
-    plan.missing.extend(
-        keep_files
-            .iter()
-            .copied()
-            .filter(|key| !listed.contains(key))
-            .map(str::to_string),
-    );
-    plan.missing.extend(
-        keep_slabs
-            .iter()
-            .filter(|key| !listed.contains(key.as_str()))
-            .cloned(),
-    );
+    // The listing is the same one every decision above was made from, so both
+    // of these are a walk over data in hand and cost no round trip. See
+    // [`GcPlan::missing`] and [`GcPlan::wrong_length`].
+    let held: std::collections::BTreeMap<&str, u64> = listing
+        .iter()
+        .map(|listed| (listed.key.as_str(), listed.size))
+        .collect();
+    // Keys, kept beside the formatted messages, because attribution needs the
+    // key and an operator needs the two numbers.
+    let mut wrong_keys: Vec<String> = Vec::new();
+    let mut check = |key: &str, want: u64, plan: &mut GcPlan| match held.get(key) {
+        None => plan.missing.push(key.to_string()),
+        Some(have) if *have != want => {
+            wrong_keys.push(key.to_string());
+            plan.wrong_length
+                .push(format!("{key}: {have} bytes, manifest says {want}"));
+        }
+        Some(_) => {}
+    };
+    for (key, want) in &keep_files {
+        check(key, *want, &mut plan);
+    }
+    for (key, want) in &keep_slabs {
+        check(key, *want, &mut plan);
+    }
 
     // Which recovery points those holes cost. A second walk over names the
     // loop above already visited, run only when there is damage to attribute,
     // because the healthy case is the one that runs every hour forever.
-    if !plan.missing.is_empty() {
-        let gone: BTreeSet<&str> = plan.missing.iter().map(String::as_str).collect();
+    if !plan.missing.is_empty() || !wrong_keys.is_empty() {
+        let gone: BTreeSet<&str> = plan
+            .missing
+            .iter()
+            .chain(wrong_keys.iter())
+            .map(String::as_str)
+            .collect();
         for (key, manifest) in &retained {
             let uuid = crate::archive::hex(&manifest.database_uuid);
             let damaged = manifest.files.iter().any(|file| {
@@ -536,7 +595,9 @@ pub fn plan(
     plan.delete.sort();
     plan.unrecognized.sort();
     plan.missing.sort();
+    plan.wrong_length.sort();
     plan.damaged_bases.sort();
+    plan.oldest_live_object = oldest_live(listing, &plan);
     Ok(plan)
 }
 
@@ -559,7 +620,7 @@ pub fn plan(
 ///
 /// Ties break on the key, so the answer does not depend on listing order --
 /// an object store with second-granularity timestamps makes ties ordinary.
-pub fn oldest_live(listing: &[(String, u64)], plan: &GcPlan) -> Option<(String, u64)> {
+pub fn oldest_live(listing: &[Listed], plan: &GcPlan) -> Option<(String, u64)> {
     let going: BTreeSet<&str> = plan
         .delete
         .iter()
@@ -568,9 +629,13 @@ pub fn oldest_live(listing: &[(String, u64)], plan: &GcPlan) -> Option<(String, 
         .collect();
     listing
         .iter()
-        .filter(|(key, _)| !going.contains(key.as_str()))
-        .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
-        .cloned()
+        .filter(|listed| !going.contains(listed.key.as_str()))
+        .min_by(|a, b| {
+            a.modified_micros
+                .cmp(&b.modified_micros)
+                .then_with(|| a.key.cmp(&b.key))
+        })
+        .map(|listed| (listed.key.clone(), listed.modified_micros))
 }
 
 /// Command-line options for one reclamation preview.
@@ -659,6 +724,7 @@ pub async fn run(options: PlanOptions) -> Result<GcPlan, ArchiveError> {
         options.list,
     );
     report("missing", &plan.missing, options.list);
+    report("the wrong length", &plan.wrong_length, options.list);
     report("unrecognized", &plan.unrecognized, options.list);
     report("would delete", &plan.delete, options.list);
     // Always, including on a healthy archive, because this is the line the
@@ -707,10 +773,10 @@ fn now_micros() -> u64 {
 /// List every base manifest under the database prefix, and every object key.
 async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, ArchiveError> {
     let hex: String = database_uuid.iter().map(|b| format!("{b:02x}")).collect();
-    let listing = store.list_relative_modified(&format!("db/{hex}/")).await?;
+    let listing = store.list_relative_meta(&format!("db/{hex}/")).await?;
     let mut bases = Vec::new();
     let mut unreadable = Vec::new();
-    for (key, _) in &listing {
+    for Listed { key, .. } in &listing {
         if !key.ends_with("/manifest.pb") || !key.contains("/base/") {
             continue;
         }
@@ -743,10 +809,9 @@ async fn survey(store: &ArchiveStore, database_uuid: &[u8]) -> Result<Survey, Ar
 /// What one listing of the database prefix found.
 struct Survey {
     bases: Vec<(String, pb::BaseManifest)>,
-    /// Every object under the prefix with its last-modified time in epoch
-    /// microseconds, sorted by key. The time is carried because the listing
-    /// already had it; see [`oldest_live`].
-    listing: Vec<(String, u64)>,
+    /// Every object under the prefix, with the size and last-modified time
+    /// the listing already carried. See [`Listed`].
+    listing: Vec<Listed>,
     /// Base manifests under this prefix whose bytes this build cannot read,
     /// each with the reason, newest listing order.
     unreadable: Vec<String>,
@@ -776,15 +841,15 @@ fn planned(
     survey: Survey,
     policy: RetentionPolicy,
 ) -> Result<GcPlan, ArchiveError> {
-    let keys: Vec<String> = survey.listing.iter().map(|(key, _)| key.clone()).collect();
-    let mut plan = plan(state, &survey.bases, &keys, policy, now_micros())?;
+    let mut plan = plan(state, &survey.bases, &survey.listing, policy, now_micros())?;
     if !survey.unreadable.is_empty() {
         plan.delete.clear();
         plan.unreadable_bases = survey.unreadable;
+        // Again, because clearing the deletions widened what the pass is
+        // keeping. A halted pass should report the floor it is actually
+        // holding rather than the one it would have held.
+        plan.oldest_live_object = oldest_live(&survey.listing, &plan);
     }
-    // After the clear, so a halted pass reports the floor it is actually
-    // holding rather than the one it would have held.
-    plan.oldest_live_object = oldest_live(&survey.listing, &plan);
     Ok(plan)
 }
 
@@ -888,6 +953,33 @@ mod tests {
         )
     }
 
+    /// The length `slab_base` gives every extent, and therefore the length
+    /// its slab objects must be listed at.
+    const SLAB: u64 = 1 << 21;
+
+    /// One object as a listing would report it, at `NOW`.
+    ///
+    /// Sizes are not decoration here: the plan checks a kept object's length
+    /// against what the manifests say, so a fixture that lists the wrong
+    /// number is reporting damage it did not mean to build.
+    fn at(key: &str, size: u64) -> Listed {
+        Listed {
+            key: key.to_string(),
+            size,
+            modified_micros: NOW,
+        }
+    }
+
+    /// A slab object of the length `slab_base`'s extents claim.
+    fn slab_object(key: &str) -> Listed {
+        at(key, SLAB)
+    }
+
+    /// An object whose length no manifest speaks for, so nothing checks it.
+    fn other(key: &str) -> Listed {
+        at(key, 0)
+    }
+
     fn wal_key(first: u64, last: u64) -> String {
         format!("db/aa/term/0000000000/wal/0000/{first:020}-{last:020}.wal")
     }
@@ -900,23 +992,24 @@ mod tests {
         }
     }
 
-    /// Every key an archive holding `bases` would list.
-    fn keys(bases: &[(String, pb::BaseManifest)], wal: &[(u64, u64)]) -> Vec<String> {
-        let mut out = vec![STATE_OBJECT.to_string(), WRITER_OBJECT.to_string()];
+    /// Every object an archive holding `bases` would list, each at the length
+    /// its manifest says.
+    fn keys(bases: &[(String, pb::BaseManifest)], wal: &[(u64, u64)]) -> Vec<Listed> {
+        let mut out = vec![other(STATE_OBJECT), other(WRITER_OBJECT)];
         for (key, manifest) in bases {
-            out.push(key.clone());
+            out.push(other(key));
             for f in &manifest.files {
                 // A slab-addressed file names no object of its own, so it
                 // contributes nothing to the listing -- its bytes are under
                 // `slabs/`, which the caller adds.
                 if !f.object_key.is_empty() {
-                    out.push(f.object_key.clone());
+                    out.push(at(&f.object_key, crate::restore::object_len(f)));
                 }
             }
         }
         for (first, last) in wal {
-            out.push(wal_key(*first, *last));
-            out.push(format!("{}.pb", wal_key(*first, *last)));
+            out.push(other(&wal_key(*first, *last)));
+            out.push(other(&format!("{}.pb", wal_key(*first, *last))));
         }
         out.sort();
         out
@@ -929,7 +1022,7 @@ mod tests {
         let (key, mut manifest) = base(generation, checkpoint_time, 100);
         let slab = |byte: u8, offset: u64| pb::FileExtent {
             offset,
-            length: 1 << 21,
+            length: SLAB,
             content_hash: vec![byte; 32],
             crc32c: 0,
         };
@@ -962,12 +1055,7 @@ mod tests {
         let orphan = crate::archive::slab_key(&uuid, &[0x99; 32]);
 
         let mut keys = keys(&bases, &[]);
-        keys.extend([
-            shared.clone(),
-            only_old.clone(),
-            only_kept.clone(),
-            orphan.clone(),
-        ]);
+        keys.extend([&shared, &only_old, &only_kept, &orphan].map(|key| slab_object(key)));
         keys.sort();
 
         // A window of zero roots the retention at the newest base, so `old`
@@ -1024,7 +1112,12 @@ mod tests {
 
         let listing = |absent: &str| {
             let mut keys = keys(&bases, &[]);
-            keys.extend(all_slabs.iter().filter(|k| *k != absent).cloned());
+            keys.extend(
+                all_slabs
+                    .iter()
+                    .filter(|k| *k != absent)
+                    .map(|k| slab_object(k)),
+            );
             keys.sort();
             keys
         };
@@ -1088,12 +1181,8 @@ mod tests {
         let stray = format!("db/{uuid}/notes-from-another-tool.txt");
 
         let mut keys = keys(&bases, &[]);
-        keys.extend([
-            shared.clone(),
-            only_dropped.clone(),
-            only_kept.clone(),
-            stray.clone(),
-        ]);
+        keys.extend([&shared, &only_dropped, &only_kept].map(|key| slab_object(key)));
+        keys.push(other(&stray));
         keys.sort();
 
         // A window of zero roots retention at the newest base, so generation
@@ -1104,19 +1193,22 @@ mod tests {
 
         // Two objects are older than the shared slab: one this pass is about
         // to delete, and one it keeps only because it cannot classify it.
-        let listing: Vec<(String, u64)> = keys
+        let listing: Vec<Listed> = keys
             .iter()
-            .map(|key| {
-                let age = if *key == stray {
+            .map(|listed| {
+                let age = if listed.key == stray {
                     1000 * HOUR
-                } else if *key == only_dropped {
+                } else if listed.key == only_dropped {
                     500 * HOUR
-                } else if *key == shared {
+                } else if listed.key == shared {
                     300 * HOUR
                 } else {
                     HOUR
                 };
-                (key.clone(), NOW - age)
+                Listed {
+                    modified_micros: NOW - age,
+                    ..listed.clone()
+                }
             })
             .collect();
 
@@ -1129,19 +1221,141 @@ mod tests {
         // And it does not depend on the order the listing arrived in: with
         // every kept object the same age, the answer is the first key rather
         // than whichever one was scanned first.
-        let flat: Vec<(String, u64)> = listing
+        let flat: Vec<Listed> = listing
             .iter()
             .rev()
-            .map(|(key, _)| (key.clone(), NOW - HOUR))
+            .map(|listed| Listed {
+                modified_micros: NOW - HOUR,
+                ..listed.clone()
+            })
             .collect();
         let first_kept = keys
             .iter()
+            .map(|listed| &listed.key)
             .find(|key| !plan.delete.contains(key) && **key != stray)
             .unwrap();
         assert_eq!(
             oldest_live(&flat, &plan),
             Some((first_kept.clone(), NOW - HOUR)),
             "ties break on the key"
+        );
+    }
+
+    /// An object that is there and is the wrong length is damage the
+    /// presence check cannot see, and it costs the same recovery points.
+    ///
+    /// A restore discovers it late: the recovery point has been selected and
+    /// everything before the short object fetched by the time the length
+    /// disagrees. The survey already holds the sizes, so it can say so first.
+    #[test]
+    fn an_object_that_is_there_and_short_costs_the_bases_that_name_it() {
+        let bases = vec![
+            slab_base(1, NOW - 100 * HOUR, 0x11),
+            slab_base(2, NOW - HOUR, 0x22),
+        ];
+        let uuid = crate::archive::hex(&bases[0].1.database_uuid);
+        let slab = |byte: u8| crate::archive::slab_key(&uuid, &[byte; 32]);
+        let shared = slab(0xee);
+
+        let mut keys = keys(&bases, &[]);
+        keys.extend([slab(0x11), slab(0x22), shared.clone()].map(|key| slab_object(&key)));
+        // The shared slab arrived half written, which is what an interrupted
+        // copy of an archive leaves behind.
+        keys.iter_mut()
+            .find(|listed| listed.key == shared)
+            .unwrap()
+            .size = SLAB / 2;
+        keys.sort();
+
+        let state = state_with(&bases[1].0);
+        let plan = plan(&state, &bases, &keys, RetentionPolicy::SURVEY, NOW).unwrap();
+
+        assert!(
+            plan.missing.is_empty(),
+            "the object is present, which is exactly the trap: {plan:?}"
+        );
+        assert_eq!(
+            plan.wrong_length,
+            vec![format!(
+                "{shared}: {} bytes, manifest says {SLAB}",
+                SLAB / 2
+            )],
+            "both numbers, because neither alone says what to do: {plan:?}"
+        );
+        assert_eq!(
+            plan.damaged_bases.len(),
+            2,
+            "every generation named it: {plan:?}"
+        );
+        assert!(!plan.is_whole(), "{plan:?}");
+    }
+
+    /// The same check on a whole-file object, where the length a manifest
+    /// speaks for is the file's own rather than its extents' total.
+    ///
+    /// Two rules, one of each kind of archive, and the pass has to apply the
+    /// one the manifest asks for -- reading a pre-slab object against an
+    /// extent total would report every such archive as damaged.
+    #[test]
+    fn a_whole_file_object_of_the_wrong_length_is_reported_too() {
+        let only = base(1, NOW - HOUR, 100);
+        let bases = vec![only.clone()];
+        let object = only.1.files[0].object_key.clone();
+
+        let mut keys = keys(&bases, &[]);
+        keys.iter_mut()
+            .find(|listed| listed.key == object)
+            .unwrap()
+            .size = 9;
+
+        let plan = plan(&state_with(&only.0), &bases, &keys, policy(24, 1), NOW).unwrap();
+
+        assert_eq!(
+            plan.wrong_length,
+            vec![format!("{object}: 9 bytes, manifest says 1")],
+            "{plan:?}"
+        );
+        assert_eq!(plan.damaged_bases, vec![only.0], "{plan:?}");
+    }
+
+    /// A sparse file stored whole in one object is measured by its runs and
+    /// not by the file they belong to.
+    ///
+    /// The object holds the present runs concatenated, so its length is their
+    /// total while the file's own length counts the holes as well. Reading
+    /// one against the other reports every sparse archive as damaged, or
+    /// misses damage in every pre-slab one. Both sizes here are written out
+    /// rather than taken from the same helper the production path uses,
+    /// because a shared derivation cannot catch itself being wrong.
+    #[test]
+    fn a_sparse_object_is_measured_by_its_runs_and_not_by_the_file() {
+        let (key, mut manifest) = base(1, NOW - HOUR, 100);
+        let object = manifest.files[0].object_key.clone();
+        let run = |offset: u64, length: u64| pb::FileExtent {
+            offset,
+            length,
+            content_hash: Vec::new(),
+            crc32c: 0,
+        };
+        manifest.files[0].size = 4096;
+        manifest.files[0].sparse = true;
+        manifest.files[0].extents = vec![run(0, 16), run(2048, 32)];
+        let bases = vec![(key.clone(), manifest)];
+        let state = state_with(&key);
+
+        let whole = vec![other(STATE_OBJECT), other(&key), at(&object, 48)];
+        let plan = plan(&state, &bases, &whole, policy(24, 1), NOW).unwrap();
+        assert!(
+            plan.is_whole(),
+            "forty-eight bytes is what the two runs total: {plan:?}"
+        );
+
+        let holes_too = vec![other(STATE_OBJECT), other(&key), at(&object, 4096)];
+        let bad = super::plan(&state, &bases, &holes_too, policy(24, 1), NOW).unwrap();
+        assert_eq!(
+            bad.wrong_length,
+            vec![format!("{object}: 4096 bytes, manifest says 48")],
+            "an object carrying the holes as well is not this manifest's: {bad:?}"
         );
     }
 
@@ -1341,7 +1555,7 @@ mod tests {
 
         // Everything the two bases name except `shared`.
         let mut keys = keys(&bases, &[]);
-        keys.push(only_kept);
+        keys.push(slab_object(&only_kept));
         keys.sort();
 
         let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
@@ -1361,10 +1575,13 @@ mod tests {
 
         // `only_old` -- the pruned generation's own slab -- is absent.
         let mut keys = keys(&bases, &[]);
-        keys.extend([
-            crate::archive::slab_key(&uuid, &[0xee; 32]),
-            crate::archive::slab_key(&uuid, &[0x22; 32]),
-        ]);
+        keys.extend(
+            [
+                crate::archive::slab_key(&uuid, &[0xee; 32]),
+                crate::archive::slab_key(&uuid, &[0x22; 32]),
+            ]
+            .map(|key| slab_object(&key)),
+        );
         keys.sort();
 
         let plan = plan(&state_with(&kept.0), &bases, &keys, policy(0, 1), NOW).unwrap();
@@ -1378,11 +1595,7 @@ mod tests {
     fn a_whole_file_base_object_the_store_lost_is_reported_too() {
         let only = base(1, NOW - HOUR, 100);
         let bases = vec![only.clone()];
-        let keys = vec![
-            STATE_OBJECT.to_string(),
-            WRITER_OBJECT.to_string(),
-            only.0.clone(),
-        ];
+        let keys = vec![other(STATE_OBJECT), other(WRITER_OBJECT), other(&only.0)];
 
         let plan = plan(&state_with(&only.0), &bases, &keys, policy(24, 1), NOW).unwrap();
 
@@ -1537,9 +1750,9 @@ mod tests {
         let only = base(1, NOW - HOUR, 100);
         let bases = vec![only.clone()];
         let mut keys = keys(&bases, &[]);
-        keys.push("db/aa/term/0000000000/attic/something.bin".into());
-        keys.push("db/aa/somethingelse".into());
-        keys.push("db/aa/term/0000000000/wal/0000/not-a-range.wal".into());
+        keys.push(other("db/aa/term/0000000000/attic/something.bin"));
+        keys.push(other("db/aa/somethingelse"));
+        keys.push(other("db/aa/term/0000000000/wal/0000/not-a-range.wal"));
         let plan = plan(&state_with(&only.0), &bases, &keys, policy(1, 1), NOW).unwrap();
         assert!(plan.delete.is_empty(), "{plan:?}");
         assert_eq!(plan.unrecognized.len(), 3, "{plan:?}");
@@ -1549,7 +1762,7 @@ mod tests {
     #[test]
     fn the_state_and_lease_objects_are_never_candidates() {
         let bases: Vec<(String, pb::BaseManifest)> = Vec::new();
-        let keys = vec![STATE_OBJECT.to_string(), WRITER_OBJECT.to_string()];
+        let keys = vec![other(STATE_OBJECT), other(WRITER_OBJECT)];
         let plan = plan(&state_with(""), &bases, &keys, policy(1, 1), NOW).unwrap();
         assert!(plan.delete.is_empty(), "{plan:?}");
         assert!(plan.unrecognized.is_empty(), "{plan:?}");
@@ -1563,9 +1776,9 @@ mod tests {
         let newer_key = "db/aa/term/0000000005/base/0/manifest.pb".to_string();
         let bases = vec![(newer_key.clone(), newer.1)];
         let keys = vec![
-            newer_key.clone(),
-            "db/aa/term/0000000000/wal/0000/00000000000000000000-00000000000000000100.wal".into(),
-            "db/aa/term/0000000005/wal/0000/00000000000000000000-00000000000000000100.wal".into(),
+            other(&newer_key),
+            other("db/aa/term/0000000000/wal/0000/00000000000000000000-00000000000000000100.wal"),
+            other("db/aa/term/0000000005/wal/0000/00000000000000000000-00000000000000000100.wal"),
         ];
         let plan = plan(&state_with(&newer_key), &bases, &keys, policy(1, 1), NOW).unwrap();
         assert!(

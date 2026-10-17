@@ -1418,6 +1418,7 @@ pub(crate) async fn retention_loop(
                         tracing::info!(
                             bases = plan.retained_bases.len(),
                             missing = plan.missing.len(),
+                            wrong_length = plan.wrong_length.len(),
                             unrecognized = plan.unrecognized.len(),
                             unreadable = plan.unreadable_bases.len(),
                             // The reading a lifecycle rule has to be set
@@ -1456,6 +1457,18 @@ pub(crate) async fn retention_loop(
                         damaged_bases = plan.damaged_bases.len(),
                         %first,
                         "a retained base names objects this archive does not hold"
+                    );
+                }
+                // Its own line rather than a count on the one above, because
+                // the operator's next move differs: an absent object has to be
+                // recovered from somewhere else, and one of the wrong length
+                // is usually an interrupted copy that can simply be re-run.
+                if let Some(first) = plan.wrong_length.first() {
+                    tracing::warn!(
+                        wrong_length = plan.wrong_length.len(),
+                        damaged_bases = plan.damaged_bases.len(),
+                        %first,
+                        "a retained base names objects this archive holds at the wrong length"
                     );
                 }
                 // The one distinction the counts above cannot draw, and the

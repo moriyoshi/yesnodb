@@ -744,6 +744,22 @@ async fn download_slab_file(
     Ok(())
 }
 
+/// How many bytes the one object holding `file` must hold.
+///
+/// The file's own length when the object is the file, and the extents' total
+/// when the object carries only the runs that are present.
+///
+/// Shared with the reclamation survey, which checks the same rule against a
+/// listing it already has. Two spellings of one rule would be worse than
+/// either: the survey would promise an archive whole that the restore then
+/// refused, or the other way round.
+pub(crate) fn object_len(file: &pb::ArchiveFile) -> u64 {
+    match file.sparse {
+        false => file.size,
+        true => file.extents.iter().map(|extent| extent.length).sum(),
+    }
+}
+
 /// Where a base object's bytes belong, and how many of them there are.
 ///
 /// A file that is not sparse is the single extent covering it, which is how
@@ -760,8 +776,7 @@ fn object_layout(file: &pb::ArchiveFile) -> (Vec<pb::FileExtent>, u64) {
             file.size,
         );
     }
-    let length = file.extents.iter().map(|extent| extent.length).sum();
-    (file.extents.clone(), length)
+    (file.extents.clone(), object_len(file))
 }
 
 async fn download_base_file(

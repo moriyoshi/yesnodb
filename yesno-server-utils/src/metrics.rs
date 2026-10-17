@@ -16,6 +16,11 @@
 //!   the two: an object a retained base names and the store does not hold. The
 //!   bucket is not too big, it is incomplete, and the symptom surfaces at a
 //!   restore — which is the one moment nobody wants to discover it.
+//! - **The wrong-length count.** The same damage as the one above, reported
+//!   by the half of the check a presence test cannot make: an object that is
+//!   there and is not the length its manifest says. It fails a restore as
+//!   completely as an absent one and later, after the recovery point has been
+//!   chosen.
 //! - **The unreadable-manifest count.** Not a third kind of damage but a
 //!   change of *state*: a pass that meets one deletes nothing, and no later
 //!   one will either until the object is explained. Without its own family
@@ -29,7 +34,7 @@
 //!   something the archive still needs, and it is alertable with arithmetic
 //!   an operator can write against their own retention setting.
 //!
-//! All four are alerting conditions, and an alerting condition has to be a
+//! All five are alerting conditions, and an alerting condition has to be a
 //! metric.
 //!
 //! # It borrows the daemon's listener rather than inventing one
@@ -95,6 +100,7 @@ pub struct ArchiveMetrics {
     surveyed: AtomicBool,
     unrecognized: AtomicU64,
     missing: AtomicU64,
+    wrong_length: AtomicU64,
     damaged_bases: AtomicU64,
     unreadable_bases: AtomicU64,
     retained_bases: AtomicU64,
@@ -126,6 +132,8 @@ impl ArchiveMetrics {
             .store(plan.unrecognized.len() as u64, Ordering::Relaxed);
         self.missing
             .store(plan.missing.len() as u64, Ordering::Relaxed);
+        self.wrong_length
+            .store(plan.wrong_length.len() as u64, Ordering::Relaxed);
         self.damaged_bases
             .store(plan.damaged_bases.len() as u64, Ordering::Relaxed);
         self.unreadable_bases
@@ -227,10 +235,24 @@ impl ArchiveMetrics {
             );
             gauge(
                 &mut s,
+                "archive_wrong_length_objects",
+                "Objects a base the last completed pass retained that the \
+                 store holds at a length the manifest does not claim. The \
+                 other half of archive_missing_objects, and the half a \
+                 presence check cannot make: such an object fails a restore \
+                 just as completely, and later. The usual cause is an \
+                 interrupted copy of the archive rather than the store that \
+                 wrote it.",
+                self.wrong_length.load(Ordering::Relaxed).to_string(),
+            );
+            gauge(
+                &mut s,
                 "archive_damaged_bases",
                 "Bases the last completed pass retained that name at least one \
-                 object the store does not hold, and so cannot be restored. The \
-                 same damage as archive_missing_objects, counted in recovery \
+                 object the store does not hold or holds at the wrong length, \
+                 and so cannot be restored. The same damage as \
+                 archive_missing_objects and archive_wrong_length_objects, \
+                 counted in recovery \
                  points: one lost shared slab can cost every generation, and \
                  many lost objects can cost only one old base.",
                 self.damaged_bases.load(Ordering::Relaxed).to_string(),
@@ -369,6 +391,43 @@ mod tests {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_times(std::fs::FileTimes::new().set_modified(when))
             .unwrap();
+    }
+
+    /// An object the store holds at the wrong length reaches its own gauge,
+    /// and costs the base that names it.
+    ///
+    /// The fixture's manifest says the file is one byte. Writing two over it
+    /// is what an interrupted copy of an archive leaves: the listing is
+    /// complete, every key is where it should be, and a restore fails after
+    /// it has chosen the recovery point.
+    #[tokio::test]
+    async fn an_object_of_the_wrong_length_reaches_the_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        archive(dir.path(), &[]);
+        let file_key = format!("db/{HEX}/term/0000000000/base/{:020}/MANIFEST", 1);
+        write(dir.path(), &file_key, b"xx");
+
+        let plan = pass(dir.path()).await;
+        assert!(plan.missing.is_empty(), "the object is present: {plan:?}");
+        assert_eq!(
+            plan.wrong_length,
+            vec![format!("{file_key}: 2 bytes, manifest says 1")],
+            "{plan:?}"
+        );
+
+        let metrics = ArchiveMetrics::new();
+        metrics.pass_completed(&plan);
+        let rendered = metrics.render();
+        assert_eq!(
+            value_of(&rendered, "archive_wrong_length_objects"),
+            Some(1),
+            "{rendered}"
+        );
+        assert_eq!(
+            value_of(&rendered, "archive_damaged_bases"),
+            Some(1),
+            "the only base names it, so the base goes with it: {rendered}"
+        );
     }
 
     /// The floor a lifecycle rule has to clear, taken off a real listing and

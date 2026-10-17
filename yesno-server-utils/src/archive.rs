@@ -114,6 +114,30 @@ pub struct WalUpload {
     pub frames: Vec<pb::WalObject>,
 }
 
+/// One object as a store's listing reported it.
+///
+/// The two fields beyond the key are carried because the listing already had
+/// them. A reclamation pass lists the whole database prefix once, so size and
+/// last-modified arrive with the key at no extra round trip, and both answer
+/// a question about the archive that would otherwise need its own crawl:
+/// [`crate::gc::GcPlan::wrong_length`] for the size, and
+/// [`crate::gc::GcPlan::oldest_live_object`] for the time.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Listed {
+    /// The key, relative to the configured prefix.
+    pub key: String,
+    /// The object's length in bytes, as the store reports it.
+    pub size: u64,
+    /// Last-modified, in epoch microseconds.
+    ///
+    /// A store reporting a time before the epoch reads as zero rather than as
+    /// an error: the value is compared against an operator's lifecycle rule
+    /// rather than against anything this code decides, and failing a
+    /// reclamation pass over a nonsensical timestamp would be the worse
+    /// outcome.
+    pub modified_micros: u64,
+}
+
 /// An object store rooted at the prefix named by the configured URL.
 #[derive(Clone)]
 pub struct ArchiveStore {
@@ -312,31 +336,22 @@ impl ArchiveStore {
 
     pub(crate) async fn list_relative(&self, prefix: &str) -> Result<Vec<String>, ArchiveError> {
         Ok(self
-            .list_relative_modified(prefix)
+            .list_relative_meta(prefix)
             .await?
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|listed| listed.key)
             .collect())
     }
 
-    /// The same listing, with each object's last-modified time in epoch
-    /// microseconds, sorted by key.
+    /// The same listing, whole: each object's size and last-modified time
+    /// alongside its key, sorted by key.
     ///
-    /// The time comes back from the listing that was happening anyway, which
-    /// is the only reason it is worth having: it is the field an object-store
-    /// lifecycle rule keys on, so it is the only thing in the archive that can
-    /// say an expiry rule is about to delete something live. See
-    /// [`crate::gc::oldest_live`].
-    ///
-    /// A store that reports a time before the epoch reads as zero rather than
-    /// as an error. The value is advisory -- it is compared against an
-    /// operator's lifecycle rule, not against anything this code decides -- and
-    /// failing a reclamation pass over a nonsensical timestamp would be the
-    /// worse outcome.
-    pub(crate) async fn list_relative_modified(
+    /// Both extra fields come back from a listing that was happening anyway,
+    /// which is the only reason they are worth having. See [`Listed`].
+    pub(crate) async fn list_relative_meta(
         &self,
         prefix: &str,
-    ) -> Result<Vec<(String, u64)>, ArchiveError> {
+    ) -> Result<Vec<Listed>, ArchiveError> {
         let objects = self
             .inner
             .list(Some(&self.path(prefix)))
@@ -353,8 +368,11 @@ impl ArchiveStore {
                     .and_then(|tail| tail.strip_prefix('/'))
                     .ok_or("object-store listing escaped the configured archive prefix")?
             };
-            let modified = object.last_modified.timestamp_micros().max(0) as u64;
-            relative.push((value.to_owned(), modified));
+            relative.push(Listed {
+                key: value.to_owned(),
+                size: object.size,
+                modified_micros: object.last_modified.timestamp_micros().max(0) as u64,
+            });
         }
         relative.sort();
         Ok(relative)

@@ -285,8 +285,9 @@ yesnoctl archive-plan \
 ```
 
 It reports what a pass with that policy would delete, what it would not
-recognize, what a base it would keep names that the store does not hold, and
-which bases those losses cost. It **deletes nothing** and takes no writer
+recognize, what a base it would keep names that the store does not hold or
+holds at a length the manifest does not claim, and which bases those losses
+cost. It **deletes nothing** and takes no writer
 lease, so it is safe to run against a live archive and alongside the sidecar
 that owns the prefix. Each list is sampled; `--list` prints every key.
 
@@ -303,8 +304,9 @@ its last-modified time. That is what a bucket lifecycle rule has to be set
 longer than, and it prints on a healthy archive too -- on the archive an
 operator is about to put a rule on, every list above it is empty.
 
-It exits **2** when the archive is not whole -- any missing object, or any
-base manifest this build cannot read -- and 0 otherwise, so a scheduled check
+It exits **2** when the archive is not whole -- any missing object, any object
+of the wrong length, or any base manifest this build cannot read -- and 0
+otherwise, so a scheduled check
 can act on the verdict without parsing the output. An exit of 1 means the
 command itself failed: an unreachable store, a bad endpoint, a typo. An
 unrecognized key is deliberately not part of the verdict; it is worth looking
@@ -390,8 +392,18 @@ publishes no reading rather than a reassuring zero:
   key next to the count. The usual causes are an object-store lifecycle rule
   (see below), a deletion by hand, and a bucket policy or replication rule
   that never applied to every prefix.
+- `yesnod_archive_wrong_length_objects`: objects a base the last pass retained
+  that the store holds at a length the manifest does not claim. The other half
+  of the gauge above, and the half a presence check cannot make: such an object
+  fails a restore just as completely, and later -- the recovery point has
+  already been chosen and everything before the object fetched. A PUT is
+  atomic, so the usual cause is not the store that wrote the archive but an
+  interrupted copy of it, which can simply be re-run. A length that agrees is
+  not a checksum; the bytes inside an object of the right size are verified at
+  a restore and nowhere cheaper.
 - `yesnod_archive_damaged_bases`: bases the last pass retained that name at
-  least one of those missing objects, and so cannot be restored. This is the
+  least one object that is missing or of the wrong length, and so cannot be
+  restored. This is the
   gauge to page on and the one to put on a dashboard: the object count above
   says how much is gone, this says what it cost. Compare it with
   `yesnod_archive_retained_bases` -- equal means no recovery point in the
@@ -412,7 +424,7 @@ publishes no reading rather than a reassuring zero:
   against. Absent rather than zero when the pass kept nothing, because a zero
   here would read as 1970 and page immediately.
 - `yesnod_archive_reclamation_last_success_timestamp_seconds`: Unix time of the
-  last completed pass, and therefore how old the six gauges above are.
+  last completed pass, and therefore how old the seven gauges above are.
 
 A failed pass deliberately leaves the gauges at their last completed reading. A
 pass that fails learns nothing, and zeroing the unrecognized count because the
