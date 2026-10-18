@@ -511,6 +511,19 @@ fn render(m: &Metrics) -> String {
         "Wall time of the most recent background checkpoint.",
         c.last_checkpoint_ms.load(Ordering::Relaxed).to_string(),
     );
+    // Process-wide, not database-scoped, and the one number that says whether
+    // this node is still skipping the holes in its own images. Rendered only
+    // on the leader surface because only a leader serves base snapshots; on a
+    // follower it would be a true zero that nothing could ever move, which is
+    // the shape `render_follower` declines for the gauges.
+    counter(
+        &mut s,
+        "snapshot_bytes_read_total",
+        "Bytes read from database files to serve base snapshots. Compare the \
+         rise across one backup or bootstrap against the apparent length of \
+         the files it served: skipping holes reads a small fraction of it.",
+        crate::sparse::snapshot_bytes_read(),
+    );
 
     // Per-class slab occupancy. Cheap: one allocator lock per shard, same as
     // the gauges above.

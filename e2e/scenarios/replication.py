@@ -60,6 +60,10 @@ assert sum(st["end_lsn"]) > 0, "the leader reports an empty log"
 
 rep = repl_follower("replica")
 
+# Bracketing the bootstrap, for the half of the saving the images cannot show.
+# See the assertion below the loop.
+read_before = snapshot_bytes_read()
+
 # The MANIFEST, not just the identity: it carries the shard count and the
 # `vshard -> shard` map, and a follower without the map looks for keys in shards
 # that do not hold them.
@@ -100,8 +104,9 @@ assert repl_ack(rep, svc, 0) == 0, "the leader still thinks this follower is beh
 # runs the leader skipped become holes rather than zeros. Neither half is
 # checked by the other, and the bytes are identical either way -- a leader that
 # went back to reading the whole image, or a follower that appended instead of
-# placing, produces a correct replica and nothing here would have noticed. It
-# was 15.5 seconds for four shards before the holes were skipped and 0.24
+# placing, produces a correct replica. Of those two this assertion sees the
+# follower's half only; the leader's is the bytes-read assertion below. It was
+# 15.5 seconds for four shards before the holes were skipped and 0.24
 # afterwards, and wall clock is not something this suite asserts on.
 #
 # Taken before `db_open` below, which replays and allocates on its own account.
@@ -115,6 +120,36 @@ assert usage["allocated"] > 0, usage
 assert usage["allocated"] * 16 < usage["bytes"], (
     usage,
     "a bootstrapped follower occupies its apparent size: the holes came back",
+)
+
+# ---- and the leader did not read the holes to find out they were holes ------
+#
+# The assertion above is about what the follower *holds*, and that is only half
+# of what the bootstrap was changed to stop doing. The leader skips a hole
+# twice over: the extent probe never reads it, and a chunk that is all zeros is
+# never sent. Only the second of those shows up in the image on disk, because
+# the follower sizes its file first and a run nobody sends is a hole either
+# way. Blinding the probe alone -- reading the whole gigabyte and still sending
+# only the chunks that carry something -- leaves the assertion above green, and
+# that was measured rather than argued: the replica came back holding 7.0 MiB
+# of an apparent 2.00 GiB, which is well inside the bound, while the bootstrap
+# went from 0.36 s to 7.9 s and every other assertion in this file passed.
+#
+# So this is the one that notices. `snapshot_bytes_read` is the leader's own
+# count of what it asked the disk for, bracketed around the bootstrap loop
+# above. Catch-up ships log records and does not touch it.
+#
+# The counter is process-wide and the harness runs its servers in this process,
+# so the difference is the reading and the absolute value is meaningless. The
+# bound is the apparent length of what was copied, which is `usage["bytes"]`:
+# the follower's images are the leader's, length for length.
+read_delta = snapshot_bytes_read() - read_before
+print("  leader read " + str(read_delta) + " of " + str(usage["bytes"]))
+assert read_delta > 0, "the bootstrap read nothing at all"
+assert read_delta * 16 < usage["bytes"], (
+    read_delta,
+    usage,
+    "the leader read the whole image to serve it: the extent probe went blind",
 )
 
 repl_stop(svc)

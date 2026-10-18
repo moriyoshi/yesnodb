@@ -39,6 +39,7 @@ for key in range(KEYS):
     wants[key].add(ordinal)
 assert flight_put(flight, keys, ords) == KEYS
 
+read_before = snapshot_bytes_read()
 report = srv_basebackup(leader, "backup")
 assert report["shards"] == SHARDS, report
 assert report["checkpoint"] == checkpoint, report
@@ -67,18 +68,45 @@ assert report["bytes"] > 0, report
 # into a failure about sparseness. `allocated > 0` keeps it from passing by
 # measuring nothing.
 #
-# What this cannot see is worth stating. The copy skips a hole twice over --
-# the extent probe never reads it, and an all-zero chunk is never written --
-# and only the second of those shows up here. Defeating the probe alone leaves
-# the output just as sparse and costs five times the wall clock, measured, with
-# nothing in the suite asserting on wall clock. Two mechanisms producing one
-# observable is the same trap as an optimization whose effect waits on an
-# upstream property: the reading cannot tell them apart.
+# What this assertion alone cannot see is worth stating, because it is half the
+# saving -- and it is not the same half at the two ends of the transfer. There
+# are two extent probes on this path and only one of them is invisible here.
+#
+# Blinding the **stream's** probe does show up: the control-plane stream has no
+# all-zero filter and sends every chunk it reads, so the receiver writes the
+# zeros and the published directory comes back 4.00 GiB allocated, which the
+# assertion below catches. Blinding the **provider's** does not: the copy into
+# the lease directory still drops every all-zero chunk, so what it stages is as
+# sparse as ever while having read the whole image to produce it. Measured on
+# 2026-10-18 with only the provider's probe defeated: 12.0 MiB allocated
+# against 4.00 GiB long -- twenty-one times inside the bound below -- and 15.3
+# seconds instead of about one. Wall clock is not something this suite asserts
+# on. The bytes read are, just below.
 print("report=" + str(report))
 assert report["allocated"] > 0, report
 assert report["allocated"] * 16 < report["bytes"], (
     report,
     "the backup occupies its apparent size: a hole-skipping path went dense",
+)
+
+# What the leader asked its disk for. Both reading paths are counted: the
+# portable provider copies each image into the lease directory, and the
+# control-plane stream then reads that copy. Skipping holes, the total is about
+# twice what the backup publishes -- 282 KiB against 156 KiB, measured. With
+# the provider's probe defeated it is 4.01 GiB, because the image is read in
+# full and the staged copy that comes out of it is still sparse for the stream
+# to read.
+#
+# The counter is this process's and the harness runs its servers inside it, so
+# the difference across the call is the reading and the absolute value is
+# whatever ran before.
+read_delta = snapshot_bytes_read() - read_before
+print("read_delta=" + str(read_delta))
+assert read_delta > 0, "the backup read nothing at all"
+assert read_delta * 16 < report["bytes"], (
+    read_delta,
+    report,
+    "the backup read its apparent size: the extent probe went blind",
 )
 
 # The report's own two numbers, against a walk of the **published** directory

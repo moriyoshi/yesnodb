@@ -188,6 +188,11 @@ async fn stream_base_snapshot(
         file.read_exact(&mut buffer[..want])
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
+        // What the disk was asked for, which is the only observable the
+        // probe above has. The chunks that go on the wire are filtered again
+        // below, and a bootstrap that read the whole image would still send
+        // exactly these.
+        crate::sparse::note_snapshot_read(want as u64);
         let chunk = &buffer[..want];
 
         if replay_off.is_none() {

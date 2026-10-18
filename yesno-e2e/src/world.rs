@@ -146,6 +146,7 @@ pub const NAMES: &[&str] = &[
     "yn_arg",
     "clock_ns",
     "disk_usage",
+    "snapshot_bytes_read",
 ];
 
 /// Every verb, across all three modules. The single source of truth for name
@@ -1228,6 +1229,30 @@ impl World {
                     ("bytes", int_obj(bytes)),
                     ("allocated", int_obj(allocated)),
                 ]))
+            }
+
+            // How many bytes this process has read out of database files to
+            // serve base snapshots.
+            //
+            // **The other half of what `disk_usage` can see.** Every
+            // hole-skipping copy here filters twice -- the extent probe
+            // decides what is read, an all-zero test decides what is sent --
+            // and the allocation of the result is set by the second filter
+            // alone. Measured on 2026-10-18: blinding the probe and leaving
+            // the all-zero test in place kept every `disk_usage` assertion
+            // green while the bootstrap read all 2.00 GiB of its images and
+            // took twenty-two times as long. This is the figure that moves
+            // instead.
+            //
+            // No handle, because the counter is the process's and the harness
+            // runs its servers inside this process. It is monotone and shared
+            // by every server and every scenario in the run, so a scenario
+            // must bracket an operation with two readings and assert on the
+            // difference; the absolute value is whatever ran before it.
+            "snapshot_bytes_read" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                Ok(int_obj(yesno_server::sparse::snapshot_bytes_read()))
             }
 
             // Unreachable while `NAMES` and this match agree, which

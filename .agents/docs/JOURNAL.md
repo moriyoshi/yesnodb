@@ -3364,3 +3364,88 @@ established, and the comment asserted it as though it had been checked. It now
 says which it is. A reason given for a line of code is a claim like any other,
 and writing it in the same breath as the code is exactly when it does not get
 tested.
+
+## 2026-10-18 -- The counter the previous entry said was missing, and the probe that was not invisible after all
+
+The entry above closed with a limit rather than a fix: the three sparseness
+assertions catch a path that stops *producing* holes and not one that stops
+*skipping the reading* of them, "and a guard for that would have to be a
+counter of bytes read, not a property of the output, and none of the three
+sites keeps one." This is that counter.
+
+`yesno_server::sparse::snapshot_bytes_read()` is a process-wide monotone total
+of bytes read off disk to serve a base snapshot, incremented at the three
+places that do the reading: the portable provider's `copy_sparse`, the
+replication leader's `stream_base_snapshot`, and the control plane's
+`FetchSnapshotFile` task. It renders on the leader's `/metrics` as
+`yesnod_snapshot_bytes_read_total`, and the harness exposes it to scenarios as
+a no-handle verb `snapshot_bytes_read()`.
+
+Process-wide rather than threaded through, and the reason is worth recording
+because it was the only real design question here. The three callers have no
+object in common: one is a free function inside a trait impl, one a free
+`async fn`, one a task spawned over a channel. Carrying a handle to all three
+is three signature changes to deliver one addition, and the consumer -- a
+Prometheus counter -- is process-wide anyway. The cost is that the figure is
+shared by every server the harness runs in its own process, so **a scenario
+must bracket an operation and assert on the difference.** The unit test in
+`sparse.rs` does the same thing for the same reason and says so, which makes
+it the smallest statement of the discipline.
+
+### What it measures
+
+| | apparent | allocated | read |
+| --- | --- | --- | --- |
+| base backup, 4 shards | 4 294 980 552 | 159 744 | 288 640 |
+| follower bootstrap, 2 shards | 2 147 498 216 | 90 112 | 73 728 |
+
+The backup reads about twice what it publishes, which is right and is the
+thing the single-number version of this would have hidden: two paths read on
+that one operation, because the provider copies each image into the lease
+directory and the stream then reads the copy.
+
+### The sabotage, and the correction it forced
+
+Blinding `next_allocated` -- returning the whole remainder, changing nothing
+else -- and running the two scenarios:
+
+| | allocated | bytes read | wall |
+| --- | --- | --- | --- |
+| bootstrap, honest | 90 112 | 73 728 | 0.36 s |
+| bootstrap, probe blind | 7 356 416 | 2 147 483 648 | 7.9 s |
+| backup, provider's probe blind | 12 611 584 | 4 307 576 704 | 15.3 s |
+| backup, every probe blind | 4 295 012 352 | -- | 27.3 s |
+
+The first three rows are the entry above vindicated: allocation rose, stayed
+well inside the sixteenth the scenarios bound it at, and the existing
+assertions passed. The bytes read rose to the whole apparent length and the
+new assertions failed. That is the guard doing exactly the job the previous
+entry specified for it.
+
+**The fourth row is the correction.** The previous entry's generalization --
+every hole-skipping path has a probe whose effect is invisible to allocation
+-- is not true of the control-plane stream. That stream has no all-zero filter
+at all; it sends every chunk it reads. So blinding its probe does make the
+published directory dense, 4.29 GiB allocated, and the *existing* assertion
+catches it. The probe that is invisible on the base-backup path is the
+provider's, and only the provider's, because `copy_sparse` keeps dropping
+all-zero chunks and hands the stream a staged copy that is as sparse as ever.
+
+The earlier measurement was not wrong, it was narrower than the sentence
+written around it: the sabotage that produced it was applied to `copy_sparse`,
+and the claim generalized to "the probe" as though there were one. Three
+comments had inherited that wording -- `basebackup.py`'s, and both of the new
+ones -- and all three now name which probe and say what the other one does.
+The pattern is the same one as yesterday's weakened `sync_tree` doc: a
+generalization written in the same breath as the measurement that suggested
+it, with nothing between them to test it.
+
+### What is still unguarded
+
+The archive capture's slab uploader probes the same way and is counted
+nowhere. It is filed as
+`the-archive-capture-is-the-one-hole-skipping-path-with-no-bytes-read-counter`
+rather than folded in here, because it runs in the sidecar process when a
+sidecar is deployed, so its reads would never reach the daemon's `/metrics`,
+and because an archive capture is not a base snapshot. The shape to copy is
+`ArchiveMetrics`, not this counter.

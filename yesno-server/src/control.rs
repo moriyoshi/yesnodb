@@ -1217,6 +1217,12 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                                 return;
                             }
                         };
+                        // What the disk was asked for. On the dense path
+                        // this grows to the file's apparent length, which is
+                        // what makes the figure say whether the caller
+                        // declared `allow_sparse` -- nothing else the client
+                        // receives differs.
+                        crate::sparse::note_snapshot_read(count as u64);
                         if count == 0 && offset < size {
                             let _ = tx
                                 .send(Err(Status::data_loss(format!(

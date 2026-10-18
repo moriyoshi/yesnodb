@@ -61,6 +61,16 @@ sequentially, or a destination filesystem with no support for sparse files will
 each want the apparent size. An archive restore reports the same pair for the
 same reason.
 
+`yesnod_snapshot_bytes_read_total` on the leader's metrics listener reports how
+much the node has read off its own disks to serve base snapshots, counting both
+base backups and standby bootstraps. It is a counter, so what to look at is how
+far it rises across one operation: skipping holes, that rise is a small
+multiple of what the backup publishes, and a node that has stopped skipping
+them reads the apparent length instead. The published directory's own size does
+not always show that difference -- a copy can read every hole and still write
+none of them -- so this is the metric to compare against a backup that suddenly
+takes much longer for no change in what it contains.
+
 The manifest is mandatory. It carries the database identity and routing map.
 Restoring shard files without it can create a new identity and route keys to the
 wrong shards.

@@ -15,6 +15,8 @@
 //! them. Nothing about the answer is specific to replication, and two copies
 //! of a `libc` call with its own safety argument is one too many.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// The next allocated run at or after `from`, as `(start, end)`.
 ///
 /// `None` when the filesystem says nothing past `from` is allocated, which is
@@ -61,6 +63,56 @@ pub fn next_allocated(file: &std::fs::File, from: u64, total_len: u64) -> Option
         true => Some((start, end)),
         false => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the probe is worth, as a number
+// ---------------------------------------------------------------------------
+
+/// Bytes read from a database file to serve a base snapshot, process-wide.
+static SNAPSHOT_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Record `count` bytes read from a database file while serving a base snapshot.
+///
+/// **This counter exists because the probe above has no other observable.**
+/// Every hole-skipping copy in this tree filters twice: [`next_allocated`]
+/// decides what is *read*, and an all-zero test decides what is *sent or
+/// written*. What comes out the other end is allocated according to the
+/// second filter alone, so an assertion that a published backup or a
+/// bootstrapped follower is mostly holes can pass with the probe wholly
+/// blind. Measured rather than assumed, on 2026-10-18, by returning the whole
+/// remainder from this function and changing nothing else: the bootstrap read
+/// all 2.00 GiB of its images instead of 72 KiB, took 7.9 seconds instead of
+/// 0.36, and the follower's directory still occupied 7.0 MiB of an apparent
+/// 2.00 GiB -- comfortably inside the bound the scenario asserts. The base
+/// backup behaves the same way when the *provider's* probe alone is blinded;
+/// its stream's probe does show up in the output, because the stream has no
+/// all-zero filter to hide behind. Wall clock is the only other thing that
+/// moves, and wall clock is not something the suite asserts on.
+///
+/// Process-wide rather than per-operation because the three callers have no
+/// object in common: the portable copy is a free function inside a trait
+/// impl, the replication sender a free `async fn`, and the control-plane
+/// stream a task spawned over a channel. Threading a handle through all three
+/// would be three signature changes carrying one addition, and the consumer
+/// is a Prometheus counter, which is process-wide regardless.
+///
+/// Relaxed, because nothing is gated on it. A scrape that crosses an
+/// increment may read either side of it, and both answers were true of some
+/// instant.
+pub fn note_snapshot_read(count: u64) {
+    SNAPSHOT_BYTES_READ.fetch_add(count, Ordering::Relaxed);
+}
+
+/// What this process has read from database files to serve base snapshots.
+///
+/// Monotone for the life of the process, so what to look at is the difference
+/// across one operation rather than the value itself. Compare that difference
+/// against the **apparent** length of the files served: a node that skips
+/// holes reads a small fraction of it, and a node that does not reads all of
+/// it.
+pub fn snapshot_bytes_read() -> u64 {
+    SNAPSHOT_BYTES_READ.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -144,6 +196,25 @@ mod tests {
             next_allocated(&file, 1 << 20, 1 << 20),
             None,
             "past the end"
+        );
+    }
+
+    /// The counter has to move, and has to keep what it was given.
+    ///
+    /// Asserted as a **difference** and with `>=` rather than `==`, because
+    /// the counter is process-wide and libtest runs this alongside whatever
+    /// else in the same binary serves a snapshot. An absolute value here
+    /// would be asserting on the order the tests happened to run in. That is
+    /// also how a scenario has to read it, which makes this the smallest
+    /// version of the same discipline.
+    #[test]
+    fn a_recorded_read_moves_the_counter() {
+        let before = super::snapshot_bytes_read();
+        super::note_snapshot_read(4096);
+        let after = super::snapshot_bytes_read();
+        assert!(
+            after >= before + 4096,
+            "{before} -> {after} did not account for 4096 bytes"
         );
     }
 }

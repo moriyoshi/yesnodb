@@ -50,6 +50,10 @@ m = srv_metrics(srv)
 assert "yesnod_shards 2" in m, m
 assert "yesnod_build_info" in m, m
 assert "# TYPE yesnod_wal_syncs_total counter" in m, m
+# Process-wide rather than database-scoped, so the family is asserted and the
+# value is not: whatever else in this process has served a base snapshot has
+# already moved it. `basebackup.py` and `replication.py` assert on the rise.
+assert "# TYPE yesnod_snapshot_bytes_read_total counter" in m, m
 # Every HELP must have a TYPE. A renderer that emits one without the other is a
 # silently failed scrape rather than a visible error.
 assert m.count("# HELP ") == m.count("# TYPE "), (

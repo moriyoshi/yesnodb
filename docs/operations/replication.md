@@ -118,6 +118,16 @@ measurement. Publish the observed window. RTO includes detecting and
 externally fencing the failed leader, selecting a standby, promoting it, and
 repointing clients. Promotion itself is only one part of that interval.
 
+A bootstrap copies shard images, which are sparse files whose apparent length
+is a whole memory-mapping segment whatever the database holds, and the leader
+reads only the parts that carry something. `yesnod_snapshot_bytes_read_total`
+on the leader says how much it has actually read for that purpose; its rise
+across one bootstrap is a small fraction of the images' apparent length when
+the holes are being skipped, and the whole apparent length when they are not.
+A standby whose own data directory stays small while bootstraps take minutes
+rather than seconds is the case this counter distinguishes, because the copy
+can read every hole and still write none of them.
+
 ## Disaster recovery: promotion and fencing
 
 Before promotion, fence the old leader by a mechanism outside yesnodb: stop its

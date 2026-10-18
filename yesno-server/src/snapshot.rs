@@ -299,6 +299,10 @@ async fn copy_sparse(from: &Path, to: &Path, size: u64, name: &str) -> Result<()
                     offset + want as u64
                 ))
             })?;
+        // Counted here rather than at the probe: what this records is what
+        // the disk was asked for, so a probe that stopped narrowing the read
+        // shows up as the figure growing to the file's apparent length.
+        crate::sparse::note_snapshot_read(want as u64);
         let chunk = &buffer[..want];
         offset += want as u64;
         if chunk.iter().all(|byte| *byte == 0) {
