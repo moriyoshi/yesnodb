@@ -288,9 +288,12 @@ fn image_state(path: &Path) -> Result<(u64, u64), BaseBackupAttemptError> {
 /// Durably publish every staged file, and report `( length, allocated )`.
 ///
 /// The measurement is taken here because this walk already opens and stats
-/// every file, and it is taken **after** the writes are flushed: a hole that
-/// has only been declared by `set_len` and not yet reconciled would otherwise
-/// be counted by whatever the page cache happened to have allocated.
+/// every file, and it is taken **after** the flush rather than before it.
+/// That ordering is defensive, not measured: a filesystem with delayed
+/// allocation may not have decided a file's block count until writeback, and
+/// on ext4 here the two orders agree, so nothing would have caught the wrong
+/// one. `basebackup.py` compares the figure against a walk of the published
+/// directory taken afterwards, which is the check that would.
 fn sync_tree(dir: &Path) -> Result<(u64, u64), std::io::Error> {
     let mut bytes = 0u64;
     let mut allocated = 0u64;

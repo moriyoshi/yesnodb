@@ -3274,3 +3274,93 @@ does not pin.
 number to use. `docs/operations/restore.md` already had a section telling an
 operator to `du` the running database; a completed restore now answers that
 question itself.
+
+## 2026-10-18 -- The third copy with no oracle, and the second time the probe turned out to be invisible
+
+The previous entry gave the base backup and the archive restore an assertion
+that their published directories are mostly holes. **The replication bootstrap
+is the same shape and was left out**, which was an oversight rather than a
+judgement: it was the *first* of the four sites fixed, on 2026-10-16, it is
+the one with the largest measured saving ( 15.5 s to 0.24 s for four shards ),
+and nothing in the suite looked at what it produced.
+
+### What it costs to have no oracle here
+
+A leader that went back to reading its whole image, or a follower that
+appended instead of placing chunks at the offsets they carry, produces a
+**correct replica**. Every assertion in `replication.py` passes: the three
+keys are set-equal against the leader and against Python's own answer, the
+cursors agree, the post-checkpoint key arrives. The only symptom is wall
+clock, which this suite does not assert on, and a standby that takes fifteen
+seconds per rebuild instead of a quarter of one.
+
+Measured now, two shards:
+
+| | |
+| --- | --- |
+| length | 2 147 498 216 ( 2.00 GiB ) |
+| allocated | 90 112 ( 88 KiB ) |
+
+The bound is a sixteenth again, which the measured figure clears by fifteen
+hundred and a dense regime misses by sixteen.
+
+### `disk_usage`, and why it is a harness verb rather than a report field
+
+The base backup and the restore could be checked from their own reports,
+because both return one. A bootstrap returns a replay offset, and the thing
+worth asserting is a property of a directory on disk. So the harness gained
+`disk_usage( name )`, which walks a directory in the scenario root recursively
+and returns `{ bytes, allocated }` -- `du --apparent-size` and `du`, the two
+numbers an operator already compares by hand.
+
+It is deliberately general rather than a `repl_*` verb. Three paths in this
+tree copy a shard image and all three now have somewhere to point it, and the
+filesystem and EBS gates have the same question open ( see
+`whether-a-snapshot-provider-other-than-portable-yields-a-sparse-backup-is-unmeasured` ).
+
+It also bought a check that was not the point of adding it. `basebackup.py`
+now compares the report's own `bytes` and `allocated` against a walk of the
+**published** directory -- the report measures staging as it fsyncs it, this
+reads the target after the rename, and they must agree. A figure taken before
+the flush, or a walk that missed a file, shows up there and nowhere else.
+They agree exactly.
+
+### The same two-mechanism structure, at a third site
+
+The previous entry found that defeating `copy_sparse`'s extent probe left the
+output just as sparse, because the all-zero chunk filter downstream caught
+what the probe stopped catching. **The replication sender does exactly the
+same thing**, and the sabotage reproduces exactly the same way:
+
+| sabotage | result |
+| --- | --- |
+| leader's `next_allocated` returns one whole run | **pass**, 358 ms to 2 787 ms |
+| ... and the all-zero chunk test too | FAIL, 2 147 508 224 allocated, 5 070 ms |
+
+So this is a property of how every hole-skipping path in this tree is built,
+not a coincidence of one of them: each has a **probe**, which decides what to
+read, and a **filter**, which decides what to send or write. Allocation sees
+only the filter. The probe's effect is entirely in wall clock -- here 2 787 ms
+against 358 ms, there five times -- and nothing gates on wall clock.
+
+That is worth stating plainly because it bounds what these three assertions
+are worth. They catch a path that stops *producing* holes. They do not catch a
+path that stops *skipping the reading* of them, which on this measurement is
+the larger half of the cost. A guard for that would have to be a counter of
+bytes read, not a property of the output, and none of the three sites keeps
+one.
+
+### A claim from this morning, weakened
+
+The previous commit's `sync_tree` doc said the measurement is taken after the
+flush because "a hole that has only been declared by `set_len` and not yet
+reconciled would otherwise be counted by whatever the page cache happened to
+have allocated." Tested by moving the `stat` back before the `sync_all`:
+**the two orders agree exactly** on ext4 here, 159 744 either way.
+
+The ordering is still right -- a filesystem with delayed allocation need not
+have decided a block count until writeback -- but it is defensive rather than
+established, and the comment asserted it as though it had been checked. It now
+says which it is. A reason given for a line of code is a claim like any other,
+and writing it in the same breath as the code is exactly when it does not get
+tested.

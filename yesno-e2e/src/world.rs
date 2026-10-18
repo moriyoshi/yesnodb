@@ -145,6 +145,7 @@ pub const NAMES: &[&str] = &[
     "yn_class_for",
     "yn_arg",
     "clock_ns",
+    "disk_usage",
 ];
 
 /// Every verb, across all three modules. The single source of truth for name
@@ -1195,6 +1196,40 @@ impl World {
                 Ok(int_obj(self.started.elapsed().as_nanos() as u64))
             }
 
+            // What a directory in the scenario root claims to be, and what it
+            // occupies: the two columns of `du --apparent-size` and `du`.
+            //
+            // **For asserting that holes stayed holes.** A shard image is
+            // grown to a whole 1 GiB mapping segment at creation, so every
+            // path that copies one -- the replication bootstrap, the base
+            // backup, the archive restore -- was taught to move only the parts
+            // that carry something. Each of those has unit tests on its
+            // halves, and the halves only compose on the published directory;
+            // a receiver that stopped declaring what it can place, or a sender
+            // that went back to a whole-file copy, keeps the unit tests green
+            // and silently costs the apparent size again. Nothing else the
+            // harness offers can see that, because the restored bytes are
+            // identical either way.
+            //
+            // Recursive, so pointing it at a directory with subdirectories
+            // does not quietly report a fraction. Symbolic links are counted
+            // as the links they are and never followed.
+            "disk_usage" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let root = self.scenario_path(a.str_at(0)?, verb)?;
+                let (bytes, allocated) = disk_usage(&root).map_err(|error| {
+                    value_err(format!(
+                        "{verb}(): cannot measure '{}': {error}",
+                        root.display()
+                    ))
+                })?;
+                Ok(dict(vec![
+                    ("bytes", int_obj(bytes)),
+                    ("allocated", int_obj(allocated)),
+                ]))
+            }
+
             // Unreachable while `NAMES` and this match agree, which
             // `every_advertised_verb_is_dispatched` enforces.
             _ => Err(type_err(format!("{verb}() is not a harness verb"))),
@@ -1468,6 +1503,38 @@ impl World {
             .take()
             .ok_or_else(|| stale_handle(verb, "batch", h))
     }
+}
+
+/// Sum `( length, allocated )` over every regular file under `root`.
+///
+/// `st_blocks` counts 512-byte units by POSIX, whatever the filesystem's own
+/// block size is -- which is why the multiplier is a constant here rather
+/// than read from the `stat` beside it. On a filesystem with no support for
+/// holes the two numbers come back equal, which is correct and would make a
+/// sparseness assertion fail honestly rather than pass by accident.
+fn disk_usage(root: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut bytes = 0u64;
+    let mut allocated = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            // `file_type` from the directory entry, so a symbolic link is
+            // counted as the link and never followed: a scenario measuring a
+            // published directory wants what that directory holds.
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let meta = entry.metadata()?;
+                bytes = bytes.saturating_add(meta.len());
+                allocated = allocated.saturating_add(meta.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Ok((bytes, allocated))
 }
 
 fn check_range(verb: &str, lo: u64, hi: u64) -> Result<(), MontyException> {

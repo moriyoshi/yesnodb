@@ -1219,8 +1219,8 @@ fn plan_and_cut(
 /// Durably publish every restored file, and report `( length, allocated )`.
 ///
 /// Measured after the flush, for the reason the base backup's own walk gives:
-/// a hole that `set_len` has declared and nothing has reconciled yet is not
-/// a hole the filesystem has agreed to.
+/// a filesystem with delayed allocation need not have decided a file's block
+/// count until writeback.
 fn sync_tree(dir: &Path) -> Result<(u64, u64), ArchiveError> {
     let mut bytes = 0u64;
     let mut allocated = 0u64;

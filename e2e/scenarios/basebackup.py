@@ -81,6 +81,15 @@ assert report["allocated"] * 16 < report["bytes"], (
     "the backup occupies its apparent size: a hole-skipping path went dense",
 )
 
+# The report's own two numbers, against a walk of the **published** directory
+# that the report did not perform. The report measures the staging directory
+# as it fsyncs it; this reads the target after the rename, recursively, and
+# must agree. A figure taken before the flush, or a walk that missed a file,
+# shows up here and nowhere else.
+walked = disk_usage("backup")
+assert walked["bytes"] == report["bytes"], (walked, report)
+assert walked["allocated"] == report["allocated"], (walked, report)
+
 # The same published directory is now an existing target. Refusal happens
 # before transfer, and the successful backup remains the oracle below.
 refused = False

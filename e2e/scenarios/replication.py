@@ -91,6 +91,32 @@ for s in range(SHARDS):
 assert shipped > 0, "the whole catch-up applied no records"
 assert repl_ack(rep, svc, 0) == 0, "the leader still thinks this follower is behind"
 
+# ---- and the images the bootstrap wrote are still mostly holes -------------
+#
+# A shard image is grown to a whole 1 GiB mapping segment at creation, so
+# these two shards are 2 GiB long whatever the leader holds. The leader locates
+# its allocated runs and sends only chunks that carry something; the follower
+# sets the length first and places each chunk at the offset it carries, so the
+# runs the leader skipped become holes rather than zeros. Neither half is
+# checked by the other, and the bytes are identical either way -- a leader that
+# went back to reading the whole image, or a follower that appended instead of
+# placing, produces a correct replica and nothing here would have noticed. It
+# was 15.5 seconds for four shards before the holes were skipped and 0.24
+# afterwards, and wall clock is not something this suite asserts on.
+#
+# Taken before `db_open` below, which replays and allocates on its own account.
+# A sixteenth is far below the measured figure and far above a dense regime;
+# what is under test is that holes are skipped at all, not how much this
+# scenario writes. `base_dedup.py` and `basebackup.py` bound the archive and
+# base-backup copies the same way and for the same reason.
+usage = disk_usage("replica")
+print("  replica " + str(usage))
+assert usage["allocated"] > 0, usage
+assert usage["allocated"] * 16 < usage["bytes"], (
+    usage,
+    "a bootstrapped follower occupies its apparent size: the holes came back",
+)
+
 repl_stop(svc)
 
 # ---- the follower applies by *recovering* ----------------------------------
