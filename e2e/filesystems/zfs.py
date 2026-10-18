@@ -54,10 +54,32 @@ fs_snapshot_release()
 assert fs_snapshot_wait(0) == 0
 
 report = fs_basebackup("zfs-backup")
+print("backup " + str(report))
 assert report["shards"] == 1, report
 assert report["checkpoint"] >= checkpoint, report
 assert report["recovered"] >= report["checkpoint"], report
 assert report["bytes"] > 0, report
+
+# And the holes survived the snapshot.
+#
+# This provider does not copy the image. It takes a dataset snapshot and leases
+# it, so what the backup stream probes with `SEEK_DATA` is the image as ZFS
+# presents it through that snapshot -- and whether a copy-on-write snapshot
+# still reports its holes is a property of ZFS, not of this tree. The portable
+# provider's own hole-skipping says nothing about it. A provider that presented
+# a fully allocated image would cost every backup through it the apparent size,
+# a gibibyte per shard, while every other assertion in this file passed.
+#
+# Measured 2026-10-18: 1 073 750 552 long, 282 624 allocated, a factor of
+# 3 800. That is about seven times what the btrfs and LVM arms allocate for the
+# same content, and the difference is this destination's record granularity
+# rather than anything the transfer did -- which is why the bound is a
+# sixteenth and not a tighter number.
+assert report["allocated"] > 0, report
+assert report["allocated"] * 16 < report["bytes"], (
+    report,
+    "a backup through the ZFS snapshot provider occupies its apparent size",
+)
 
 restored = db_open("zfs-backup", shards=1)
 snapshot = db_snapshot(restored)

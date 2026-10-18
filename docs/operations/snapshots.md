@@ -76,6 +76,35 @@ that immutable directory through the same Protobuf RPCs. It is slower and uses
 temporary local space, but remains consistent and needs no ZFS, Btrfs, or LVM
 tooling.
 
+## Every local provider yields a sparse backup
+
+A shard image is a sparse file whose apparent length is a whole
+memory-mapping segment, currently one gibibyte, whatever the database holds. A
+base backup skips the empty part: the daemon locates the allocated runs of the
+file the lease presents and the client places only what it receives.
+
+For the portable provider that is a property of its own copy. For the others it
+is a property of the filesystem, because they do not copy at all -- they
+snapshot and lease the image in place, so what the daemon probes is whatever
+the snapshot presents. Measured on 2026-10-18, one shard holding a few
+kilobytes, against an apparent 1 073 750 552 bytes in every case:
+
+| provider | allocated | ratio |
+| --- | --- | --- |
+| Btrfs | 40 960 | 26 000 |
+| LVM | 40 960 | 26 000 |
+| ZFS | 282 624 | 3 800 |
+
+All three preserve the holes. The copy-on-write providers share unwritten
+extents rather than materializing them; the LVM provider snapshots a block
+device, so the filesystem mounted off the snapshot carries the same extent map
+and a hole was never allocated in the first place. ZFS allocating about seven
+times as much for the same content is the destination dataset's record
+granularity, not a difference in what crossed the wire.
+
+The EBS providers are not covered by this measurement. Verify the ratio on a
+first backup before sizing a destination against it.
+
 ## ZFS and Btrfs
 
 Configure one backend on the server:

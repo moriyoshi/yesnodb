@@ -44,10 +44,30 @@ fs_snapshot_release()
 assert fs_snapshot_wait(0) == 0
 
 report = fs_basebackup("lvm-backup")
+print("backup " + str(report))
 assert report["shards"] == 1, report
 assert report["checkpoint"] >= checkpoint, report
 assert report["recovered"] >= report["checkpoint"], report
 assert report["bytes"] > 0, report
+
+# And the holes survived the snapshot, for a different reason than on the two
+# copy-on-write filesystems.
+#
+# This provider snapshots a logical volume, which is a *block* device: the
+# filesystem mounted off the snapshot is the same ext4 image with the same
+# extent map, so a hole is a hole because nothing was ever allocated to it, not
+# because a snapshot chose to share it. That makes it the arm most likely to
+# behave and still the one worth asserting, because nothing else in this file
+# would notice a backup through it going dense -- the restored database would
+# be correct and cost a gibibyte per shard.
+#
+# Measured 2026-10-18: 1 073 750 552 long, 40 960 allocated, a factor of
+# 26 000 -- the same figure the btrfs arm reports to the byte.
+assert report["allocated"] > 0, report
+assert report["allocated"] * 16 < report["bytes"], (
+    report,
+    "a backup through the LVM snapshot provider occupies its apparent size",
+)
 
 restored = db_open("lvm-backup", shards=1)
 snapshot = db_snapshot(restored)

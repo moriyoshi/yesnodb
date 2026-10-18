@@ -44,10 +44,32 @@ fs_snapshot_release()
 assert fs_snapshot_wait(0) == 0
 
 report = fs_basebackup("btrfs-backup")
+print("backup " + str(report))
 assert report["shards"] == 1, report
 assert report["checkpoint"] >= checkpoint, report
 assert report["recovered"] >= report["checkpoint"], report
 assert report["bytes"] > 0, report
+
+# And the holes survived the snapshot.
+#
+# This provider does not copy the image. It takes a subvolume snapshot and
+# leases it, so what the backup stream probes with `SEEK_DATA` is the image as
+# btrfs presents it through that snapshot -- and whether a copy-on-write
+# snapshot still reports its holes is a property of btrfs, not of this tree.
+# The portable provider's own hole-skipping says nothing about it. A provider
+# that presented a fully allocated image would cost every backup through it the
+# apparent size, a gibibyte per shard, while every other assertion in this file
+# passed.
+#
+# Measured 2026-10-18: 1 073 750 552 long, 40 960 allocated, a factor of
+# 26 000. The LVM arm reports the same figure to the byte and the ZFS arm about
+# seven times more, which is a destination granularity difference and not a
+# difference in what was transferred.
+assert report["allocated"] > 0, report
+assert report["allocated"] * 16 < report["bytes"], (
+    report,
+    "a backup through the btrfs snapshot provider occupies its apparent size",
+)
 
 restored = db_open("btrfs-backup", shards=1)
 snapshot = db_snapshot(restored)

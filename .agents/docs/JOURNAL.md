@@ -3510,3 +3510,54 @@ produces, and what it read to produce it.
 The restore row is not an omission. It places extents into a file it sized
 first; there is no probe on that path to go blind, which is why the earlier
 sabotage of its all-zero window filter was the one that did fire.
+
+## 2026-10-18 -- Three of the four snapshot providers measured, and all three keep the holes
+
+Filed this morning as `whether-a-snapshot-provider-other-than-portable-yields-a-sparse-backup-is-unmeasured`, on the grounds that
+`basebackup.py` asserts the published directory is mostly holes and runs
+against the **portable** provider -- the only one whose copy this tree wrote.
+The others do not copy at all: they snapshot and lease the image in place, so
+what the daemon probes with `SEEK_DATA` is whatever the snapshot presents, and
+that is a property of btrfs, of ZFS and of the device-mapper, not of us.
+
+The Docker filesystem gate turned out to be runnable here ( `/dev/kvm`
+present ), so it was measured rather than left filed. One shard holding a few
+kilobytes, apparent 1 073 750 552 bytes in every arm:
+
+| provider | allocated | ratio |
+| --- | --- | --- |
+| btrfs | 40 960 | 26 000 |
+| LVM | 40 960 | 26 000 |
+| ZFS | 282 624 | 3 800 |
+
+All three preserve the holes, and each arm now bounds its backup at a
+sixteenth of its apparent length.
+
+Two things in that table are worth keeping rather than just the verdict.
+
+**btrfs and LVM agree to the byte, and for different reasons.** btrfs shares
+unwritten extents with the snapshot; LVM snapshots a block device, so the
+filesystem mounted off the snapshot is the same image with the same extent map
+and a hole was never allocated to begin with. Two mechanisms, one figure. The
+LVM arm is therefore the one most likely to behave and was still worth
+asserting, because nothing else in that file would notice it going dense: the
+restored database would be correct and cost a gibibyte per shard.
+
+**ZFS allocates about seven times as much for the same content**, and that is
+the destination's record granularity rather than a hole-skipping failure --
+the stream sent the same data. It is recorded because it is exactly the kind
+of figure a later session would otherwise read as a regression. It is also why
+all three bounds are a sixteenth: a bound tight enough to be interesting on
+btrfs would fail on ZFS for a reason that has nothing to do with the property
+under test.
+
+The EBS arms remain unmeasured and the item is narrowed to them. They need a
+deployed fixture, and `aws_basebackup` already returns `allocated`, so when
+that fixture runs it is one line.
+
+### What this closes
+
+With this, every path that moves a shard image has an oracle for both halves
+of what it was taught to skip, and every local snapshot provider has one for
+the half that is a property of the filesystem underneath it rather than of
+this tree.
