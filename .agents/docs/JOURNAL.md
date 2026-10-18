@@ -3162,3 +3162,115 @@ One thing measured and not improved: a capture-heavy scenario
 was never the reading. The all-zero filter already kept the *writes* sparse;
 it was `tokio::io::copy` materializing the destination that cost, and that
 scenario's captures do not go through it.
+
+## 2026-10-18 -- A backup that moved 156 KiB reported 4 GiB, and nothing in the suite said the holes were skipped
+
+Two gaps, one shape, closed together. Both follow directly from the previous
+entry: once a base backup stopped moving the empty part of a shard image, the
+number the report carried became wrong and the saving became unguarded.
+
+### The report was measuring the wrong thing, and had been all along
+
+`BaseBackupReport::bytes` is the sum of `metadata().len()` over the published
+directory, taken by the walk that fsyncs it. A shard image is grown to a whole
+1 GiB mapping segment when it is created, so four shards are four gibibytes
+long whatever the database holds. Measured on `basebackup.py` -- four shards,
+sixty-four keys:
+
+| | |
+| --- | --- |
+| length | 4 294 980 552 ( 4.00 GiB ) |
+| allocated | 159 744 ( 156 KiB ) |
+
+The operator-facing completion line said `bytes=4294980552`. An operator
+sizing a backup destination from it would provision four gibibytes for a
+hundred and fifty-six kilobytes, off by a factor of **twenty-six thousand**.
+
+This was always true of the length, but it was not always misleading: before
+the sparse work the published copy really was fully allocated, so the one
+number answered both questions. Skipping the holes split the two questions
+apart and left the report answering only the one nobody asks. A number that
+stops being right because something *else* got better is worth looking for
+after any change like this -- the number itself does not change, so nothing
+draws attention to it.
+
+Both are now reported, neither in place of the other, because both are real:
+the length is what a reader of the directory sees and what copying it without
+hole detection costs -- `tar` without `-S`, a sequential archiver, a
+destination filesystem with no support for holes -- and the allocated size is
+what the target has actually been charged. The measurement rule lives in one
+`pub(crate) fn occupancy` at the crate root, for the reason `ctx` lives there:
+the base backup and the archive restore both need it, neither owns the other,
+and the two reports have to mean the same thing by one reading of `stat`
+rather than two. The restore's report gained the same pair; its module doc
+already said the restored copy was "content-identical and differently
+allocated", and that difference now has a number ( 2.00 GiB long, 6.02 MiB
+allocated, on a two-shard archive ).
+
+`st_blocks` counts 512-byte units by POSIX, whatever the filesystem's own
+block size is. Two unit tests bracket the multiplier from both sides, because
+4096 -- which `stat` prints right beside it as `IO Block` -- is the obvious
+wrong guess and would over-report eightfold.
+
+### Seventeen times, with no oracle
+
+The other half. The previous entry measured the base backup from 13 500 ms to
+800 ms and committed it with unit tests on each half: `copy_sparse` keeps the
+content and drops the holes, and the control-plane stream arm does not send
+the chunks a client can place itself. **Neither test composes.** `allow_sparse`
+is a capability the *caller* declares, and the same change had to write
+`allow_sparse: false` into four struct literals -- two tests and two e2e
+callers that want the path and never the bytes. A receiver that stopped
+setting it, or a provider that went back to a whole-file copy, keeps every
+unit test green and costs the transfer its apparent size again. The only
+symptom is the suite being slower, and nothing gates on wall clock.
+
+So `basebackup.py` now asserts that the published directory is mostly holes,
+which is the same argument `archive_integrity.py` makes about `missing`: the
+unit tests share a derivation with the thing they check, and only the
+composition catches a drift between the parts. The bound is a sixteenth --
+nowhere near either the measured figure, which clears it by seventeen hundred,
+or a dense regime, which misses it by sixteen. What is under test is that holes
+are skipped at all, not how much a scenario happens to write, and a tight
+bound would turn adding a key to the scenario into a failure about sparseness.
+`allocated > 0` keeps it from passing by measuring nothing.
+
+### Six sabotages, and the three that passed were the informative ones
+
+| sabotage | basebackup.py | archive.py |
+| --- | --- | --- |
+| receiver sets `allow_sparse: false` | FAIL, 4 295 012 352 allocated, 8 325 ms | -- |
+| `copy_sparse`'s extent probe always returns one whole run | **pass**, 3 990 ms | -- |
+| ... and the all-zero chunk filter too | FAIL, 4 295 012 352 allocated, 11 112 ms | -- |
+| restore's all-zero window filter defeated | -- | **pass** |
+| restore materializes the interior gaps before each extent | -- | **pass** |
+| restore materializes the whole image | -- | FAIL, 2 147 512 320 allocated |
+
+A sabotage that does not fire is a result, not a failed attempt, and three of
+these six mapped out which mechanism actually produces the observable.
+
+**The copy skips a hole twice over**, and only the second skip is visible
+here. Defeating the extent probe makes the provider *read* the whole image --
+five times the wall clock -- while the all-zero chunk filter downstream keeps
+the *output* just as sparse. The assertion cannot tell the two mechanisms
+apart because they produce one observable. That is the previous entry's lesson
+from the other side: there, two changes had to land before either could be
+measured; here, two mechanisms both have to break before the measurement
+moves. Either way the reading is not about the mechanism you are holding.
+
+**On the restore side almost all of the difference is the trailing hole.** A
+shard image carries its data near the front, so what holds the 2 GiB open is
+`set_len` declaring the length and the extents then being placed at their
+offsets -- not the window filter, and not the interior gaps, which are small.
+Defeating the all-zero window filter changes nothing because a slab object
+carries only its own runs and there is no zero left to filter. The comment in
+`archive.py` says this, so the next reader knows what the assertion does and
+does not pin.
+
+### Where the numbers go
+
+`docs/operations/backup.md` now says to size a destination against
+`allocated`, gives the measured pair, and says when `bytes` is still the right
+number to use. `docs/operations/restore.md` already had a section telling an
+operator to `du` the running database; a completed restore now answers that
+question itself.

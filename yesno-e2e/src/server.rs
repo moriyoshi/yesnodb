@@ -1095,6 +1095,7 @@ impl World {
                     ("recovered", int_obj(report.recovered_version)),
                     ("term", int_obj(report.term as u64)),
                     ("bytes", int_obj(report.bytes)),
+                    ("allocated", int_obj(report.allocated)),
                     ("attempts", int_obj(report.attempts as u64)),
                 ]))
             }
@@ -1127,6 +1128,7 @@ impl World {
                     ("term", int_obj(report.term as u64)),
                     ("base_generation", int_obj(report.base_generation)),
                     ("bytes", int_obj(report.bytes)),
+                    ("allocated", int_obj(report.allocated)),
                 ]))
             }
 
@@ -1209,6 +1211,7 @@ impl World {
                     ("term", int_obj(report.term as u64)),
                     ("base_generation", int_obj(report.base_generation)),
                     ("bytes", int_obj(report.bytes)),
+                    ("allocated", int_obj(report.allocated)),
                     ("published", int_obj(u64::from(report.paused_at.is_none()))),
                     (
                         "directory",

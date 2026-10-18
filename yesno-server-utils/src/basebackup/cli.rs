@@ -95,9 +95,14 @@ pub async fn run(cli: BasebackupOptions) -> Result<BaseBackupReport, BasebackupE
 }
 
 /// Render the stable human-facing completion line.
+///
+/// `bytes` is the directory's length and `allocated` is what it occupies. The
+/// second is the one to size a backup destination against; the first is what
+/// the destination will need if whatever copies it next does not preserve
+/// holes, which is why both are printed.
 pub fn completion_line(report: &BaseBackupReport) -> String {
     format!(
-        "base backup complete: target={} uuid={} term={} shards={} checkpoint={} recovered={} bytes={} attempts={}",
+        "base backup complete: target={} uuid={} term={} shards={} checkpoint={} recovered={} bytes={} allocated={} attempts={}",
         report.target.display(),
         uuid_hex(&report.db_uuid),
         report.term,
@@ -105,6 +110,7 @@ pub fn completion_line(report: &BaseBackupReport) -> String {
         report.checkpoint_version,
         report.recovered_version,
         report.bytes,
+        report.allocated,
         report.attempts
     )
 }

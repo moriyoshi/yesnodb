@@ -64,6 +64,11 @@ actually in use -- often three orders of magnitude. Size the target volume from
 `du` on the running database, not from `ls -l` and not from the size of the
 archive objects.
 
+A completed restore reports both numbers itself, as `bytes` and `allocated`,
+so a restore that has already run answers the sizing question for the next one
+without a `du` on anything. The same pair appears on a base backup's completion
+line.
+
 The restored copy is content-identical to the original and allocated the same
 way: empty regions are left as holes rather than written out as zeros. A
 filesystem that does not support sparse files will allocate the whole apparent

@@ -1420,6 +1420,7 @@ impl World {
                     ("checkpoint", int_obj(report.checkpoint_version)),
                     ("recovered", int_obj(report.recovered_version)),
                     ("bytes", int_obj(report.bytes)),
+                    ("allocated", int_obj(report.allocated)),
                 ]))
             }
             "fs_archive_start" => {

@@ -1589,6 +1589,7 @@ impl World {
                     ("checkpoint", int_obj(report.checkpoint_version)),
                     ("recovered", int_obj(report.recovered_version)),
                     ("bytes", int_obj(report.bytes)),
+                    ("allocated", int_obj(report.allocated)),
                 ]))
             }
             "aws_crash_server" => {

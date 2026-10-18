@@ -94,6 +94,21 @@ srv_archive_stop(archive)
 restored_report = srv_restore("objects", "restore-v2", 2)
 assert restored_report["recovered"] == 2, restored_report
 assert restored_report["checkpoint"] <= 2, restored_report
+# The restored copy is content-identical and differently allocated, which the
+# restore module states in prose and nothing else states in numbers. Measured
+# when this was written: 2.00 GiB long, 6.02 MiB allocated.
+#
+# What it pins is narrower than it looks, and worth naming. Almost all of that
+# difference is the **trailing** hole -- a shard image carries its data near
+# the front and the rest of the mapping segment is empty -- so what holds it
+# open is the length being declared by `set_len` and the extents then being
+# placed at their offsets. Materializing the image first makes this fail;
+# defeating the all-zero window filter does not, because the slab objects
+# carry only their own runs and there is nothing zero left to filter. See
+# `basebackup.py` for the same oracle on the other copy.
+print("restored_report=" + str(restored_report))
+assert restored_report["allocated"] > 0, restored_report
+assert restored_report["allocated"] * 16 < restored_report["bytes"], restored_report
 restored = db_open("restore-v2", shards=1)
 snapshot = db_snapshot(restored)
 assert snap_load(snapshot, 1) == [10, 20, 50]

@@ -228,6 +228,15 @@ pub struct RestoreReport {
     pub shards: u32,
     /// Bytes in the published directory.
     pub bytes: u64,
+    /// What the published directory occupies, which is far less than its
+    /// length because the holes come back as holes.
+    ///
+    /// The module's "Holes are not restored" note says the copy is
+    /// content-identical and differently allocated. This is that difference,
+    /// measured, so a report says it in numbers rather than only in prose: a
+    /// restored four-shard database is four gibibytes long whatever it holds,
+    /// and an operator provisioning for the restore needs the other number.
+    pub allocated: u64,
     /// What was done with the recovered directory.
     pub action: TargetAction,
     /// Set when `action` was [`TargetAction::Pause`]: the staging directory that
@@ -1207,18 +1216,26 @@ fn plan_and_cut(
     Ok((selected, plan.times.get(&selected).copied()))
 }
 
-fn sync_tree(dir: &Path) -> Result<u64, ArchiveError> {
+/// Durably publish every restored file, and report `( length, allocated )`.
+///
+/// Measured after the flush, for the reason the base backup's own walk gives:
+/// a hole that `set_len` has declared and nothing has reconciled yet is not
+/// a hole the filesystem has agreed to.
+fn sync_tree(dir: &Path) -> Result<(u64, u64), ArchiveError> {
     let mut bytes = 0u64;
+    let mut allocated = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
             let file = std::fs::File::open(entry.path())?;
-            bytes = bytes.saturating_add(file.metadata()?.len());
             file.sync_all()?;
+            let (len, held) = crate::occupancy(&file.metadata()?);
+            bytes = bytes.saturating_add(len);
+            allocated = allocated.saturating_add(held);
         }
     }
     std::fs::File::open(dir)?.sync_all()?;
-    Ok(bytes)
+    Ok((bytes, allocated))
 }
 
 /// Reconstruct and atomically publish one archived database directory.
@@ -1276,7 +1293,7 @@ pub async fn restore_to(
         term = yesno_core::promote_database(&staging.path, term.saturating_add(1))?;
     }
 
-    let bytes = sync_tree(&staging.path)?;
+    let (bytes, allocated) = sync_tree(&staging.path)?;
     let mut database_uuid = [0u8; 16];
     database_uuid.copy_from_slice(&manifest.database_uuid);
     let mut report = RestoreReport {
@@ -1290,6 +1307,7 @@ pub async fn restore_to(
         target: recovery_target,
         shards,
         bytes,
+        allocated,
         action,
         paused_at: None,
     };
@@ -1503,7 +1521,7 @@ pub fn completion_line(report: &RestoreReport) -> String {
         _ => "restore complete",
     };
     format!(
-        "{verb}: target={} uuid={} term={} base={} checkpoint={} recovered={} shards={} bytes={} recovered_time={} action={:?}",
+        "{verb}: target={} uuid={} term={} base={} checkpoint={} recovered={} shards={} bytes={} allocated={} recovered_time={} action={:?}",
         report.directory.display(),
         uuid_hex(&report.database_uuid),
         report.term,
@@ -1512,6 +1530,7 @@ pub fn completion_line(report: &RestoreReport) -> String {
         report.recovered_version,
         report.shards,
         report.bytes,
+        report.allocated,
         time,
         report.action,
     )
@@ -1798,6 +1817,7 @@ mod tests {
             },
             shards: 2,
             bytes: 4096,
+            allocated: 4096,
             action: TargetAction::Publish,
             paused_at: None,
         }));

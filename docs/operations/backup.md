@@ -42,8 +42,24 @@ replica recovery, synchronizes it, and publishes the target with one directory
 rename.
 
 The completion line records the database UUID, leadership term, shard count,
-base checkpoint, recovered version, byte size, and attempt count. Store the
+base checkpoint, recovered version, two sizes, and attempt count. Store the
 completed directory outside the leader and standby failure domain.
+
+**Size the destination against `allocated`, not against `bytes`.** A shard
+image is a sparse file whose apparent length is a whole memory-mapping segment,
+currently one gibibyte, whatever the database holds, and a base backup copies
+only the parts that carry something: the daemon reads just the allocated runs,
+sends just the chunks that carry data, and the client places each one at the
+offset it carries. The published directory is therefore long and almost empty.
+Measured on a four-shard database holding a few hundred kilobytes: **156 KiB
+allocated against an apparent 4.00 GiB**, and the transfer about seventeen
+times quicker than the same backup taken without skipping the holes.
+
+`bytes` is still the number to use when whatever handles the directory next
+does not preserve holes. `tar` without `-S`, an archiver that reads the file
+sequentially, or a destination filesystem with no support for sparse files will
+each want the apparent size. An archive restore reports the same pair for the
+same reason.
 
 The manifest is mandatory. It carries the database identity and routing map.
 Restoring shard files without it can create a new identity and route keys to the
