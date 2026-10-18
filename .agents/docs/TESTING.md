@@ -139,7 +139,7 @@ nothing has ever guaranteed a hand-written count.
 | `fs_*` | `filesystems.rs` | deployed `yesnod` + `yesno-archive` over the local control socket, checkpoint-triggered direct ZFS/Btrfs/LVM snapshots, stateful Winterbaume S3, hot base backup, crash reconciliation, S3 restore, and restored-daemon reads in a disposable QEMU/KVM guest |
 | `search_*` | `search.rs` | the Java application adapters and version-locked OpenSearch/Elasticsearch plugins, including pinned downloads and disposable engines |
 | `srv_*` | `server.rs` | the shipped `yesnod` daemon, started in-process, plus the `yesnoctl` backup/restore and `yesno-archive` library entry points: lifecycle, metrics, auth and explicit control capability rules, control-plane checkpoint, replication/follower roles, hot-backup restore, object publication, and retention-gap rebootstrap |
-| `yn_*` `clock_ns` `disk_usage` `snapshot_bytes_read` | `world.rs` | the harness itself: constants, corpus knobs, a clock, what a directory in the scenario root claims to be against what it occupies, and how much this process has read off disk to serve base snapshots |
+| `yn_*` `clock_ns` `disk_usage` `snapshot_bytes_read` `archive_bytes_read` | `world.rs` | the harness itself: constants, corpus knobs, a clock, what a directory in the scenario root claims to be against what it occupies, and how much this process has read off disk to serve base snapshots or to upload bases |
 
 ### Waiting for an asynchronous subject
 

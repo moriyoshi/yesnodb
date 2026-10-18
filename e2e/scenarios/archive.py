@@ -12,6 +12,7 @@ flight = srv_flight(leader)
 
 assert flight_put(flight, [1, 1, 1], [10, 20, 50]) == 3
 
+read_before = archive_bytes_read()
 archive = srv_archive_start(leader, "objects", "archive-work")
 # Startup and listener events prove that the control subscription is running,
 # but only a completed checkpoint event may activate the first base.
@@ -29,6 +30,45 @@ assert initial["term"] == 0, initial
 # because shipping the holes is still correct.
 assert initial["base_object_bytes"] > 0, initial
 assert initial["base_object_bytes"] * 64 < initial["base_apparent_bytes"], initial
+
+# And the capture did not read the holes to find out they were holes, which is
+# the half of the saving the assertion above is blind to.
+#
+# The uploader skips a hole twice: the extent probe decides which 2 MiB slab
+# windows are read at all, and an all-zero test decides which of the windows
+# that were read become objects. The archive records only what survives the
+# second test, so blinding the probe leaves what the archive holds byte for
+# byte identical and moves nothing but the wall clock. That was measured here,
+# not argued: with the probe returning the whole file, this capture reported
+# `base_object_bytes` 6 299 648 and `slab_objects` 4 -- the same two figures as
+# an honest run, to the byte -- and took 8.9 seconds instead of 1.8. The
+# assertion above passed. That is a stronger version of what the same sabotage
+# showed on 2026-10-18 for the base backup and the replication bootstrap, where
+# the allocation at least shifted, and it is why reading the whole image cost
+# 17.3 seconds for a four-shard capture before this module learned `SEEK_DATA`.
+#
+# Measured when this was written: 6 299 648 bytes read of an apparent
+# 2 147 491 840, a factor of three hundred and forty. A sixteenth is the bound,
+# which a blind probe misses by sixteen times and this clears by twenty-one, for
+# the reason the other three sites give -- what is under test is that holes are
+# skipped at all, not how much this scenario happens to write.
+#
+# The counter is process-wide and the harness runs its sidecars inside this
+# process, so the difference across the capture is the reading.
+read_delta = archive_bytes_read() - read_before
+print("capture read " + str(read_delta) + " of " + str(initial["base_apparent_bytes"]))
+assert read_delta > 0, "the capture read nothing at all"
+assert read_delta * 16 < initial["base_apparent_bytes"], (
+    read_delta,
+    initial,
+    "the capture read its apparent size: the extent probe went blind",
+)
+# An object's bytes were read to produce it, so this cannot be less. It can be
+# more, and legitimately: a window that is allocated but all zeros is read and
+# stored as nothing, and a slab the active base already holds is read, hashed
+# and then not uploaded. Here the two came out equal, which says every window
+# this capture read carried something.
+assert read_delta >= initial["base_object_bytes"], (read_delta, initial)
 
 # A later ordinary checkpoint is observation, not a new recovery root. Wait
 # until both checkpoint phases have crossed the durable event cursor so this

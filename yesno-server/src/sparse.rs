@@ -100,7 +100,7 @@ static SNAPSHOT_BYTES_READ: AtomicU64 = AtomicU64::new(0);
 /// Relaxed, because nothing is gated on it. A scrape that crosses an
 /// increment may read either side of it, and both answers were true of some
 /// instant.
-pub fn note_snapshot_read(count: u64) {
+pub(crate) fn note_snapshot_read(count: u64) {
     SNAPSHOT_BYTES_READ.fetch_add(count, Ordering::Relaxed);
 }
 

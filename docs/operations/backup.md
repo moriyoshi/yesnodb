@@ -394,6 +394,15 @@ The counters accumulate over the sidecar's lifetime and reset when it restarts:
   interval is shorter than the capture, and the interval should be raised.
 - `yesnod_archive_objects_deleted_total`: archive objects deleted. Flat at zero
   on a sidecar with no `--retention-window`, which surveys and deletes nothing.
+- `yesnod_archive_base_bytes_read_total`: bytes read off the database's own
+  files to upload bases. A shard image is a sparse file whose apparent length
+  is a whole memory-mapping segment whatever the database holds, and a capture
+  reads only the parts that carry something -- measured on a two-shard
+  database, 6.0 MiB read of an apparent 2.00 GiB. What the archive stores does
+  not show that difference, because a capture that read every hole would store
+  exactly the same objects; the symptom of losing it is a capture that takes
+  several times as long for no change in what it produces, and this counter is
+  what distinguishes that from a slower object store.
 
 The gauges report the last completed pass, reclaiming or surveying. They are
 absent until one completes, so a sidecar that has never surveyed the archive

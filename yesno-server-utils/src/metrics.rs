@@ -209,6 +209,20 @@ impl ArchiveMetrics {
             "Archive objects reclamation has deleted.",
             self.deleted.load(Ordering::Relaxed),
         );
+        // Not one of this struct's fields, and deliberately rendered here
+        // anyway: the reading happens in the slab uploader, which has no
+        // `ArchiveMetrics` to hand, and this is the family an operator scrapes
+        // for archive work. The daemon renders its own snapshot counter the
+        // same way.
+        counter(
+            &mut s,
+            "archive_base_bytes_read_total",
+            "Bytes read from database files to upload bases. Compare the rise \
+             across one capture against the apparent length of the files it \
+             captured: skipping holes reads a small fraction of it, and the \
+             objects stored look identical either way.",
+            crate::archive::base_bytes_read(),
+        );
 
         // Withheld until a pass has completed: see the module comment. An
         // absent family says "never surveyed"; a zero would say "surveyed and

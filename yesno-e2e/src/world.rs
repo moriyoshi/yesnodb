@@ -147,6 +147,7 @@ pub const NAMES: &[&str] = &[
     "clock_ns",
     "disk_usage",
     "snapshot_bytes_read",
+    "archive_bytes_read",
 ];
 
 /// Every verb, across all three modules. The single source of truth for name
@@ -1253,6 +1254,22 @@ impl World {
                 a.exact(0)?;
                 a.no_kwargs()?;
                 Ok(int_obj(yesno_server::sparse::snapshot_bytes_read()))
+            }
+
+            // The same figure for an archive capture, which is a separate
+            // counter in a separate crate because a capture runs in the
+            // sidecar process when a sidecar is deployed and serves an
+            // archive rather than a base snapshot.
+            //
+            // Bracket a capture and compare the rise against the apparent
+            // length of what it captured. The stored objects cannot show this:
+            // the uploader reads whole slab windows and stores only the ones
+            // that are not all zeros, so blinding its extent probe leaves
+            // every object, extent and checksum in the archive identical.
+            "archive_bytes_read" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                Ok(int_obj(yesno_server_utils::archive::base_bytes_read()))
             }
 
             // Unreachable while `NAMES` and this match agree, which

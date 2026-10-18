@@ -98,6 +98,49 @@ const SLAB_OBJECT_BYTES: usize = yesno_core::store::SLAB_SIZE as usize;
 /// because each task holds its slab in memory: this many times
 /// [`SLAB_OBJECT_BYTES`] is the upload's working set.
 const SLAB_UPLOAD_CONCURRENCY: usize = 16;
+
+/// Bytes read from a database file to upload a base, process-wide.
+static BASE_BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Record `count` bytes read from a database file while uploading a base.
+///
+/// **The capture skips a hole twice and only one of the two is visible in the
+/// archive.** The extent probe decides which slab windows are read at all,
+/// and the all-zero test above decides which of the windows that were read
+/// become objects. The stored bytes are set by the second test alone, so a
+/// probe that stopped narrowing the read would leave every object, every
+/// extent and every checksum in this archive byte for byte identical, and
+/// only the wall clock would move -- 17.3 seconds for a four-shard capture
+/// before the holes were skipped, which is where this module's `SEEK_DATA`
+/// came from in the first place.
+///
+/// That is not a hypothesis about this path. It was measured on the other
+/// three hole-skipping copies in this tree on 2026-10-18, by blinding their
+/// probe and watching every assertion about their output stay green. See
+/// `yesno_server::sparse::note_snapshot_read`, which is this counter's
+/// opposite number for a base snapshot. They are deliberately **not** the
+/// same counter: a capture runs in the sidecar process when a sidecar is
+/// deployed, so its reads would never reach the daemon's `/metrics`, and it
+/// serves an archive rather than a base snapshot.
+///
+/// Process-wide and relaxed for the reasons that counter gives: there is no
+/// object the reading and the reporting share, nothing is gated on the value,
+/// and a scrape that crosses an increment may read either side of it.
+fn note_base_read(count: u64) {
+    BASE_BYTES_READ.fetch_add(count, Ordering::Relaxed);
+}
+
+/// What this process has read from database files to upload bases.
+///
+/// Monotone for the life of the process, so what to look at is the difference
+/// across one capture. Compare it against the **apparent** length of the
+/// files captured, which a published base reports as the sum of its files'
+/// `size`: a capture that skips holes reads a small fraction of that, and one
+/// that does not reads all of it.
+pub fn base_bytes_read() -> u64 {
+    BASE_BYTES_READ.load(Ordering::Relaxed)
+}
+
 pub(crate) const STATE_OBJECT: &str = "state.pb";
 pub(crate) const WRITER_OBJECT: &str = "writer.pb";
 
@@ -676,6 +719,10 @@ impl ArchiveStore {
                 )
                 .into());
             }
+            // What the disk was asked for, which is the only observable the
+            // probe above has: everything below this line filters again, and
+            // the archive records only what survives that second filter.
+            note_base_read(count as u64);
             let filled = &slab[..count];
             checksum = crc32c::crc32c_append(checksum, filled);
             read_total = at + count as u64;

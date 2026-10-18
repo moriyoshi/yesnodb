@@ -3449,3 +3449,64 @@ rather than folded in here, because it runs in the sidecar process when a
 sidecar is deployed, so its reads would never reach the daemon's `/metrics`,
 and because an archive capture is not a base snapshot. The shape to copy is
 `ArchiveMetrics`, not this counter.
+
+## 2026-10-18 -- The fourth copy, and the sabotage that left the archive identical to the byte
+
+The entry above filed the archive capture as the one hole-skipping path still
+counted nowhere. This closes it, the same day, because the shape was already
+decided and the only open question was where the number should surface.
+
+`yesno_server_utils::archive::base_bytes_read()` is the counter, incremented
+in the slab uploader at the `fill` that reads a window. It renders on the
+sidecar's own family as `yesnod_archive_base_bytes_read_total` -- not on the
+daemon's, for the two reasons the TODO gave: a capture runs in the sidecar
+process when a sidecar is deployed, so its reads would never reach the
+daemon's `/metrics`, and an archive capture is not a base snapshot. The
+harness reads it through `archive_bytes_read()`, beside `snapshot_bytes_read`.
+
+`note_base_read` is private and `note_snapshot_read` was narrowed from `pub`
+to `pub(crate)` in the same change. Neither has a caller outside its crate and
+R1 turns a `pub fn` into a promise; the previous commit made one of them public
+for no reason, which is the mistake `stats.rs` is the standing precedent for.
+
+### What it measures, and the sabotage
+
+`archive.py`, two shards and three ordinals, bracketing the first capture:
+
+| | base_object_bytes | slab_objects | bytes read | wall |
+| --- | --- | --- | --- | --- |
+| honest | 6 299 648 | 4 | 6 299 648 | 1.8 s |
+| probe blind | 6 299 648 | 4 | 2 147 491 840 | 8.9 s |
+
+**The archive is identical to the byte.** Every object, every extent, every
+checksum, the object count and the stored total all come back the same, the
+existing `base_object_bytes * 64 < base_apparent_bytes` assertion passes, and
+the only two things that move are this counter and the clock. That is a
+stronger demonstration than either of the two taken earlier today: on the
+bootstrap and on the backup's provider half the allocation at least shifted,
+far enough to be visible but not far enough to cross the bound. Here there is
+nothing in the output to shift, because the uploader's second filter -- the
+all-zero window test -- decides the entire content of the archive on its own.
+
+The honest figures being *equal* rather than merely close is worth a note: it
+says every window this capture read carried something, so nothing was read and
+then discarded. `archive.py` asserts `read >= base_object_bytes` as a
+cross-check and says why it is an inequality -- an allocated-but-zero window
+is read and stored as nothing, and a slab the active base already holds is
+read, hashed and not uploaded.
+
+### Where this leaves the four paths
+
+Every hole-skipping copy in the tree now has both halves asserted: what it
+produces, and what it read to produce it.
+
+| path | output oracle | read oracle |
+| --- | --- | --- |
+| base backup | `basebackup.py`, allocated | `basebackup.py`, `snapshot_bytes_read` |
+| follower bootstrap | `replication.py`, allocated | `replication.py`, `snapshot_bytes_read` |
+| archive restore | `archive.py`, allocated | none; a restore writes rather than reads |
+| archive capture | `archive.py`, object bytes | `archive.py`, `archive_bytes_read` |
+
+The restore row is not an omission. It places extents into a file it sized
+first; there is no probe on that path to go blind, which is why the earlier
+sabotage of its all-zero window filter was the one that did fire.
