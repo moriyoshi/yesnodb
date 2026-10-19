@@ -271,6 +271,16 @@ impl KeyLanes {
     /// this type has no transport. A caller that has advertised a batch cap
     /// enforces it before calling, which is also the order that keeps the
     /// refusal attributable to the limit the peer was told about.
+    ///
+    /// **A poisoned handle is refused here as well, and a caller that tells an
+    /// engine failure apart from a bad request has to ask [`Self::poisoned`]
+    /// first.** The error is the same `Invariant` either way: this type has one
+    /// error for a broken invariant and no notion of whose fault it is. A
+    /// transport that mapped every refusal from this method onto "the peer sent
+    /// something wrong" would describe a handle killed by a failed read as a
+    /// batch the peer composed badly -- which is the one distinction a caller
+    /// reporting statuses most needs to keep, and one that did go wrong for a day
+    /// in this tree.
     pub fn check_targets(&self, prefixes: &[Prefix48]) -> Result<()> {
         if self.poisoned {
             return Err(CodecError::Invariant(

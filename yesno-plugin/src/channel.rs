@@ -1091,6 +1091,21 @@ impl Session {
         let Some(h) = self.handles.get_mut(&id) else {
             return Self::fault(Status::InvalidArgument, "no such lane handle");
         };
+        // Poisoning is asked about separately, and first. `check_targets` refuses a
+        // poisoned handle with the same `Invariant` it uses for a batch the peer
+        // composed badly, and those two must not reach the peer as one status: this
+        // method takes care everywhere else to keep caller input and operational
+        // failure apart, and routing a dead handle through the arm below told a peer
+        // whose engine read had failed that its own input was wrong. `block_advance`
+        // and `block_advance_many` report the same handle as `Internal` because
+        // their refusal comes back through `status_from_core`, so asking here is
+        // what keeps the three paths saying the same thing about one handle.
+        if h.lanes.poisoned() {
+            return Self::fault(
+                Status::Internal,
+                "these key lanes were poisoned by an earlier failure",
+            );
+        }
         // The whole batch, before anything moves. The engine's message names which
         // rule failed, and it is the caller's input either way -- `status_from_core`
         // would call an `Invariant` internal, which is right for an engine fault
@@ -1703,5 +1718,277 @@ mod tests {
                 lane_a.kind
             );
         }
+    }
+
+    // ---- A poisoned handle, as a peer sees it ----------------------------------
+    //
+    // `KeyLanes` poisons itself when a seek or a payload read fails, and the
+    // `Session` has to turn that into something a peer can act on. The core tests
+    // cover the engine's half by calling `poison` directly; these cover this
+    // file's half, which until now was asserted nowhere -- and the first thing
+    // that showed up when it was asserted was a wrong status, recorded in
+    // `.agents/docs/JOURNAL.md` under 2026-10-20.
+    //
+    // **The one thing these tests reach past the protocol for is the poisoning
+    // itself**, through the private handle map. There is no frame that poisons a
+    // handle and there must not be: poisoning is what an *operational* failure
+    // does, and `Session::handle` offers no way to make an engine read fail. The
+    // alternative considered was a `#[doc( hidden )] pub fn poison_for_test` on
+    // `Session`, which would let these live beside the other protocol tests in
+    // `tests/channel_session.rs` at the cost of a public method whose only
+    // purpose is to break a handle. One line of private access inside the crate
+    // is the cheaper of the two. Everything else here goes through `handle`.
+    //
+    // What is still **not** covered, and is filed as
+    // `lane-handle-poisoning-is-untested-above-the-engine`: a real operational
+    // failure driving the engine into this state. These start from the state, not
+    // from the fault that produces it.
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A greeted session on a two-key database, with one handle over the whole
+    /// prefix space and a block already read.
+    ///
+    /// `max_blocks` is 4 so a target batch can be legal, and `max_handles` is 2 so
+    /// a leaked arena slot is observable rather than merely likely.
+    fn session_with_handle(tag: &str) -> (Cleanup, Session, u64) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("yesno-poison-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let clean = Cleanup(dir.clone());
+
+        let db = yesno_core::Db::open_with(
+            &dir,
+            yesno_core::DbOptions {
+                shards: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut b = db.batch();
+        // key 10: chunks 0, 1 and 5. key 30: chunk 3, so some blocks have an absent
+        // lane and the fixture is not uniformly present.
+        for c in [0u64, 1, 5] {
+            for i in 0..3u64 {
+                b.insert(10, c * 65536 + 7 + i);
+            }
+        }
+        b.insert_range(30, 3 * 65536, 3 * 65536 + 4096);
+        b.commit().unwrap();
+        db.checkpoint().unwrap();
+
+        let slot = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(db))));
+        let host = crate::Host::new(slot, 1, crate::abi::Role::Leader);
+        let limits = Limits {
+            max_handles: 2,
+            max_lanes: 4,
+            max_blocks: 4,
+            max_snapshots: 8,
+            max_writes: crate::ipc::MAX_WRITES,
+            max_expr_bytes: crate::ipc::MAX_EXPR_BYTES,
+        };
+        let arena = Arena::new(limits.arena_bytes()).expect("memfd arena");
+        let mut s = Session::new(host, arena, limits);
+        assert_eq!(
+            s.handle(Frame::ClientHello {
+                protocol: crate::ipc::VERSION as u32,
+                name: "poison".into()
+            }),
+            Frame::Done
+        );
+        let snapshot = match s.handle(Frame::SnapshotOpen) {
+            Frame::SnapshotOpened { snapshot, .. } => snapshot,
+            other => panic!("{other:?}"),
+        };
+        let lanes = match s.handle(Frame::LanesAcquire {
+            snapshot,
+            keys: vec![10, 30],
+        }) {
+            Frame::LanesAcquired { lanes, .. } => lanes,
+            other => panic!("{other:?}"),
+        };
+        (clean, s, lanes)
+    }
+
+    /// Put the handle into the state a failed seek or payload read leaves behind.
+    fn poison(s: &mut Session, lanes: u64) {
+        s.handles
+            .get_mut(&lanes)
+            .expect("the fixture's handle")
+            .lanes
+            .poison();
+    }
+
+    fn status_of(f: &Frame) -> u32 {
+        match f {
+            Frame::Fault { status, .. } => *status,
+            other => panic!("expected a fault, got {other:?}"),
+        }
+    }
+
+    /// A dead handle is an engine failure, not a bad request.
+    ///
+    /// This is a regression test for a defect this file shipped on 2026-10-19 and
+    /// kept for a day: `Session::block_seek_many` asked `check_targets` first,
+    /// and `check_targets` refuses a poisoned handle with the same `Invariant` it
+    /// uses for a batch the peer composed badly. Every such refusal was reported
+    /// as `InvalidArgument`, so a peer whose engine read had failed was told its
+    /// own input was wrong -- the one distinction the method is written to
+    /// preserve, lost on the path that most needed it.
+    ///
+    /// **The batch below is deliberately legal**: ascending, unique, inside the
+    /// window and past the position. Nothing about it is refusable, so the status
+    /// can only be about the handle.
+    #[test]
+    fn a_poisoned_handle_faults_a_target_batch_as_an_engine_failure() {
+        let (_c, mut s, lanes) = session_with_handle("targets");
+        poison(&mut s, lanes);
+        let f = s.handle(Frame::BlockSeekMany {
+            lanes,
+            prefixes: vec![1, 3],
+        });
+        assert_eq!(
+            status_of(&f),
+            Status::Internal as u32,
+            "a poisoned handle must not come back as the peer's input error"
+        );
+        assert_ne!(
+            status_of(&f),
+            Status::InvalidArgument as u32,
+            "this is the exact confusion the check exists to prevent"
+        );
+    }
+
+    /// Every later request fails, and the peer can still tidy up.
+    ///
+    /// The three read paths must agree about one handle, which is why this asserts
+    /// the batched advance as well as the single one: they reach the poisoned
+    /// state through different calls -- `advance` for both, `check_targets` for
+    /// the batch -- and a status that depended on which request arrived would make
+    /// a peer's retry logic depend on its own last choice of frame.
+    ///
+    /// `BlockRelease` is the exception and answers `Done`. It is not a read: it
+    /// says "I am finished with the payloads", and a peer that has just been
+    /// faulted has to be able to say that. Refusing it would leave a conscientious
+    /// peer with no way to close out the handle except by releasing it.
+    #[test]
+    fn a_poisoned_handle_refuses_every_later_read() {
+        let (_c, mut s, lanes) = session_with_handle("reads");
+        assert!(matches!(
+            s.handle(Frame::BlockAdvance { lanes }),
+            Frame::Block { .. }
+        ));
+        assert_eq!(s.handle(Frame::BlockRelease { lanes }), Frame::Done);
+        poison(&mut s, lanes);
+
+        for f in [
+            s.handle(Frame::BlockAdvance { lanes }),
+            s.handle(Frame::BlockAdvanceMany {
+                lanes,
+                max_blocks: 2,
+            }),
+            s.handle(Frame::BlockSeekMany {
+                lanes,
+                prefixes: vec![5],
+            }),
+        ] {
+            assert_eq!(
+                status_of(&f),
+                Status::Internal as u32,
+                "all three read paths must describe the same dead handle the same way"
+            );
+        }
+        assert_eq!(
+            s.handle(Frame::BlockRelease { lanes }),
+            Frame::Done,
+            "a faulted peer must still be able to give the payloads back"
+        );
+    }
+
+    /// Poisoning drops the containers of the block the peer was reading.
+    ///
+    /// Not merely "the peer cannot ask for them again" -- the handle stops holding
+    /// them, so a later bug that found a way back in would find nothing rather
+    /// than a half-advanced block that reads like a whole one. The engine does
+    /// this; what this asserts is that the `Session` keeps no second copy of its
+    /// own, which it does not and which is worth a test because both batched paths
+    /// encode straight through `h.lanes.lane( i )`.
+    ///
+    /// The arena bytes are a separate matter and are **not** claimed here: with a
+    /// shared region the last block's payloads are in the peer's own mapping and
+    /// poisoning cannot erase them. What ends that lend is the response, and the
+    /// response is a fault.
+    #[test]
+    fn poisoning_drops_the_block_the_peer_was_reading() {
+        let (_c, mut s, lanes) = session_with_handle("open");
+        assert!(matches!(
+            s.handle(Frame::BlockAdvance { lanes }),
+            Frame::Block { .. }
+        ));
+        let h = s.handles.get(&lanes).expect("the fixture's handle");
+        assert!(h.lanes.present() > 0, "the test is vacuous without a block");
+        poison(&mut s, lanes);
+        let h = s
+            .handles
+            .get(&lanes)
+            .expect("the handle is kept, not dropped");
+        assert_eq!(
+            h.lanes.present(),
+            0,
+            "a poisoned handle holds no containers"
+        );
+        assert_eq!(
+            (0..h.arity).filter(|&i| h.lanes.lane(i).is_some()).count(),
+            0,
+            "and no lane of it is readable"
+        );
+    }
+
+    /// Releasing a poisoned handle gives the arena slot back.
+    ///
+    /// A session that leaked a slot per poisoning would run out of handles and
+    /// then refuse an acquisition for a reason unrelated to the failure that
+    /// actually happened -- the worst kind of second-order fault, because the peer
+    /// is told about a limit rather than about the engine. With `max_handles` at 2
+    /// the leak is immediate and the reused offset is checkable.
+    #[test]
+    fn releasing_a_poisoned_handle_returns_its_arena_slot() {
+        let (_c, mut s, first) = session_with_handle("slots");
+        let snapshot = match s.handle(Frame::SnapshotOpen) {
+            Frame::SnapshotOpened { snapshot, .. } => snapshot,
+            other => panic!("{other:?}"),
+        };
+        let off = |f: Frame| match f {
+            Frame::LanesAcquired { arena_off, .. } => arena_off,
+            other => panic!("{other:?}"),
+        };
+        let second = off(s.handle(Frame::LanesAcquire {
+            snapshot,
+            keys: vec![10],
+        }));
+        assert_ne!(second, 0, "the second handle takes the second slot");
+        assert_eq!(s.outstanding().1, 2, "both handles are live");
+
+        poison(&mut s, first);
+        assert_eq!(s.handle(Frame::LanesRelease { lanes: first }), Frame::Done);
+        assert_eq!(s.outstanding().1, 1, "the poisoned handle was dropped");
+
+        // Offset 0, because the fixture's handle was the first acquisition and so
+        // took the first slot. Asserting the number rather than merely that an
+        // acquisition succeeded is what makes this about the slot: with
+        // `max_handles` at 2 a leaked slot would refuse outright, but a slot
+        // freed and then mis-indexed would succeed and overlap the live handle.
+        let again = off(s.handle(Frame::LanesAcquire {
+            snapshot,
+            keys: vec![30],
+        }));
+        assert_eq!(again, 0, "the poisoned handle's slot comes back for reuse");
+        assert_ne!(again, second, "and it is not the live handle's slot");
+        assert_eq!(s.outstanding().1, 2);
     }
 }

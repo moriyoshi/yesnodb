@@ -3746,3 +3746,106 @@ Worth keeping because the hazard is invisible at the call site: `key_bounds`
 handles `hi == PREFIX_EXCLUSIVE_END` explicitly and conspicuously, so a reader
 naturally concludes `lo` was simply forgotten. It was not, and the reason lives
 ten lines away in a different function.
+
+## 2026-10-20 — The untested half of poisoning was hiding a wrong status, and the test that found it
+
+Yesterday's prefix-bounded lanes work shipped with one gap filed rather than
+closed: `KeyLanes` poisons itself when a seek or a payload read fails, the
+`Session` turns that into a fault and keeps the dead handle, and **nothing above
+the engine asserted any of it**. The entry
+`lane-handle-poisoning-is-untested-above-the-engine` listed four things a closure
+would have to show. Writing the first of them failed immediately, and not
+because the test was wrong.
+
+### The defect
+
+`block_seek_many` validated in this order: batch size against `max_blocks`, then
+the handle exists, then `KeyLanes::check_targets( prefixes )`. The third refuses
+a batch that is empty, non-ascending, outside the window or behind the position
+-- all of which are the peer's input -- and it also refuses a **poisoned**
+handle, with the same `CodecError::Invariant`. The method mapped the whole arm to
+`Status::InvalidArgument`, with a comment explaining, correctly, why a bad batch
+must not be reported as `Internal`.
+
+So a peer whose handle had just died of an engine failure was told that its own
+input was wrong. It is the exact inversion of the distinction the method is
+written around, on the path where it matters most: `InvalidArgument` invites a
+peer to fix its request and retry, and every retry on that handle fails the same
+way forever.
+
+`block_advance` and `block_advance_many` were right, and right by accident of
+shape rather than by care -- they reach the poisoned state through
+`KeyLanes::advance`, whose `Err` goes through `status_from_core`, which calls an
+`Invariant` internal. Three paths, one handle, two answers.
+
+Fixed by asking `KeyLanes::poisoned()` before `check_targets` and faulting
+`Internal`, so all three agree. `check_targets` now carries a rustdoc paragraph
+saying that it refuses poisoning too, that its error cannot say whose fault it
+is, and that a caller reporting statuses must ask `poisoned()` first. The type
+has one error for a broken invariant and no notion of blame; that is a reasonable
+thing for a core type to be, but it is a trap for every transport, and the next
+one deserves to be warned at the call site rather than to find out from a peer.
+
+### Where the tests went, and the public method they did not need
+
+Four tests, in `yesno-plugin/src/channel.rs`'s own `mod tests` rather than in
+`tests/channel_session.rs` where the other fifty protocol tests live:
+
+- `a_poisoned_handle_faults_a_target_batch_as_an_engine_failure` -- the
+  regression test, with a batch that is deliberately legal in every respect so
+  the status can only be about the handle.
+- `a_poisoned_handle_refuses_every_later_read` -- all three read paths answer
+  `Internal`, and `BlockRelease` still answers `Done`, because a faulted peer
+  must be able to say it is finished with the payloads.
+- `poisoning_drops_the_block_the_peer_was_reading` -- the handle holds no
+  containers afterwards, so the `Session` keeps no second copy of its own. The
+  arena bytes are explicitly not claimed: with a shared region the last block's
+  payloads are in the peer's mapping and poisoning cannot erase them. What ends
+  that lend is the response, and the response is a fault.
+- `releasing_a_poisoned_handle_returns_its_arena_slot` -- and returns *that*
+  slot, asserted by offset, because a slot freed but mis-indexed would succeed
+  and overlap a live handle while a leaked one would merely refuse.
+
+They live in `src/` because the only thing they need that the protocol cannot
+give is the poisoning itself, and `Session::handle` has no frame that poisons a
+handle and must not grow one: poisoning is what an operational failure does. One
+line reaching the private handle map inside the crate was preferred to a
+`#[doc( hidden )] pub fn poison_for_test` on `Session`, which would have put the
+tests beside their siblings at the cost of a public method whose only purpose is
+to break a handle. `Arena::write_at_for_test` is the precedent for the other
+choice and was weighed; the difference is that an arena write has no private
+route at all from an integration test, while this does.
+
+### Sabotage
+
+Three, each restored by `cp` from a scratchpad copy:
+
+1. The new `poisoned()` check removed -- `a_poisoned_handle_faults_a_target_batch_as_an_engine_failure`
+   and `a_poisoned_handle_refuses_every_later_read` both fail, reporting status 1
+   where 2 was expected. This is the defect as it shipped.
+2. `self.slots[ h.index ] = false` dropped from `lanes_release` -- the slot test
+   fails with `Fault { status: 1, message: "no free arena slot" }`, which is
+   precisely the second-order fault its doc comment describes: the peer is told
+   about a limit instead of about the engine.
+3. ( Not re-run ) poisoning not clearing containers is already covered at the
+   core layer by `a_poisoned_handle_refuses_every_later_advance`.
+
+### What is still not tested, stated plainly
+
+These tests start from a poisoned handle. **No test above `yesno-core` makes a
+real engine read fail**, so the transition itself -- a seek or a payload read
+returning `Err` under a live snapshot -- is exercised nowhere outside the core's
+own direct `poison()` calls. The TODO entry stays open for that half, narrowed to
+it, with one lever recorded for whoever takes it: `container::codec::decode` is a
+fuzz target by contract, so corrupting a stored container yields `Err` rather
+than a panic. What is missing is a way to find those bytes without
+checkpoint-format knowledge, and `Host` holds a concrete `Arc<Db>` with no trait
+seam to substitute a failing store.
+
+### The general point
+
+The gap was filed honestly and the filing was not enough. A contract asserted on
+one side of an interface and merely documented on the other is not half-tested;
+it is untested where it is consumed, and the two sides had already drifted within
+a day of being written -- by the author, in one file, with the reason for the
+distinction in a comment ten lines above the line that broke it.
