@@ -80,7 +80,14 @@ use crate::Prefix48;
 /// The legal exclusive endpoint for a half-open chunk-prefix range.
 ///
 /// Unlike an individual [`Prefix48`], the upper endpoint may equal `2^48`.
-const PREFIX_EXCLUSIVE_END: u64 = 1u64 << 48;
+///
+/// Public because the bounded readers built on it -- notably
+/// [`crate::KeyLanes::in_prefix_range`], and this crate's own single-key and
+/// batched prefix-range planners -- are unusable without the one value their
+/// upper endpoint may legally take, and the alternative is every caller, in
+/// every crate and every language binding, writing `1 << 48` and being right by
+/// coincidence.
+pub const PREFIX_EXCLUSIVE_END: u64 = 1u64 << 48;
 
 /// Where one chunk of the plan comes from.
 enum Source {
@@ -164,12 +171,22 @@ impl KeyStream {
         ))
     }
 
-    /// One stream per key, all planned in one pass per shard.
+    /// One stream per key over `[lo, hi)`, all planned in one pass per shard.
     ///
-    /// See [`KeyStream::build_plans`] for what the sharing saves and what it
-    /// deliberately leaves alone.
-    pub(super) fn batch(snap: &Snapshot, keys: &[u64]) -> Result<Vec<KeyStream>> {
-        let plans = Self::build_plans(snap, keys)?;
+    /// `0 .. PREFIX_EXCLUSIVE_END` is the whole key, so this is the only batched
+    /// constructor rather than a bounded variant of one -- there was an unbounded
+    /// `batch` beside it and it was a one-line forward to this, which is a second
+    /// name for the same thing and a second place to look.
+    ///
+    /// See [`KeyStream::build_plans_range`] for what the sharing saves, what it
+    /// deliberately leaves alone, and why narrowing costs it nothing.
+    pub(super) fn batch_in_prefix_range(
+        snap: &Snapshot,
+        keys: &[u64],
+        lo: Prefix48,
+        hi: Prefix48,
+    ) -> Result<Vec<KeyStream>> {
+        let plans = Self::build_plans_range(snap, keys, lo, hi)?;
         Ok(keys
             .iter()
             .zip(plans)
@@ -216,28 +233,60 @@ impl KeyStream {
         Self::build_plan_range(snap, key, 0, PREFIX_EXCLUSIVE_END)
     }
 
+    /// Reject a prefix interval no planner can honour.
+    ///
+    /// Shared by the single-key and batched planners because the check has to
+    /// happen **before** the interval is packed into a [`ChunkKey`]: a planner
+    /// that packed first would mask the one legal exclusive endpoint to zero
+    /// rather than reject an illegal one. Two planners each remembering that is
+    /// two chances to forget it.
+    pub(super) fn check_prefix_range(lo: Prefix48, hi: Prefix48) -> Result<()> {
+        match lo > hi || hi > PREFIX_EXCLUSIVE_END {
+            true => Err(crate::error::CodecError::Invariant(
+                "invalid chunk prefix range",
+            )),
+            false => Ok(()),
+        }
+    }
+
+    /// The `ChunkKey` endpoints one key's `[lo, hi)` prefixes occupy.
+    ///
+    /// `PREFIX_EXCLUSIVE_END` becomes the key's own range end rather than a
+    /// packed prefix, which is exactly the case [`Self::check_prefix_range`]
+    /// has to run before: `ChunkKey::new` would mask it to zero and plan
+    /// nothing at all.
+    ///
+    /// **`lo` is packed unconditionally, and that is sound rather than an
+    /// oversight.** `check_prefix_range` admits `lo <= hi <= PREFIX_EXCLUSIVE_END`,
+    /// so `lo` can only reach the exclusive end when `hi` is there too -- and both
+    /// callers return on `lo == hi` *before* reaching this function. A `lo` that
+    /// arrives here is therefore strictly below the end and packs exactly. The
+    /// early return is load-bearing for this reason as well as for the empty plan
+    /// it produces. Moving it after this call would turn `END..END` into a scan of
+    /// the whole key, which is caught -- `an_empty_window_still_pins_the_snapshot`
+    /// asserts that window yields no block -- so the argument is pinned by a test
+    /// and not only by this paragraph.
+    fn key_bounds(key: u64, lo: Prefix48, hi: Prefix48) -> (ChunkKey, ChunkKey) {
+        (
+            ChunkKey::new(key, lo),
+            match hi == PREFIX_EXCLUSIVE_END {
+                true => ChunkKey::range_end(key),
+                false => ChunkKey::new(key, hi),
+            },
+        )
+    }
+
     /// Build only the plan entries in the half-open prefix interval.
     fn build_plan_range(snap: &Snapshot, key: u64, lo: Prefix48, hi: Prefix48) -> Result<Plan> {
         snap.check_live()?;
-        if lo > hi || hi > PREFIX_EXCLUSIVE_END {
-            return Err(crate::error::CodecError::Invariant(
-                "invalid chunk prefix range",
-            ));
-        }
+        Self::check_prefix_range(lo, hi)?;
         if lo == hi {
             return Ok(Plan {
                 steps: Vec::new(),
                 disk: 0,
             });
         }
-        // Validate before packing: `ChunkKey::new` masks the legal exclusive
-        // endpoint to zero rather than rejecting it.
-        let start = ChunkKey::new(key, lo);
-        let end = if hi == PREFIX_EXCLUSIVE_END {
-            ChunkKey::range_end(key)
-        } else {
-            ChunkKey::new(key, hi)
-        };
+        let (start, end) = Self::key_bounds(key, lo, hi);
         let i = snap.shard_index(key);
         let shard = &snap.db.shards[i];
 
@@ -270,7 +319,7 @@ impl KeyStream {
         }
     }
 
-    /// Plans for several keys, sharing one node reader per shard.
+    /// Plans for several keys in `[lo, hi)`, sharing one node reader per shard.
     ///
     /// # What this saves, and what it deliberately does not
     ///
@@ -306,8 +355,41 @@ impl KeyStream {
     /// spanned the `tree.range` walk and cost 1.80x at 8 threads sharing a
     /// shard. Batching must not re-widen it, so the reader is built once under
     /// a lock held no longer than before and every descent runs outside it.
-    fn build_plans(snap: &Snapshot, keys: &[u64]) -> Result<Vec<Arc<Plan>>> {
+    ///
+    /// # The window is a parameter rather than a second planner
+    ///
+    /// **Everything above is the reason.** A bounded acquisition that planned one
+    /// key at a time would give up the one memtable acquisition and the one node
+    /// reader per shard, and on a wide batch that setup is the whole saving
+    /// batching bought. Narrowing changes which `ChunkKey` endpoints the cursor
+    /// is aimed at and nothing else -- a narrowed interval is still inside its
+    /// key's, and the keys are still ascending -- so the resume property the
+    /// sharing rests on survives it and the window costs nothing.
+    ///
+    /// `0 .. PREFIX_EXCLUSIVE_END` is the whole key, which is how the unbounded
+    /// callers spell themselves; there is no second entry point for them.
+    ///
+    /// The interval is validated once, before any endpoint is packed, for the
+    /// reason [`Self::check_prefix_range`] gives. `lo == hi` is legal and plans
+    /// nothing, which is what lets a caller ask for an empty window without
+    /// special-casing it -- and the handle it produces still pins a snapshot.
+    fn build_plans_range(
+        snap: &Snapshot,
+        keys: &[u64],
+        lo: Prefix48,
+        hi: Prefix48,
+    ) -> Result<Vec<Arc<Plan>>> {
         snap.check_live()?;
+        Self::check_prefix_range(lo, hi)?;
+        if lo == hi {
+            // One shared empty plan: every key's answer is the same and a plan
+            // is immutable, so `keys.len()` copies of it would be waste.
+            let empty = Arc::new(Plan {
+                steps: Vec::new(),
+                disk: 0,
+            });
+            return Ok(keys.iter().map(|_| Arc::clone(&empty)).collect());
+        }
         let mut out: Vec<Option<Arc<Plan>>> = vec![None; keys.len()];
         let mut by_shard: std::collections::BTreeMap<usize, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -339,13 +421,10 @@ impl KeyStream {
                 order
                     .iter()
                     .map(|&key| {
-                        mem.chunks_in_key_range(
-                            ChunkKey::range_start(key),
-                            ChunkKey::range_end(key),
-                            snap.version,
-                        )
-                        .map(|(p, c)| (p, c.cloned()))
-                        .collect()
+                        let (start, end) = Self::key_bounds(key, lo, hi);
+                        mem.chunks_in_key_range(start, end, snap.version)
+                            .map(|(p, c)| (p, c.cloned()))
+                            .collect()
                     })
                     .collect()
             };
@@ -363,19 +442,22 @@ impl KeyStream {
                 Some((tree, store)) => {
                     let reader = store.lock().unwrap().published_nodes();
 
-                    // **One cursor for the shard.** Each key's interval is
-                    // `[key, key+1)` and ascending keys are adjacent in
+                    // **One cursor for the shard.** Each key's interval lies
+                    // inside `[key, key+1)` and ascending keys are adjacent in
                     // `ChunkKey` order, so `reaim` usually resumes inside the
                     // leaf already in hand and descends only when the next key
                     // is outside it. A cursor per key descends every time.
-                    let mut cursor = tree.range(
-                        &reader,
-                        ChunkKey::range_start(order[0]),
-                        ChunkKey::range_end(order[0]),
-                    );
+                    //
+                    // Narrowing only moves these endpoints inward, which leaves
+                    // the ascending-resume property the sharing rests on
+                    // intact: a narrowed interval is still inside its key's,
+                    // and the keys are still in order.
+                    let first = Self::key_bounds(order[0], lo, hi);
+                    let mut cursor = tree.range(&reader, first.0, first.1);
                     for (n, (overlay, &key)) in overlays.into_iter().zip(order.iter()).enumerate() {
                         if n > 0 {
-                            cursor.reaim(ChunkKey::range_start(key), ChunkKey::range_end(key))?;
+                            let (start, end) = Self::key_bounds(key, lo, hi);
+                            cursor.reaim(start, end)?;
                         }
                         let plan = Arc::new(Self::merge_plan(overlay, Some(cursor.by_ref()))?);
                         for &at in &distinct[&key] {
@@ -394,7 +476,7 @@ impl KeyStream {
 
     /// Merge one key's memtable overlay with its index scan into a [`Plan`].
     ///
-    /// Extracted so that [`Self::build_plan_range`] and [`Self::build_plans`]
+    /// Extracted so that [`Self::build_plan_range`] and [`Self::build_plans_range`]
     /// run the **same** merge rather than two copies of it. A batched planner
     /// that reimplemented this could diverge from the single-key one on a
     /// tombstone or an empty container and no test of either alone would see it;
@@ -864,7 +946,7 @@ mod tests {
 
     /// Assert the batched planner agrees with the per-key one for every key.
     fn plans_agree(snap: &Snapshot, keys: &[u64]) {
-        let batched = KeyStream::build_plans(snap, keys).unwrap();
+        let batched = KeyStream::build_plans_range(snap, keys, 0, PREFIX_EXCLUSIVE_END).unwrap();
         assert_eq!(batched.len(), keys.len());
         for (at, &key) in keys.iter().enumerate() {
             let alone = KeyStream::build_plan(snap, key).unwrap();
@@ -962,7 +1044,10 @@ mod tests {
         // And the plans drive identical streams, which is what a caller depends on.
         for &key in &keys {
             let want = snap.load(key).unwrap();
-            let got = KeyStream::batch(&snap, &[key]).unwrap().pop().unwrap();
+            let got = KeyStream::batch_in_prefix_range(&snap, &[key], 0, PREFIX_EXCLUSIVE_END)
+                .unwrap()
+                .pop()
+                .unwrap();
             assert_eq!(drain(got), want, "key {key}");
         }
         drop(snap);

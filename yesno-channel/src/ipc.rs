@@ -132,13 +132,43 @@
 /// set expression, so neither stream can be decoded as the other.
 pub const MAGIC: &[u8; 4] = b"YSNL";
 
-/// Protocol version. Bumped when a field changes meaning, never for a new kind.
+/// Protocol version. Bumped when a field changes meaning **or a kind is added**.
 ///
-/// 3 since 2026-10-09, when [`Frame::ServerHello`] grew `max_expr_bytes`. A new
-/// *kind* would not have needed this -- an old server faults on one it does not
-/// know, which is a clean refusal -- but a greeting one field longer is a shape
-/// change, and `decode` refuses trailing bytes, so the two builds must not try.
-pub const VERSION: u8 = 3;
+/// 3 since 2026-10-09, when [`Frame::ServerHello`] grew `max_expr_bytes`. 4 since
+/// 2026-10-19, when [`Frame::LanesAcquireRange`] and [`Frame::BlockSeekMany`]
+/// were added.
+///
+/// # The sentence this comment used to carry was wrong about its own reader
+///
+/// It said a new *kind* would not need a bump, because "an old server faults on
+/// one it does not know, which is a clean refusal". It is not a refusal. The kind
+/// byte is resolved inside [`Frame::decode`], so an unknown one fails as
+/// [`IpcError::UnknownKind`] rather than becoming a frame -- and `read_frame`
+/// turns every
+/// decode error except `Truncated` into `io::ErrorKind::InvalidData`, which both
+/// `serve_blocking` and the client propagate out of their read loops. There is no
+/// resynchronisation point, because the length that would let a reader skip the
+/// body is in the frame it just rejected. **The connection dies, and with it every
+/// snapshot and lane handle on it.**
+///
+/// So a peer cannot ask whether a server supports a kind. Probing costs the
+/// pinned snapshot it was probing on behalf of, which is strictly worse than not
+/// having the feature. The alternatives were weighed and rejected:
+///
+/// * **Optional trailing fields** on an existing request. `decode` refuses
+///   trailing bytes by design and the strict check is load-bearing, so an old
+///   decoder treats the longer frame as malformed -- the same connection death,
+///   moved to a frame whose kind is known.
+/// * **A capability bitmap in the greeting.** That *is* a greeting shape change,
+///   which is the case the bump already existed for, so it buys nothing except a
+///   second mechanism saying the same thing.
+///
+/// What a bump buys instead is that the mismatch surfaces at the greeting, before
+/// a snapshot exists to lose: the client checks the exact version, so an old peer
+/// against a new server, or the reverse, refuses at hello. Client and server are
+/// built from one tree here, so lockstep costs nothing a rolling deployment would
+/// notice -- and the thing it rules out is a silent half-support.
+pub const VERSION: u8 = 4;
 
 /// Magic, version, flags, kind, reserved, length.
 pub const HEADER_LEN: usize = 12;
@@ -591,6 +621,8 @@ pub enum Kind {
     ChunkPut = 15,
     SnapshotEvalCardinality = 16,
     SnapshotEvalLoad = 17,
+    LanesAcquireRange = 18,
+    BlockSeekMany = 19,
     // responses, 64..127
     ServerHello = 64,
     SnapshotOpened = 65,
@@ -634,6 +666,8 @@ impl Kind {
             15 => Kind::ChunkPut,
             16 => Kind::SnapshotEvalCardinality,
             17 => Kind::SnapshotEvalLoad,
+            18 => Kind::LanesAcquireRange,
+            19 => Kind::BlockSeekMany,
             64 => Kind::ServerHello,
             65 => Kind::SnapshotOpened,
             66 => Kind::LanesAcquired,
@@ -901,6 +935,75 @@ pub enum Frame {
         lanes: u64,
         max_blocks: u32,
     },
+    /// [`Frame::LanesAcquire`] over a half-open 48-bit prefix window `[lo, hi)`.
+    ///
+    /// Answered by [`Frame::LanesAcquired`], exactly as the unbounded form is: the
+    /// window changes which chunks the handle will ever resolve, not what a handle
+    /// is, so the reply carries no new field and the arena slice is the same shape.
+    ///
+    /// # Why a separate kind rather than a window on `LanesAcquire`
+    ///
+    /// Two fields appended to an existing request are trailing bytes to a decoder
+    /// that does not expect them, and this one refuses trailing bytes. See
+    /// [`VERSION`] for what that costs. A kind of its own also keeps the unbounded
+    /// request the cheapest thing on the wire, which is what most callers send.
+    ///
+    /// `hi` may be `2^48` and no higher -- that is the whole-key window and the
+    /// value a caller reaches by asking for "everything from here". The engine
+    /// spells it `PREFIX_EXCLUSIVE_END`, and it is not named here because this
+    /// crate deliberately does not link the engine; see this crate's manifest. `lo == hi` is an empty window and is **not** an error: the reply
+    /// is a handle that pins the snapshot and yields no block, which is what lets a
+    /// caller compute a window at the end of a scan without a special case. Both
+    /// are checked by the server, not here, because the legal range is a property
+    /// of the engine's key space rather than of the frame.
+    LanesAcquireRange {
+        snapshot: u64,
+        keys: Vec<u64>,
+        lo: u64,
+        hi: u64,
+    },
+    /// Read the blocks at exactly these prefixes, in this order.
+    ///
+    /// The target counterpart of [`Frame::BlockAdvanceMany`], answered by the same
+    /// [`Frame::Blocks`] or [`Frame::BlocksInline`] and releasing the previous batch
+    /// implicitly for the same reason. A caller gathering a sparse set of prefixes
+    /// pays one seek per prefix it wants, rather than one advance per prefix that
+    /// exists between them.
+    ///
+    /// # The reply has one block per target, which is the difference that matters
+    ///
+    /// [`Frame::BlockAdvanceMany`] returning fewer blocks than asked for means the
+    /// scan ended. **This one never returns fewer.** A target no lane holds comes
+    /// back as a block with every lane absent, and a target past the last stored
+    /// chunk does too, because a caller tiling N lanes over M targets needs M
+    /// answers positionally -- dropping the empty ones would shift the rest onto the
+    /// wrong targets, silently. A short reply is therefore a protocol violation
+    /// here rather than an end-of-scan signal.
+    ///
+    /// A consequence worth stating: a window dense in holes costs **more** frames
+    /// this way than a sequential walk over the same range, because the walk skips
+    /// what is not there and this does not. Targets are for a caller that knows
+    /// which prefixes it wants and expects most of them to be sparse.
+    ///
+    /// # What the server checks
+    ///
+    /// `prefixes` must be nonempty, strictly ascending -- which also makes them
+    /// unique -- inside the handle's window, strictly past every prefix the handle
+    /// has already emitted or been asked for, and no more numerous than the
+    /// `max_blocks` the greeting advertised. The **whole** batch is checked before
+    /// any of it runs, so a batch whose fourth target is backwards leaves the handle
+    /// exactly where it was rather than three blocks further on with no way back.
+    ///
+    /// The batch limit is `max_blocks` and not a bound of its own: that is the
+    /// number the arena slot was sized for, so an arena server physically cannot
+    /// place more, and an inline server's payload cap is derived from the same
+    /// product. Asking for more is a fault, **not** a truncated reply -- truncating
+    /// would drop targets, and a caller cannot tell a dropped target from an absent
+    /// one.
+    BlockSeekMany {
+        lanes: u64,
+        prefixes: Vec<u64>,
+    },
 
     // --- responses ---
     /// Sent first, before any request is answered.
@@ -1077,6 +1180,8 @@ impl Frame {
             Frame::BlockAdvance { .. } => Kind::BlockAdvance,
             Frame::BlockRelease { .. } => Kind::BlockRelease,
             Frame::BlockAdvanceMany { .. } => Kind::BlockAdvanceMany,
+            Frame::LanesAcquireRange { .. } => Kind::LanesAcquireRange,
+            Frame::BlockSeekMany { .. } => Kind::BlockSeekMany,
             Frame::SnapshotCardinality { .. } => Kind::SnapshotCardinality,
             Frame::SnapshotContains { .. } => Kind::SnapshotContains,
             Frame::SnapshotMax { .. } => Kind::SnapshotMax,
@@ -1211,6 +1316,41 @@ impl Frame {
             Frame::BlockAdvanceMany { lanes, max_blocks } => {
                 p.extend_from_slice(&lanes.to_le_bytes());
                 p.extend_from_slice(&max_blocks.to_le_bytes());
+            }
+            Frame::LanesAcquireRange {
+                snapshot,
+                keys,
+                lo,
+                hi,
+            } => {
+                // The same lane bound as `LanesAcquire`, for the same reason: a
+                // declared count sizes a `Vec` on the far side.
+                if keys.len() > MAX_LANES {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&snapshot.to_le_bytes());
+                p.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+                for k in keys {
+                    p.extend_from_slice(&k.to_le_bytes());
+                }
+                // After the keys rather than before, so the two acquisition
+                // requests share a prefix and a reader of one decodes the other's
+                // opening fields the same way.
+                p.extend_from_slice(&lo.to_le_bytes());
+                p.extend_from_slice(&hi.to_le_bytes());
+            }
+            Frame::BlockSeekMany { lanes, prefixes } => {
+                // [`MAX_BATCH`] because the reply is one block per target and a
+                // `Blocks` frame is bounded by it -- a request this encoder let
+                // through would have no legal answer.
+                if prefixes.len() > MAX_BATCH {
+                    return Err(IpcError::TooLarge);
+                }
+                p.extend_from_slice(&lanes.to_le_bytes());
+                p.extend_from_slice(&(prefixes.len() as u32).to_le_bytes());
+                for t in prefixes {
+                    p.extend_from_slice(&t.to_le_bytes());
+                }
             }
             Frame::Blocks { blocks } => {
                 if blocks.len() > MAX_BATCH {
@@ -1529,6 +1669,38 @@ impl Frame {
                 lanes: r.u64()?,
                 max_blocks: r.u32()?,
             },
+            Kind::LanesAcquireRange => {
+                let snapshot = r.u64()?;
+                let n = r.u32()? as usize;
+                // Checked before allocating, as every counted field here is.
+                if n > MAX_LANES {
+                    return Err(IpcError::TooLarge);
+                }
+                let mut keys = Vec::with_capacity(n);
+                for _ in 0..n {
+                    keys.push(r.u64()?);
+                }
+                Frame::LanesAcquireRange {
+                    snapshot,
+                    keys,
+                    lo: r.u64()?,
+                    hi: r.u64()?,
+                }
+            }
+            Kind::BlockSeekMany => {
+                let lanes = r.u64()?;
+                let n = r.u32()? as usize;
+                // Checked before allocating, and against the bound the *reply* has:
+                // see the encoder for why a larger request could not be answered.
+                if n > MAX_BATCH {
+                    return Err(IpcError::TooLarge);
+                }
+                let mut prefixes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    prefixes.push(r.u64()?);
+                }
+                Frame::BlockSeekMany { lanes, prefixes }
+            }
             Kind::Blocks => {
                 let n = r.u32()? as usize;
                 if n > MAX_BATCH {
@@ -1866,6 +2038,25 @@ mod tests {
             Frame::LanesRelease { lanes: 3 },
             Frame::BlockAdvance { lanes: 3 },
             Frame::BlockRelease { lanes: 3 },
+            // The exclusive end is in here on purpose: it is the one upper
+            // endpoint above a 48-bit prefix, so a `u64` field that carried 48
+            // bits would round-trip every other case and fail this one.
+            Frame::LanesAcquireRange {
+                snapshot: 7,
+                keys: vec![10, 20, 30],
+                lo: 5,
+                hi: 1u64 << 48,
+            },
+            Frame::LanesAcquireRange {
+                snapshot: 7,
+                keys: Vec::new(),
+                lo: 1u64 << 48,
+                hi: 1u64 << 48,
+            },
+            Frame::BlockSeekMany {
+                lanes: 3,
+                prefixes: vec![1, 2, 9, (1u64 << 48) - 1],
+            },
             Frame::SnapshotCardinality {
                 snapshot: 7,
                 key: 10,
@@ -2175,6 +2366,8 @@ mod tests {
                 | Kind::SnapshotKeyRange
                 | Kind::SnapshotEvalCardinality
                 | Kind::SnapshotEvalLoad
+                | Kind::LanesAcquireRange
+                | Kind::BlockSeekMany
                 | Kind::Apply
                 | Kind::ChunkPut => Direction::Request,
                 Kind::ServerHello

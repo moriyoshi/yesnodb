@@ -26,6 +26,7 @@
 //! yesno-channel-peer --hold <socket> <key>...           # scan, then hold and wait
 //! yesno-channel-peer --write <socket> <key> <ord>...    # insert, then scan that key
 //! yesno-channel-peer --write-n <socket> <key> <count>   # insert count ordinals in one frame
+//! yesno-channel-peer --targets <socket> <key>...        # bounded window, exact target batch
 //! ```
 //!
 //! `--write-n` exists so the **widest legal frame** can be exercised across a real process
@@ -44,6 +45,16 @@
 //! `--hold` keeps the snapshot open and blocks for ever, so a caller can kill the
 //! process and observe what the server does about it. It prints `holding` first,
 //! so the caller knows the snapshot exists before it pulls the trigger.
+//!
+//! `--targets` is the one mode built on the **official client** rather than on the
+//! raw frames above, and it is deliberate twice over. It is how a consumer should
+//! reach the bounded window and the exact-target batch -- the validation rules are
+//! fiddly enough that hand-rolling them is how a peer gets them subtly wrong -- and
+//! it is the only thing in the tree that drives that client across a real process
+//! boundary, where every other client test shares an address space with its server.
+//! It also works in **both** transports from one code path, because the client hides
+//! which one it got, so a caller can serve it either way and compare the output byte
+//! for byte.
 
 use std::io::{Read, Write};
 
@@ -187,6 +198,9 @@ enum Mode {
     /// with its cluster faces, since it is running before anything is ingested. A
     /// long-lived plugin re-opens as the database advances, and this is that.
     Watch,
+    /// Acquire a bounded window, read an exact batch of target prefixes, and show
+    /// what a refused batch does to the handle.
+    Targets,
 }
 
 /// How long `Mode::Watch` keeps a snapshot before taking the next one.
@@ -203,6 +217,7 @@ fn main() -> std::process::ExitCode {
         Some((first, rest)) if first == "--write" => (Mode::Write, rest),
         Some((first, rest)) if first == "--write-n" => (Mode::WriteN, rest),
         Some((first, rest)) if first == "--watch" => (Mode::Watch, rest),
+        Some((first, rest)) if first == "--targets" => (Mode::Targets, rest),
         _ => (Mode::Once, &args[..]),
     };
     let Some((path, keys)) = rest.split_first() else {
@@ -226,6 +241,18 @@ fn main() -> std::process::ExitCode {
     if mode == Mode::WriteN && keys.len() != 2 {
         eprintln!("--write-n needs exactly a key and a count");
         return std::process::ExitCode::from(2);
+    }
+
+    // The official client, not the raw frames: a different entry point rather than
+    // a mode of `run`, because it shares none of that function's state.
+    if mode == Mode::Targets {
+        return match run_targets(path, &keys) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("peer failed: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
     match run(path, &keys, mode) {
@@ -349,7 +376,11 @@ fn scan_once(peer: &mut Peer, keys: &[u64], mode: Mode) -> std::io::Result<u64> 
     match mode {
         // The write modes have already printed their commit; the scan they then run behaves
         // like `Once`, which is the whole point -- the read path is unchanged by the write.
-        Mode::Once | Mode::Write | Mode::WriteN => {}
+        //
+        // `Targets` never reaches here: it runs on the official client and leaves
+        // `main` before `run`, so this arm exists only to keep the match exhaustive
+        // and would be a bug if it were ever taken.
+        Mode::Once | Mode::Write | Mode::WriteN | Mode::Targets => {}
         Mode::Hold => {
             // Snapshot deliberately still open. Announce it, then block: whoever
             // started this wants to kill it and watch the server clean up.
@@ -371,6 +402,121 @@ fn scan_once(peer: &mut Peer, keys: &[u64], mode: Mode) -> std::io::Result<u64> 
         }
     }
     Ok(total)
+}
+
+/// A bounded window and an exact target batch, through the official client.
+///
+/// # What it prints, and why that is the whole test
+///
+/// `window <total>` is the cardinality of every lane of every block **inside the
+/// window**, which is strictly less than a whole-key scan of the same keys: the
+/// chunks below `WINDOW_LO` are never read, so a window that silently did nothing
+/// would print the larger figure. Then one `block` line per target, in the order
+/// asked for, with the number of lanes present -- so an all-absent target prints
+/// `present 0` rather than being missing, and a duplicated key prints two.
+///
+/// The two `refused` lines are the point of the mode. A batch that is not ascending
+/// is refused by the client before a byte is sent; a batch whose first target is
+/// behind the handle's position is refused by the server. **Both leave the handle
+/// usable**, which the `after` line proves by reading a further target on the same
+/// handle -- an exact-target reader that lost its handle to a bad batch would have
+/// to re-acquire, and re-acquiring means another snapshot or another round of
+/// planning for a mistake that cost the server nothing.
+fn run_targets(path: &str, keys: &[u64]) -> std::io::Result<()> {
+    use yesno_plugin::client::Client;
+
+    /// Low enough to exclude prefix 0 and high enough to include a target past
+    /// every stored chunk, so both edges of the window are exercised.
+    const WINDOW_LO: u64 = 1;
+    const WINDOW_HI: u64 = 10;
+
+    let fail = |e: yesno_plugin::client::Error| std::io::Error::other(format!("{e}"));
+    let client = Client::connect(path, "yesno-channel-peer").map_err(fail)?;
+    let snap = client.snapshot().map_err(fail)?;
+    let mut cursor = snap
+        .lanes_in_prefix_range(keys.to_vec(), WINDOW_LO, WINDOW_HI)
+        .map_err(fail)?;
+
+    // Sequential first, so the window's effect is visible as a total before any
+    // target is named -- and so the shared forward position starts somewhere other
+    // than the beginning for the batch that follows.
+    let mut total = 0u64;
+    while cursor.advance().map_err(fail)? {
+        for i in 0..cursor.lane_count() {
+            let (lane, bytes) = cursor.lane(i).map_err(fail)?;
+            total += count(lane.kind, bytes);
+        }
+    }
+    println!("window {total}");
+
+    // A fresh handle, because the walk above consumed the shared position.
+    let mut cursor = snap
+        .lanes_in_prefix_range(keys.to_vec(), WINDOW_LO, WINDOW_HI)
+        .map_err(fail)?;
+
+    // One target past what the greeting advertised, before any position is taken.
+    // Refused for its **size**, which is the only fault these targets have: they
+    // are ascending, inside the window and ahead of a handle that has read nothing.
+    let cap = client.limits().max_blocks as u64;
+    let oversized: Vec<u64> = (WINDOW_LO..WINDOW_LO + cap + 1).collect();
+    match cursor.seek_many(&oversized) {
+        Err(_) => println!("refused oversized {}", oversized.len()),
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "a batch of {} targets was accepted against max_blocks {cap}",
+                oversized.len()
+            )))
+        }
+    }
+
+    // Exactly `max_blocks` targets, so the boundary is the case under test rather
+    // than one avoided. 2 holds nothing and must still answer; 9 is past every
+    // stored chunk and is read further down, on the same handle.
+    let targets: Vec<u64> = vec![1, 2, 3, 5];
+    let n = cursor.seek_many(&targets).map_err(fail)?;
+    if n != targets.len() {
+        return Err(std::io::Error::other(format!(
+            "asked for {} targets and got {n} blocks",
+            targets.len()
+        )));
+    }
+    for (at, &target) in targets.iter().enumerate() {
+        if at > 0 && !cursor.advance().map_err(fail)? {
+            return Err(std::io::Error::other(format!(
+                "the batch ran out before target {target}"
+            )));
+        }
+        let mut card = 0u64;
+        let mut present = 0usize;
+        for i in 0..cursor.lane_count() {
+            let (lane, bytes) = cursor.lane(i).map_err(fail)?;
+            if lane.kind != LaneKind::Absent {
+                present += 1;
+                card += count(lane.kind, bytes);
+            }
+        }
+        println!(
+            "block {} present {present} card {card}",
+            cursor.prefix().unwrap_or(u64::MAX)
+        );
+    }
+
+    // Refused by this client, before anything is sent.
+    match cursor.seek_many(&[7, 6]) {
+        Err(_) => println!("refused descending"),
+        Ok(_) => return Err(std::io::Error::other("a descending batch was accepted")),
+    }
+    // Refused by the server: 4 is behind the position the batch above reached, and
+    // the whole batch goes with it even though 9 alone would have been legal.
+    match cursor.seek_many(&[4, 9]) {
+        Err(_) => println!("refused backwards"),
+        Ok(_) => return Err(std::io::Error::other("a backwards batch was accepted")),
+    }
+    // And the handle survived both, which is why they are refusals rather than
+    // failures.
+    let n = cursor.seek_many(&[9]).map_err(fail)?;
+    println!("after {n} block {}", cursor.prefix().unwrap_or(u64::MAX));
+    Ok(())
 }
 
 /// Ordinals in one lane's payload, per its representation.

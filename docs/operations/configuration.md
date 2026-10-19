@@ -72,6 +72,25 @@ the peer beside the daemon:
 | `--plugin-channel-max-blocks` | `YESNOD_PLUGIN_CHANNEL_MAX_BLOCKS` | blocks one response may carry |
 | `--plugin-channel-inline` | `YESNOD_PLUGIN_CHANNEL_INLINE` | serve payloads in the frames, not a shared region |
 
+`max-blocks` bounds two things that look different to a peer and are the same
+number here. A peer walking a key in order receives at most this many blocks per
+request, and a peer that instead names the exact prefixes it wants may name at
+most this many of them in one request. The second is **refused** rather than
+trimmed when a peer asks for more, because every named prefix gets an answer --
+including the ones at which nothing is stored -- so a trimmed reply would drop
+requests rather than shorten them. Raising this raises the shared region a
+connection reserves, since the region holds one slot per handle and one
+sub-region per block within it.
+
+A peer also announces a protocol version when it connects, and `yesnod` accepts
+only the one it was built with. The channel is a private interface between the
+daemon and a peer shipped alongside it, not a stable public protocol: **upgrade
+the two together.** A peer built against an older daemon is refused at the
+greeting, which is deliberate -- it fails immediately, with nothing open, rather
+than part way through a query -- and the fix is to rebuild the peer. The version
+rises when a request or a reply is added as well as when one changes shape, so
+treat any daemon upgrade as requiring a matching peer.
+
 These have no flags and are set in the configuration file:
 
 | key | default | meaning |

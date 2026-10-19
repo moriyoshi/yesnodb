@@ -131,7 +131,14 @@ yesno/
                                 #   Holds its own Snapshot clone so the pin does not depend
                                 #   on the lane count. A failed advance poisons the handle:
                                 #   next_chunk cannot be un-advanced, and a partly populated
-                                #   block is a plausible wrong answer.
+                                #   block is a plausible wrong answer. Every handle has a
+                                #   half-open prefix window, the unbounded case being the
+                                #   widest rather than its absence, and ONE forward position
+                                #   shared by the sequential advance and the exact-prefix
+                                #   seek -- so mixing them is monotone instead of unchecked.
+                                #   Caller input ( a backwards or out-of-window target, a
+                                #   batch validated whole before any of it runs ) leaves the
+                                #   handle untouched; only an operational failure poisons.
         manifest.rs             # MANIFEST: db uuid, shard count, term, and the vshard -> shard map
         readers.rs              # cross-process reader registry: a foreign reader's
                                 #   ( pid, version, ckpt_seq ), plus an appended identity

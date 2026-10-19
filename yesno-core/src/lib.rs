@@ -167,7 +167,7 @@ pub use container::{Container, ContainerKind};
 // outside this crate — so a caller could read the field but could not construct
 // the struct with anything but its default. That is a hole in the API rather
 // than a widening of it; the type is already `#[non_exhaustive]`.
-pub use db::keystream::{KeySource, KeyStream};
+pub use db::keystream::{KeySource, KeyStream, PREFIX_EXCLUSIVE_END};
 pub use db::lanes::KeyLanes;
 pub use db::{BackupLease, Db, DbOptions, Snapshot, SpaceAmpPolicy, WriteBatch};
 pub use error::{CodecError, Result};

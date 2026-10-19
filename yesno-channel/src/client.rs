@@ -787,12 +787,42 @@ impl Snapshot {
 
     /// Acquire a lane handle over `keys` and read their blocks in order.
     pub fn lanes(&self, keys: Vec<u64>) -> Result<LaneCursor> {
-        let frame = self.request(Frame::LanesAcquire {
+        self.acquire(Frame::LanesAcquire {
             snapshot: self.id,
             keys,
-        })?;
+        })
+    }
+
+    /// Acquire a lane handle restricted to the prefix window `[lo, hi)`.
+    ///
+    /// The chunks outside the window are never resolved, never read and never
+    /// transferred, which is the saving -- as against receiving them and discarding
+    /// them here, where the read has already been paid for.
+    ///
+    /// `hi` may be `yesno_core::PREFIX_EXCLUSIVE_END`, `2^48`, which is the whole
+    /// key and makes this identical to [`Self::lanes`]. `lo == hi` is an empty
+    /// window and not an error: the cursor is valid and its first [`LaneCursor::advance`]
+    /// reports the end of the walk, which is what lets a caller compute a window
+    /// without a special case for having arrived at the end of one.
+    pub fn lanes_in_prefix_range(&self, keys: Vec<u64>, lo: u64, hi: u64) -> Result<LaneCursor> {
+        self.acquire(Frame::LanesAcquireRange {
+            snapshot: self.id,
+            keys,
+            lo,
+            hi,
+        })
+    }
+
+    /// Send an acquisition and build the cursor its reply describes.
+    ///
+    /// One body for both acquisitions because the reply is the same frame and the
+    /// cursor is the same shape: a window restricts what the handle will resolve
+    /// and changes nothing a cursor needs to know. Two copies of this would be two
+    /// places for the arena offset and the advertised limits to be read differently.
+    fn acquire(&self, request: Frame) -> Result<LaneCursor> {
+        let frame = self.request(request)?;
         let Frame::LanesAcquired { lanes, arena_off } = frame else {
-            return protocol("yesnod did not answer LanesAcquire with LanesAcquired");
+            return protocol("yesnod did not answer a lane acquisition with LanesAcquired");
         };
         Ok(LaneCursor {
             conn: Arc::clone(&self.conn),
@@ -875,18 +905,136 @@ impl LaneCursor {
                 })
             });
         let response = under_version(self.version, result)?;
+        let (blocks, payload) = self.unpack(response)?;
+        self.install(blocks, payload)?;
 
+        // **Fewer blocks than asked for means the scan ended** -- the frame's own
+        // documented convention, and `is_empty()` is not the same test: a batch that
+        // comes back short is final, so stopping only on an empty batch costs one
+        // wasted round trip at the end of every handle. Exactly as many may or may
+        // not have more, which is why that case asks again.
+        self.done = self.blocks.len() < self.max_blocks as usize;
+        Ok(())
+    }
+
+    /// Read exactly these prefixes, in one round trip, and stop on the first.
+    ///
+    /// For a caller that already knows which prefixes it wants. A sequential walk
+    /// over the same span pays one block per prefix that *exists* between the ones
+    /// asked for; this pays one per prefix asked for, so it wins exactly when the
+    /// targets are sparse within the window and loses when they are dense. Dense
+    /// windows are still available -- that is what [`Self::advance`] is.
+    ///
+    /// # A borrowed slice, on purpose
+    ///
+    /// The targets are read and encoded during the call and nothing retains them, so
+    /// a caller can keep one bounded scratch buffer and refill it per batch rather
+    /// than allocating a `Vec` per gather. That is the whole reason this does not
+    /// take `Vec<u64>` as [`Snapshot::lanes`] takes its keys.
+    ///
+    /// # What the caller must satisfy
+    ///
+    /// Nonempty, strictly ascending -- which also makes them unique -- inside the
+    /// handle's window, strictly past every prefix this cursor has already read, and
+    /// at most `max_blocks` of them, which [`Client::limits`] reports. yesnod checks
+    /// the **whole** batch before it moves anything, so a batch with a bad later
+    /// target leaves the handle exactly where it was and may simply be corrected and
+    /// re-sent.
+    ///
+    /// # Every target comes back, including the empty ones
+    ///
+    /// A target no lane holds is a block with every lane absent, as is a target past
+    /// the last stored chunk, so block `j` is always target `j` and a caller may
+    /// index by position. This is checked here rather than assumed: a reply that
+    /// dropped or reordered a target would otherwise silently attribute one target's
+    /// payloads to another.
+    ///
+    /// On return the cursor is positioned on the **first** target, so
+    /// [`Self::prefix`] is already that target and [`Self::advance`] steps to the
+    /// next one. That differs from `advance`, which fetches and positions in one
+    /// call, and it is the difference that lets a caller check what it got before
+    /// reading any of it.
+    ///
+    /// # Mixing with the sequential walk
+    ///
+    /// The handle keeps **one** forward position for both, so a later target must be
+    /// past anything already walked and vice versa -- that much is the engine's
+    /// contract and this client cannot and does not loosen it. What this client does
+    /// not offer is resuming the walk *after* a target batch: `advance` reports the
+    /// end once the batch is consumed, rather than silently continuing through the
+    /// rest of the window, because a `while advance()` loop written for a sequential
+    /// cursor would otherwise read the whole remainder of a handle a caller had
+    /// finished with. Call this again for the next batch of targets; a caller that
+    /// genuinely wants to interleave the two drives the frames itself.
+    pub fn seek_many(&mut self, prefixes: &[u64]) -> Result<usize> {
+        if prefixes.is_empty() {
+            return protocol("a target batch must name a prefix");
+        }
+        if prefixes.len() > self.max_blocks as usize {
+            return protocol(format!(
+                "this batch names {} targets and this yesnod accepts {}",
+                prefixes.len(),
+                self.max_blocks
+            ));
+        }
+        // Checked before the round trip, not because yesnod would miss it -- it
+        // checks the whole batch itself -- but because a caller's own bug is worth
+        // reporting without spending a request, and because the position this
+        // compares against is one the client already knows.
+        if prefixes.windows(2).any(|p| p[0] >= p[1]) {
+            return protocol("target prefixes must be strictly ascending");
+        }
+        let result = self
+            .conn
+            .lock()
+            .map_err(|_| Error::Protocol("the plugin channel lock was poisoned".into()))
+            .and_then(|mut conn| {
+                conn.request(Frame::BlockSeekMany {
+                    lanes: self.handle,
+                    prefixes: prefixes.to_vec(),
+                })
+            });
+        let response = under_version(self.version, result)?;
+        let (blocks, payload) = self.unpack(response)?;
+        // Positional, so this is the check that makes indexing by target legal.
+        if blocks.len() != prefixes.len() {
+            return protocol(format!(
+                "asked for {} targets and yesnod returned {} blocks",
+                prefixes.len(),
+                blocks.len()
+            ));
+        }
+        if blocks.iter().zip(prefixes).any(|(b, &t)| b.prefix != t) {
+            return protocol("yesnod's blocks do not match the targets asked for");
+        }
+        self.install(blocks, payload)?;
+        // The batch is the whole reply; see "Mixing with the sequential walk".
+        self.done = true;
+        Ok(self.blocks.len())
+    }
+
+    /// The blocks and payload of a batched reply, checked against the arena mode.
+    fn unpack(&self, response: Frame) -> Result<(Vec<Block>, Vec<u8>)> {
         // The response form must match the connection's mode. Either crossed is the
         // server contradicting its own greeting, not something to adapt to.
-        let (blocks, payload) = match response {
-            Frame::Blocks { blocks } if self.arena.is_some() => (blocks, Vec::new()),
-            Frame::BlocksInline { blocks, payload } if self.arena.is_none() => (blocks, payload),
-            Frame::Blocks { .. } | Frame::BlocksInline { .. } => {
-                return protocol("yesnod's block response contradicts its arena mode");
+        match response {
+            Frame::Blocks { blocks } if self.arena.is_some() => Ok((blocks, Vec::new())),
+            Frame::BlocksInline { blocks, payload } if self.arena.is_none() => {
+                Ok((blocks, payload))
             }
-            _ => return protocol("yesnod did not answer BlockAdvanceMany with blocks"),
-        };
+            Frame::Blocks { .. } | Frame::BlocksInline { .. } => {
+                protocol("yesnod's block response contradicts its arena mode")
+            }
+            _ => protocol("yesnod did not answer a block request with blocks"),
+        }
+    }
 
+    /// Validate a batch of blocks and make it the cursor's current one.
+    ///
+    /// Shared by the sequential and target paths because every check here is about
+    /// the server's output rather than about which request asked for it. A second
+    /// copy for targets would be the copy that forgot one.
+    fn install(&mut self, blocks: Vec<Block>, payload: Vec<u8>) -> Result<()> {
         // Validate the server's output. A client that trusts its server cannot tell
         // a yesnod bug from its own.
         if blocks.iter().any(|b| b.lanes.len() > self.max_lanes) {
@@ -921,12 +1069,6 @@ impl LaneCursor {
             }
         }
 
-        // **Fewer blocks than asked for means the scan ended** -- the frame's own
-        // documented convention, and `is_empty()` is not the same test: a batch that
-        // comes back short is final, so stopping only on an empty batch costs one
-        // wasted round trip at the end of every handle. Exactly as many may or may
-        // not have more, which is why that case asks again.
-        self.done = blocks.len() < self.max_blocks as usize;
         self.blocks = blocks;
         self.inline = payload;
         self.at = 0;

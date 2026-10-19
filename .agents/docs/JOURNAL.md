@@ -3561,3 +3561,188 @@ With this, every path that moves a shard image has an oracle for both halves
 of what it was taught to skip, and every local snapshot provider has one for
 the half that is a property of the filesystem underneath it rather than of
 this tree.
+
+## 2026-10-19 — Prefix-bounded lanes, exact target batches, and the version comment that was wrong about its own reader
+
+Implementation of the haiiie handoff at
+`/home/moriyoshi/src/haiiie/.agents-workspace/tmp/scaled12-prefix-current-20261019/HANDOFF.txt`:
+a prefix-bounded `KeyLanes` acquisition, and held batched reads at exact target
+prefixes, wired core -> `Session` -> yesnod -> official client. Three findings
+are worth keeping; the rest is in the code's own comments.
+
+### The window is a planner parameter, because the alternative gives back what batching bought
+
+`KeyStream::build_plans` hoists one memtable acquisition and one
+`published_nodes` reader per shard out of the per-key loop, and drives **one**
+cursor per shard over that shard's distinct keys in ascending order, resuming
+inside the leaf it already holds. A bounded acquisition implemented the
+obvious way -- plan each key over its own window -- gives all of that back, and
+on a wide batch that setup *is* the saving.
+
+So the window is a parameter to the batched planner rather than a second
+planner. It moves the `ChunkKey` endpoints the cursor is aimed at and nothing
+else: a narrowed interval is still inside its key's, and the keys are still
+ascending, so the ascending-resume property the sharing rests on survives
+untouched.
+
+Measured as a structural check rather than a timing: a sabotage that leaves
+the planning narrowed but aims the cursor at the whole key fails
+`a_window_yields_exactly_the_blocks_inside_it` and
+`a_window_agrees_with_the_unbounded_scan_on_the_overlap`, and nothing else in
+the suite notices. That second test is the one that matters -- it asserts the
+bounded handle agrees with the unbounded one on the blocks they share, so a
+window may drop a block and may never alter one.
+
+The unbounded entry points were **deleted** rather than kept beside the ranged
+ones. `KeyStream::batch` and `build_plans` had become one-line forwards to
+`batch_in_prefix_range` and `build_plans_range`, which is a second name for
+the same thing and a second place to look; `0 .. PREFIX_EXCLUSIVE_END` is now
+how the unbounded callers spell themselves. `PREFIX_EXCLUSIVE_END` became
+`pub` and is re-exported, because a bounded reader is unusable without the one
+value its upper endpoint may legally take and the alternative is every caller
+writing `1 << 48` and being right by coincidence.
+
+### One shared forward position, and why the handle keeps a single mark
+
+`KeyLanes` now carries `last`, the highest prefix it has emitted **or been
+asked for**, and both ways of moving update it: `advance` walks to the next
+block any lane holds, `seek_block` jumps to a named one.
+
+A handle with a separate mark per mode would let a caller interleave the two
+and read a prefix twice, or read one it had already passed and get an empty
+block that is indistinguishable from genuine absence. One mark makes mixing
+legal and monotone instead of forbidden and unchecked. The sabotage is a
+one-line deletion -- `advance` not updating `last` -- and
+`sequential_and_target_moves_share_one_position` is the only test that fails.
+
+Two rules follow and are enforced at the engine rather than at a transport:
+
+* **Caller input leaves the handle untouched.** A target outside the window, at
+  or behind the position, a non-ascending batch, an empty batch: refused with
+  the position, the open block and its payloads intact. `check_targets`
+  validates the **whole** batch before `seek_block` runs on any of it, so a
+  batch whose fourth target is backwards costs nothing rather than leaving the
+  handle three blocks further on with no way back.
+* **Operational failure poisons.** A failed seek or payload read cannot be
+  undone, so the handle is poisoned and the partial containers released, for
+  the reason `advance` already had: a partly populated block is a plausible
+  wrong answer.
+
+Batch *size* is deliberately not checked in the engine. That is a property of
+a transport's advertised limits and `KeyLanes` has no transport; checking it
+where the limit was advertised is also what keeps the refusal attributable to
+the number the peer was told.
+
+### The channel's version comment was wrong about its own reader, and it decided the compatibility question
+
+`ipc::VERSION`'s rationale said a new *kind* needs no bump, because "an old
+server faults on one it does not know, which is a clean refusal".
+
+**It is not a refusal.** The kind byte is resolved inside `Frame::decode`, so
+an unknown one fails as `IpcError::UnknownKind` rather than becoming a frame.
+`read_frame` turns every decode error except `Truncated` into
+`io::ErrorKind::InvalidData`, and both `serve_blocking` and the client
+propagate that out of their read loops with `?`. There is no resynchronisation
+point, because the length that would let a reader skip the body is in the frame
+it just rejected. The connection dies, and with it every snapshot and lane
+handle on it.
+
+That is what settled requirement 5. A peer cannot ask whether a server
+supports a kind: probing costs the pinned snapshot it was probing on behalf
+of, which is worse than not having the feature. The alternatives were weighed
+and rejected in the comment itself -- optional trailing fields are the same
+connection death moved to a known kind, since `decode` refuses trailing bytes
+by design; a greeting capability bitmap *is* a greeting shape change, which is
+the case the bump already existed for.
+
+So `VERSION` is 4, the comment's rule now reads "or a kind is added", and the
+paragraph recording why the old one was false is in the file. Client and
+server are built from one tree, so lockstep costs nothing a rolling deployment
+would notice, and what it rules out is a silent half-support: the mismatch
+surfaces at the greeting, before a snapshot exists to lose.
+
+### The wire, and the one place the new batch is the opposite of the old one
+
+Two kinds: `LanesAcquireRange { snapshot, keys, lo, hi }` answered by the
+existing `LanesAcquired`, and `BlockSeekMany { lanes, prefixes }` answered by
+the existing `Blocks` or `BlocksInline`. No response frame changed shape.
+
+`BlockAdvanceMany` returning fewer blocks than asked for means the scan ended.
+**`BlockSeekMany` never returns fewer.** A target no lane holds comes back as a
+block with every lane absent, and so does a target past the last stored chunk,
+because a caller tiling N lanes over M targets needs M answers positionally --
+dropping the empty ones would shift the rest onto the wrong targets, silently.
+A batch longer than the advertised `max_blocks` is therefore a **fault, not a
+truncated reply**: truncating drops targets, and a dropped target is
+indistinguishable from an absent one, which is a legitimate answer this request
+must also be able to give.
+
+The batch limit is `max_blocks` itself rather than a bound of its own, which is
+what makes it right in both transports without a second number. With an arena
+that is exactly how many sub-slots the handle's slice was sized for; inline,
+`Session::with_arena` already clamped the same figure down from
+`MAX_INLINE_PAYLOAD`. One number, because both were derived from the same
+capacity.
+
+A consequence worth stating rather than discovering: a window dense in holes
+costs **more** frames this way than a sequential walk over the same range,
+because the walk skips what is not there and this does not. Targets are for a
+caller that expects its prefixes to be sparse within the window.
+
+yesnod needed no change at all. `serve_locked` reads a frame and calls
+`Session::handle`; the `Session` is the only dispatcher, so the wiring is
+structural. That is worth recording as a property of the design rather than as
+an absence of work.
+
+### What the tests cover, and the one thing they do not
+
+Core: eleven tests on windows and targets, four of which were confirmed by
+sabotage ( cursor aimed at the whole key; whole-batch validation reduced to
+its first element; `advance` not sharing the position; an all-absent target
+dropped rather than returned ).
+
+`Session`: thirteen frame-level tests, including that an illegal window is an
+`InvalidArgument` rather than an `Internal` -- `status_from_core` maps
+`CodecError::Invariant` to `Internal`, which is right for an engine fault and
+wrong for a batch the peer composed, so caller-input rules are asked *before*
+construction through `KeyLanes::check_prefix_range`, one implementation with
+two callers rather than a rule written twice.
+
+Separate process, through the **official client**, served both ways from one
+binary: `--targets` on `yesno-channel-peer`. Nothing in the tree drove that
+client across a process boundary before this; every other client test shares an
+address space with its server. The arena and inline arms assert identical
+stdout, and a third test compares them against *each other* rather than against
+a constant, which is the assertion the first two cannot make -- a change
+breaking both the same way would need the constant edited.
+
+**Not covered: operational poisoning above the engine.** There is no way to
+inject a seek or read failure through `Session::handle`, so the poisoning path
+is tested at the core layer, where `poison()` is public and can be called, and
+the `Session` only propagates. That gap predates this change -- nothing covered
+it for `advance` either -- and it is filed rather than papered over.
+
+## 2026-10-19 — Addendum: the empty-window early return is load-bearing twice, and a test says so
+
+A fifth sabotage on the prefix-bounded work above, run after both gates, because
+the comment it justifies made a claim I had reasoned to rather than measured.
+
+`key_bounds` packs `lo` unconditionally with `ChunkKey::new`, which masks
+`PREFIX_EXCLUSIVE_END` to zero. That is sound only because
+`check_prefix_range` admits `lo <= hi <= PREFIX_EXCLUSIVE_END`, so `lo` reaches
+the exclusive end only when `hi` is there too -- and both planners return on
+`lo == hi` **before** calling `key_bounds`. The early return therefore does two
+jobs: it produces the empty plan, and it is what keeps the packing exact.
+
+I wrote that argument into the comment and asserted a test would catch the
+return being moved below the call. Measured rather than left as reasoning:
+moving it there makes `END..END` plan `[prefix 0, range_end)`, which is the
+whole key, and `an_empty_window_still_pins_the_snapshot` is the **only** failure
+out of 149 `db::` tests. The comment now names that test rather than claiming
+the breakage would be silent, which was the wording's original and wrong
+implication.
+
+Worth keeping because the hazard is invisible at the call site: `key_bounds`
+handles `hi == PREFIX_EXCLUSIVE_END` explicitly and conspicuously, so a reader
+naturally concludes `lo` was simply forgotten. It was not, and the reason lives
+ten lines away in a different function.

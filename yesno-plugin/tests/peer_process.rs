@@ -45,6 +45,16 @@ impl Drop for Clean {
 /// should be able to demonstrate it without the server, which is the same reason
 /// `Session::handle` is a function rather than a socket loop.
 fn serve(tag: &str, keys: &[u64]) -> (Clean, std::path::PathBuf, Arc<Db>) {
+    serve_with(tag, keys, true)
+}
+
+/// `serve`, with the transport chosen.
+///
+/// `arena` false is what a host with no shared memory does: no descriptor is sent
+/// and payloads travel inside the response frames. It is the same `Session` either
+/// way, which is why one peer binary can be served both ways and its output
+/// compared -- see `the_same_peer_reads_the_same_targets_in_both_transports`.
+fn serve_with(tag: &str, keys: &[u64], arena: bool) -> (Clean, std::path::PathBuf, Arc<Db>) {
     let mut dir = std::env::temp_dir();
     dir.push(format!("yesno-peerproc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -88,13 +98,21 @@ fn serve(tag: &str, keys: &[u64]) -> (Clean, std::path::PathBuf, Arc<Db>) {
             let Ok(stream) = incoming else { break };
             let host = host.clone();
             std::thread::spawn(move || {
-                let Ok(arena) = Arena::new(limits.arena_bytes()) else {
-                    return;
+                let mut session = match arena {
+                    true => {
+                        let Ok(region) = Arena::new(limits.arena_bytes()) else {
+                            return;
+                        };
+                        if send_fd(&stream, region.as_fd()).is_err() {
+                            return;
+                        }
+                        Session::new(host, region, limits)
+                    }
+                    // No descriptor at all, which is how a peer learns there is no
+                    // shared region: the greeting's `arena_bytes` is zero and the
+                    // first byte it reads is already the frame.
+                    false => Session::new_inline(host, limits),
                 };
-                if send_fd(&stream, arena.as_fd()).is_err() {
-                    return;
-                }
-                let mut session = Session::new(host, arena, limits);
                 let writer = std::sync::Mutex::new(stream.try_clone().unwrap());
                 let _ = serve_locked(&mut session, stream, &writer);
             });
@@ -432,5 +450,107 @@ fn a_separate_process_sends_the_widest_legal_apply() {
         db.snapshot().unwrap().cardinality(900).unwrap() as usize,
         n,
         "the host must hold all {n} ordinals a separate process sent in one frame"
+    );
+}
+
+/// The bounded window and the exact-target batch, **across a process boundary**.
+///
+/// # What only a second process shows here
+///
+/// Every other test of this feature either drives `Session::handle` directly or
+/// shares an address space with its server. This runs the official client as its
+/// own program against a real socket, which is the arrangement a deployment has and
+/// the one in which an arena offset computed from the wrong `max_lanes`, or a
+/// payload the two sides pack differently, actually produces wrong answers rather
+/// than a borrow error.
+///
+/// The expected output is given in full rather than checked line by line, so a line
+/// that disappears fails the test as loudly as a line that changes. Reading it from
+/// the fixture: keys 10, 10 and 30, with key 10 holding chunks 0, 1 and 5 at three
+/// ordinals each and key 30 a 4097-ordinal run at chunk 3.
+///
+/// * `window 4109` -- the window is `[1, 10)`, so chunk 0 is outside it. Both copies
+///   of key 10 contribute, hence `3 + 3` at prefix 1 and again at prefix 5, plus the
+///   run's 4097 at prefix 3. A whole-key scan of the same keys reaches 4115, and the
+///   six-ordinal difference **is** the window.
+/// * `refused oversized 5` -- one target more than the `max_blocks` of 4 this
+///   harness advertises, refused for its size alone: those five targets are
+///   ascending, inside the window and ahead of a handle that has read nothing.
+/// * one `block` line per target, in the order asked for, for a batch of exactly
+///   `max_blocks` so the boundary is tested rather than avoided. Prefix 2 holds
+///   nothing and still answers `present 0` rather than being dropped. Where key 10
+///   is present, `present 2` is the duplicate key occupying two lanes, which is what
+///   keeps lane index equal to argument index.
+/// * `refused descending` then `refused backwards` -- one caught by the client
+///   before it sent anything, one by the server after checking the whole batch --
+///   and then `after 1 block 9`, a target past every stored chunk, read on the same
+///   handle, which is that handle still working after both refusals.
+const TARGET_OUTPUT: &str = "window 4109\n\
+                             refused oversized 5\n\
+                             block 1 present 2 card 6\n\
+                             block 2 present 0 card 0\n\
+                             block 3 present 1 card 4097\n\
+                             block 5 present 2 card 6\n\
+                             refused descending\n\
+                             refused backwards\n\
+                             after 1 block 9\n";
+
+fn run_targets_peer(tag: &str, arena: bool) -> String {
+    let (_c, sock, db) = serve_with(tag, &[10, 10, 30], arena);
+    let out = std::process::Command::new(peer_binary())
+        .arg("--targets")
+        .arg(&sock)
+        .args(["10", "10", "30"])
+        .output()
+        .expect("the peer binary must run");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "peer failed: {}{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Two handles and two snapshots were opened; both must be gone once the peer is.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.live_readers() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        db.live_readers(),
+        0,
+        "a bounded handle must release its snapshot like any other"
+    );
+    stdout
+}
+
+/// Targets through the arena, from another process.
+#[test]
+fn a_separate_process_reads_exact_targets_through_the_arena() {
+    assert_eq!(run_targets_peer("targets-arena", true), TARGET_OUTPUT);
+}
+
+/// Targets with the payloads in the frames, from another process.
+#[test]
+fn a_separate_process_reads_exact_targets_inline() {
+    assert_eq!(run_targets_peer("targets-inline", false), TARGET_OUTPUT);
+}
+
+/// The two transports agree, byte for byte.
+///
+/// **This is the assertion the two tests above cannot make.** They each compare
+/// against a constant, so a change that broke both in the same way would need the
+/// constant edited and would be caught by review rather than by a gate. This
+/// compares the transports against *each other*, and the two use genuinely
+/// different arithmetic for the same bytes: arena lanes are a fixed stride from
+/// `batched_lane_offset`, inline lanes are a running sum over packed payloads. One
+/// block would hide it -- the stride term is multiplied by zero at block 0 -- and a
+/// five-target batch does not.
+#[test]
+fn the_same_peer_reads_the_same_targets_in_both_transports() {
+    let arena = run_targets_peer("targets-both-a", true);
+    let inline = run_targets_peer("targets-both-i", false);
+    assert_eq!(
+        arena, inline,
+        "the two payload paths disagree about the same blocks"
     );
 }

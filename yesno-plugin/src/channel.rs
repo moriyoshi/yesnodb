@@ -424,7 +424,19 @@ impl Session {
             Frame::Apply { writes } => self.apply(&writes),
             Frame::ChunkPut { writes } => self.chunk_put(&writes),
             Frame::SnapshotClose { snapshot } => self.snapshot_close(snapshot),
-            Frame::LanesAcquire { snapshot, keys } => self.lanes_acquire(snapshot, &keys),
+            Frame::LanesAcquire { snapshot, keys } => {
+                // The unbounded request is the widest window rather than a second
+                // path, so the two acquisitions cannot drift apart in anything but
+                // their endpoints.
+                self.lanes_acquire(snapshot, &keys, 0, yesno_core::PREFIX_EXCLUSIVE_END)
+            }
+            Frame::LanesAcquireRange {
+                snapshot,
+                keys,
+                lo,
+                hi,
+            } => self.lanes_acquire(snapshot, &keys, lo, hi),
+            Frame::BlockSeekMany { lanes, prefixes } => self.block_seek_many(lanes, &prefixes),
             Frame::LanesRelease { lanes } => self.lanes_release(lanes),
             Frame::BlockAdvance { lanes } => self.block_advance(lanes),
             Frame::BlockRelease { lanes } => self.block_release(lanes),
@@ -828,9 +840,24 @@ impl Session {
         Frame::Done
     }
 
-    fn lanes_acquire(&mut self, snapshot: u64, keys: &[u64]) -> Frame {
+    /// Open a handle over the half-open prefix window `[lo, hi)`.
+    ///
+    /// Every quota the unbounded path enforces is enforced here, because this *is*
+    /// the unbounded path: `0 .. PREFIX_EXCLUSIVE_END` is the widest window, not a
+    /// separate case. A window narrows which chunks the handle will resolve and
+    /// changes nothing about what a handle costs the session -- it still claims an
+    /// arena slot of the same size, still counts against `max_handles`, and still
+    /// keeps its snapshot open -- so a bounded acquisition must not be a way around
+    /// any of the three.
+    fn lanes_acquire(&mut self, snapshot: u64, keys: &[u64], lo: u64, hi: u64) -> Frame {
         if keys.len() > self.limits.max_lanes {
             return Self::fault(Status::InvalidArgument, "too many lanes for this server");
+        }
+        // Asked before constructing, so a window the engine would reject is
+        // reported as the caller's error rather than as an internal one; see
+        // `KeyLanes::check_prefix_range` for why the constructor still checks.
+        if let Err(e) = KeyLanes::check_prefix_range(lo, hi) {
+            return Self::fault(Status::InvalidArgument, &e.to_string());
         }
         let Some(snap) = self.snapshots.get(&snapshot) else {
             return Self::fault(Status::InvalidArgument, "no such snapshot");
@@ -838,7 +865,7 @@ impl Session {
         let Some(index) = self.slots.iter().position(|used| !used) else {
             return Self::fault(Status::InvalidArgument, "no free arena slot");
         };
-        let lanes = match KeyLanes::new(snap, keys) {
+        let lanes = match KeyLanes::in_prefix_range(snap, keys, lo, hi) {
             Ok(l) => l,
             Err(e) => return Self::fault(status_from_core(&e), "cannot open the lanes"),
         };
@@ -1008,6 +1035,117 @@ impl Session {
         if !out.is_empty() {
             h.block_open = true;
         }
+        if self.arena.is_some() {
+            Frame::Blocks { blocks: out }
+        } else {
+            Frame::BlocksInline {
+                blocks: out,
+                payload,
+            }
+        }
+    }
+
+    /// Read exactly these prefixes, one block each, in the order asked for.
+    ///
+    /// The target counterpart of [`Self::block_advance_many`], and it shares that
+    /// method's implicit release of the previous batch for the same reason: over a
+    /// request-response channel, asking for the next batch is what ends the last
+    /// one.
+    ///
+    /// # Where the batch limit comes from, and why exceeding it is a fault
+    ///
+    /// `max_blocks`, the number already in the greeting -- not a bound of this
+    /// method's own. With an arena that is exactly how many sub-slots the handle's
+    /// slice was sized for, so a longer batch has nowhere to land; inline, the same
+    /// number was clamped down from the payload cap by `with_arena`, so a longer
+    /// batch would be refused by this server's own encoder after the work was done.
+    /// One number covers both transports because both derived it from the same
+    /// capacity.
+    ///
+    /// It is **refused rather than truncated**, which is the opposite of
+    /// `block_advance_many`. There, a short reply means the scan ended and a peer
+    /// asks again. Here every target must come back, so a truncated reply would
+    /// silently drop targets -- and a dropped target is indistinguishable from a
+    /// target at which no lane holds anything, which is a legitimate answer this
+    /// method must also be able to give.
+    ///
+    /// # Validation precedes every mutation
+    ///
+    /// The whole batch is checked before the first seek, so a batch whose later
+    /// target is backwards or outside the window costs nothing: the handle keeps
+    /// its position, its open block and its payloads. An **operational** failure
+    /// partway through is the other case entirely -- it cannot be undone, so it
+    /// poisons the handle and the peer gets a fault instead of the blocks already
+    /// gathered. A partial reply would be a correct-looking answer to a different
+    /// question.
+    fn block_seek_many(&mut self, id: u64, prefixes: &[u64]) -> Frame {
+        let block_bytes = self.limits.block_bytes();
+        let slot_bytes = self.limits.slot_bytes();
+        let cap = self.limits.max_blocks.max(1);
+        if prefixes.len() > cap {
+            return Self::fault(
+                Status::InvalidArgument,
+                "more target prefixes than the advertised max_blocks",
+            );
+        }
+        let Some(h) = self.handles.get_mut(&id) else {
+            return Self::fault(Status::InvalidArgument, "no such lane handle");
+        };
+        // The whole batch, before anything moves. The engine's message names which
+        // rule failed, and it is the caller's input either way -- `status_from_core`
+        // would call an `Invariant` internal, which is right for an engine fault
+        // and wrong for a batch the peer composed.
+        if let Err(e) = h.lanes.check_targets(prefixes) {
+            return Self::fault(Status::InvalidArgument, &e.to_string());
+        }
+        h.block_open = false;
+        let base = h.index * slot_bytes;
+        let arity = h.arity;
+        let mut out: Vec<WireBlock> = Vec::with_capacity(prefixes.len());
+        let absent = Lane {
+            kind: LaneKind::Absent,
+            count: 0,
+        };
+        let mut payload = Vec::new();
+        // Word-aligned for the reason `block_advance_many` records: it is what makes
+        // `encode_into`'s bitmap fast path a property of this file rather than of
+        // the stack.
+        let mut words = [0u64; LANE_BYTES / 8];
+        let scratch: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
+        for (j, &target) in prefixes.iter().enumerate() {
+            if let Err(e) = h.lanes.seek_block(target) {
+                // Poisoned by the engine already; the peer gets nothing rather than
+                // the blocks gathered so far.
+                return Self::fault(status_from_core(&e), "cannot seek to a target prefix");
+            }
+            let mut lanes = Vec::with_capacity(arity);
+            for i in 0..arity {
+                lanes.push(match h.lanes.lane(i) {
+                    None => absent,
+                    Some(c) => match self.arena.as_mut() {
+                        Some(arena) => arena.encode_at(base + j * block_bytes + i * LANE_BYTES, c),
+                        None => {
+                            let lane = encode_into(scratch, c);
+                            let n = lane.kind.payload_bytes(lane.count);
+                            payload.extend_from_slice(&scratch[..n]);
+                            lane
+                        }
+                    },
+                });
+            }
+            // `target`, not the handle's prefix: they are equal by construction and
+            // the target is what the peer asked for, so a block is attributable to
+            // its request even if that construction ever changed.
+            out.push(WireBlock {
+                prefix: target,
+                lanes,
+            });
+        }
+        // Every target produced a block, so the last one's payloads are lent until
+        // the next request -- the same state the batched advance leaves behind. The
+        // emptiness check the advance needs is absent here because a nonempty batch
+        // always yields a nonempty reply.
+        h.block_open = true;
         if self.arena.is_some() {
             Frame::Blocks { blocks: out }
         } else {

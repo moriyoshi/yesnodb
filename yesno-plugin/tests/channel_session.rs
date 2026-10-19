@@ -2201,3 +2201,530 @@ fn a_malformed_write_is_refused_and_stages_nothing() {
         "a refused batch must stage none of itself, including its valid entries"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bounded windows and exact target batches, at the frame boundary
+// ---------------------------------------------------------------------------
+
+/// A session with room for a real target batch.
+///
+/// The shared `limits()` has `max_blocks: 1`, which is the unbatched behaviour and
+/// would cap every batch here at one target -- so these tests build their own, and
+/// 4 is the figure the assertions below quote.
+fn target_limits() -> Limits {
+    Limits {
+        max_handles: 2,
+        max_lanes: 4,
+        max_blocks: 4,
+        max_snapshots: 64,
+        max_writes: yesno_plugin::ipc::MAX_WRITES,
+        max_expr_bytes: yesno_plugin::ipc::MAX_EXPR_BYTES,
+    }
+}
+
+/// A greeted session on the fixture database, with `target_limits`.
+fn target_session(tag: &str) -> (Clean, Host, Session, u64) {
+    let l = target_limits();
+    let (clean, host, _drop) = setup(tag);
+    let arena = Arena::new(l.arena_bytes()).unwrap();
+    let mut s = Session::new(host.clone(), arena, l);
+    greet(&mut s);
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    (clean, host, s, snapshot)
+}
+
+fn acquire_window(s: &mut Session, snapshot: u64, keys: Vec<u64>, lo: u64, hi: u64) -> u64 {
+    match s.handle(Frame::LanesAcquireRange {
+        snapshot,
+        keys,
+        lo,
+        hi,
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The prefixes of every block a batched walk reaches.
+fn walk_prefixes(s: &mut Session, lanes: u64) -> Vec<u64> {
+    let mut seen = Vec::new();
+    loop {
+        match s.handle(Frame::BlockAdvanceMany {
+            lanes,
+            max_blocks: 4,
+        }) {
+            Frame::Blocks { blocks } => {
+                let n = blocks.len();
+                seen.extend(blocks.into_iter().map(|b| b.prefix));
+                if n < 4 {
+                    return seen;
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A bounded acquisition yields exactly the blocks inside its window, and the
+/// unbounded request is the widest window rather than a different code path.
+#[test]
+fn a_bounded_acquisition_serves_only_its_window() {
+    let (_c, _h, mut s, snapshot) = target_session("win-blocks");
+
+    let whole = acquire_window(&mut s, snapshot, vec![10, 20, 30], 0, 1u64 << 48);
+    assert_eq!(walk_prefixes(&mut s, whole), vec![0, 1, 3, 5]);
+    assert_eq!(s.handle(Frame::LanesRelease { lanes: whole }), Frame::Done);
+
+    // The same request spelled the old way must agree, which is what makes the
+    // unbounded frame a window rather than a second implementation.
+    let legacy = match s.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![10, 20, 30],
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(walk_prefixes(&mut s, legacy), vec![0, 1, 3, 5]);
+    assert_eq!(s.handle(Frame::LanesRelease { lanes: legacy }), Frame::Done);
+
+    let bounded = acquire_window(&mut s, snapshot, vec![10, 20, 30], 1, 5);
+    assert_eq!(
+        walk_prefixes(&mut s, bounded),
+        vec![1, 3],
+        "prefix 0 is below the window and 5 is its exclusive end"
+    );
+}
+
+/// An empty window is a handle, not an error, and it pins the snapshot like any
+/// other -- which is what makes `END..END` safe to compute at the end of a scan.
+#[test]
+fn an_empty_window_is_a_handle_that_still_pins_its_snapshot() {
+    let (_c, _h, mut s, snapshot) = target_session("win-empty");
+    let end = 1u64 << 48;
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 20], end, end);
+
+    match s.handle(Frame::BlockAdvanceMany {
+        lanes,
+        max_blocks: 4,
+    }) {
+        Frame::Blocks { blocks } => assert!(blocks.is_empty(), "{blocks:?}"),
+        other => panic!("{other:?}"),
+    }
+    // The quota is unchanged by the window being empty: the handle is real, so the
+    // snapshot under it cannot be closed.
+    let f = s.handle(Frame::SnapshotClose { snapshot });
+    assert_eq!(fault_status(&f), Status::InvalidArgument as u32);
+    assert_eq!(s.handle(Frame::LanesRelease { lanes }), Frame::Done);
+    assert_eq!(s.handle(Frame::SnapshotClose { snapshot }), Frame::Done);
+}
+
+/// A window the engine cannot express is the **caller's** error, not an internal
+/// one, and it is reported before a handle or an arena slot is spent.
+#[test]
+fn an_illegal_window_is_an_invalid_argument() {
+    let (_c, _h, mut s, snapshot) = target_session("win-bad");
+    let end = 1u64 << 48;
+    for (lo, hi) in [(0, end + 1), (5, 1), (end + 1, end + 1)] {
+        let f = s.handle(Frame::LanesAcquireRange {
+            snapshot,
+            keys: vec![10],
+            lo,
+            hi,
+        });
+        assert_eq!(
+            fault_status(&f),
+            Status::InvalidArgument as u32,
+            "window {lo}..{hi} must be refused as caller input"
+        );
+    }
+    assert_eq!(
+        s.outstanding(),
+        (1, 0),
+        "a refused window must not consume a handle"
+    );
+}
+
+/// A bounded acquisition still counts against `max_handles` and `max_lanes`: a
+/// window narrows what a handle reads, not what it costs the session.
+#[test]
+fn a_bounded_handle_counts_against_the_same_quotas() {
+    let (_c, _h, mut s, snapshot) = target_session("win-quota");
+    let f = s.handle(Frame::LanesAcquireRange {
+        snapshot,
+        keys: vec![10, 20, 30, 10, 20],
+        lo: 0,
+        hi: 4,
+    });
+    assert_eq!(
+        fault_status(&f),
+        Status::InvalidArgument as u32,
+        "five lanes against a max_lanes of four"
+    );
+
+    let a = acquire_window(&mut s, snapshot, vec![10], 0, 4);
+    let b = acquire_window(&mut s, snapshot, vec![10], 0, 4);
+    let f = s.handle(Frame::LanesAcquireRange {
+        snapshot,
+        keys: vec![10],
+        lo: 0,
+        hi: 4,
+    });
+    assert_eq!(
+        fault_status(&f),
+        Status::InvalidArgument as u32,
+        "a third handle against a max_handles of two"
+    );
+    assert_eq!(s.handle(Frame::LanesRelease { lanes: a }), Frame::Done);
+    assert_eq!(s.handle(Frame::LanesRelease { lanes: b }), Frame::Done);
+}
+
+/// One block per target, in the order asked for, including targets no lane holds.
+#[test]
+fn every_target_comes_back_as_a_block() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-all");
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 10, 30], 0, 1u64 << 48);
+
+    // 2 holds nothing, 9 is past every stored chunk.
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1, 2, 3, 9],
+    }) {
+        Frame::Blocks { blocks } => {
+            let got: Vec<_> = blocks
+                .iter()
+                .map(|b| {
+                    (
+                        b.prefix,
+                        b.lanes
+                            .iter()
+                            .filter(|l| l.kind != LaneKind::Absent)
+                            .count(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![(1, 2), (2, 0), (3, 1), (9, 0)],
+                "every target must answer, and a duplicate key must fill both lanes"
+            );
+            // Fixed lane slots: an absent lane keeps its index rather than shifting.
+            assert!(blocks.iter().all(|b| b.lanes.len() == 3));
+            assert_eq!(blocks[2].lanes[0].kind, LaneKind::Absent);
+            assert_eq!(blocks[2].lanes[2].kind, LaneKind::Run);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A batch is checked whole before anything moves, so a bad **later** target costs
+/// the handle nothing -- and the handle is usable immediately afterwards.
+#[test]
+fn a_bad_later_target_refuses_the_whole_batch_and_moves_nothing() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-batch");
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 30], 0, 1u64 << 48);
+
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 1),
+        other => panic!("{other:?}"),
+    }
+
+    // Each of these is legal in its first element and wrong later, except the last
+    // two which are wrong at the front. All must be refused identically.
+    for bad in [
+        vec![3u64, 2],
+        vec![3, 3],
+        vec![3, 1u64 << 48],
+        vec![1, 5],
+        vec![0, 5],
+        vec![],
+    ] {
+        let f = s.handle(Frame::BlockSeekMany {
+            lanes,
+            prefixes: bad.clone(),
+        });
+        assert_eq!(
+            fault_status(&f),
+            Status::InvalidArgument as u32,
+            "batch {bad:?} must be refused"
+        );
+    }
+
+    // Nothing moved: 3 is still ahead of the position, which it would not be if any
+    // of the refused batches had been partly executed.
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![3, 5],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(
+            blocks.iter().map(|b| b.prefix).collect::<Vec<_>>(),
+            vec![3, 5],
+            "the handle must still be at prefix 1 after six refusals"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A target outside the handle's own window is refused, so a window is a bound on
+/// the handle rather than a hint about its first walk.
+#[test]
+fn a_target_outside_the_window_is_refused() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-window");
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 30], 1, 5);
+    for bad in [vec![0u64], vec![5], vec![9], vec![1, 5]] {
+        let f = s.handle(Frame::BlockSeekMany {
+            lanes,
+            prefixes: bad.clone(),
+        });
+        assert_eq!(
+            fault_status(&f),
+            Status::InvalidArgument as u32,
+            "{bad:?} is not inside [1, 5)"
+        );
+    }
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1, 3],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 2),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// More targets than the greeting advertised is a **fault**, not a short reply.
+///
+/// The opposite of `BlockAdvanceMany`, which caps and returns what it can. Here a
+/// truncated reply would drop targets, and a dropped target is indistinguishable
+/// from one at which no lane holds anything.
+#[test]
+fn more_targets_than_max_blocks_is_refused_rather_than_truncated() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-cap");
+    let lanes = acquire_window(&mut s, snapshot, vec![10], 0, 1u64 << 48);
+    let f = s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![0, 1, 2, 3, 4],
+    });
+    assert_eq!(
+        fault_status(&f),
+        Status::InvalidArgument as u32,
+        "five targets against the max_blocks of four this session advertised"
+    );
+    // Exactly the limit is accepted, so the refusal above is the boundary and not
+    // an off-by-one that forbids a legal batch.
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![0, 1, 2, 3],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 4),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Sequential and target reads share one forward position on the handle.
+#[test]
+fn a_walk_and_a_target_batch_share_one_position() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-mixed");
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 20, 30], 0, 1u64 << 48);
+
+    match s.handle(Frame::BlockAdvanceMany {
+        lanes,
+        max_blocks: 2,
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(
+            blocks.iter().map(|b| b.prefix).collect::<Vec<_>>(),
+            vec![0, 1]
+        ),
+        other => panic!("{other:?}"),
+    }
+    // 1 was just emitted by the walk, so a target at it is behind the shared
+    // position even though no target has ever been asked for.
+    let f = s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1, 3],
+    });
+    assert_eq!(fault_status(&f), Status::InvalidArgument as u32);
+
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![3],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    // And the walk resumes past the target rather than repeating what it consumed.
+    match s.handle(Frame::BlockAdvanceMany {
+        lanes,
+        max_blocks: 4,
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(
+            blocks.iter().map(|b| b.prefix).collect::<Vec<_>>(),
+            vec![5],
+            "the walk must not re-emit the block the target read"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A bounded handle reads the version it pinned, whatever happens afterwards.
+#[test]
+fn a_write_after_a_bounded_acquisition_is_invisible_to_it() {
+    let (_c, host, mut s, snapshot) = target_session("tgt-iso");
+    let lanes = acquire_window(&mut s, snapshot, vec![10], 0, 1u64 << 48);
+
+    // Written and checkpointed between the acquisition and the target read.
+    let db = host.db().expect("the fixture database");
+    let mut b = db.batch();
+    b.insert(10, 4 * 65536 + 1);
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![4],
+    }) {
+        Frame::Blocks { blocks } => {
+            assert_eq!(blocks.len(), 1, "the target still answers");
+            assert_eq!(
+                blocks[0].lanes[0].kind,
+                LaneKind::Absent,
+                "a chunk written after the snapshot must be absent"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // A snapshot opened now does see it, which is what makes the absence above a
+    // property of the pin rather than of the write having failed.
+    let fresh = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let later = acquire_window(&mut s, fresh, vec![10], 4, 5);
+    match s.handle(Frame::BlockSeekMany {
+        lanes: later,
+        prefixes: vec![4],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks[0].lanes[0].kind, LaneKind::Array),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An unknown handle is refused for a target read as for any other.
+#[test]
+fn a_target_read_on_an_unknown_handle_is_refused() {
+    let (_c, _h, mut s, snapshot) = target_session("tgt-unknown");
+    let lanes = acquire_window(&mut s, snapshot, vec![10], 0, 1u64 << 48);
+    let f = s.handle(Frame::BlockSeekMany {
+        lanes: lanes + 999,
+        prefixes: vec![1],
+    });
+    assert_eq!(fault_status(&f), Status::InvalidArgument as u32);
+    // The real handle is untouched by the refusal of a different one.
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A bounded handle, and one mid-target-batch, is drained by the socket closing
+/// exactly as an unbounded one is.
+///
+/// The disconnect-drain rule is the reclamation story and it must not acquire an
+/// exception: a handle with a window still pins a snapshot, and a handle left with
+/// an open block of target payloads still holds containers. Dropping the session is
+/// what a dead peer provides, and it has to be enough for both.
+#[test]
+fn dropping_a_session_releases_a_bounded_handle_mid_batch() {
+    let (_c, host, mut s, snapshot) = target_session("tgt-drain");
+    let lanes = acquire_window(&mut s, snapshot, vec![10, 20], 1, 6);
+    // Left deliberately open: the payloads of these two blocks are lent to the peer
+    // and the handle is between requests, which is the state a peer dies in.
+    match s.handle(Frame::BlockSeekMany {
+        lanes,
+        prefixes: vec![1, 3],
+    }) {
+        Frame::Blocks { blocks } => assert_eq!(blocks.len(), 2),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.outstanding(), (1, 1));
+    let db = host.db().unwrap();
+    assert_eq!(db.live_readers(), 1);
+
+    drop(s);
+    assert_eq!(
+        db.live_readers(),
+        0,
+        "a window and an open target block must not survive the session"
+    );
+}
+
+/// A target batch describes the same lanes whichever transport carries it.
+///
+/// Descriptors only, deliberately: the **payload bytes** of a target batch are
+/// compared across the two transports end to end, through the official client and a
+/// real socket, by `the_same_peer_reads_the_same_targets_in_both_transports` in
+/// `peer_process.rs` -- which is a stronger claim than this file can make, because
+/// an in-process test would have to re-map the arena and so would be checking its
+/// own arithmetic against itself. What is worth asserting here is that the reply
+/// *shape* does not depend on the transport: the same four targets, the same lane
+/// kinds, the same counts, and no block dropped by the inline path's tighter cap.
+#[test]
+fn a_target_batch_describes_the_same_lanes_in_both_transports() {
+    fn describe(arena: bool) -> Vec<(u64, Vec<(LaneKind, u32)>)> {
+        let l = target_limits();
+        let (_c, host, _drop) = setup(if arena { "tgt-both-a" } else { "tgt-both-i" });
+        let mut s = match arena {
+            true => Session::new(host, Arena::new(l.arena_bytes()).unwrap(), l),
+            false => Session::new_inline(host, l),
+        };
+        greet(&mut s);
+        let snapshot = match s.handle(Frame::SnapshotOpen) {
+            Frame::SnapshotOpened { snapshot, .. } => snapshot,
+            other => panic!("{other:?}"),
+        };
+        let lanes = acquire_window(&mut s, snapshot, vec![10, 20, 30], 0, 1u64 << 48);
+        let blocks = match s.handle(Frame::BlockSeekMany {
+            lanes,
+            prefixes: vec![1, 2, 3, 5],
+        }) {
+            Frame::Blocks { blocks } if arena => blocks,
+            Frame::BlocksInline { blocks, payload } if !arena => {
+                // The payload must account for exactly the descriptors, which is the
+                // one thing only the inline path can get wrong.
+                let want: usize = blocks
+                    .iter()
+                    .flat_map(|b| b.lanes.iter())
+                    .map(|l| l.kind.payload_bytes(l.count))
+                    .sum();
+                assert_eq!(
+                    payload.len(),
+                    want,
+                    "packed payload does not match its lanes"
+                );
+                blocks
+            }
+            other => panic!("the reply contradicts the transport: {other:?}"),
+        };
+        blocks
+            .into_iter()
+            .map(|b| {
+                (
+                    b.prefix,
+                    b.lanes.iter().map(|l| (l.kind, l.count)).collect(),
+                )
+            })
+            .collect()
+    }
+    assert_eq!(
+        describe(true),
+        describe(false),
+        "the two transports describe the same four targets differently"
+    );
+}
