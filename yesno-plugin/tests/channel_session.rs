@@ -2728,3 +2728,236 @@ fn a_target_batch_describes_the_same_lanes_in_both_transports() {
         "the two transports describe the same four targets differently"
     );
 }
+
+// ---- A handle poisoned by a real engine failure -------------------------------
+//
+// Everything above about poisoning starts from a handle already poisoned. These
+// do not: they damage a stored chunk under a live snapshot and let the engine
+// discover it, which is the half of
+// `lane-handle-poisoning-is-untested-above-the-engine` that the core's own
+// `poison()` calls and the session tests in `src/channel.rs` both leave open.
+//
+// **Why damaging a file is a legitimate test and not a trick.** Every stored
+// family is content-checked on first touch -- `SegmentedMmap::verify_once`
+// recomputes the packed page's CRC, the extent trailer's CRC and the index
+// node's, once per faulted region. A flipped byte in a payload therefore comes
+// back as `CodecError::Invariant( "extent payload fails its stored checksum" )`
+// from the read that first touches it, which is precisely an operational
+// failure midway through a lane advance. Nothing is mocked and no seam was added
+// to production code to make this reachable.
+//
+// The one assumption is that a write through the file is visible through the
+// mapping the snapshot holds. That is true on Linux, which this file already
+// requires for the memfd arena.
+
+/// The chunk this fixture marks for damage: every other value in chunk 5, so the
+/// container is a bitmap whose words are all `0x5555_5555_5555_5555` and whose
+/// payload is findable in the shard file without parsing it.
+const MARK: usize = 2048;
+
+/// A session whose stored bytes a test can damage, and the directory holding
+/// them.
+///
+/// Reopened after the checkpoint so reads come from the file rather than from a
+/// memtable -- damaging bytes that nothing reads would prove nothing.
+fn corruptible(tag: &str) -> (Clean, std::path::PathBuf, Session) {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-chan-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let clean = Clean(dir.clone());
+
+    let opts = || DbOptions {
+        shards: 1,
+        ..Default::default()
+    };
+    let db = Db::open_with(&dir, opts()).unwrap();
+    let mut b = db.batch();
+    // chunk 0: three values, small enough to ride inline and left intact, so the
+    // handle is known to be working before it is broken.
+    for i in 0..3u64 {
+        b.insert(10, 7 + i);
+    }
+    // chunk 5: the marked bitmap.
+    for i in 0..32768u64 {
+        b.insert(10, 5 * 65536 + i * 2);
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+
+    let db = Db::open_with(&dir, opts()).unwrap();
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    let l = limits();
+    let arena = Arena::new(l.arena_bytes()).expect("memfd arena");
+    let mut session = Session::new(host, arena, l);
+    greet(&mut session);
+    (clean, dir, session)
+}
+
+/// Flip one byte in the middle of the marked chunk's payload.
+///
+/// Scanned for rather than computed: the offset is an allocator decision and
+/// hard-coding it would turn a layout change into a confusing failure here. The
+/// scan walks the shard in a megabyte at a time and stops at the first run,
+/// because the file is a sparse gigabyte and reading it whole would cost more
+/// than the rest of this suite together.
+fn damage_the_marked_chunk(dir: &std::path::Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let path = dir.join("shard-0000.yno");
+    let mut f = std::fs::File::open(&path).expect("the shard file");
+    let len = f.metadata().unwrap().len();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    let mut run = 0usize;
+    let mut found = None;
+    while at < len && found.is_none() {
+        let n = f.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        for (i, &b) in buf[..n].iter().enumerate() {
+            run = if b == 0x55 { run + 1 } else { 0 };
+            if run >= MARK {
+                // The middle of the run, so the byte is inside the payload rather
+                // than at an edge that might belong to something adjacent.
+                found = Some(at + i as u64 - (MARK / 2) as u64);
+                break;
+            }
+        }
+        at += n as u64;
+    }
+    let off = found.expect("the marked chunk's payload is in the shard file");
+
+    let mut w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    w.seek(SeekFrom::Start(off)).unwrap();
+    w.write_all(&[0x56]).unwrap();
+    w.sync_all().unwrap();
+    off
+}
+
+/// A failed read poisons the handle, and the peer is told it was the engine.
+///
+/// The whole chain, with nothing simulated: a good block comes back, one byte of
+/// the next chunk's stored payload is flipped, and the advance that reaches it
+/// fails its checksum inside the engine. What the peer sees is `Internal` -- and
+/// then sees it for every later request, including a target batch that is legal
+/// in every respect, which is the case that was reported as `InvalidArgument`
+/// until 2026-10-20.
+#[test]
+fn a_failed_read_poisons_the_handle_and_the_peer_is_told_it_was_the_engine() {
+    let (_c, dir, mut s) = corruptible("damaged");
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let lanes = match s.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![10],
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    };
+
+    match s.handle(Frame::BlockAdvance { lanes }) {
+        Frame::Block { prefix, .. } => assert_eq!(prefix, 0, "the intact chunk comes back"),
+        other => panic!("the handle must work before it is broken: {other:?}"),
+    }
+    assert_eq!(s.handle(Frame::BlockRelease { lanes }), Frame::Done);
+
+    damage_the_marked_chunk(&dir);
+
+    let f = s.handle(Frame::BlockAdvance { lanes });
+    assert_eq!(
+        fault_status(&f),
+        Status::Internal as u32,
+        "a checksum failure in the engine is not the peer's bad request"
+    );
+
+    // Every later request, and the target batch above all: it reaches the poisoned
+    // state through `check_targets` rather than through `advance`, which is how it
+    // came to report a dead handle as `InvalidArgument`.
+    for later in [
+        s.handle(Frame::BlockAdvance { lanes }),
+        s.handle(Frame::BlockAdvanceMany {
+            lanes,
+            max_blocks: 1,
+        }),
+        s.handle(Frame::BlockSeekMany {
+            lanes,
+            prefixes: vec![5],
+        }),
+    ] {
+        assert_eq!(
+            fault_status(&later),
+            Status::Internal as u32,
+            "the handle stays dead, and says so the same way every time"
+        );
+    }
+
+    // And the peer can still let go of it, slot and all.
+    assert_eq!(s.handle(Frame::BlockRelease { lanes }), Frame::Done);
+    assert_eq!(s.handle(Frame::LanesRelease { lanes }), Frame::Done);
+    match s.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![10],
+    }) {
+        Frame::LanesAcquired { arena_off, .. } => assert_eq!(
+            arena_off, 0,
+            "the dead handle's arena slot comes back for reuse"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The damage reaches one handle, not the session.
+///
+/// A second handle over the same snapshot still serves the chunk that was not
+/// damaged. This is worth asserting because poisoning is deliberately coarse --
+/// it kills a whole handle for one lane's failure -- and a reader could
+/// reasonably wonder whether it is coarser still. It is not: the snapshot, the
+/// session and every other handle on it are untouched.
+#[test]
+fn a_poisoned_handle_does_not_take_the_session_with_it() {
+    let (_c, dir, mut s) = corruptible("blast");
+    let snapshot = match s.handle(Frame::SnapshotOpen) {
+        Frame::SnapshotOpened { snapshot, .. } => snapshot,
+        other => panic!("{other:?}"),
+    };
+    let acquire = |s: &mut Session| match s.handle(Frame::LanesAcquire {
+        snapshot,
+        keys: vec![10],
+    }) {
+        Frame::LanesAcquired { lanes, .. } => lanes,
+        other => panic!("{other:?}"),
+    };
+    let first = acquire(&mut s);
+    let second = acquire(&mut s);
+
+    damage_the_marked_chunk(&dir);
+
+    // The damaged chunk is at prefix 5, so walking the first handle reaches it and
+    // dies there.
+    assert!(matches!(
+        s.handle(Frame::BlockAdvance { lanes: first }),
+        Frame::Block { .. }
+    ));
+    assert_eq!(s.handle(Frame::BlockRelease { lanes: first }), Frame::Done);
+    assert_eq!(
+        fault_status(&s.handle(Frame::BlockAdvance { lanes: first })),
+        Status::Internal as u32
+    );
+
+    // The second handle has not reached the damage, and is served normally.
+    match s.handle(Frame::BlockAdvance { lanes: second }) {
+        Frame::Block { prefix, .. } => assert_eq!(prefix, 0),
+        other => panic!("a second handle must be unaffected: {other:?}"),
+    }
+    assert_eq!(s.handle(Frame::BlockRelease { lanes: second }), Frame::Done);
+
+    // And the session itself still answers for the snapshot it holds.
+    assert!(matches!(
+        s.handle(Frame::SnapshotOpen),
+        Frame::SnapshotOpened { .. }
+    ));
+}

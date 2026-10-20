@@ -3849,3 +3849,86 @@ one side of an interface and merely documented on the other is not half-tested;
 it is untested where it is consumed, and the two sides had already drifted within
 a day of being written -- by the author, in one file, with the reason for the
 distinction in a comment ten lines above the line that broke it.
+
+## 2026-10-20 — A real checksum failure, and the half of the contract that was only documented
+
+The morning's entry fixed a status and left half of
+`lane-handle-poisoning-is-untested-above-the-engine` open: those tests start
+*from* a poisoned handle, reached through the private handle map, so no real
+engine failure drove the transition anywhere above `yesno-core`. The entry
+listed two candidate seams, both unattractive -- a `Db` whose store errors on
+demand, which is test-only machinery inside a production type, or corrupting a
+checkpointed shard, described there as "real but slow and platform-sensitive".
+
+**Neither was needed, and the second was neither slow nor hard.** The lever was
+already in the tree and was recorded in `db/store.rs` on 2026-09-14: all three
+stored families are content-checked on first touch. `SegmentedMmap::verify_once`
+recomputes the packed page's CRC, the standalone extent's trailer CRC and, in
+`NodeReader::node`, the index node's, once per faulted region. So a single
+flipped byte in a stored payload comes back as
+
+```
+Invariant( "extent payload fails its stored checksum" )
+```
+
+from the read that first touches it -- which is exactly an operational failure
+midway through a lane advance, arriving through the ordinary read path with
+nothing mocked and no seam added anywhere.
+
+### Finding the bytes without parsing the format
+
+The obstacle the morning's entry recorded was locating a chunk's payload in the
+file. The fixture sidesteps it by **marking** the chunk it intends to damage:
+chunk 5 of key 10 gets every other value, so the container is a bitmap whose
+words are all `0x5555_5555_5555_5555`, and its payload is a run of `0x55`
+thousands of bytes long. A scan for a run of 2048 finds it without knowing
+anything about the allocator, and the middle of the run is damaged so the byte
+is certainly inside the payload rather than at an edge. The shard is a sparse
+gigabyte, so the scan reads a megabyte at a time and stops at the first run; the
+hit is around 2 MB in and both tests together run in 0.11 s.
+
+A probe under `.agents-workspace/tmp/` established the whole chain before any
+test was written, and was deleted afterwards. It took one attempt.
+
+### What the tests now assert, end to end
+
+`a_failed_read_poisons_the_handle_and_the_peer_is_told_it_was_the_engine`: an
+intact first block, one flipped byte, then the advance that reaches chunk 5
+faults `Internal`; every later request faults `Internal` too, **including a
+target batch that is legal in every respect** -- which is the case that was
+reported as `InvalidArgument` until this morning, now proven through a real
+failure rather than a simulated one; `BlockRelease` still answers `Done`; and
+`LanesRelease` gives the arena slot back for reuse.
+
+`a_poisoned_handle_does_not_take_the_session_with_it`: a second handle over the
+same snapshot, which has not reached the damage, is served normally, and the
+session still opens snapshots. Poisoning is deliberately coarse -- a whole
+handle dies for one lane's failure -- and this pins how coarse.
+
+Both live in `yesno-plugin/tests/channel_session.rs` beside the other fifty
+protocol tests, because unlike the morning's four they need nothing the protocol
+cannot give.
+
+### Vacuity check
+
+Replacing the flip with a write of the same byte makes both tests fail at
+`fault_status` -- "expected a fault, got Block". The failure is caused by the
+damage and not by anything incidental to the fixture.
+
+### What this cost, against what it was expected to cost
+
+The entry had this filed as a design question needing a seam. It was a
+twenty-line fixture and a byte. The reason it looked harder than it was is worth
+keeping: the capability that made it easy -- per-region content checks on first
+touch -- was built for a different purpose entirely, to close
+`stored-page-crcs-are-not-verified`, and nothing connected it to the question of
+how a test might make a read fail. **A durable check against corruption is also
+a durable way to inject it**, and that is now written down where the next person
+asking "how do I make the engine fail for real" will find it.
+
+### The assumption, stated
+
+A write through the file must be visible through the mapping the snapshot
+holds. True on Linux, which these tests already require for the memfd arena. On
+a platform where it is not, these two tests would fail rather than pass
+silently, which is the right way round.
