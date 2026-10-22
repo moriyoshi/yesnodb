@@ -710,10 +710,21 @@ impl Session {
             };
             match yesno_core::container::codec::decode(kind, &bytes, w.card) {
                 Ok(c) => decoded.push((w.key, w.prefix, c)),
+                // `InvalidArgument`, not `status_from_core`. **Every input to this
+                // decode is the peer's**: the kind, the cardinality and the bytes. The
+                // decoder is a fuzz target by contract, so for any input it returns an
+                // error or a valid container, which makes every error it returns here
+                // attributable to those three and none of them to the engine --
+                // `BadLength`, `BadCardinality`, `BadRunCount` and `OutOfBounds` are all
+                // statements about the frame. `status_from_core` called all four
+                // internal, so a peer that sent a malformed payload was told its request
+                // was fine and the server was broken, while the message beside it said
+                // the opposite. The engine's own text is appended because it names which
+                // rule failed, and a peer can only fix what it is told.
                 Err(e) => {
                     return Self::fault(
-                        status_from_core(&e),
-                        &format!("chunk {i}: the payload is not a {kind:?} container"),
+                        Status::InvalidArgument,
+                        &format!("chunk {i}: the payload is not a {kind:?} container: {e}"),
                     );
                 }
             }

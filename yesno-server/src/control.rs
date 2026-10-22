@@ -1136,7 +1136,7 @@ impl pb::control_plane_server::ControlPlane for ControlService {
         let access = manager
             .open_file(&request.lease_id, &request.name, request.allow_direct_path)
             .await
-            .map_err(|error| Status::not_found(error.to_string()))?;
+            .map_err(lease_status)?;
         let (tx, rx) = mpsc::channel(4);
         let manager = manager.clone();
         let lease_id = request.lease_id;
@@ -1189,6 +1189,17 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                                 Some((start, end)) => {
                                     if start != offset {
                                         offset = start;
+                                        // `unavailable` here and `internal`
+                                        // for the open in `open_file`, and the
+                                        // two disagree on purpose. The open is
+                                        // where the lease's promise is checked:
+                                        // a file it listed and the mount does
+                                        // not have is a broken invariant, which
+                                        // is what `INTERNAL` means. By this
+                                        // point that check has passed and the
+                                        // descriptor is live, so what is left
+                                        // is the device misbehaving under it --
+                                        // transient, retryable, `UNAVAILABLE`.
                                         if let Err(error) =
                                             file.seek(std::io::SeekFrom::Start(offset)).await
                                         {
@@ -1210,6 +1221,8 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                             false => SNAPSHOT_FILE_CHUNK,
                         };
                         let mut bytes = vec![0u8; want];
+                        // `unavailable` for the same reason as the seek
+                        // above: the invariant was checked at the open.
                         let count = match file.read(&mut bytes).await {
                             Ok(count) => count,
                             Err(error) => {
@@ -1236,10 +1249,11 @@ impl pb::control_plane_server::ControlPlane for ControlService {
                         // marker rather than on the last byte, because the
                         // last byte may be inside a hole nothing sends.
                         let last = !sparse && offset.saturating_add(count as u64) == size;
-                        if manager.keep_alive(&lease_id).is_err() {
-                            let _ = tx
-                                .send(Err(Status::not_found("snapshot lease expired")))
-                                .await;
+                        // Mid-stream, and through the same mapping as every
+                        // other lease failure. This said "expired" whatever
+                        // happened, which is one of the two things it can be.
+                        if let Err(error) = manager.keep_alive(&lease_id) {
+                            let _ = tx.send(Err(lease_status(error))).await;
                             return;
                         }
                         if tx
@@ -1292,7 +1306,7 @@ impl pb::control_plane_server::ControlPlane for ControlService {
         })?;
         let ttl = manager
             .keep_alive(&request.into_inner().lease_id)
-            .map_err(|error| Status::not_found(error.to_string()))?;
+            .map_err(lease_status)?;
         Ok(Response::new(pb::BaseSnapshotLifetime {
             lease_ttl_secs: ttl,
         }))
@@ -1310,7 +1324,7 @@ impl pb::control_plane_server::ControlPlane for ControlService {
         manager
             .release(&request.into_inner().lease_id)
             .await
-            .map_err(|error| Status::not_found(error.to_string()))?;
+            .map_err(lease_status)?;
         Ok(Response::new(pb::ReleaseBaseSnapshotResponse {}))
     }
 
@@ -1380,6 +1394,48 @@ fn role_requested(
 
 fn internal(error: BoxError) -> Status {
     Status::internal(error.to_string())
+}
+
+/// Turn a lease-scoped failure into the status its peer should act on.
+///
+/// **A status code is an instruction, and these four say four different
+/// things.** `NOT_FOUND` is terminal, and that is correct for the two
+/// failures that are about the request -- an id no live lease answers to, a
+/// name the lease does not list. It was also what this server said when its
+/// own provider cleanup failed, and that one is a lie with a cost: the lease
+/// is still held, an LVM snapshot is still on the volume group, this process
+/// has already queued the retry, and a client told `NOT_FOUND` on a release
+/// stops asking about a thing that has not gone away. `transient` in the
+/// archive sidecar retries `UNAVAILABLE` and nothing else, so `Retrying` is
+/// the code that makes the client's behaviour match what the server is
+/// actually doing. `crate::replication`'s WAL catalog already answers for
+/// its own failed file opens the same way.
+///
+/// `INTERNAL` for [`crate::snapshot::LeaseError::Server`] rather than
+/// `UNAVAILABLE`, because that is `INTERNAL`'s own definition: a file the lease
+/// promised and the snapshot no longer has is an invariant this server broke.
+/// The mid-stream `seek` and `read` failures in `fetch_snapshot_file` answer
+/// `UNAVAILABLE` for the same event one step later, and that is not a sweep
+/// miss -- by then the open has already checked the promise, so what is left is
+/// a device condition under a live descriptor. The comments there say so,
+/// because the split reads like a miss until it is re-derived.
+///
+/// Not `FAILED_PRECONDITION` for either server-side case, which this RPC
+/// family has already spent: `capture_base` in the sidecar reads it on
+/// `begin_base_snapshot` as "this server has no provider, take the network
+/// path". `Releasing` keeps it because that is precisely what it means -- the
+/// lease exists and is not usable yet -- and no fallback watches the two
+/// calls that can return it.
+fn lease_status(error: crate::snapshot::LeaseError) -> Status {
+    use crate::snapshot::LeaseError;
+
+    let message = error.to_string();
+    match error {
+        LeaseError::NoSuchLease | LeaseError::NoSuchFile => Status::not_found(message),
+        LeaseError::Releasing => Status::failed_precondition(message),
+        LeaseError::Retrying(_) => Status::unavailable(message),
+        LeaseError::Server(_) => Status::internal(message),
+    }
 }
 
 /// The replication service currently available on the shared endpoint.
@@ -2472,6 +2528,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cleanups.load(Ordering::Relaxed), 1);
+    }
+
+    /// Every lease-scoped failure as the peer sees it.
+    ///
+    /// This is the half that was missing. The manager's own
+    /// `failed_release_is_retried_without_reopening_the_lease` covers the
+    /// behaviour -- the lease stays, the cleanup retries -- and it cannot see
+    /// what a peer is told, because the status is produced one layer up. All
+    /// four failures were `NOT_FOUND`, so a client was told its lease had
+    /// expired when the truth was that this server could not run the
+    /// provider's cleanup, and `NOT_FOUND` is terminal: the archive sidecar's
+    /// `transient` retries `UNAVAILABLE` and not that.
+    #[tokio::test]
+    async fn a_lease_failure_tells_the_peer_whose_fault_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("MANIFEST"), b"immutable manifest").unwrap();
+        let (snapshots, _cleanups) =
+            crate::snapshot::SnapshotManager::for_test_with_cleanup_failures(
+                root.path(),
+                std::time::Duration::from_secs(5),
+                false,
+                1,
+            );
+        let database = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(database.path()).unwrap());
+        let replication = ReplicationSlot::default();
+        replication.install_with_db(
+            crate::replication::LeaderService::with_retention(
+                database.path(),
+                db.shard_count(),
+                db.retention_floor(),
+            ),
+            db,
+        );
+        let journal = tempfile::tempdir().unwrap();
+        let hub = EventHub::open(journal.path()).unwrap();
+        let (commands, _received) = mpsc::channel(1);
+        let service = ControlService {
+            hub,
+            commands,
+            authorizer: test_authorizer(),
+            replication,
+            snapshots: Some(snapshots),
+            snapshot_agent: crate::snapshot::agent::SnapshotAgentBroker::new(),
+        };
+
+        let lease = service
+            .begin_base_snapshot(authorized(pb::BeginBaseSnapshotRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The peer's error: an id no lease answers to.
+        let status = service
+            .keep_base_snapshot_alive(authorized(pb::KeepBaseSnapshotAliveRequest {
+                lease_id: b"no-such-lease".to_vec(),
+            }))
+            .await
+            .expect_err("an unknown lease id is refused");
+        assert_eq!(status.code(), tonic::Code::NotFound, "{status}");
+
+        // The peer's error: a name this lease does not list.
+        let status = service
+            .fetch_snapshot_file(authorized(pb::FetchSnapshotFileRequest {
+                lease_id: lease.lease_id.clone(),
+                name: "ABSENT".into(),
+                allow_sparse: false,
+                allow_direct_path: false,
+            }))
+            .await
+            .expect_err("a file outside the lease is refused");
+        assert_eq!(status.code(), tonic::Code::NotFound, "{status}");
+
+        // This server's failure, and it is retrying: the injected cleanup
+        // failure leaves the lease held and an expiry queued.
+        let status = service
+            .release_base_snapshot(authorized(pb::ReleaseBaseSnapshotRequest {
+                lease_id: lease.lease_id.clone(),
+            }))
+            .await
+            .expect_err("a failed provider cleanup is reported");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "a cleanup this server is retrying must not read as a lease that is gone: {status}"
+        );
+
+        // The lease that release just failed on is still held, so the call
+        // that can still reach it may not say otherwise.
+        let status = service
+            .keep_base_snapshot_alive(authorized(pb::KeepBaseSnapshotAliveRequest {
+                lease_id: lease.lease_id.clone(),
+            }))
+            .await
+            .expect_err("a lease awaiting cleanup cannot be kept alive");
+        assert_eq!(
+            status.code(),
+            tonic::Code::FailedPrecondition,
+            "the lease exists and is not usable, which is not NOT_FOUND: {status}"
+        );
+
+        // This server's failure, and retrying will not help: the file the
+        // lease promised is gone from the snapshot. No seam -- the file is
+        // simply taken away, which a snapshot's immutability says cannot
+        // happen, and the peer has nothing to fix either way.
+        let (snapshots, _cleanups) = crate::snapshot::SnapshotManager::for_test(
+            root.path(),
+            std::time::Duration::from_secs(5),
+            false,
+        );
+        let service = ControlService {
+            snapshots: Some(snapshots),
+            ..service
+        };
+        let lease = service
+            .begin_base_snapshot(authorized(pb::BeginBaseSnapshotRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        std::fs::remove_file(root.path().join("MANIFEST")).unwrap();
+        let status = service
+            .fetch_snapshot_file(authorized(pb::FetchSnapshotFileRequest {
+                lease_id: lease.lease_id,
+                name: "MANIFEST".into(),
+                allow_sparse: false,
+                allow_direct_path: false,
+            }))
+            .await
+            .expect_err("a snapshot that lost its own file is reported");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "the lease lists the file, so the peer has nothing to fix: {status}"
+        );
     }
 
     #[tokio::test]

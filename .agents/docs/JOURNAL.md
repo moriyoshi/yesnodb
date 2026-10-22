@@ -3932,3 +3932,341 @@ A write through the file must be visible through the mapping the snapshot
 holds. True on Linux, which these tests already require for the memfd arena. On
 a platform where it is not, these two tests would fail rather than pass
 silently, which is the right way round.
+
+## 2026-10-20 — Auditing the rest of the fault surface for the defect that turned up twice
+
+Two defects in one day had the same shape: a contract asserted on one side of an
+interface and only documented on the other, with the attribution of a fault
+getting it wrong. That is a class, not a coincidence, so the rest of the
+channel's fault surface was read against it -- every `Self::fault` site in
+`yesno-plugin/src/channel.rs`, asking of each whether its status names the right
+party and whether anything asserts it.
+
+### One more defect, on the write path
+
+`chunk_put` decodes each peer-supplied container before staging anything:
+
+```rust
+match yesno_core::container::codec::decode( kind, &bytes, w.card ) {
+    Err( e ) => return Self::fault(
+        status_from_core( &e ),
+        &format!( "chunk {i}: the payload is not a {kind:?} container" ),
+    ),
+```
+
+**Every input to that decode is the peer's** -- the kind, the cardinality and the
+bytes -- and the decoder is a fuzz target by contract, so every error it returns
+is a statement about those three. `status_from_core` sends `BadLength`,
+`BadCardinality`, `BadRunCount` and `OutOfBounds` all to `Status::Internal`, so a
+peer that sent a malformed payload was told its request was fine and the server
+was broken. The message beside it said the opposite in the same breath.
+
+Fixed to `InvalidArgument`, with the decoder's own text appended -- it names
+which rule failed, and a peer can only fix what it is told.
+
+**Why it survived.** `a_non_ascending_array_payload_is_an_error_not_a_panic`
+covers this path and matches `Frame::Fault { .. }`, without the status. Its
+neighbour `a_follower_refuses_a_chunk_write` does assert the status. The
+behaviour was asserted; the attribution was not -- the same gap as the lane
+handle, in a test rather than in a comment.
+`a_malformed_chunk_payload_is_the_peers_error_not_an_internal_one` now covers
+four shapes: a payload shorter than its cardinality, a zero cardinality, a
+bitmap that is not a whole bitmap, and a descending array.
+
+### Two paths read, probed, and found already right
+
+**The pushed-down expression path.** `yesno-eval` returns
+`CodecError::Invariant` for several things that are plainly properties of the
+peer's expression -- `"index is at or above the vector's arity"`, `"a fold over
+an empty vector has no value"`, `"modulus is zero"`, division by zero -- and
+those would reach a peer through `with_snapshot` and `status_from_core` as
+`Internal`. **They are not reachable from a decodable `SetExpr`.** Probed, not
+reasoned: `At( List[ Key( 10 ), Key( 20 ) ], 7 )` comes back
+`InvalidArgument: "this is not a decodable set expression: index is at or above
+the vector's arity"`, and `Fold( List[], Or )` comes back
+`InvalidArgument: "... vector has no elements"`. `yesno-wire`'s decoder
+validates arity and indices rather than only structure, so the attribution is
+settled before evaluation begins, and `decode_pushed_down` already carries the
+reasoning in its rustdoc: "`InvalidArgument` for a malformed expression rather
+than `Internal`. It is the peer's bytes that are wrong." That paragraph is why
+this path was right and the chunk path was not.
+
+Division and modulus live in `BigExpr`, which `SetExpr` does not embed, so they
+are out of reach of this frame entirely.
+
+**The dispatch catch-all.** `handle`'s final arm faults `Internal` for an
+unhandled request kind, which reads like a mis-attribution and is not:
+`handle` rejects any frame whose kind is not a request with `InvalidArgument` as
+its first act, so the arm is reachable only if this file forgot one of its own
+request kinds. `Internal` is then exactly right.
+
+### What to carry away
+
+The audit was worth running and the ratio is the finding: three paths examined,
+one wrong. The one that was wrong had no reasoning recorded at its call site,
+and both that were right had it -- `decode_pushed_down` in prose, the catch-all
+in a comment naming the check that makes it unreachable. **A status is a claim
+about whose fault something is, and that claim is not checkable by reading the
+line it is on.** Where the reasoning was written down it was also correct; where
+it was absent, `status_from_core` had been reached for because it was there.
+
+## 2026-10-21 — The same audit on the Flight surface, where a fix had stopped at the path it was found on
+
+Yesterday's audit of `yesno-plugin`'s fault surface found one defect in three
+paths. The same question asked of `yesno-flight` -- does this status name the
+right party, and does anything assert it -- found something different and worse:
+not a status reasoned about wrongly, but a **correct mapping that exists and is
+bypassed**.
+
+### `engine_status` was written for this and four sites did not call it
+
+`yesno-flight/src/lib.rs` has `engine_status`, which maps `ReadOnlyReplica` to
+`failed_precondition`, `VersionReclaimed` to `failed_precondition` with "call
+GetFlightInfo again", `VersionNotVisible` to `invalid_argument` with "a ticket is
+only valid against the server that minted it", and `SnapshotTooOld` to `aborted`
+with "retry at a fresh snapshot; a long scan can resume from the key named here".
+Each arm carries a paragraph about why that code and not another. It is one of
+the more carefully reasoned functions in the tree.
+
+Four call sites handed it nothing and wrote `Status::internal( e.to_string() )`
+instead:
+
+- `get_flight_info`, the `Request2::Key` arm -- `snap.cardinality( key )`.
+- `get_flight_info`, the `Request2::Expr` arm -- `expr::cardinality( set, &snap )`.
+- `list_flights` -- `db.snapshot()` and `snap.keys()`.
+
+In `get_flight_info` the effect is visible in six lines of source:
+`snapshot_at( version )` is mapped through `engine_status`, and the count two
+lines below it is not. A client whose pushed-down `count(*)` was cut short by the
+space-amplification bound received `INTERNAL` and a debug string where the
+function three lines up would have given it `ABORTED` and the key to resume from.
+
+**And this exact bug has a fix and a post-mortem already, in the same file.** The
+comment above the `do_get` stream says the read path "used to be
+`ExternalError( Box::new( e ) )` in and `Status::internal( e.to_string() )` out,
+and the pair silently collapsed **every** read-path failure to `Internal`", that
+a client switching on `code()` "saw one value for a stale ticket, an evicted
+snapshot and a genuine server fault alike, and the first two are things it can
+act on", and -- the sentence that matters -- "Found while asserting on the codes
+rather than on the messages, which is the only way this shows up."
+
+The fix went in where it was found and was not swept across the surface. This is
+the `gate-clippy-saw-two-crates` shape again: a correction applied to one
+instance of a pattern while its siblings kept the behaviour.
+
+All four now call `engine_status`.
+
+### What cannot be asserted, said plainly
+
+**These four are reasoned, not covered.** `ticket_consistency.rs` already asserts
+codes on the read path, and its lever -- age the ticket out by writing and
+checkpointing with no reader holding the floor, then `do_get` -- reaches `do_get`
+only. For the two `get_flight_info` sites the window between taking the snapshot
+and counting is inside a single call, so the engine errors they now map cannot be
+provoked deterministically from outside. `db.evict_oldest_reader()` is the public
+lever for `SnapshotTooOld` and it cannot be made to fire in that window.
+
+The change is still right -- it routes an engine error through the function
+written to classify engine errors, and the file already argues why -- but it
+should not be reported as tested.
+
+### The one left open, with the premise measured
+
+`engine_status`'s fallback is `internal`, and `CodecError::Invariant` carries two
+unrelated things: a statement about the peer's expression, and a statement about
+the engine. A probe settled whether a peer can reach the first:
+`AnyExpr::Big( Div( Lit 1, Lit 0 ) )` encodes to 20 bytes, `AnyExpr::decode`
+accepts it -- the wire validates arity and indices but does not constant-fold a
+divisor -- and `yesno_eval::big` then returns `Err( Invariant( "division by
+zero" ) )`. So a consumer that divides by zero in a pushed-down expression is
+told the server is broken, over Flight and over the channel alike.
+
+It is **not** fixable at either mapping, and that is the interesting part. The
+variant cannot be remapped wholesale in either direction: calling every
+`Invariant` the peer's fault would report a corrupted extent as a bad request,
+which is precisely the inversion `block_seek_many` shipped for a day. The lane
+handles escaped only because `KeyLanes::poisoned()` gave the transport a cheap
+predicate to ask first. Expressions have no such predicate, so the fix belongs in
+the error type, and that is a new variant on `CodecError` touching four crates.
+Filed as `a-peers-invalid-expression-is-reported-as-an-engine-fault` rather than
+started, because a new variant on a core error enum wants confirming first.
+
+### Four for four
+
+Four defects of one class in two days, across two transports, every one of them
+in code that passed both gates and all of its tests. None was found by a test
+failing. They were found by asking, of a line that already worked, *who does this
+blame*. Two of the four had the reasoning written at the call site and were
+right; the two that were wrong had reached for the nearest conversion function.
+The Flight one had the reasoning written **sixty lines away, about itself**.
+
+## 2026-10-22 -- The control plane told a backup client its lease was gone while still holding it
+
+Fifth of the same class, and the first one on the control plane. The audit
+question is unchanged: *who does this status blame, and what asserts it.*
+
+`yesno-server/src/control.rs` answered three snapshot-lease RPCs --
+`fetch_snapshot_file`, `keep_base_snapshot_alive`, `release_base_snapshot` --
+with `.map_err( |error| Status::not_found( error.to_string() ) )`. All three.
+The reason is visible one file away: `SnapshotManager`'s lease methods return
+`SnapshotError`, which is `Box<dyn Error + Send + Sync>`, so the handler had a
+message and no category and picked one code for every message it might get.
+
+**Three of the failures those methods can return are the peer's and three are
+not.** The peer's: an id no live lease answers to, a name the lease does not
+list. Not the peer's: `tokio::fs::File::open` and `std::fs::File::open` on the
+server's own snapshot mount, for a name the lease itself handed out; and
+`provider.cleanup` failing inside `release`, which is the interesting one,
+because the three lines above that `return` put the lease back in the map, set
+a retry deadline and spawn an expiry task. **The status said the lease did not
+exist; the function's own next statements prove it does.** The module header
+says the same thing in words -- "live cleanup failures remain retryable lease
+state" -- and `NOT_FOUND` is terminal.
+
+The cost is not cosmetic. `base_backup` in `yesno-server-utils` fails the whole
+backup on a release error, so an operator reads `NOT_FOUND: snapshot lease does
+not exist or has expired` after a transfer that completed and verified, and the
+knob that message points at is the lease TTL. The actual failure is an
+`lvremove` that did not run, leaving an LVM snapshot on the volume group that
+this process is quietly retrying. And `transient` in `sidecar.rs` retries
+`UNAVAILABLE`, `CANCELLED`, `DEADLINE_EXCEEDED` and `UNKNOWN` -- not
+`NOT_FOUND`, so the code was also an instruction to stop asking.
+
+**The fix puts the attribution where the knowledge is.** `LeaseError` in
+`snapshot.rs` has five variants and the three lease methods return it:
+`NoSuchLease` and `NoSuchFile` ( the peer's, `NOT_FOUND` ), `Releasing` ( the
+lease exists and is not usable yet, `FAILED_PRECONDITION` ), `Retrying` ( this
+server failed and has queued its own retry, `UNAVAILABLE` ) and `Server` ( this
+server failed at something retrying will not fix, `INTERNAL` ). The last two are
+separate variants rather than one because the two call sites genuinely differ:
+a failed cleanup is retried on a timer, while a file the lease promised and the
+filesystem no longer has is a broken invariant that will fail the same way
+forever. One code for both would have been wrong for one of them.
+
+`FAILED_PRECONDITION` was not available for the server-side cases, and that is
+worth recording because it is not obvious: `capture_base` in the sidecar reads
+that code on `begin_base_snapshot` as "this server has no provider, take the
+network path". The family has spent it. `Releasing` keeps it because that is
+exactly what it means and no fallback watches the two calls that return it.
+
+`From<std::io::Error> for LeaseError` giving `Server` is deliberate: the two
+`?`s at the end of `open_file` are the easiest place in the method to lose the
+attribution, and the conversion keeps it without the call site remembering.
+
+**Why five rounds of tests did not catch it.** `failed_release_is_retried_
+without_reopening_the_lease` has covered this exact sequence since the retry
+behaviour was written -- release fails, keep-alive refuses, open refuses,
+cleanup runs again -- with `assert!( ... .is_err() )` three times. An `is_err()`
+cannot see which error, and the status is produced one layer up, so the test was
+true and the thing it was closest to was wrong. That is the same shape as
+`a_non_ascending_array_payload_is_an_error_not_a_panic` matching `Fault { .. }`
+without the status, which hid the `chunk_put` defect two days ago. Both are now
+assertions on the category.
+
+**Covered through the real handlers.** `a_lease_failure_tells_the_peer_whose_
+fault_it_was` in `control.rs`'s own `mod tests` builds a `ControlService` with
+`for_test_with_cleanup_failures( .., 1 )` and asserts four codes from the four
+RPCs. The `Server` case needs no seam: `std::fs::remove_file` takes the file
+away from under a live lease, which a snapshot's immutability says cannot
+happen, and the peer cannot fix it either way. Four sabotages, each restoring
+one piece of the old behaviour, fail at their own assertion and nowhere else --
+all four collapsed to `NOT_FOUND` fails at the release ( `left: NotFound,
+right: Unavailable`, with the message beside it reading "this server could not
+finish with the snapshot lease and is retrying", which is what the defect looked
+like ); `Releasing` alone fails at the keep-alive; `Server` alone fails at the
+fetch; and making `From<io::Error>` yield `NoSuchFile` fails both the new
+manager test and the handler test.
+
+**The replication surface was audited in the same pass and is clean.** Two
+`Status::internal` sites about a shard image the follower cannot influence, an
+`out_of_range` for a shard a follower named that does not exist, and an
+`out_of_range` / `failed_precondition` pair on retention and cursor staleness
+that already carry their reasoning. The one thing that *looked* like the sweep
+miss I keep finding -- `batch_from`'s first call site having no
+`WalCursorNotOnRecordBoundary` arm while its sibling eighty lines down has one
+with a careful comment -- is not one: that publisher's base is the cursor
+itself, so `names_a_record` returns true on its first comparison and the variant
+cannot arrive. Only the `over_log` call has a base behind the cursor. A comment
+now says so, because the next reader will ask.
+
+Five defects of this class in four days, none found by a test failing. The
+pattern in all five is the same and it is not about care: where a function
+returns a type that cannot express whose fault the failure was, the status its
+caller writes is a guess, and a guess that compiles looks exactly like a
+decision. `SnapshotError` is the right type for the provider surface and the
+wrong type for the three methods that answer a peer, and the only way to see
+that was to ask what the peer is told.
+
+## 2026-10-22 -- Auditing the rest of the status surface, and checking the lease fix against its neighbours
+
+Finishing the sweep the lease defect came out of. `yesno-server/src/guard.rs`
+and `auth.rs` are the two remaining consumer-facing status surfaces and both are
+clean -- and clean in a way worth copying, because every status there carries
+its attribution *at the call site*: "`permission_denied`, never
+`unauthenticated`. The caller proved who they are and simply may not; telling
+them otherwise invites an infinite retry with a credential that will never
+work." `require` even documents its *ordering* ( term before permission,
+because a caller on a superseded leader has a worse problem than a missing
+permission ). The one asymmetry is `authorize` answering `unauthenticated` for
+a missing `Principal` extension and `internal` for a missing `AuthzChannel`,
+both of which are wiring failures seated by the same interceptor -- left alone,
+because `guard.rs::who` records the fail-closed reasoning for the first and
+both arms deny either way.
+
+**A mechanical form of the audit question, and what it found.** The five
+defects all have one mechanism: a status whose *message* came from the error and
+whose *code* came from nowhere. That shape greps:
+`Status::<code>( e.to_string() )` and `Status::<code>( format!( "{e:?}" ) )`
+with no match on the error. Twenty-nine sites workspace-wide, which is small
+enough to read all of them.
+
+Thirteen are in `yesno-flight`, the file audited yesterday, and that was the
+useful thing to check -- a surface reported complete has to survive being asked
+again. All thirteen hold: every one is either a `JoinError` from
+`spawn_blocking` whose inner result already goes through `engine_status`
+( `2436`, `2500`, `2519`, `2544` are the clearest -- `internal` on the join,
+`engine_status` on the value ), an Arrow IPC schema failure on a schema this
+server built, or, at `2118`, a decode failure on the client's own `FlightData`
+stream answered `invalid_argument`. The `snapshot_at` site at `1519` looks bare
+and is not: the whole `match` it sits in takes `.map_err( engine_status )` three
+lines down, which is the very line yesterday's comment points at. Nine more are
+`replication/mod.rs` answering `unavailable` for reads of the leader's own WAL
+and image, which is right for a follower whose correct move is to try another
+endpoint. So the previous round's report was accurate.
+
+**Then the sweep turned on the change I had just made, and it was right to.**
+`fetch_snapshot_file` answers `unavailable` when a mid-stream `seek` or `read`
+on the snapshot file fails, and I had just made the `open` of that same file
+`internal`. Two codes for what looks like one event, with the half I wrote being
+the odd one out -- the same shape as every defect this week.
+
+It survived the check, and the reason is worth keeping because it is not
+visible from either line alone. **The open is where the lease's promise is
+tested.** A file the lease listed and the mount does not have is "invariants
+expected by the underlying system have been broken", which is `INTERNAL`'s own
+definition. Past that point the promise has been verified and the descriptor is
+live, so a failure is the device misbehaving under it -- transient, retryable,
+`UNAVAILABLE`. Different events, correct codes, and both now say so in a
+comment, because the split reads like a sweep miss until it is re-derived and
+the next reader should not have to.
+
+**One premise I had for the split was wrong, and dropping it does not change
+the answer.** I had also reasoned that `UNAVAILABLE` would make a client take a
+fresh lease, which retrying the same file cannot. It would not: the sidecar's
+`transient` retries only the WAL subscribe, the WAL stream and the term check,
+and a failed `refresh_base` ends the archiver run outright -- `break 'run
+Err( error )`. `base_backup` propagates either way too. So no client's
+behaviour today turns on this code at all, and the choice rests entirely on
+what the code claims, which is where it should have rested to begin with. Worth
+recording as the kind of argument to distrust: "a client would do X" is
+checkable, and I checked it after using it.
+
+Five surfaces audited, five defects, two clean, and the one apparent
+inconsistency in my own fix resolved as deliberate. The class is now understood
+well enough to state as a rule: **a status is a claim about whose fault
+something is, so a function whose error type cannot express that claim must not
+be the last word before a status is written.** Where the type cannot carry it
+-- `Box<dyn Error>`, a single `Invariant` variant for two kinds of failure --
+either the type grows a distinction or the status is a guess. The remaining
+known instance is `a-peers-invalid-expression-is-reported-as-an-engine-fault`
+in TODO.md, which needs the first of those and is filed rather than started.

@@ -58,6 +58,82 @@ use std::sync::atomic::AtomicUsize;
 
 pub(crate) type SnapshotError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Why a lease-scoped request failed, and whose fault that was.
+///
+/// **The one bit a boxed error cannot carry.** [`SnapshotError`] is the right
+/// shape for the provider surface: an `lvcreate` that would not run and an
+/// `lvremove` that would not finish have nothing in common but their text, and
+/// nothing above them branches on which it was. The three lease methods --
+/// [`SnapshotManager::keep_alive`], [`SnapshotManager::open_file`] and
+/// [`SnapshotManager::release`] -- are different, because their caller is a
+/// gRPC handler and a status code is a *claim about whose fault the failure
+/// was*. Boxing erased that claim, so the handler had one code for all of
+/// them and told a peer its lease did not exist when the truth was that this
+/// server could not read its own snapshot mount or could not run the
+/// provider's cleanup.
+///
+/// The distinction is only drawable here, where the failure happens. A caller
+/// holding the box can read the message and cannot categorize it, and a status
+/// is not checkable by reading the line it is written on -- which is how this
+/// went unnoticed while the lease behaviour itself was covered.
+#[derive(Debug)]
+pub(crate) enum LeaseError {
+    /// No live lease answers to this id: never issued, expired, or already
+    /// cleaned up and forgotten.
+    NoSuchLease,
+    /// The lease exists, its release failed, and its cleanup is being retried.
+    ///
+    /// Deliberately not [`Self::NoSuchLease`]. The provider's objects are
+    /// still there -- an LVM snapshot filling its volume group, an EBS volume
+    /// still billed -- and a client told the lease was gone stops waiting for
+    /// them to go.
+    Releasing,
+    /// The lease exists and does not list a file by this name.
+    NoSuchFile,
+    /// This server failed at its own work and has already queued the retry.
+    ///
+    /// The lease is kept and cleanup runs again on a timer, so the state a
+    /// peer is looking at is temporary by construction. That is what separates
+    /// this from [`Self::Server`], and the separation is the reason this type
+    /// has five variants rather than four: one code for both would be wrong
+    /// for one of the two call sites.
+    Retrying(SnapshotError),
+    /// This server failed at work it will not retry on the peer's behalf.
+    ///
+    /// A file the lease promised and the filesystem no longer has is the
+    /// shape to picture: a snapshot is immutable for the lease's lifetime, so
+    /// this is a broken invariant rather than a condition that passes.
+    Server(SnapshotError),
+}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchLease => f.write_str("snapshot lease does not exist or has expired"),
+            Self::Releasing => f.write_str("snapshot lease was released and is awaiting cleanup"),
+            Self::NoSuchFile => f.write_str("file is not part of this snapshot lease"),
+            // The text names the server for the same reason the code does. The
+            // defect this type closed had the status and the message beside it
+            // saying opposite things, and an operator reads the message.
+            Self::Retrying(error) => write!(
+                f,
+                "this server could not finish with the snapshot lease and is retrying: {error}"
+            ),
+            Self::Server(error) => {
+                write!(f, "this server could not serve the snapshot lease: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LeaseError {}
+
+impl From<std::io::Error> for LeaseError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Server(Box::new(error))
+    }
+}
+
 static LEASE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,7 +634,7 @@ impl SnapshotManager {
     }
 
     #[cfg(test)]
-    fn for_test_with_cleanup_failures(
+    pub(crate) fn for_test_with_cleanup_failures(
         root: &Path,
         ttl: Duration,
         direct: bool,
@@ -734,13 +810,11 @@ impl SnapshotManager {
         self.ensure_namespace().await.map(|_| ())
     }
 
-    pub(crate) fn keep_alive(&self, id: &[u8]) -> Result<u64, SnapshotError> {
+    pub(crate) fn keep_alive(&self, id: &[u8]) -> Result<u64, LeaseError> {
         let mut leases = self.leases.lock().unwrap();
-        let lease = leases
-            .get_mut(id)
-            .ok_or("snapshot lease does not exist or has expired")?;
+        let lease = leases.get_mut(id).ok_or(LeaseError::NoSuchLease)?;
         if lease.released {
-            return Err("snapshot lease was released and is awaiting cleanup".into());
+            return Err(LeaseError::Releasing);
         }
         lease.expires = Instant::now() + self.ttl;
         Ok(self.ttl.as_secs().max(1))
@@ -751,20 +825,18 @@ impl SnapshotManager {
         id: &[u8],
         name: &str,
         request_direct_path: bool,
-    ) -> Result<SnapshotFileAccess, SnapshotError> {
+    ) -> Result<SnapshotFileAccess, LeaseError> {
         let (path, size, direct) = {
             let mut leases = self.leases.lock().unwrap();
-            let lease = leases
-                .get_mut(id)
-                .ok_or("snapshot lease does not exist or has expired")?;
+            let lease = leases.get_mut(id).ok_or(LeaseError::NoSuchLease)?;
             if lease.released {
-                return Err("snapshot lease was released and is awaiting cleanup".into());
+                return Err(LeaseError::Releasing);
             }
             let file = lease
                 .files
                 .iter()
                 .find(|file| file.name == name)
-                .ok_or("file is not part of this snapshot lease")?;
+                .ok_or(LeaseError::NoSuchFile)?;
             lease.expires = Instant::now() + self.ttl;
             (
                 lease.root.join(&file.name),
@@ -775,6 +847,11 @@ impl SnapshotManager {
         if direct {
             return Ok(SnapshotFileAccess::Direct { path, size });
         }
+        // Both opens are this server reading its own snapshot mount, for a
+        // name the lease itself handed the peer. `From<std::io::Error>` makes
+        // them `Server`, which is the whole reason the conversion exists:
+        // `?` here is the easiest place in the method to lose the attribution,
+        // and the type now keeps it without the call site having to remember.
         Ok(SnapshotFileAccess::Stream {
             file: tokio::fs::File::open(&path).await?,
             probe: std::fs::File::open(&path)?,
@@ -782,19 +859,23 @@ impl SnapshotManager {
         })
     }
 
-    pub(crate) async fn release(self: &Arc<Self>, id: &[u8]) -> Result<(), SnapshotError> {
+    pub(crate) async fn release(self: &Arc<Self>, id: &[u8]) -> Result<(), LeaseError> {
         let mut lease = self
             .leases
             .lock()
             .unwrap()
             .remove(id)
-            .ok_or("snapshot lease does not exist or has expired")?;
+            .ok_or(LeaseError::NoSuchLease)?;
         if let Err(error) = self.provider.cleanup(&lease.cleanup).await {
             lease.released = true;
             lease.expires = Instant::now() + self.cleanup_retry;
             self.leases.lock().unwrap().insert(id.to_vec(), lease);
             spawn_expiry(Arc::downgrade(self), id.to_vec(), self.cleanup_retry);
-            return Err(error);
+            // `Retrying`, and the three lines above are the proof: the lease
+            // was just put back and an expiry was spawned, so the lease a
+            // peer would be told does not exist is one this process is still
+            // holding and still working on.
+            return Err(LeaseError::Retrying(error));
         }
         Ok(())
     }
@@ -1256,12 +1337,29 @@ mod tests {
         );
         let lease = manager.begin().await.unwrap();
 
-        assert!(manager.release(&lease.id).await.is_err());
-        assert!(manager.keep_alive(&lease.id).is_err());
-        assert!(manager
-            .open_file(&lease.id, "MANIFEST", false)
-            .await
-            .is_err());
+        // Which error, not merely that there was one. This test asserted
+        // `is_err()` three times and passed for a day while the handler above
+        // turned all three into one status, which was the wrong one for two
+        // of them. An `is_err()` cannot see that, and nothing else was
+        // looking: the categories below are exactly what `lease_status` reads.
+        assert!(
+            matches!(
+                manager.release(&lease.id).await,
+                Err(LeaseError::Retrying(_))
+            ),
+            "a failed cleanup is this server retrying, not a lease that is gone"
+        );
+        assert!(
+            matches!(manager.keep_alive(&lease.id), Err(LeaseError::Releasing)),
+            "the lease is still held while its cleanup is retried"
+        );
+        assert!(
+            matches!(
+                manager.open_file(&lease.id, "MANIFEST", false).await,
+                Err(LeaseError::Releasing)
+            ),
+            "the lease is still held while its cleanup is retried"
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             while cleanups.load(Ordering::Relaxed) < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1269,7 +1367,47 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(manager.release(&lease.id).await.is_err());
+        // The retry removed the lease before calling cleanup and the second
+        // cleanup succeeded, so by the time the counter reads 2 the lease is
+        // genuinely gone -- and only now is `NoSuchLease` the truth.
+        assert!(
+            matches!(
+                manager.release(&lease.id).await,
+                Err(LeaseError::NoSuchLease)
+            ),
+            "the retry succeeded, so the lease is gone rather than pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_the_lease_promised_and_the_mount_lost_is_the_servers_failure() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path());
+        let (manager, _cleanups) = manager(root.path(), Duration::from_secs(5), false);
+        let lease = manager.begin().await.unwrap();
+        assert!(lease.files.iter().any(|file| file.name == "MANIFEST"));
+
+        // No seam: take the file away from under the lease. A snapshot is
+        // immutable for the lease's lifetime, so this is an invariant the
+        // server broke and not a name the peer got wrong -- and the peer
+        // cannot tell the two apart from `NOT_FOUND`, which is what both
+        // used to be.
+        std::fs::remove_file(root.path().join("MANIFEST")).unwrap();
+
+        assert!(
+            matches!(
+                manager.open_file(&lease.id, "MANIFEST", false).await,
+                Err(LeaseError::Server(_))
+            ),
+            "the lease lists the file, so its absence on disk is not the peer's error"
+        );
+        assert!(
+            matches!(
+                manager.open_file(&lease.id, "ABSENT", false).await,
+                Err(LeaseError::NoSuchFile)
+            ),
+            "a name the lease does not list is the peer's error"
+        );
     }
 
     #[tokio::test]

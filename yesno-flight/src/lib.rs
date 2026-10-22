@@ -1439,11 +1439,9 @@ impl FlightService for YesnoFlightService {
         // invisibly — the same rule `do_get` follows.
         let keys = tokio::task::spawn_blocking(move || {
             span.in_scope(move || -> Result<Vec<(u64, u64)>, Status> {
-                let snap = db
-                    .snapshot()
-                    .map_err(|e| Status::internal(format!("{e:?}")))?;
+                let snap = db.snapshot().map_err(engine_status)?;
                 let version = snap.version();
-                let keys = snap.keys().map_err(|e| Status::internal(e.to_string()))?;
+                let keys = snap.keys().map_err(engine_status)?;
                 Ok(keys.into_iter().map(|k| (k, version)).collect())
             })
         })
@@ -1531,9 +1529,14 @@ impl FlightService for YesnoFlightService {
             // Exact, from the index alone: `card_m1` per chunk, no payload
             // touched.
             Request2::Key(key) => {
-                let total = snap
-                    .cardinality(key)
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                // `engine_status`, not a bare `internal`. The comment in `do_get`
+                // below records why: collapsing every engine failure to `Internal`
+                // leaves a client unable to tell a stale ticket or an evicted
+                // snapshot -- both of which it can act on -- from a server fault.
+                // That was fixed on the read path where it was found and not swept
+                // across this one, so `snapshot_at` three lines above mapped
+                // correctly while the count beside it did not.
+                let total = snap.cardinality(key).map_err(engine_status)?;
                 (total, Ticket::whole_key(snap.version(), key))
             }
             // Exact without materializing an ordinary Boolean result. A top-level
@@ -1546,8 +1549,7 @@ impl FlightService for YesnoFlightService {
                 // one row. Counting a vector by `cardinality` would report the
                 // wrong shape to a coordinator sizing an endpoint.
                 let total = match &e {
-                    AnyExpr::Set(set) => expr::cardinality(set, &snap)
-                        .map_err(|err| Status::internal(err.to_string()))?,
+                    AnyExpr::Set(set) => expr::cardinality(set, &snap).map_err(engine_status)?,
                     AnyExpr::VecInt(v) => u64::from(v.arity()),
                     AnyExpr::Big(_) => 1,
                     AnyExpr::VecBig(v) => u64::from(v.arity()),

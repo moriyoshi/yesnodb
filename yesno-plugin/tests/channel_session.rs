@@ -2961,3 +2961,82 @@ fn a_poisoned_handle_does_not_take_the_session_with_it() {
         Frame::SnapshotOpened { .. }
     ));
 }
+
+/// A malformed chunk payload is the peer's error, and the status has to say so.
+///
+/// `codec::decode`'s input here is *entirely* peer-supplied -- kind, cardinality
+/// and bytes -- and it is a fuzz target by contract, so every error it returns is
+/// attributable to those bytes and none of them to the engine. Routing them
+/// through `status_from_core` called all four of `BadLength`, `BadCardinality`,
+/// `BadRunCount` and `OutOfBounds` an internal fault, which tells a peer its
+/// request was fine and the server is broken. The message said the opposite in
+/// the same breath: "the payload is not a {kind} container".
+///
+/// `a_non_ascending_array_payload_is_an_error_not_a_panic` could not see this. It
+/// asserts that a fault comes back and not which one, which is the same shape of
+/// gap as the lane-handle poisoning: the behaviour was asserted, the attribution
+/// was not.
+#[test]
+fn a_malformed_chunk_payload_is_the_peers_error_not_an_internal_one() {
+    use yesno_plugin::ipc::{ChunkWrite, LaneKind};
+
+    let (_c, _host, mut s) = setup("chunkblame");
+    greet(&mut s);
+
+    // One case per error the decoder can reach from peer bytes.
+    let cases: Vec<(&str, ChunkWrite)> = vec![
+        (
+            "a payload shorter than the cardinality claims",
+            ChunkWrite {
+                key: 1,
+                prefix: 0,
+                kind: LaneKind::Array,
+                count: 3,
+                card: 3,
+                payload: vec![7, 0],
+            },
+        ),
+        (
+            "a cardinality of zero",
+            ChunkWrite {
+                key: 1,
+                prefix: 0,
+                kind: LaneKind::Array,
+                count: 1,
+                card: 0,
+                payload: vec![7, 0],
+            },
+        ),
+        (
+            "a bitmap whose payload is not a whole bitmap",
+            ChunkWrite {
+                key: 1,
+                prefix: 0,
+                kind: LaneKind::Bitmap,
+                count: 1,
+                card: 1,
+                payload: vec![0; 16],
+            },
+        ),
+        (
+            "a descending array",
+            ChunkWrite {
+                key: 1,
+                prefix: 0,
+                kind: LaneKind::Array,
+                count: 3,
+                card: 3,
+                payload: vec![11, 0, 9, 0, 7, 0],
+            },
+        ),
+    ];
+
+    for (what, w) in cases {
+        let f = s.handle(Frame::ChunkPut { writes: vec![w] });
+        assert_eq!(
+            fault_status(&f),
+            Status::InvalidArgument as u32,
+            "{what} is the peer's error, not the server's"
+        );
+    }
+}

@@ -532,6 +532,16 @@ impl Replication for LeaderService {
                 let batch = match WalPublisher::new(req.shard, &window, next).batch_from(next, max)
                 {
                     Ok(b) => b,
+                    // No `WalCursorNotOnRecordBoundary` arm here, and that is
+                    // not the sweep miss it looks like. This publisher's base
+                    // *is* `next`, so `names_a_record` returns true on its
+                    // first comparison and the variant cannot arrive; the
+                    // `over_log` call below has a base behind the cursor,
+                    // which is the only shape that can raise it. What is left
+                    // reachable is a record in the leader's own retained log
+                    // that will not decode, and the follower can do nothing
+                    // about that -- so `Internal` is the attribution rather
+                    // than the default.
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(format!("{e:?}")))).await;
                         return;
