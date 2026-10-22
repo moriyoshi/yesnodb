@@ -4270,3 +4270,68 @@ be the last word before a status is written.** Where the type cannot carry it
 either the type grows a distinction or the status is a guess. The remaining
 known instance is `a-peers-invalid-expression-is-reported-as-an-engine-fault`
 in TODO.md, which needs the first of those and is filed rather than started.
+
+## 2026-10-22 -- The Python client can send container payloads, and the encoder needed no Roaring
+
+`three-clients-cannot-send-container-batches` has been open since 2026-10-13:
+the container write wire measured 64.8x less wire than one row per set bit, and
+only the Rust client could build a batch. The Python, Go and Java clients could
+*ask* whether the server accepted containers and could not produce one. Python
+is closed.
+
+**The payload encoder was the small half, and the entry's framing of it was
+pessimistic in an instructive way.** It said Python and Go "have no
+per-container access to a roaring value at all, so for them this is a payload
+encoder as well as a wire change", which reads as though a Roaring library were
+the thing standing in the way. It was not. A container payload is three fixed
+layouts over sorted 16-bit values -- `2 * cardinality` little-endian `u16`s;
+1024 little-endian `u64` words with bit `i` for value `i`; a `u16` run count
+then `(start, length - 1)` pairs -- and all three are in one table in
+`docs/storage-format.md`. `yesnodb.client.containers` implements that table in
+about 250 lines with no dependency beyond `struct` and `pyarrow`. **The
+documentation being self-contained is what made this cheap**, which is the rule
+in CLAUDE.md earning its keep rather than costing anything: a client author
+needs no access to `yesno-core` to write a conforming encoder.
+
+**The encoding choice is "smallest valid", and that is a different question
+from the one the engine answers.** `yesno-core` chooses with hysteresis --
+`BITMAP_DEMOTE` is 3584, well below the 4096 cardinality at which an array
+first beats a bitmap -- because it is deciding whether to *re-encode* a
+container being mutated, and flapping between representations costs more than
+either. A fresh encode has nothing to flap against, and the engine normalizes
+whatever arrives, so the client minimizes bytes. Worth stating because copying
+`BITMAP_DEMOTE` into a client would look like fidelity and would cost wire.
+
+**Two test layers, chosen because they fail differently.** The unit layer
+checks bytes against a decoder written independently from the same
+documentation table -- an oracle sharing code with the encoder would agree with
+it about a shared mistake -- plus two hypothesis properties: any chunk
+round-trips, and no viable encoding is smaller than the one chosen. The
+integration layer writes all three encodings through a real `yesnod` and
+compares against Python sets, and asserts that all three kinds really appear so
+the test is not three names for one path. A payload the encoder got wrong comes
+back from the server as `invalid_argument` or decodes to a different set.
+
+**Four sabotages, and all four fail both layers.** A big-endian array payload
+fails 6 tests; a run `length` where `length - 1` belongs fails 5; a reversed
+bitmap bit order fails 2; and emitting `cardinality - 1` in the cardinality
+column -- the `card_m1` confusion the on-disk `ChunkRef` invites -- fails 4. The
+last is the one that proves the acknowledgement comparison is live: the client
+sums the `cardinality` column rather than counting batch rows, because the
+server acknowledges *ordinals applied* and one container row carries up to
+65 536 of them. Counting rows would have made every successful call look short
+by four orders of magnitude.
+
+**One thing found while reading the server for this.** `codec::decode`'s doc
+comment says `card` "is used only to cross-check the decoded intervals" for
+runs, and `decode_run( bytes )` does not take `card` at all -- the cross-check
+is not there. It does not matter in practice, because a wrong run cardinality
+is caught one layer up by the acknowledgement comparison described above, which
+is how the sabotage was detected. Left alone rather than fixed: correcting the
+comment is a one-line change to `yesno-core` that obliges both gates, and the
+sentence is wrong about a parameter that is absent rather than misleading about
+one that is present.
+
+Go and Java remain. Java needs only the plumbing, measured on 2026-10-13. Go
+needs both halves, but Python having needed no Roaring library is evidence the
+encoder is the cheaper half there too, and this module is a direct model.

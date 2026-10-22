@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.flight as flight
 
+from .containers import CONTAINERS_SCHEMA, container_batches
 from .errors import ProtocolError
 from .expression import ORDINAL_LIMIT, QueryRequest, SetExpr, _u64
 from .ticket import Ticket
@@ -52,9 +53,11 @@ FEATURE_MIXED_PUT = 1 << 0
 FEATURE_WRITE_TRANSACTIONS = 1 << 1
 #: Container payloads on the write wire, 64.8x less than one row per set bit.
 #:
-#: This names what the *server* accepts. This client cannot build such a batch
-#: yet, so the bit is here to answer :meth:`YesnoClient.supports` honestly
-#: rather than to unlock a path.
+#: Ask before :meth:`YesnoClient.insert_containers` or
+#: :meth:`YesnoClient.apply_containers`. A server predating the wire reads a
+#: container batch as the mutation schema it was expecting and refuses it, so an
+#: unchecked call fails rather than misapplying -- but it fails per batch, after
+#: some have already committed.
 FEATURE_CONTAINER_PUT = 1 << 2
 
 TokenProvider: TypeAlias = str | Callable[[], str]
@@ -576,6 +579,37 @@ class Client:
 
         return self._put_mutations(b"apply", mutations)
 
+    def insert_containers(self, sets: Iterable[tuple[int, Iterable[int]]]) -> Ack:
+        """Insert whole sets as **container payloads**, one commit per batch.
+
+        One row per 65 536-ordinal chunk instead of one per set bit: the server
+        measured 64.8x less wire on a half-dense page, and a dense chunk is
+        8 KiB here against 512 KiB of ordinals. The payload is the Roaring-spec
+        bytes the page store itself holds, so nothing re-encodes on arrival.
+
+        Container rows **union** into what is already under the key. There is no
+        removal form -- see :mod:`yesnodb.client.containers`.
+
+        Check :data:`FEATURE_CONTAINER_PUT` first. Ordinals need not arrive
+        sorted and a key may repeat, though a repeated key costs a second row
+        for every chunk it touches twice.
+        """
+
+        return self.apply_containers(container_batches(sets))
+
+    def apply_containers(self, batches: Iterable[pa.RecordBatch]) -> Ack:
+        """Insert caller-built container batches, one commit per batch.
+
+        For a caller holding containers already -- a dump being restored, a
+        page of a foreign Roaring file -- rather than ordinals to encode. Build
+        the batches with :class:`~yesnodb.client.ContainerBatchBuilder`, whose
+        schema this checks before sending: a batch the server reads as the
+        mutation wire instead would be refused one round trip later, with some
+        earlier batches already committed.
+        """
+
+        return self._put_containers(b"apply", batches)
+
     def begin_write(self) -> WriteTxn:
         """Open a write transaction spanning several calls."""
 
@@ -751,6 +785,40 @@ class Client:
             raise ProtocolError(f"yesnodb acknowledged {acknowledged.rows} of {sent} ingest pairs")
         return acknowledged
 
+    def _put_containers(self, command: bytes, batches: Iterable[pa.RecordBatch]) -> Ack:
+        descriptor = flight.FlightDescriptor.for_command(command)
+        writer, acknowledgements = self._flight.do_put(
+            descriptor, CONTAINERS_SCHEMA, self._call_options()
+        )
+        # **Cardinality, not rows.** The server acknowledges the ordinals it
+        # applied, and a container row carries up to 65 536 of them. Comparing
+        # batch rows here would make every successful call look short.
+        sent = 0
+        acknowledged: Ack | None = None
+        try:
+            for batch in batches:
+                _check_container_batch(batch)
+                writer.write_batch(batch)
+                sent += _container_cardinality(batch)
+            writer.done_writing()
+
+            while True:
+                metadata = acknowledgements.read()
+                if metadata is None:
+                    break
+                acknowledged = Ack._decode(bytes(metadata))
+        finally:
+            # PyArrow reports some server-side DoPut failures only here.
+            writer.close()
+
+        if acknowledged is None:
+            raise ProtocolError("yesnodb returned no ingest acknowledgement")
+        if acknowledged.rows != sent:
+            raise ProtocolError(
+                f"yesnodb acknowledged {acknowledged.rows} of {sent} container ordinals"
+            )
+        return acknowledged
+
     def _action(self, name: str, request: bytes = b"") -> bytes:
         body = bytearray()
         for result in self._flight.do_action(flight.Action(name, request), self._call_options()):
@@ -884,6 +952,23 @@ def _mutation_batches(mutations: Iterable[Mutation]) -> Iterator[pa.RecordBatch]
             rows = []
     if rows:
         yield _mutation_batch(rows)
+
+
+def _check_container_batch(batch: pa.RecordBatch) -> None:
+    if not isinstance(batch, pa.RecordBatch):
+        raise TypeError("batches must contain pyarrow.RecordBatch values")
+    # Exact, because the server picks the wire *by* the schema: a batch that
+    # misses by a field name or an integer width is read as the mutation
+    # schema, which it also does not match, and refused as that instead.
+    if not batch.schema.equals(CONTAINERS_SCHEMA, check_metadata=False):
+        raise ValueError(f"container batch has the wrong schema: {batch.schema}")
+    if any(batch.column(i).null_count for i in range(batch.num_columns)):
+        raise ValueError("container batches must not contain nulls")
+
+
+def _container_cardinality(batch: pa.RecordBatch) -> int:
+    total = pc.sum(batch.column(3)).as_py()
+    return 0 if total is None else int(total)
 
 
 def _check_pair_batch(batch: pa.RecordBatch) -> None:

@@ -1,5 +1,20 @@
 """Python client for yesnodb over Apache Arrow Flight."""
 
+from .containers import (
+    ARRAY_MAX,
+    BATCH_CHUNKS,
+    BITMAP_BYTES,
+    CHUNK_BITS,
+    CHUNK_CARD,
+    CONTAINERS_SCHEMA,
+    KIND_ARRAY,
+    KIND_BITMAP,
+    KIND_RUN,
+    RUN_MAX_INTERVALS,
+    ContainerBatchBuilder,
+    container_batches,
+    encode_chunk,
+)
 from .errors import ExpressionError, ProtocolError, TicketError, YesnoError
 from .expression import (
     MAGIC,
@@ -99,10 +114,19 @@ from .flight import (
 from .ticket import TICKET_HEADER_LEN, SetWire, Ticket
 
 __all__ = [
+    "ARRAY_MAX",
+    "BATCH_CHUNKS",
     "BATCH_ROWS",
+    "BITMAP_BYTES",
+    "CHUNK_BITS",
+    "CHUNK_CARD",
+    "CONTAINERS_SCHEMA",
     "FEATURE_CONTAINER_PUT",
     "FEATURE_MIXED_PUT",
     "FEATURE_WRITE_TRANSACTIONS",
+    "KIND_ARRAY",
+    "KIND_BITMAP",
+    "KIND_RUN",
     "MAGIC",
     "MAX_DEPTH",
     "MAX_NODES",
@@ -120,6 +144,7 @@ __all__ = [
     "PAIR_SCHEMA",
     "QUERY_MAGIC",
     "QUERY_VERSION",
+    "RUN_MAX_INTERVALS",
     "SORT_BIG",
     "SORT_VEC_BIG",
     "TICKET_HEADER_LEN",
@@ -141,6 +166,7 @@ __all__ = [
     "BoolExpr",
     "Cardinality",
     "Client",
+    "ContainerBatchBuilder",
     "Contains",
     "Div",
     "Empty",
@@ -196,5 +222,7 @@ __all__ = [
     "YesnoError",
     "big",
     "complement",
+    "container_batches",
+    "encode_chunk",
     "xor",
 ]

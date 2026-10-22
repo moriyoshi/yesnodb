@@ -8,8 +8,14 @@ import pytest
 
 import yesnodb
 from yesnodb.client import (
+    CHUNK_CARD,
+    CONTAINERS_SCHEMA,
+    FEATURE_CONTAINER_PUT,
     FEATURE_MIXED_PUT,
     FEATURE_WRITE_TRANSACTIONS,
+    KIND_ARRAY,
+    KIND_BITMAP,
+    KIND_RUN,
     OP_DELETE_KEY,
     OP_INSERT,
     OP_INSERT_RANGE,
@@ -17,6 +23,7 @@ from yesnodb.client import (
     And,
     At,
     Client,
+    ContainerBatchBuilder,
     Key,
     Literal,
     Mutation,
@@ -286,3 +293,108 @@ def test_a_mutation_is_validated_on_every_construction_path() -> None:
         Mutation(key=1, lo=9, hi=4, op=OP_INSERT_RANGE)
     with pytest.raises(ValueError):
         Mutation(key=1, lo=0, hi=0, op=99)
+
+
+@pytest.mark.integration
+def test_container_payloads_round_trip_through_the_server(
+    server_factory: Callable[..., object],
+) -> None:
+    """One of each encoding, written as containers and read back as ordinals.
+
+    The server's own decoder is the oracle, which is the point of running this
+    against a daemon rather than asserting bytes: a payload this client builds
+    wrongly is refused as `invalid_argument` or decodes to a different set, and
+    both show up here as a mismatch against the Python sets below.
+    """
+
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        assert client.supports(FEATURE_CONTAINER_PUT)
+
+        # Chosen so that all three encodings are exercised, with the chunk
+        # boundary crossed inside one key.
+        sparse = {i * 7 for i in range(500)}
+        dense = {(1 << 16) + i for i in range(0, CHUNK_CARD, 2)}
+        spans = {(2 << 16) + i for i in range(5_000)}
+        far = {(1 << 40) + 3}
+        expected = sparse | dense | spans | far
+
+        ack = client.insert_containers([(11, expected)])
+        assert ack.rows == len(expected)
+        assert ack.version is not None
+
+        assert set(client.get(11).collect_ordinals()) == expected
+
+        # Every encoding really was used, so the test is not three names for
+        # one path.
+        builder = ContainerBatchBuilder()
+        builder.push_set(11, expected)
+        batch = builder.finish()
+        assert batch is not None
+        assert set(batch.column(2).to_pylist()) == {KIND_ARRAY, KIND_BITMAP, KIND_RUN}
+
+
+@pytest.mark.integration
+def test_container_rows_union_into_what_is_already_there(
+    server_factory: Callable[..., object],
+) -> None:
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        client.insert_batch([(12, 1), (12, 2)])
+        client.insert_containers([(12, [2, 3])])
+        assert client.get(12).collect_ordinals() == [1, 2, 3]
+
+        # And a second container write over the same chunk, to be sure the
+        # union is not "last writer wins" at chunk granularity.
+        client.insert_containers([(12, range(100, 110))])
+        assert client.get(12).collect_ordinals() == [1, 2, 3, *range(100, 110)]
+
+
+@pytest.mark.integration
+def test_a_payload_the_server_refuses_is_reported_as_the_callers_error(
+    server_factory: Callable[..., object],
+) -> None:
+    """A batch built by hand rather than by the encoder, so it is wrong.
+
+    This is the half `encode_chunk` cannot cover: it is the server's validation
+    of a payload, not this client's. The cardinality says three values and the
+    payload carries two, which `codec::decode` refuses -- and the status has to
+    name the caller, because every input to that decode came from here.
+    """
+
+    running = server_factory()
+    short = pa.RecordBatch.from_arrays(
+        [
+            pa.array([13], type=pa.uint64()),
+            pa.array([0], type=pa.uint64()),
+            pa.array([KIND_ARRAY], type=pa.uint8()),
+            pa.array([3], type=pa.uint32()),
+            pa.array([(7).to_bytes(2, "little")], type=pa.binary()),
+        ],
+        schema=CONTAINERS_SCHEMA,
+    )
+
+    with Client(running.endpoint) as client:
+        # `invalid argument` is pyarrow's own rendering of gRPC status 3, so
+        # this asserts the *code* and not the server's wording: the peer built
+        # every input to that decode, and a status blaming the server would
+        # send an operator looking in the wrong place.
+        with pytest.raises(pa.ArrowInvalid, match="invalid argument"):
+            client.apply_containers([short])
+        assert client.get(13).collect_ordinals() == []
+
+
+@pytest.mark.integration
+def test_a_batch_with_the_wrong_schema_never_reaches_the_server(
+    server_factory: Callable[..., object],
+) -> None:
+    running = server_factory()
+    wrong = pa.RecordBatch.from_arrays(
+        [pa.array([1], type=pa.uint64()), pa.array([2], type=pa.uint64())],
+        names=["key", "ordinal"],
+    )
+
+    with Client(running.endpoint) as client, pytest.raises(ValueError, match="wrong schema"):
+        client.apply_containers([wrong])
