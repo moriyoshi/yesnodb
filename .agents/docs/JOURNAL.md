@@ -4446,3 +4446,60 @@ in-loop run length off by one ( Go 35 / 1, Python 2 / 1 ), reversed bitmap bit
 order ( Go 32 / 1 ), and an acknowledgement short by one ordinal per row ( Go
 1 / 1 ) -- the last confirming the cardinality comparison is live, since the server
 acknowledges ordinals and the client must not count rows.
+
+## 2026-10-23 -- Turning yesterday's coverage hole on the crate's own generators, which were healthy and unenforced
+
+Having found that neither client suite put a multi-interval run container on the
+wire, the obvious question is whether `yesno-core`'s own property layer has the
+same hole. **It does not, and it knew not to** -- `container_values()` in
+`proptest_oracle.rs` carries a comment recording that its first version produced
+a bitmap in 3 of 258 draws, that "a generator that cannot reach a kind cannot
+test it", and one arm exists explicitly so "run containers have more than one
+interval". The lesson I spent a day rediscovering in two client languages was
+already written down in a Rust test file. It did not travel because a client
+author has no reason to read one: `docs/storage-format.md` is what makes a client
+encoder cheap, and the *testing* knowledge lives somewhere a client author never
+goes.
+
+**Measured rather than trusted**, with a standalone harness under
+`.agents-workspace/tmp` that drives the real strategy and classifies each draw
+through `Container::from_sorted` plus `optimize`. At 2048 cases: 565 array, 726
+bitmap, 750 run, of which **323 hold more than one interval**, and all nine
+kernel pairs between 87 and 150 -- including the bitmap x bitmap pair the comment
+says the first version never reached. So the generator's promise holds today.
+
+**What did not hold is that anything checks it.** The repair in that comment ends
+"check the distribution rather than trusting it: printing the ( kind, kind ) pair
+per case is how the gap was found", which is an instruction to a human who has no
+reason to be reading it at the moment they edit a weight. The distribution was
+verified once, by hand, and has been unguarded since -- and the two client suites
+are what that costs.
+
+`container_values_reaches_every_encoding` now asserts it: every kind at least a
+tenth of the cases, at least 100 multi-interval runs, every kernel pair at least
+20. **It cannot be a `proptest!` block**, which is why it did not already exist --
+each case runs in its own closure with no memory of the others, so a property can
+assert things about one draw and never that the draws together covered anything.
+The strategy is driven by hand with `TestRng::deterministic_rng`, verified to
+produce byte-identical counts across runs. The bounds are far looser than the
+measurement on purpose: a proptest release may move the stream under a fixed
+seed, and a test that fails on a dependency bump for a reason unrelated to this
+crate is worse than a loose bound.
+
+**Three sabotages of the generator, two caught and the third correctly ignored.**
+Removing the dense arm gives "produced 0 bitmap containers"; removing the
+several-stretches arm gives "only 0 of 452 run containers held more than one
+interval". Shortening the long-stretch arm from `1..8000` to `1..2` is **not**
+caught, and should not be: those draws become one or two values and encode as
+arrays, while runs still arrive from the other arm, so nothing the test claims to
+protect is lost. A threshold for single-interval runs would be a number invented
+for a shape no mechanism identifies as load-bearing.
+
+**The scope here was deliberately not widened.** The audit question -- does a
+randomized generator silently reach only one branch -- applies to every generator
+in the tree, and chasing all of them is a sweep rather than a finding. This one
+was worth doing because the client defect gave it a concrete mechanism and
+`container_values` gave it a written claim to check. `scripts/check-feature-bits.py`
+got a one-line correction in the same pass: its docstring still said all three
+non-Rust clients could name the container bit and none could send one, which has
+been two-thirds false since yesterday.

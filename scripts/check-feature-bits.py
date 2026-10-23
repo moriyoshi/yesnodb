@@ -39,11 +39,12 @@ wire -- contains every bit declared beside it. A bit that is declared and not
 advertised is invisible from the client side: `supports()` returns false
 forever and the caller concludes it is talking to an old server.
 
-It does **not** check that a client can *use* a capability. The Java, Python and
-Go clients can all ask whether the server accepts container batches and none of
-them can send one; that is a genuine gap, it is recorded in `TODO.md`, and it is
-not something this can see. Naming a bit is the client's claim about the
-protocol, not about itself.
+It does **not** check that a client can *use* a capability. Naming a bit is the
+client's claim about the protocol, not about itself. When this was written, all
+three non-Rust clients could ask whether the server accepts container batches
+and none of them could send one; Python closed that on 2026-10-22 and Go on
+2026-10-23, and Java remains open in `TODO.md`. That gap was never visible here
+and still is not.
 
 It also does not check the C ABI or the C++ client, which expose no stats
 surface at all. Add them here when they grow one.

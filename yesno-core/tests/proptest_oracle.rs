@@ -93,6 +93,113 @@ fn container_values() -> impl Strategy<Value = Vec<u16>> {
     })
 }
 
+/// The promise `container_values` makes, enforced rather than advised.
+///
+/// Its comment says the arms are "weighted to reach all three encodings" and
+/// tells the reader to "check the distribution rather than trusting it". That
+/// instruction is the whole problem: the distribution *was* checked by hand
+/// once, after an earlier version produced a bitmap in 3 of 258 draws, and
+/// nothing since then would notice it collapsing again. A weight edit, or a
+/// change to `ARRAY_MAX` or `BITMAP_DEMOTE`, moves it silently -- and a
+/// generator that stops reaching a kind takes every property above with it
+/// while the suite stays green.
+///
+/// **This cannot be a `proptest!` block**, which is why it did not already
+/// exist. Each case runs in its own closure with no memory of the others, so a
+/// property can assert things about one draw and never that the draws
+/// *together* covered anything. The strategy has to be driven by hand to count
+/// across it.
+///
+/// Measured at 2048 cases: 565 array, 726 bitmap, 750 run -- of which 323 carry
+/// more than one interval -- and every one of the nine kernel pairs at least 87
+/// times. The bounds below are far looser than that on purpose. The RNG is
+/// seeded deterministically so this never flakes, but a proptest release may
+/// change the stream underneath a fixed seed, and a test that fails on a
+/// dependency bump for a reason unrelated to this crate is worse than a loose
+/// bound.
+///
+/// Multi-interval runs are called out separately because a single interval and
+/// several exercise different code: an encoder or kernel bug in the interval
+/// *list* is invisible to a container holding one run. A client encoder with
+/// exactly that hole shipped on 2026-10-22 and is recorded in `JOURNAL.md`.
+#[test]
+fn container_values_reaches_every_encoding() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    use yesno_core::container::Container;
+
+    const CASES: u32 = 2048;
+    let mut runner = TestRunner::new_with_rng(
+        Config {
+            cases: CASES,
+            ..Config::default()
+        },
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let strategy = container_values();
+
+    let slot = |kind: ContainerKind| match kind {
+        ContainerKind::Array => 0usize,
+        ContainerKind::Bitmap => 1,
+        ContainerKind::Run => 2,
+    };
+    let names = ["array", "bitmap", "run"];
+    let mut kinds = [0u32; 3];
+    let mut multi_interval_runs = 0u32;
+    // The pair distribution, because the kernel properties draw twice per case
+    // and a kind reached only on one side of the pair leaves a kernel arm
+    // untested.
+    let mut pairs = [[0u32; 3]; 3];
+    let mut pending: Option<ContainerKind> = None;
+
+    for _ in 0..CASES {
+        let values = strategy.new_tree(&mut runner).unwrap().current();
+        if values.is_empty() {
+            pending = None;
+            continue;
+        }
+        let mut container = Container::from_sorted(&values);
+        container.optimize();
+        let kind = container.kind();
+        kinds[slot(kind)] += 1;
+        if kind == ContainerKind::Run {
+            // Counted from the values rather than from the container, so this
+            // does not depend on a run-count accessor existing.
+            let intervals = 1 + values.windows(2).filter(|w| w[1] != w[0] + 1).count();
+            if intervals > 1 {
+                multi_interval_runs += 1;
+            }
+        }
+        match pending.take() {
+            Some(first) => pairs[slot(first)][slot(kind)] += 1,
+            None => pending = Some(kind),
+        }
+    }
+
+    for (index, name) in names.iter().enumerate() {
+        assert!(
+            kinds[index] >= CASES / 10,
+            "container_values produced {} {name} containers in {CASES} cases ( {kinds:?} );              the arms it claims to weight no longer reach this encoding",
+            kinds[index],
+        );
+    }
+    assert!(
+        multi_interval_runs >= 100,
+        "only {multi_interval_runs} of {} run containers held more than one interval;          the interval list goes untested when every run is a single stretch",
+        kinds[2],
+    );
+    for (first, row) in pairs.iter().enumerate() {
+        for (second, count) in row.iter().enumerate() {
+            assert!(
+                *count >= 20,
+                "the {} x {} kernel pair came up {count} times in {CASES} cases ( {pairs:?} );                  that arm is barely exercised",
+                names[first],
+                names[second],
+            );
+        }
+    }
+}
+
 fn runny_ordinals() -> impl Strategy<Value = Vec<u64>> {
     prop::collection::vec((0u64..3000, 1u64..400), 0..40).prop_map(|spans| {
         let mut v: Vec<u64> = Vec::new();
