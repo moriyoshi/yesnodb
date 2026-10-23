@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import struct
+from random import Random
 
 import pyarrow as pa
 import pytest
@@ -98,6 +99,29 @@ def test_a_full_chunk_is_one_run() -> None:
     assert payload == struct.pack("<HHH", 1, 0, CHUNK_CARD - 1)
 
 
+def test_a_clustered_chunk_is_a_multi_interval_run() -> None:
+    """100 blocks of 50, which is the only hand-written multi-interval case.
+
+    5 000 values shut the array out on cardinality alone, and 100 intervals
+    cost 402 bytes against the bitmap's 8 192. ``_runs`` emits its last
+    interval from the statement after its loop rather than from inside it, so
+    an error in the loop's length arithmetic is invisible to every
+    single-interval case -- and it was invisible to this whole suite until this
+    test and the sweep below were added. A sabotage confirming that is in the
+    journal.
+    """
+
+    values = [block * 100 + offset for block in range(100) for offset in range(50)]
+    kind, cardinality, payload = encode_chunk(values)
+    assert kind == KIND_RUN
+    assert cardinality == 5000
+    assert int.from_bytes(payload[:2], "little") == 100
+    assert len(payload) == 2 + 4 * 100
+    # The second interval, which the loop wrote.
+    assert struct.unpack_from("<HH", payload, 6) == (100, 49)
+    assert decode_chunk(kind, cardinality, payload) == values
+
+
 def test_adjacent_runs_are_coalesced() -> None:
     # The server's decoder repairs adjacency rather than refusing it, but only
     # because a foreign file may carry it. Emitting it would make the server
@@ -151,6 +175,62 @@ def test_no_encoding_beats_the_one_chosen(values: list[int]) -> None:
     if len(values) <= ARRAY_MAX:
         viable.append(2 * len(values))
     assert len(payload) == min(viable)
+
+
+#: Chunk shapes spanning the three encodings, and the shapes within them.
+#:
+#: The hypothesis properties above cover one corner of this well and cannot
+#: reach the others: a strategy over sorted sets of uniform draws produces
+#: arrays, almost never a run container, and never a bitmap, because a bitmap
+#: wins only above ``ARRAY_MAX`` values. This sweep is deterministic for a
+#: second reason -- the assertion that every encoding actually appeared has to
+#: hold inside one test, and hypothesis runs each example in its own call.
+CHUNK_SHAPES = [
+    ("contiguous", CHUNK_CARD, 1, 3000),
+    ("clustered runs", 50, 8, 6000),
+    ("dense scatter", 1, 2, 20000),
+    ("sparse", 1, 64, 400),
+    ("very sparse", 1, 1024, 40),
+    ("singleton", 1, 1, 1),
+]
+
+
+def _random_chunk(random: Random, run_len: int, gap_max: int, size: int) -> list[int]:
+    """Ascending unique values in runs of at most ``run_len``, gaps of at least one."""
+
+    values: list[int] = []
+    value = random.randrange(gap_max)
+    while len(values) < size and value < CHUNK_CARD:
+        for _ in range(1 + random.randrange(run_len)):
+            if len(values) >= size or value >= CHUNK_CARD:
+                break
+            values.append(value)
+            value += 1
+        value += 1 + random.randrange(gap_max)
+    return values
+
+
+def test_every_encoding_round_trips_and_none_is_beaten() -> None:
+    seen: dict[int, int] = {}
+    intervals = 0
+    for name, run_len, gap_max, size in CHUNK_SHAPES:
+        for seed in range(30):
+            values = _random_chunk(Random(seed), run_len, gap_max, size)
+            kind, cardinality, payload = encode_chunk(values)
+            assert cardinality == len(values), name
+            assert decode_chunk(kind, cardinality, payload) == values, name
+            runs = 1 + sum(1 for a, b in itertools.pairwise(values) if b != a + 1)
+            viable = [BITMAP_BYTES, 2 + 4 * runs]
+            if len(values) <= ARRAY_MAX:
+                viable.append(2 * len(values))
+            assert len(payload) == min(viable), name
+            seen[kind] = seen.get(kind, 0) + 1
+            if kind == KIND_RUN:
+                intervals = max(intervals, int.from_bytes(payload[:2], "little"))
+    # Without these the sweep could pass having built one encoding throughout,
+    # or only single-interval runs, which is what let a sabotage through.
+    assert set(seen) == {KIND_ARRAY, KIND_BITMAP, KIND_RUN}, seen
+    assert intervals >= 2, intervals
 
 
 def test_a_set_is_split_into_chunks_by_its_high_bits() -> None:

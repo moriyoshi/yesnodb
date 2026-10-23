@@ -32,6 +32,7 @@ from yesnodb.client import (
     TLSConfig,
     View,
     ViewSpec,
+    container_batches,
 )
 
 
@@ -317,8 +318,12 @@ def test_container_payloads_round_trip_through_the_server(
         sparse = {i * 7 for i in range(500)}
         dense = {(1 << 16) + i for i in range(0, CHUNK_CARD, 2)}
         spans = {(2 << 16) + i for i in range(5_000)}
+        # Clustered, so one payload carries many intervals rather than one.
+        # Every other shape here that reaches a run encoding reaches a single
+        # interval, and the server's decoder walks the interval list.
+        clustered = {(3 << 16) + b * 100 + o for b in range(100) for o in range(50)}
         far = {(1 << 40) + 3}
-        expected = sparse | dense | spans | far
+        expected = sparse | dense | spans | clustered | far
 
         ack = client.insert_containers([(11, expected)])
         assert ack.rows == len(expected)
@@ -327,12 +332,19 @@ def test_container_payloads_round_trip_through_the_server(
         assert set(client.get(11).collect_ordinals()) == expected
 
         # Every encoding really was used, so the test is not three names for
-        # one path.
+        # one path, and at least one run payload carries more than one
+        # interval.
         builder = ContainerBatchBuilder()
         builder.push_set(11, expected)
         batch = builder.finish()
         assert batch is not None
         assert set(batch.column(2).to_pylist()) == {KIND_ARRAY, KIND_BITMAP, KIND_RUN}
+        runs = [
+            batch.column(4)[i].as_py()
+            for i in range(batch.num_rows)
+            if batch.column(2)[i].as_py() == KIND_RUN
+        ]
+        assert max(int.from_bytes(p[:2], "little") for p in runs) >= 2
 
 
 @pytest.mark.integration
@@ -350,6 +362,32 @@ def test_container_rows_union_into_what_is_already_there(
         # union is not "last writer wins" at chunk granularity.
         client.insert_containers([(12, range(100, 110))])
         assert client.get(12).collect_ordinals() == [1, 2, 3, *range(100, 110)]
+
+
+@pytest.mark.integration
+def test_a_container_apply_is_one_commit_however_many_batches(
+    server_factory: Callable[..., object],
+) -> None:
+    """Three batches, one version.
+
+    The server accumulates every batch of an ``apply`` into one write batch and
+    commits at end of stream, so a read-your-writes caller can bind to the
+    version in the ack and see all of it. Nothing in the client shows that, and
+    the docstrings here said the opposite -- "one commit per batch", copied from
+    the insert wire where it is true -- until this test was written.
+    """
+
+    running = server_factory()
+
+    with Client(running.endpoint) as client:
+        before = client.insert_containers([(20, [1])])
+        batches = list(
+            container_batches([(21, [1 << 20]), (22, [2 << 20]), (23, [3 << 20])], max_chunks=1)
+        )
+        assert len(batches) == 3
+        after = client.apply_containers(batches)
+        assert before.version is not None
+        assert after.version == before.version + 1
 
 
 @pytest.mark.integration

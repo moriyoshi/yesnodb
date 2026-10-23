@@ -41,9 +41,9 @@ const (
 	FeatureMixedPut          uint64 = 1 << 0
 	FeatureWriteTransactions uint64 = 1 << 1
 	// FeatureContainerPut reports container payloads on the write wire, which
-	// cost 64.8x less than one row per set bit. It names what the *server*
-	// accepts: this client cannot build such a batch yet, so the bit answers
-	// Supports honestly rather than unlocking a path.
+	// cost 64.8x less than one row per set bit. Build them with
+	// InsertContainers or ContainerBatchBuilder; a server that predates the
+	// wire rejects the batch, because apply accepts only schemas it knows.
 	FeatureContainerPut uint64 = 1 << 2
 )
 

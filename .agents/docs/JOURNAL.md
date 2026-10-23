@@ -4335,3 +4335,114 @@ one that is present.
 Go and Java remain. Java needs only the plumbing, measured on 2026-10-13. Go
 needs both halves, but Python having needed no Roaring library is evidence the
 encoder is the cheaper half there too, and this module is a direct model.
+
+## 2026-10-23 -- The Go client can send container payloads, and the encoder shrank where the types could carry it
+
+`three-clients-cannot-send-container-batches` is down to Java. `yesno-flight-go`
+now has `containers.go` ( ~380 lines with its doc comments ) plus
+`InsertContainers`, `ApplyContainers` and `putContainers` on the client, and
+`FeatureContainerPut`'s comment no longer says this client cannot build such a
+batch.
+
+**The Python module was a direct model and the port was mostly mechanical**, which
+is what the TODO predicted. The one place it was not is worth keeping: typing a
+chunk's values as `[]uint16` makes three of the Python encoder's checks
+*unrepresentable* rather than merely unnecessary. Python has to assert that every
+value is in `0..65536`, that a chunk holds at most 65 536 values, and that the run
+count stays under the decoder's 32 768-interval bound. In Go the first is the
+type, the second follows from the first plus strict ascent, and so does the third
+-- strictly ascending `uint16` values cannot produce more than 32 768 intervals.
+What remains to check is non-emptiness and strict ascent, which is the part no
+type can carry. `EncodeChunk`'s doc comment says this where a reader will look for
+the missing checks.
+
+**Arrow memory is the one thing Go has that Python does not**, so the builder and
+`ContainerBatches` document who owns a batch and two tests assert it with
+`memory.NewCheckedAllocator` and `AssertSize( t, 0 )`. There was no precedent for
+a leak assertion anywhere in the Go client; there is now.
+
+**The surface is smaller than Python's on purpose.** `ContainerBatches` returns a
+slice rather than an iterator, because `putPairs` already builds its whole record
+slice up front and matching the file beats matching the other language. The
+allocator is the first parameter because that is arrow-go's own convention, and
+`nil` means `memory.DefaultAllocator`.
+
+Both client gates pass: `yesno-flight-go/gate.sh` ( gofmt, `go mod tidy -diff`,
+`go vet` with and without the integration tag, `go test -race` both ways against a
+freshly built `yesnod` ) and `yesno-flight-python/gate.sh` ( 123 tests ). No Rust
+source changed, so neither Rust gate was obliged.
+
+## 2026-10-23 -- A sabotage coarser than the code it tests overstates what the suite covers
+
+Two defects in yesterday's Python container work, both found by porting it rather
+than by reading it, and the second is the reusable one.
+
+**The commit granularity was documented backwards.** `insert_containers` and
+`apply_containers` both said "one commit per batch". They send `apply`, which
+accumulates every batch of the stream into one write batch and commits at end of
+stream -- the server says so in as many words at the commit site, and `Apply`'s own
+docstring in all three clients says so correctly. The phrase was copied from
+`insert_batches`, where it is true. `apply_containers` then went further and
+described a hazard that does not exist: "a batch the server reads as the mutation
+wire would be refused one round trip later, with some earlier batches already
+committed". Nothing commits until end of stream, so the whole call is discarded.
+
+The cost is not cosmetic. A caller reading that cannot bind a read to the version
+its write landed at -- which is the entire point of the ack carrying a version --
+and a caller wanting atomicity would conclude it has to open a write transaction
+to get what `apply` already gives it. **Nothing asserted it**, which is why it
+survived a gate; `test_a_container_apply_is_one_commit_however_many_batches` and
+the Go test beside it now do, with three single-chunk batches and
+`after.version == before.version + 1`. That assertion also establishes, against a
+real server, that a commit advances the version by exactly one.
+
+**The run encoder was wrong in a way four sabotages had reported as covered.**
+Yesterday's note recorded "a run length off by one ( 5 tests )" as one of four
+sabotages proving the Python layers were not vacuous. The sabotage edited
+`runs.append( ( start, previous - start ) )`, and in Python that statement appears
+*twice* -- once inside `_runs`'s loop and once after it -- with identical text, so
+`str.replace` hit both. The same sabotage written against Go hit only the in-loop
+statement, because Go spells the second one `return append( runs, ... )`, and it
+failed **nothing**: unit 0, integration 0.
+
+The reason is that nothing in either suite put a multi-interval run container on
+the wire. A run encoding only wins when the values cluster, and it only wins over
+an array when the cardinality is above `ARRAY_MAX` -- so every case that reached a
+run encoding reached a *single* interval, written by the statement after the loop.
+Re-running the narrowed sabotage against Python confirmed the identical hole
+there: **120 tests passed with an encoder that wrote every non-final interval one
+value too long.**
+
+Fixed in both clients the same way, and the fix is two things rather than one:
+
+* A hand-written case at the only shape that produces it -- 100 blocks of 50
+  values, where 5 000 values shut the array out on cardinality and 100 intervals
+  cost 402 bytes against the bitmap's 8 192 -- asserting the *second* interval's
+  bytes explicitly, because the second is the one the loop writes.
+* A **coverage assertion inside the randomized sweep**: it fails unless all three
+  kinds appeared and unless the widest run container it built had at least two
+  intervals. This earned its place immediately. The first Go generator produced
+  kind 2 for all 200 seeds and nothing else, and the assertion said so on its
+  first run. Python's hypothesis strategy -- `sorted( set( uniform draws ) )`,
+  `max_size=4000` -- has the mirror-image blind spot: it can produce neither a
+  bitmap, because that needs more than `ARRAY_MAX` values, nor a run, because
+  uniform draws do not cluster. Both sweeps are now deterministic over named
+  shapes for that reason, since the assertion that every encoding appeared has to
+  hold inside one test and hypothesis runs each example in its own call.
+
+**The finding to carry.** A sabotage is an experiment on the *suite*, and its
+result is only as narrow as the edit. An edit that happens to break two code paths
+tells you the suite catches at least one of them, and reading it as "this path is
+covered" is a conclusion the experiment does not support. Yesterday's four counts
+were honestly recorded and three of them were sound; the fourth measured a
+different thing than the sentence next to it claimed. **Prefer a sabotage that
+changes exactly one statement, and when a textual substitution is the tool, count
+the matches.** Python's `str.replace` and `sed` both replace every occurrence by
+default, which is the trap.
+
+The four sabotages, re-run against both strengthened suites, now fail both layers
+in both languages: big-endian array values ( Go unit 64, integration 1 ), the
+in-loop run length off by one ( Go 35 / 1, Python 2 / 1 ), reversed bitmap bit
+order ( Go 32 / 1 ), and an acknowledgement short by one ordinal per row ( Go
+1 / 1 ) -- the last confirming the cardinality comparison is live, since the server
+acknowledges ordinals and the client must not count rows.

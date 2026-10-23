@@ -49,6 +49,44 @@ func main() {
 }
 ```
 
+## Writing whole sets
+
+The pair wire costs one row per ordinal. `InsertContainers` costs one row per
+65,536-ordinal chunk, carrying the Roaring-spec payload the page store itself
+holds, which the server measured at 64.8x less wire on a half-dense page:
+
+```go
+ordinals := make([]uint64, 0, 333_334)
+for ordinal := uint64(0); ordinal < 1_000_000; ordinal += 3 {
+	ordinals = append(ordinals, ordinal)
+}
+if ok, err := client.Supports(ctx, yesnodb.FeatureContainerPut); err != nil {
+	log.Fatal(err)
+} else if ok {
+	_, err = client.InsertContainers(ctx, []yesnodb.Set{{Key: 42, Ordinals: ordinals}})
+} else {
+	pairs := make([]yesnodb.Pair, 0, len(ordinals))
+	for _, ordinal := range ordinals {
+		pairs = append(pairs, yesnodb.Pair{Key: 42, Ordinal: ordinal})
+	}
+	_, err = client.InsertBatch(ctx, pairs)
+}
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+One commit for the whole call, like `Apply`: every chunk becomes visible at the
+single version the `Ack` reports, however many batches the sets were split
+across. Container rows union into what is already under the key; there is no
+removal form, because the write wire reuses the read side's schema unchanged
+and that schema has no operation column. Remove with `RemoveRange` instead.
+
+A caller that already holds containers -- restoring a dump, forwarding a
+portable Roaring file -- builds batches with `ContainerBatchBuilder` and sends
+them through `ApplyContainers`. The builder and the batches own Arrow memory:
+release each batch, and release the builder when done with it.
+
 ## Consistency and streaming
 
 `PrepareKey`, `PrepareQuery`, and `PrepareQueryAt` return a `QueryInfo` whose

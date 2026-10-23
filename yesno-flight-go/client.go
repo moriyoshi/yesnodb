@@ -673,6 +673,114 @@ func (c *Client) Apply(ctx context.Context, mutations []Mutation) (Ack, error) {
 	return c.putMutations(ctx, "apply", mutations)
 }
 
+// InsertContainers unions whole sets into the database as container payloads.
+//
+// One row per 65,536-ordinal chunk instead of one per set bit: the server
+// measured 64.8x less wire on a half-dense page, and a dense chunk is 8 KiB
+// here against 512 KiB of ordinals. The payload is the Roaring-spec bytes the
+// page store itself holds, so nothing re-encodes on arrival.
+//
+// Container rows union into what is already under the key. There is no removal
+// form -- use RemoveRange on the mutation wire.
+//
+// Check Supports with FeatureContainerPut first. Ordinals need not arrive
+// sorted and a key may repeat, though a repeated key costs a second row for
+// every chunk it touches twice.
+//
+// One commit, like Apply: every chunk in the call becomes visible at the single
+// version the Ack reports, however many batches the sets were split across.
+func (c *Client) InsertContainers(ctx context.Context, sets []Set) (Ack, error) {
+	records, err := ContainerBatches(c.allocator, sets, containerBatchChunks)
+	if err != nil {
+		return Ack{}, err
+	}
+	defer func() {
+		for _, record := range records {
+			record.Release()
+		}
+	}()
+	return c.ApplyContainers(ctx, records)
+}
+
+// ApplyContainers sends caller-owned container batches as one commit.
+//
+// For a caller holding containers already -- a dump being restored, a page of a
+// portable Roaring file -- rather than ordinals to encode. Build the batches
+// with ContainerBatchBuilder, whose schema this checks before opening a stream:
+// a batch the server would read as the mutation wire instead is refused here,
+// where nothing has been sent yet.
+func (c *Client) ApplyContainers(ctx context.Context, records []arrow.RecordBatch) (Ack, error) {
+	return c.putContainers(ctx, "apply", records)
+}
+
+func (c *Client) putContainers(ctx context.Context, command string, records []arrow.RecordBatch) (Ack, error) {
+	// Cardinality, not rows. The server acknowledges the ordinals it applied,
+	// and one container row carries up to 65,536 of them, so comparing batch
+	// rows against the acknowledgement would make every successful call look
+	// short. The comparison is therefore also a checksum of the decode: the
+	// cardinality this client encoded against the cardinality the server read
+	// out of the payloads.
+	var sent uint64
+	for _, record := range records {
+		cardinality, err := validateContainerRecord(record)
+		if err != nil {
+			return Ack{}, err
+		}
+		if sent > math.MaxUint64-cardinality {
+			return Ack{}, errors.New("yesnodb container cardinality overflows uint64")
+		}
+		sent += cardinality
+	}
+	ctx, err := c.rpcContext(ctx)
+	if err != nil {
+		return Ack{}, err
+	}
+	stream, err := c.flight.DoPut(ctx)
+	if err != nil {
+		return Ack{}, err
+	}
+	writer := flight.NewRecordWriter(stream, ipc.WithSchema(ContainersSchema()), ipc.WithAllocator(c.allocator))
+	writer.SetFlightDescriptor(commandDescriptor([]byte(command)))
+	for _, record := range records {
+		if err := writer.Write(record); err != nil {
+			return Ack{}, err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return Ack{}, err
+	}
+	if err := stream.CloseSend(); err != nil {
+		return Ack{}, err
+	}
+	if headers, headerErr := stream.Header(); headerErr == nil {
+		if err := c.observeHeaders(headers); err != nil {
+			return Ack{}, err
+		}
+	}
+	var acknowledged *Ack
+	for {
+		result, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return Ack{}, err
+		}
+		ack, err := decodeAck(result.AppMetadata)
+		if err != nil {
+			return Ack{}, err
+		}
+		acknowledged = &ack
+	}
+	if acknowledged == nil {
+		return Ack{}, protocolError("ingest", "server returned no acknowledgement")
+	}
+	if acknowledged.Rows != sent {
+		return Ack{}, protocolErrorf("ingest", "server acknowledged %d of %d container ordinals", acknowledged.Rows, sent)
+	}
+	return *acknowledged, nil
+}
+
 // BeginWrite opens a write transaction spanning several calls.
 func (c *Client) BeginWrite(ctx context.Context) (WriteTxn, error) {
 	handle, err := c.uint64Action(ctx, "begin_write", nil)

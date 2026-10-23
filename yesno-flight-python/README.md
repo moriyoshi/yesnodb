@@ -37,9 +37,12 @@ with Client("http://127.0.0.1:50051") as client:
         client.insert((42, o) for o in range(0, 1_000_000, 3))
 ```
 
-Container rows union into what is already under the key; there is no removal
-form, because the write wire reuses the read side's schema unchanged and that
-schema has no operation column. Remove with `Mutation.remove_range` instead.
+One commit for the whole call, like `apply`: every chunk becomes visible at the
+single version the ack reports, however many batches the sets were split
+across. Container rows union into what is already under the key; there is no
+removal form, because the write wire reuses the read side's schema unchanged
+and that schema has no operation column. Remove with `Mutation.remove_range`
+instead.
 A caller that already holds containers -- restoring a dump, forwarding a
 foreign Roaring file -- builds batches with `ContainerBatchBuilder` and sends
 them through `apply_containers`.

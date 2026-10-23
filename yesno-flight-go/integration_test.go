@@ -8,19 +8,25 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -500,4 +506,209 @@ func ordinalsOf(ctx context.Context, t *testing.T, client *Client, key uint64) [
 		t.Fatal(err)
 	}
 	return got
+}
+
+func TestContainerPayloadsAgainstRealServer(t *testing.T) {
+	server := startServer(t, serverOpen)
+	client, err := Dial(server.address, WithInsecureTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if ok, err := client.Supports(ctx, FeatureContainerPut); err != nil || !ok {
+		t.Fatalf("Supports = %v, %v; the shipped server accepts container batches", ok, err)
+	}
+
+	// One set per encoding, so the test fails if any one layout is wrong rather
+	// than only the layout a single shape happens to pick. Which encoding each
+	// set gets is asserted below rather than assumed.
+	contiguous := make([]uint64, 0, 5000)
+	for ordinal := uint64(0); ordinal < 5000; ordinal++ {
+		contiguous = append(contiguous, ordinal)
+	}
+	sparse := make([]uint64, 0, 100)
+	for index := uint64(0); index < 100; index++ {
+		sparse = append(sparse, index*613)
+	}
+	dense := make([]uint64, 0, 20000)
+	for index := uint64(0); index < 20000; index++ {
+		dense = append(dense, index*3)
+	}
+	// Clustered, so one payload carries many intervals rather than one. Every
+	// other shape here that reaches a run encoding reaches a single interval,
+	// and the server's decoder walks the interval list.
+	clustered := make([]uint64, 0, 5000)
+	for block := uint64(0); block < 100; block++ {
+		for offset := uint64(0); offset < 50; offset++ {
+			clustered = append(clustered, block*100+offset)
+		}
+	}
+	// Three chunks under one key, which is the only shape that exercises
+	// prefix48 at all: every other set here lives in chunk zero.
+	straddling := []uint64{7, 1 << 16, (1 << 16) + 9, 5 << 16}
+
+	sets := []Set{
+		{Key: 1, Ordinals: contiguous},
+		{Key: 2, Ordinals: sparse},
+		{Key: 3, Ordinals: dense},
+		{Key: 4, Ordinals: straddling},
+		{Key: 5, Ordinals: clustered},
+	}
+
+	// The kinds actually sent, read off the batch rather than predicted.
+	records, err := ContainerBatches(nil, sets, containerBatchChunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[uint8]int{}
+	ordinals := uint64(0)
+	intervals := 0
+	for _, record := range records {
+		kinds := record.Column(2).(*array.Uint8)
+		cardinalities := record.Column(3).(*array.Uint32)
+		payloads := record.Column(4).(*array.Binary)
+		for index := 0; index < kinds.Len(); index++ {
+			seen[kinds.Value(index)]++
+			ordinals += uint64(cardinalities.Value(index))
+			if kinds.Value(index) == KindRun {
+				intervals = max(intervals, int(binary.LittleEndian.Uint16(payloads.Value(index))))
+			}
+		}
+	}
+	for _, kind := range []uint8{KindArray, KindBitmap, KindRun} {
+		if seen[kind] == 0 {
+			t.Fatalf("these sets never produced kind %d: %v", kind, seen)
+		}
+	}
+	if intervals < 2 {
+		t.Fatalf("the widest run payload sent had %d intervals; the decoder's walk is untested", intervals)
+	}
+
+	ack, err := client.ApplyContainers(ctx, records)
+	for _, record := range records {
+		record.Release()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Rows != ordinals {
+		t.Fatalf("Ack.Rows = %d, want the %d ordinals encoded rather than a row count", ack.Rows, ordinals)
+	}
+	if ack.Version == 0 {
+		t.Fatal("a committed container write must report a version")
+	}
+	for _, set := range sets {
+		want := slices.Sorted(maps.Keys(uniqueOrdinals(set.Ordinals)))
+		if got := ordinalsOf(ctx, t, client, set.Key); !reflect.DeepEqual(got, want) {
+			t.Fatalf("key %d read back %d ordinals, want %d", set.Key, len(got), len(want))
+		}
+	}
+
+	// Container rows union into what is already there, which is the whole
+	// reason the wire has no op column.
+	if _, err := client.Insert(ctx, []Pair{{Key: 9, Ordinal: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.InsertContainers(ctx, []Set{{Key: 9, Ordinals: []uint64{2, 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ordinalsOf(ctx, t, client, 9); !reflect.DeepEqual(got, []uint64{1, 2, 3}) {
+		t.Fatalf("key 9 = %v; a container row unions rather than replaces", got)
+	}
+
+	// One commit for the whole call, however many batches it took. This is the
+	// property a read-your-writes caller depends on, and it is not visible
+	// anywhere in the client: apply accumulates every batch into one write
+	// batch and commits at end of stream.
+	before, err := client.InsertContainers(ctx, []Set{{Key: 10, Ordinals: []uint64{1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	split, err := ContainerBatches(nil, []Set{
+		{Key: 11, Ordinals: []uint64{1 << 20}},
+		{Key: 12, Ordinals: []uint64{2 << 20}},
+		{Key: 13, Ordinals: []uint64{3 << 20}},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(split) != 3 {
+		t.Fatalf("maxChunks of one produced %d batches, want three", len(split))
+	}
+	after, err := client.ApplyContainers(ctx, split)
+	for _, record := range split {
+		record.Release()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != before.Version+1 {
+		t.Fatalf("three batches advanced the version from %d to %d; apply is one commit",
+			before.Version, after.Version)
+	}
+}
+
+func TestAContainerPayloadTheServerRefusesIsTheCallersFault(t *testing.T) {
+	server := startServer(t, serverOpen)
+	client, err := Dial(server.address, WithInsecureTransport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Built by hand rather than by the encoder, so it is wrong: the cardinality
+	// says three values and the payload carries two. This is the half
+	// EncodeChunk cannot cover -- it is the server's validation of a payload,
+	// not this client's -- and the status has to name the caller, because every
+	// input to that decode came from here.
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, ContainersSchema())
+	defer builder.Release()
+	builder.Field(0).(*array.Uint64Builder).Append(13)
+	builder.Field(1).(*array.Uint64Builder).Append(0)
+	builder.Field(2).(*array.Uint8Builder).Append(KindArray)
+	builder.Field(3).(*array.Uint32Builder).Append(3)
+	builder.Field(4).(*array.BinaryBuilder).Append([]byte{7, 0})
+	short := builder.NewRecordBatch()
+	defer short.Release()
+
+	_, err = client.ApplyContainers(ctx, []arrow.RecordBatch{short})
+	if err == nil {
+		t.Fatal("a payload shorter than its cardinality must be refused")
+	}
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Fatalf("refusal code = %s, want InvalidArgument: the peer built every input to that decode", code)
+	}
+	if got := ordinalsOf(ctx, t, client, 13); len(got) != 0 {
+		t.Fatalf("key 13 = %v after a refused apply; nothing may have committed", got)
+	}
+
+	// A wrong schema never reaches the server at all, so nothing commits and
+	// the error is this client's rather than a status.
+	pairs := array.NewRecordBuilder(memory.DefaultAllocator, PairsSchema())
+	defer pairs.Release()
+	pairs.Field(0).(*array.Uint64Builder).Append(14)
+	pairs.Field(1).(*array.Uint64Builder).Append(1)
+	wrong := pairs.NewRecordBatch()
+	defer wrong.Release()
+	if _, err := client.ApplyContainers(ctx, []arrow.RecordBatch{wrong}); err == nil {
+		t.Fatal("the pair schema must be refused as a container batch")
+	} else if status.Code(err) != codes.Unknown {
+		t.Fatalf("a locally refused batch produced a gRPC status %s; it should never have been sent", status.Code(err))
+	}
+	if got := ordinalsOf(ctx, t, client, 14); len(got) != 0 {
+		t.Fatalf("key 14 = %v; the batch was never sent", got)
+	}
+}
+
+func uniqueOrdinals(ordinals []uint64) map[uint64]struct{} {
+	unique := make(map[uint64]struct{}, len(ordinals))
+	for _, ordinal := range ordinals {
+		unique[ordinal] = struct{}{}
+	}
+	return unique
 }

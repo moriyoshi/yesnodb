@@ -580,7 +580,7 @@ class Client:
         return self._put_mutations(b"apply", mutations)
 
     def insert_containers(self, sets: Iterable[tuple[int, Iterable[int]]]) -> Ack:
-        """Insert whole sets as **container payloads**, one commit per batch.
+        """Insert whole sets as **container payloads**, in one commit.
 
         One row per 65 536-ordinal chunk instead of one per set bit: the server
         measured 64.8x less wire on a half-dense page, and a dense chunk is
@@ -593,19 +593,28 @@ class Client:
         Check :data:`FEATURE_CONTAINER_PUT` first. Ordinals need not arrive
         sorted and a key may repeat, though a repeated key costs a second row
         for every chunk it touches twice.
+
+        **One commit for the whole call**, like :meth:`apply` and unlike
+        :meth:`insert`: every chunk becomes visible at the single version the
+        ack reports, however many batches the sets were split across.
         """
 
         return self.apply_containers(container_batches(sets))
 
     def apply_containers(self, batches: Iterable[pa.RecordBatch]) -> Ack:
-        """Insert caller-built container batches, one commit per batch.
+        """Insert caller-built container batches, in one commit.
 
         For a caller holding containers already -- a dump being restored, a
         page of a foreign Roaring file -- rather than ordinals to encode. Build
         the batches with :class:`~yesnodb.client.ContainerBatchBuilder`, whose
         schema this checks before sending: a batch the server reads as the
-        mutation wire instead would be refused one round trip later, with some
-        earlier batches already committed.
+        mutation wire instead is refused here, before a stream is opened.
+
+        The server accumulates every batch of an ``apply`` into one write batch
+        and commits at end of stream, so the version in the ack names the
+        single instant at which all of them became visible. An error anywhere
+        in the stream therefore discards the whole call rather than leaving
+        earlier batches committed.
         """
 
         return self._put_containers(b"apply", batches)
