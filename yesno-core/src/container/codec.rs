@@ -75,8 +75,32 @@ pub fn encode_into(out: &mut Vec<u8>, c: &Container) {
 
 /// Decode a payload of a known kind.
 ///
-/// `card` is the cardinality carried alongside in the index (`card_m1 + 1`); for
-/// runs it is used only to cross-check the decoded intervals.
+/// `card` is the cardinality carried alongside in the index (`card_m1 + 1`), and
+/// it plays a **different role for each kind** -- one parameter, three meanings:
+///
+/// - **Array**: authoritative. It *is* the payload length, `2 * card` bytes, so a
+///   wrong `card` does not disagree with the payload, it selects a different one.
+/// - **Bitmap**: cross-checked against the popcount, and a disagreement is an
+///   error. Nothing in the payload states the cardinality, and every identity in
+///   `ops::card` trusts the cached length.
+/// - **Run**: **ignored**. The payload is self-describing -- `nruns`, then the
+///   intervals -- so the cardinality is derived from it and `card` is not
+///   consulted at all.
+///
+/// The run case reads like an oversight and is not. **Measured against the
+/// `roaring` crate on 2026-10-23**: tamper the declared cardinality of a
+/// serialized container and the reference implementation reaches the same verdict
+/// as this decoder on all three kinds -- array truncated to the declared count,
+/// bitmap refused naming both numbers, run accepted with the payload's own count.
+/// Adding a cross-check here would make us stricter than the oracle on the one
+/// kind the oracle does not check, which is what
+/// `the_declared_cardinality_is_checked_exactly_where_roaring_checks_it` in
+/// `tests/differential.rs` now pins. The differential gate would not have caught
+/// the divergence on its own: it serializes sets it built, so the declared
+/// cardinality always agrees and a disagreeing file is never generated.
+///
+/// This doc comment previously said `card` was "used only to cross-check the
+/// decoded intervals" for runs, which described a check that has never existed.
 pub fn decode(kind: ContainerKind, bytes: &[u8], card: u32) -> Result<Container> {
     match kind {
         ContainerKind::Array => decode_array(bytes, card),
@@ -697,6 +721,14 @@ mod tests {
 
     /// Build a run payload: the spec-mandated `nruns` prefix, then
     /// `(start, len_minus_1)` pairs.
+    ///
+    /// Tests built on this pass `0` for `decode`'s `card`, and that is a
+    /// deliberate don't-care rather than a cardinality: a run payload is
+    /// self-describing, so `decode` does not consult `card` for this kind at all
+    /// -- see its doc comment, and
+    /// `the_declared_cardinality_is_checked_exactly_where_roaring_checks_it` in
+    /// `tests/differential.rs` for why that matches the reference implementation.
+    /// A `0` here would be rejected out of hand for either other kind.
     fn run_bytes(runs: &[(u16, u16)]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(runs.len() as u16).to_le_bytes());

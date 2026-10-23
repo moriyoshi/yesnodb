@@ -4503,3 +4503,95 @@ was worth doing because the client defect gave it a concrete mechanism and
 got a one-line correction in the same pass: its docstring still said all three
 non-Rust clients could name the container bit and none could send one, which has
 been two-thirds false since yesterday.
+
+## 2026-10-23 -- A doc comment described a check that never existed, and adding it would have been wrong
+
+`container::codec::decode`'s doc said of its `card` parameter that "for runs it is
+used only to cross-check the decoded intervals". `decode_run( bytes )` takes no
+`card`. The discrepancy was filed on 2026-10-22 and left as a one-line fix for
+whenever something else touched `yesno-core`.
+
+**It was not a one-line fix, because the obvious direction was the wrong one.**
+Two readings were available: the doc is stale, or the check is missing. Three
+pieces of in-tree evidence pointed at "missing". `decode_bitmap` rejects a
+declared cardinality that disagrees with its popcount, and the comment beside it
+says why -- "every cardinality identity in `ops::card` silently returns a wrong
+number, because they all trust the cached length". `fuzz_targets/decode_container.rs`
+takes the cardinality from the fuzzer rather than deriving it, with the comment
+"letting the fuzzer disagree with the payload is the point, not a nuisance -- that
+disagreement is exactly the bitmap-popcount defect". And its list of four defects
+found when the target was written includes the bitmap case, with no run analogue.
+So the boundary's stated policy is to refuse a self-contradictory cardinality, and
+one of three kinds does not.
+
+**The oracle says otherwise, kind by kind.** Measured against the `roaring` crate:
+serialize a one-container bitmap, tamper the declared cardinality in the
+descriptive header, and both implementations refuse it -- `Expected cardinality was
+21845 but was 43690` against `Invariant( "bitmap cardinality disagrees with
+popcount" )`. Do the same to a run container and **both accept it and both report
+the payload's own count**, 5000 against a declared 2500. Do it to an array and both
+accept it and both return the declared count, because for an array `card` *is* the
+payload length -- `2 * card` bytes -- so a wrong one does not contradict the
+payload, it selects a shorter one.
+
+So one parameter has three roles: an array's length, a bitmap's cross-check, and
+for a run nothing at all. We match the reference implementation on all three,
+including on the one it does not check. Adding the cross-check would have made us
+stricter than CRoaring on the `.roaring` import path, whose whole purpose is to
+read foreign files, and whose leniency policy is already written into
+`decode_run`: "Accept anything a conforming writer could emit so foreign CRoaring
+files stay readable".
+
+**The M0 gate structurally could not have caught that divergence.** Every other
+test in `differential.rs` serializes a set it built itself, so the declared
+cardinality always agrees with the payload and a disagreeing file is never
+generated. The disagreement has to be constructed. Both sabotages below leave the
+other eleven tests green.
+
+**What went in.** `decode`'s doc now states the three roles, records the
+measurement and the date, and says plainly that the sentence it replaces described
+a check that has never existed. `the_declared_cardinality_is_checked_exactly_where_roaring_checks_it`
+in `tests/differential.rs` pins all three verdicts against the oracle: first that
+we and `roaring` agree about whether the tampered file is readable, then what
+each kind's answer is, so a change that makes both lenient or both strict together
+still fails rather than passing by agreeing about something new.
+
+**Both directions are proven live.** Adding the run cross-check -- the exact edit
+a future session would make from reading the old comment -- fails the new test and
+nothing else in `differential.rs`. Disabling the bitmap popcount check fails it in
+the other direction, reporting `Some( 21845 )` against the oracle's `None`, which
+is the cached-length lie `BitmapContainer::from_store( store, card )` produces
+when the check is gone.
+
+**A smaller finding inside the sabotage.** The run-cross-check edit also failed
+three unit tests in `codec.rs` -- `a_run_reaching_the_final_ordinal_is_accepted`
+and the two adjacency-coalescing tests -- but not because they test the semantics.
+They pass `card = 0`, a don't-care that is only legal because the parameter is
+ignored, and 0 is never a valid cardinality. A session doing the tightening would
+read those three failures as mechanical and repair them by passing the true count,
+after which nothing would stand in the way. That is the difference between a test
+that fails incidentally and one that states the oracle's verdict: only the second
+has to be argued with. `run_bytes`' doc comment now says the `0` is deliberate and
+points at both the decoder's doc and the new test.
+
+**The transferable part.** A comment that describes a check is a claim about
+behaviour, and the cheapest reading of a comment that disagrees with its code is
+that the code is behind. Here the comment was simply wrong, and the way to find
+that out was to ask the oracle rather than to make the code match the prose. The
+differential dev-dependency is for exactly this and it cost two scratch binaries
+under `.agents-workspace/tmp/run-card-check/`.
+
+**Where the unchecked field is actually reachable, for a client author.** On the
+Flight container wire the `cardinality` column is peer-supplied and arrives
+beside the payload rather than being derived from it, so this is the one path
+where the two can disagree without a corrupt file. Nothing downstream is harmed:
+`yesno_arrow::read_containers` passes the column to `decode`, which ignores it for
+a run, and `staged_rows` reports `c.len()` from the *decoded* container, so the
+chunk that lands and the ordinal count that is acknowledged both come from the
+payload. What the client loses is the error -- a run row whose two fields
+disagree is accepted silently, where an array or bitmap row is `invalid_argument`
+-- and it learns about it only from the acknowledgement comparison, which is
+exactly how the ack-short-by-one sabotage was caught on 2026-10-22. The Go and
+Python clients derive both fields from the same values, so neither can produce
+the disagreement; a third-party client that computes them separately can.
+

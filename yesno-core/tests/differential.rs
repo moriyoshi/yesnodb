@@ -144,6 +144,106 @@ fn the_roaring_crate_can_parse_what_we_write() {
     }
 }
 
+/// One `card` parameter, three roles, and we match the oracle on each of them.
+///
+/// `codec::decode` takes the cardinality from the index beside the payload, and
+/// what it does with it depends entirely on the kind: it is an array's *length*,
+/// a bitmap's *cross-check*, and for a run it is not consulted at all. That last
+/// one reads like a missing check -- `decode`'s own doc comment claimed for a
+/// long time that runs were cross-checked, and they never were -- so the
+/// question is whether to add it.
+///
+/// The answer is no, and this test is why. Tamper the declared cardinality in a
+/// serialized file and the `roaring` crate reaches the *same* verdict as we do on
+/// every kind: it truncates an array to the declared count, refuses a bitmap
+/// naming both numbers, and accepts a run with the payload's own count. Adding a
+/// run cross-check would make us stricter than the reference implementation on
+/// the one kind it does not check, and `.roaring` import is the path that exists
+/// to read foreign files.
+///
+/// **This is the kind of divergence the rest of the M0 gate structurally cannot
+/// see.** Every other test here serializes a set it built itself, so the declared
+/// cardinality always agrees with the payload and a disagreeing file is never
+/// generated. The disagreement has to be constructed by hand, which is what the
+/// tamper below is.
+#[test]
+fn the_declared_cardinality_is_checked_exactly_where_roaring_checks_it() {
+    /// Offset of container `i`'s `(key, card - 1)` pair in the descriptive header.
+    fn header_offset(bytes: &[u8], containers: usize, i: usize) -> usize {
+        let cookie = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let head = if cookie & 0xFFFF == yesno_core::roaring_format::SERIAL_COOKIE {
+            // Run cookie: the container count rides in the high half, and a
+            // run-flag bitset follows.
+            4 + containers.div_ceil(8)
+        } else {
+            // No-run cookie: a separate u32 count follows.
+            8
+        };
+        head + 4 * i
+    }
+
+    // One container each, so the tamper has one unambiguous target. `optimize`
+    // is what decides between a run payload and the other two.
+    let cases: [(&str, Vec<u32>, bool); 3] = [
+        ("array", (0..500u32).map(|i| i * 7).collect(), false),
+        (
+            "bitmap",
+            (0..65_536u32).filter(|v| v % 3 != 0).collect(),
+            false,
+        ),
+        ("run", (1_000..6_000u32).collect(), true),
+    ];
+
+    for (kind, vals, optimize) in cases {
+        let mut theirs: roaring::RoaringBitmap = vals.iter().copied().collect();
+        if optimize {
+            theirs.optimize();
+        }
+        let mut bytes = Vec::new();
+        theirs.serialize_into(&mut bytes).unwrap();
+
+        let off = header_offset(&bytes, 1, 0);
+        let declared = u16::from_le_bytes([bytes[off + 2], bytes[off + 3]]) as u32 + 1;
+        assert_eq!(
+            declared as usize,
+            vals.len(),
+            "{kind}: a conforming writer must declare the true cardinality,              so the tamper below is a real disagreement"
+        );
+
+        for wrong in [declared / 2, declared - 1] {
+            let mut tampered = bytes.clone();
+            tampered[off + 2..off + 4].copy_from_slice(&((wrong - 1) as u16).to_le_bytes());
+
+            let reference = roaring::RoaringBitmap::deserialize_from(&tampered[..])
+                .map(|b| b.len())
+                .ok();
+            let ours = Roaring32::deserialize(&tampered)
+                .map(|r| r.cardinality())
+                .ok();
+            assert_eq!(
+                ours, reference,
+                "{kind}: declared {declared} tampered to {wrong} -- we and the                  roaring crate disagree about whether that file is readable"
+            );
+
+            // Then the stronger half: *what* they agree on, stated per kind so
+            // that a change which makes both lenient or both strict together
+            // still fails here rather than passing by agreeing about something
+            // new.
+            match kind {
+                // The declared count is the array's length, so a smaller one
+                // selects a shorter, still strictly ascending payload.
+                "array" => assert_eq!(ours, Some(u64::from(wrong))),
+                // Nothing in a bitmap payload states its cardinality, and
+                // `ops::card` trusts the cached length.
+                "bitmap" => assert_eq!(ours, None),
+                // Self-describing: `nruns`, then the intervals.
+                "run" => assert_eq!(ours, Some(vals.len() as u64)),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------- semantic
 
 #[test]
