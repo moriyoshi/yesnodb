@@ -4595,3 +4595,189 @@ exactly how the ack-short-by-one sabotage was caught on 2026-10-22. The Go and
 Python clients derive both fields from the same values, so neither can produce
 the disagreement; a third-party client that computes them separately can.
 
+
+## 2026-10-24 -- The fuzz targets had never been run by anything, and two of the three are saturated
+
+`scripts/gate.sh` prints the three fuzz targets under a banner that reads
+`== not run even by --deep`, derived from the directory so the list cannot go
+stale. Nothing runs them. The script's own header already names this as the
+failure mode it exists to fight: "The fuzz targets, the aged-state measurement
+and Valgrind are each documented, each catch things nothing else does, and each
+only help when somebody remembers. Several of the bugs found in this codebase
+were sitting in front of a tool that could see them for whole milestones."
+
+**The tooling is on this host**, which is what made the complaint answerable
+rather than a note: `cargo-fuzz` at `~/.cargo/bin/cargo-fuzz` and a nightly
+toolchain, `rustc 1.100.0-nightly ( 5db7f4be8 2026-09-01 )`. So all three ran,
+180 seconds each, against their existing local corpora.
+
+**All three are clean**, and no artifact was written:
+
+| target | runs | edges at start | edges at end | corpus |
+| --- | --- | --- | --- | --- |
+| `decode_container` | 4 024 836 | 274 | 274 | 55 -> 59 |
+| `roaring_import` | 538 546 | 801 | 801 | 241 -> 256 |
+| `decode_expr` | 19 241 943 | 1 727 | 1 749 | 1 317 -> 1 413 |
+
+**Two of the three found no new edge at all**, and the one that did is the one
+whose input comes from a peer. `decode_container` and `roaring_import` are
+saturated at their corpora -- four million and half a million executions bought
+zero coverage between them -- while `decode_expr` gained 22 edges and 96 corpus
+entries and was still climbing when the budget ran out. That ordering is already
+written in `decode_expr.rs`'s own docstring and is worth restating as a measured
+fact: "A container payload arrives inside a file the server wrote; an expression
+arrives from a *client*, through a Flight ticket or a `QueryRequest` descriptor
+command, and nothing upstream of the decoder has looked at it." Budget belongs
+on that target, and more time on the other two buys nothing until their corpora
+change.
+
+**A stale crash artifact that no longer crashes.** `artifacts/roaring_import/`
+holds one file, `oom-024f72f2edec1a92241ede347a32c0be273b0287`, 60 bytes, dated
+2026-08-25, and it is mentioned nowhere in JOURNAL.md or TODO.md. Replayed, it
+executes in 0 ms and returns. So either the defect was fixed and neither the
+artifact nor a record was cleaned up, or it was never a defect in the code --
+`decode_expr` peaked at **1 040 MB RSS** in this run against libFuzzer's default
+`rss_limit_mb` of 2 048, which shows the limit is reachable on this surface
+without anything being wrong. **That matters for any gate step**: an inherited
+default turns a memory-hungry input into a reported crash, so a replay step has
+to set `-rss_limit_mb` deliberately. The artifact is left in place -- it is a
+pre-existing file in an ignored directory and not mine to remove.
+
+**What the 24 million executions bought is thrown away per machine.** The corpus
+directories are listed in `yesno-core/fuzz/.gitignore`, so the inputs that cost
+all of the above compute to discover exist only here. That is the opposite of
+this project's policy for the other randomized layer: CLAUDE.md says of proptest
+that `tests/*.proptest-regressions` "is a checked-in regression corpus -- commit
+new seeds, never delete them to make the suite green". The fuzz corpus has no
+such policy and gets the opposite treatment, for no recorded reason.
+
+**Measured what closing that would cost**, because the only reason to leave it is
+size. Minimized with libFuzzer's own `-merge=1` into a scratch directory rather
+than `cargo fuzz cmin`, which rewrites the corpus in place and would have
+discarded the original:
+
+| target | minimized files | content bytes | replay |
+| --- | --- | --- | --- |
+| `decode_container` | 57 | 969 | 0.07 s |
+| `roaring_import` | 249 | 26 144 | 0.76 s |
+| `decode_expr` | 1 406 | 125 729 | 0.13 s |
+| **total** | **1 712** | **152 842** | **0.96 s** |
+
+So a committed corpus is 149 KB of content in 1 712 files, and replaying all of
+it is **under one second** -- a real regression check over inputs that took 24
+million executions to find, at a cost that rounds to nothing. The expense is not
+the replay, it is building the three instrumented targets, which was 22 seconds
+incremental here.
+
+**Not taken, because two parts of it are the maintainer's call**, and filed as
+`fuzz-corpora-are-discarded-and-the-targets-run-nowhere` in TODO.md: committing
+1 712 files to the tree is a repo decision, and making `cargo-fuzz` plus a
+nightly toolchain a gate dependency is another. The second has a precedent that
+makes it cheap -- `client_gate` in `gate.sh` already runs a step only when its
+tool is present, reports a missing one by name in the verdict, and refuses to
+pass silently, which exists because four client gates once ran in CI alone.
+
+**One thing not worth taking.** libFuzzer recommended a dictionary for each
+target, and for `decode_expr` it is almost entirely generic integer patterns --
+no `YSNX` magic, because the corpus already carries it and mutation preserves
+it. A dictionary built by hand from the format's own tag table is the lever on
+the unsaturated target; the auto-recommended one is not it.
+
+## 2026-10-24 -- A dictionary written from the tag table is worth eleven times the coverage of none
+
+The fuzz survey earlier today left one lever named and untaken: `decode_expr` was
+the only unsaturated target, and the dictionary libFuzzer recommends for it is
+not the one to use -- almost entirely generic integer patterns, and without the
+`YSNX` magic, because the corpus already carries it and so the recommender never
+sees it as valuable. A useful dictionary had to come from the format's own tag
+table. It now exists, and the measurement is unambiguous.
+
+**`yesno-core/fuzz/decode_expr.dict`, 55 tokens**, taken from `yesno-wire`: the
+six-byte header ( magic, version, and the reserved byte that must be zero ),
+whole minimal expressions so a mutator can splice a valid tree rather than
+rediscover the header, the list nodes with their `u16` child counts, the leaves
+with their payload widths attached, the fold and view selectors in the position
+after a subtree where they mean anything, and the eighteen bignum operators.
+
+**A/B, same starting corpus, 120 seconds, two seeds per arm:**
+
+| arm | seed | edges | gain | features | corpus |
+| --- | --- | --- | --- | --- | --- |
+| no dictionary | 1 | 1 749 -> 1 755 | +6 | 6 191 -> 6 298 | 1 395 -> 1 430 |
+| no dictionary | 2 | 1 749 -> 1 757 | +8 | 6 191 -> 6 362 | 1 392 -> 1 444 |
+| dictionary | 1 | 1 749 -> 1 825 | **+76** | 6 190 -> 6 871 | 1 395 -> 1 576 |
+| dictionary | 2 | 1 749 -> 1 839 | **+90** | 6 191 -> 7 103 | 1 392 -> 1 618 |
+
+The ranges do not overlap, so one run of each would have shown the same
+conclusion -- but two seeds per arm is what makes that a statement rather than a
+hope, and this project has been burned by the single pair before: the sparse-base
+measurement recorded that "baseline materialize ranged 4.09 to 5.89 s across
+runs, so a single pair of runs could have shown any conclusion wanted".
+
+**It is not buying coverage by running slower.** Execution rate was 115 403 and
+127 655 per second without the dictionary and 119 527 and 113 261 with it -- the
+same band. The gain is structural: a `u16` child count and a six-byte header are
+things a byte-at-a-time mutator almost never assembles by chance, so the tokens
+are openings into the recursive grammar rather than hints about values.
+
+**Four runs, no crash**, and no artifact written in either arm. The corpora used
+were copies under `.agents-workspace/tmp/`, so the four arms could not pollute
+each other and the crate's own corpus was left alone.
+
+**Two places now say so, both derived rather than listed.** `fuzz/README.md`
+carries the numbers and the flag, because cargo-fuzz does not pick a dictionary
+up by name. And `scripts/gate.sh`'s fuzz-target block appends
+`-- -dict=fuzz/<name>.dict` when that file exists, on the same principle its own
+comment already states for the target list: "a hand-written list is the thing
+that goes stale, so derive it and the drift cannot recur". Printing the command
+without the flag would have been advertising the arm that finds an order of
+magnitude less. The path is `fuzz/<name>.dict` rather than `<name>.dict` because
+that block tells the reader to stand in `yesno-core`, and the two are not
+interchangeable -- checked both ways, and from `yesno-core` the bare name gives
+`ParseDictionaryFile: file does not exist or is empty`, which libFuzzer reports
+without failing the run.
+
+That last detail is the one worth keeping. A mistyped dictionary path is not an
+error: the fuzzer prints a line and carries on with no dictionary at all, which
+is exactly the no-dictionary arm above wearing the appearance of the other one.
+Any step that passes `-dict` should be read once for `Dictionary: N entries`
+before its numbers are believed.
+
+## 2026-10-24 -- Fifteen minutes of `decode_expr` with the dictionary: clean, and flattening
+
+The previous entry's A/B was 120 seconds a run, short enough that it said
+little about whether the expression decoder holds up under a real budget. So
+it got one: 900 seconds, `-fork=8`, `-rss_limit_mb=4096`, the dictionary
+(log read for `Dictionary: 55 entries` before anything else), seeded from the
+union of the two dictionary arms' corpora (1638 seeds after libFuzzer's
+dedup), on the AArch64 Cortex-X925 development host. Corpus and artifacts
+went to a scratch directory, so the crate's own corpus is untouched.
+
+**610,227,772 executions, oom/timeout/crash 0/0/0, no artifact.**
+
+```text
+  time    edges   features   corpus
+    2 s    1858       7186     1638
+   76 s    1893       7597     1792
+  190 s    1902       7923     1884
+  352 s    1925       8278     2015
+  566 s    1937       8484     2076
+  829 s    1942       8581     2129
+  903 s    1942       8601     2144
+```
+
++84 edges, and the curve is bending over: half the gain arrived in the first
+quarter of the run and the last 74 seconds added none. Features were still
+moving at the end, so it is not saturated in the sense `decode_container` and
+`roaring_import` are, but the cheap part of the dictionary's gain has been
+collected. The execution rate fell from about 150k/s to 60k-95k/s as the
+corpus grew; that is ordinary for fork mode on a growing corpus and is not a
+finding.
+
+What this establishes is the negative it can establish: the decoder a
+client's bytes reach first -- `SetExpr::decode`, `AnyExpr::decode` and
+`QueryRequest::decode` -- survived six hundred million mutated inputs aimed at
+its grammar without a panic, an allocation past the limit, or a hang. It does
+not change either of the decisions `fuzz-corpora-are-discarded-and-the-targets-run-nowhere`
+hands back; it is the number a "should this run in CI" argument would start
+from, and a per-run budget of a few minutes now has a measured curve behind it.

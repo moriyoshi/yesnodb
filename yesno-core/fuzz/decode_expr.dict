@@ -1,0 +1,93 @@
+# libFuzzer dictionary for the `decode_expr` target.
+#
+# Written from `yesno-wire`'s own tag table, rather than from the dictionary
+# libFuzzer recommends at the end of a run. That recommendation was almost
+# entirely generic integer patterns and did not even include the magic: the
+# corpus already carries it, so the mutator never has to invent it and the
+# recommender therefore never sees it as valuable.
+#
+# Measured on 2026-10-24: same starting corpus, 120 seconds, two seeds per arm.
+# Without this file the run gained 6 and 8 edges; with it, 76 and 90, at an
+# unchanged execution rate of 113 000 to 128 000 per second. The gain is
+# structural rather than a speed effect: the tokens below are the openings into
+# the recursive grammar, and a child count or a six-byte header is something a
+# byte-at-a-time mutator almost never assembles by chance.
+#
+# Pass it explicitly; cargo-fuzz does not pick a dictionary up by name:
+#
+#   cargo +nightly fuzz run decode_expr -- -dict=decode_expr.dict
+#
+# The headers come first because nothing decodes without one: six bytes of
+# magic, version and a reserved byte that must be zero.
+header_expr="YSNX\x01\x00"
+header_query="YSNQ\x01\x00"
+header_query_pinned="YSNQ\x01\x01"
+
+# Whole minimal expressions, so a mutator can splice a valid tree rather than
+# having to rediscover the header each time.
+expr_empty="YSNX\x01\x00\x00"
+expr_hole="YSNX\x01\x00\x0d"
+expr_andnot_empty="YSNX\x01\x00\x05\x00\x00"
+
+# List nodes: tag then a u16 child count. These are the openings into the
+# recursive grammar, and a count the mutator has to guess byte by byte is what
+# keeps it out.
+and_0="\x03\x00\x00"
+and_1="\x03\x01\x00"
+and_2="\x03\x02\x00"
+and_3="\x03\x03\x00"
+or_0="\x04\x00\x00"
+or_1="\x04\x01\x00"
+or_2="\x04\x02\x00"
+or_3="\x04\x03\x00"
+list_1="\x0b\x01\x00"
+list_2="\x0b\x02\x00"
+int_list_2="\x16\x02\x00"
+big_list_2="\x24\x02\x00"
+
+# Leaves with their payload width attached.
+key_zero="\x01\x00\x00\x00\x00\x00\x00\x00\x00"
+key_one="\x01\x01\x00\x00\x00\x00\x00\x00\x00"
+range_unit="\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+literal_1="\x09\x01\x00\x00\x00"
+literal_2="\x09\x02\x00\x00\x00"
+int_lit="\x14\x00\x00\x00\x00\x00\x00\x00\x00"
+
+# Fold and view: an operand then a one-byte selector, so the selector only
+# means anything in the position after a subtree.
+fold_or="\x07\x00\x00"
+fold_and="\x07\x00\x01"
+fold_xor="\x07\x00\x02"
+view_interleaved="\x0c\x00"
+view_blocked="\x0c\x01"
+pack_interleaved="\x0a\x00"
+expand_interleaved="\x08\x00"
+
+# Scalar queries over a set.
+cardinality="\x12\x00"
+rank="\x13\x00"
+contains="\x17\x00"
+select="\x0e\x00"
+map_set="\x0f\x00"
+map_int="\x10\x00"
+map_bool="\x11\x00"
+map_big="\x25\x00"
+
+# The bignum half: the newest surface and the one carrying the decode-time
+# budgets, so the tags that combine operands matter more than the literals.
+big_lit_0="\x18\x00\x00\x00\x00"
+big_widen="\x19\x00"
+big_read="\x1a\x00"
+big_read_signed="\x1b\x00"
+big_neg="\x1c\x00"
+big_add="\x1d\x00\x00"
+big_sub="\x1e\x00\x00"
+big_mul="\x1f\x00\x00"
+big_div="\x20\x00\x00"
+big_rem="\x21\x00\x00"
+big_truncate="\x22\x00"
+big_saturate="\x23\x00"
+big_fold="\x26\x00"
+big_pow_mod="\x27\x00\x00\x00"
+big_zip="\x28\x00\x00"
+big_scale="\x29\x00\x00"

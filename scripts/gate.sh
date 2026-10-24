@@ -684,11 +684,25 @@ printf '\n\033[1m== not run even by --deep\033[0m\n'
 # undercounting it by two. The same reasoning as `SCRIPT_STEMS` in
 # `scripts/check-todo-refs.py`: a hand-written list is the thing that goes
 # stale, so derive it and the drift cannot recur.
+#
+# A target's dictionary is derived the same way, and for a stronger reason than
+# tidiness: measured on 2026-10-24, `decode_expr` gained 6 and 8 edges in 120
+# seconds without its dictionary and 76 and 90 with it, at an unchanged execution
+# rate. Printing the command without the flag would be advertising the arm that
+# finds an order of magnitude less. The path is relative to `yesno-core` because
+# that is where this line tells the reader to stand.
 for target in yesno-core/fuzz/fuzz_targets/*.rs; do
     [[ -e "$target" ]] || continue
     name=${target##*/}
-    printf '   fuzz target: cd yesno-core && cargo +nightly fuzz run %s\n' "${name%.rs}"
+    name=${name%.rs}
+    if [[ -f "yesno-core/fuzz/$name.dict" ]]; then
+        printf '   fuzz target: cd yesno-core && cargo +nightly fuzz run %s -- -dict=fuzz/%s.dict\n' \
+            "$name" "$name"
+    else
+        printf '   fuzz target: cd yesno-core && cargo +nightly fuzz run %s\n' "$name"
+    fi
 done
 printf '   they need a time budget, so they take an argument rather than a default\n'
+printf '   set -rss_limit_mb deliberately: decode_expr peaks near 1 GiB when healthy\n'
 
 verdict "$EXPECT_STEPS_DEEP"
