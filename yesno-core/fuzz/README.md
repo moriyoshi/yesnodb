@@ -49,23 +49,57 @@ memory-hungry case as a crash.
 
 ## The dictionary, and why it is worth the flag
 
-`decode_expr.dict` holds 55 structural tokens taken from `yesno-wire`'s tag
-table -- the six-byte header, whole minimal expressions, the list nodes with
-their `u16` child counts, the leaves with their payload widths, and the bignum
-operators. cargo-fuzz does not pick a dictionary up by name, so it has to be
-passed:
+`decode_expr.dict` holds 82 tokens, and **none of them was written by hand**.
+Each comes from a minimal well-formed expression -- one per node kind, 41 in
+all -- encoded by `yesno-wire`'s own encoder and decoded back to the same value
+before it was kept. Each expression contributes its node bytes, which can be
+spliced into a subtree, and its whole encoding with the header. cargo-fuzz does
+not pick a dictionary up by name, so it has to be passed, and the path is
+relative to where you stand:
 
 ```console
-cargo +nightly fuzz run decode_expr -- -dict=decode_expr.dict
+cd yesno-core && cargo +nightly fuzz run decode_expr -- -dict=fuzz/decode_expr.dict
 ```
 
-**Measured on 2026-10-24, and it is not a marginal effect.** Same starting
-corpus, 120 seconds, two seeds per arm: without the dictionary the run gained
-**6 and 8** edges, with it **76 and 90**, at an unchanged execution rate of
-113 000 to 128 000 per second. So it is not buying coverage by running slower --
-the tokens are the openings into the recursive grammar, and a child count or a
-six-byte header is something a byte-at-a-time mutator almost never assembles by
-chance.
+A mistyped path is not an error: libFuzzer prints `ParseDictionaryFile: file
+does not exist or is empty` and runs with no dictionary. Read the log for
+`Dictionary: 82 entries` before believing any number from the run.
+
+**Measured on 2026-10-24, from the same minimized corpus, 120 seconds a run**,
+edges gained per seed:
+
+| dictionary | seeds | gain |
+|---|---|---|
+| none | 6 | 6 to 16 |
+| the earlier hand-written file, 55 tokens | 8 | 14 to 90 |
+| this file, 82 tokens | 6 | **106 to 111** |
+
+The hand-written file is the cautionary half. It was adopted on two seeds that
+happened to score 76 and 90, and a coverage report later showed its fold tokens
+could never parse: a fold is the tag, then a whole vector expression, then the
+operator byte, and the tokens put the operator straight after the tag. The view,
+pack and expand tokens had the same mistake. libFuzzer has no way to say that a
+token cannot parse, so the only signal was a noisy gain. Generating the tokens from
+the encoder ends that class of error, and the spread across seeds shrank from
+76 edges to 5.
+
+## Reading a coverage report of the corpus
+
+`cargo fuzz coverage` replays the **corpus**, and a corpus keeps only inputs
+that added a libFuzzer feature. So a line at zero means "no retained input
+reaches it", not "never executed". Two kinds of zero in `yesno-wire` look the
+same in the report and are not:
+
+- **Executed but never retained.** The `FOLD_XOR` decode arm is at zero after
+  hundreds of millions of executions with a correct XOR token in the
+  dictionary. A single XOR-fold input does reach it, but merged into the corpus
+  it adds 0 features: in the optimized fuzzing build its edge is already
+  covered by other inputs, so libFuzzer has no reason to keep one.
+- **Unreachable at the default length.** The per-node `TooManyNodes`
+  rejections need more than `MAX_NODES` (4096) nodes of at least one byte each,
+  after a six-byte header, so at least 4103 bytes. libFuzzer's default
+  `-max_len` is 4096. To fuzz the node cap past the junction pre-check, pass
+  `-max_len=16384`.
 
 The dictionary libFuzzer itself recommends at the end of a run is not the one to
 use. It is almost entirely generic integer patterns and does not include the

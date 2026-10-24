@@ -686,10 +686,10 @@ printf '\n\033[1m== not run even by --deep\033[0m\n'
 # stale, so derive it and the drift cannot recur.
 #
 # A target's dictionary is derived the same way, and for a stronger reason than
-# tidiness: measured on 2026-10-24, `decode_expr` gained 6 and 8 edges in 120
-# seconds without its dictionary and 76 and 90 with it, at an unchanged execution
-# rate. Printing the command without the flag would be advertising the arm that
-# finds an order of magnitude less. The path is relative to `yesno-core` because
+# tidiness: measured on 2026-10-24 over six seeds, `decode_expr` gained 6 to 16
+# edges in 120 seconds without its dictionary and 106 to 111 with it. Printing
+# the command without the flag would be advertising the arm that finds an order
+# of magnitude less. The path is relative to `yesno-core` because
 # that is where this line tells the reader to stand.
 for target in yesno-core/fuzz/fuzz_targets/*.rs; do
     [[ -e "$target" ]] || continue
