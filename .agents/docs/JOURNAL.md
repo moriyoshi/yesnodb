@@ -4883,3 +4883,145 @@ variance. Generate tokens from the encoder whenever there is one. Read a
 corpus coverage report as a statement about what the corpus *kept*. And when
 an A/B arm's spread is wide, read the spread as a symptom before quoting the
 mean.
+
+## 2026-10-25 -- Two saturated fuzz targets were a length cap and a small sample
+
+On 2026-10-24 `decode_container` and `roaring_import` each ended a 180-second
+run on exactly the edge count they started with, and this journal, the TODO
+and the fuzz README all called them saturated. The day's next finding, that
+`decode_expr` looked weaker than it was because its dictionary could not
+parse, was reason enough to ask whether "zero new edges" meant "nothing left"
+or "nothing reachable". It meant the second for one target and "not enough
+runs" for the other.
+
+**`decode_container` could not produce a valid bitmap, by arithmetic.** The
+input is a selector byte, four bytes of cardinality and the payload, and a
+bitmap payload must be exactly `BITMAP_BYTES` = 8192 bytes. libFuzzer's
+default `-max_len` is 4096 ("will not generate inputs larger than 4096 bytes",
+in both 2026-10-24 logs), and the corpus's largest file was 93 bytes.
+`cargo fuzz coverage` over that corpus shows `decode_bitmap` with every line
+after the length check at zero: the `BitStore` construction, the popcount
+cross-check and the `Ok`. So the defect this target's header lists second,
+"a bitmap whose stated cardinality is not its popcount", has not been
+reachable here since the corpus was regrown at the default length. This
+zero is a real one, unlike yesterday's `FOLD_XOR`, because no input of
+legal length can reach the line at all.
+
+Raising `-max_len` is not the fix. The mutator would still have to grow a
+93-byte seed to exactly 8197 bytes, and it changes lengths a few bytes at a
+time. The target now reads the selector's high bit as "fit this bitmap
+payload": zero-pad or truncate it to 8192 bytes. With the bit clear the
+payload is passed through unchanged, so wrong lengths are still fuzzed. Only
+bitmaps are fitted, because an array's or a run's length follows from a value
+in the input, so padding would make nothing reachable that a short input
+cannot already express. Rebuilt with `cargo +nightly fuzz build`, and `cargo
+fmt --check` passes in the fuzz crate.
+
+Then 300 s with `-fork=4` from a scratch copy of the corpus: **36 231 915
+executions, 291 -> 343 edges, no crash, OOM or timeout.** The target that had
+gained nothing in 4 million runs gained 52. Coverage of the new corpus has
+`decode_bitmap`'s length check at 41, the popcount comparison at 39, the
+mismatch rejection at 1 and `Ok` at 38. Nineteen `codec.rs` lines at zero
+before are covered now.
+
+**`roaring_import` was undersampled.** It runs at roughly 2 000 executions a
+second, against 25k-38k for `decode_container` and 100k for `decode_expr`, so
+538 546 executions was a small sample. Two 300 s runs on four workers from the
+same corpus, about 3 million executions each:
+
+```text
+  max_len        edges
+  default        812 -> 841   (+29)
+  16384          812 -> 849   (+37)
+```
+
+One run per arm, so the 8-edge gap is within noise. Running longer is what
+helped, not the bigger limit. Neither run produced an input over 1132 bytes,
+so **a bitmap container from the input file is still unreached**. The 150
+bitmap decodes in this target's coverage come from its round trip: a dense set
+from a small run container is written back out as a bitmap and re-read. The
+popcount-mismatch line is at zero there, which is the tell, because our own
+writer never produces a mismatch. `decode_container` now covers the bitmap
+decoder itself, so what remains uncovered in `roaring_import` is the file
+framing around a bitmap container. A seed holding a real bitmap container,
+written with the `roaring` crate, would cover it, but corpora are gitignored
+and whether to commit them is the open decision in
+`fuzz-corpora-are-discarded-and-the-targets-run-nowhere`.
+
+**What changed.** `fuzz_targets/decode_container.rs` gains the fitted mode,
+with a comment giving the reason and the date. The fuzz README's budget
+section is rewritten. The TODO item carries a dated correction under its
+"two of three are saturated" paragraph, which stays as the record.
+
+**The transferable part.** "No new coverage" is a statement about the search,
+not about the code under it. Before calling a fuzz target saturated, check
+three things: whether the input format can reach each accept path within
+`-max_len`, whether coverage of the corpus has zero-count lines past a length
+check, and whether the execution count is large for this target's speed rather
+than for some other target's. Yesterday's entry checked none of them, and
+reported a number that was true about the run and false about the decoder.
+
+## 2026-10-25 -- The node budget was enforced by seven decoders and tested in none
+
+`MAX_NODES` is enforced by a two-line check at the top of each of
+`yesno-wire`'s seven recursive decoders (`expr`, `vec_expr`, `int_expr`,
+`vec_int_expr`, `big_expr`, `big_vector`, `bool_expr`), plus a pre-check at
+each list node that refuses a child count the remaining budget cannot hold.
+The only unit test touching the cap, `a_lying_child_count_does_not_allocate`,
+reaches the pre-check. **No test reached a per-node check**, and the fuzz
+target could not stand in for one. At the default `-max_len` of 4096 no
+accepted expression can approach 4096 nodes, and the target's only
+node-related assertion is a bound on `keys()`. A decoder that stopped
+counting its own nodes would have passed every check this tree runs.
+
+**The fuzzer does not close it at a larger length either.** `decode_expr`
+for 300 s on eight workers at `-max_len=16384`, with the dictionary
+(`Dictionary: 82 entries` read from the log first): 239 042 927 executions, no
+crash, OOM or timeout, and 11 corpus inputs over 4096 bytes, the largest
+11 729. Coverage of that corpus has the per-node arms in `expr` and `vec_expr`
+at 2 each. The arms in `int_expr`, `vec_int_expr`, `big_expr`, `big_vector`
+and `bool_expr` are still at zero, as is `bool_expr`'s depth check. Reaching
+them needs a tree whose 4097th node falls in that sort, and nothing in the
+search aims at that.
+
+The first attempt at this run wrote `-dict=$PWD/...` inside `( cd $D && ... )`,
+so `$PWD` expanded to the scratch directory. In fork mode libFuzzer printed
+`ParseDictionaryFile: file does not exist or is empty` and **exited** rather
+than running without the dictionary, which is safer than the non-fork
+behaviour recorded on 2026-10-24. Either way the log check caught it.
+
+**`every_sort_counts_against_the_node_budget`**, in `yesno-wire`'s test
+module, pins the cap per sort at the exact boundary. Each case is a list or
+junction of 600 elements of a fixed shape, padded with one-node fillers so
+the total is exactly `MAX_NODES` (which must decode) or `MAX_NODES + 1` (which
+must be refused with `TooManyNodes`). Each shape is chosen so the sort under
+test supplies a large share of the nodes: `cardinality( empty )` for int,
+`at( [ 0 ], 0 )` for int vector, `read( empty, 1 )` for big,
+`fold( [ 1 ], add )` for big vector, `map_bool( [ empty ], contains( _, 0 ) )`
+for bool, and `fold( [ empty ], or )` for set vector. Every case is full of
+sets, so it also covers the set decoder. The `MAX_NODES` side is what keeps
+the count honest: the test passed on its first run, and an off-by-one in any
+shape's node count would have failed one side or the other.
+
+**Sabotaged one decoder at a time**, by deleting its `self.nodes += 1` from a
+scratch copy of `lib.rs` and running the test against it. All seven fail:
+
+```text
+  expr           -> int: one node past MAX_NODES must be refused
+  int_expr       -> int
+  vec_int_expr   -> int
+  big_expr       -> big
+  big_vector     -> big
+  bool_expr      -> bool
+  vec_expr       -> bool
+```
+
+(Each line names the first failing case; the loop stops there.) The file was
+put back from the scratch copy and confirmed byte-identical with `cmp`.
+
+This is the point `CLAUDE.md` makes about the allocation tests, applied to a
+bound rather than a kernel: a budget enforced in several places is several
+implementations, and only a test that can fail for each of them keeps them
+all honest. The fuzz target's check on whatever it accepts reads as covering
+this, but it is vacuous unless the fuzzer can produce an input near the bound,
+and at the default length it cannot.

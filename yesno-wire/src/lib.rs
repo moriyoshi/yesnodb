@@ -3250,6 +3250,101 @@ mod tests {
         let colliding = u64::from_le_bytes(*b"YSNQ\0\0\0\0");
         assert!(!QueryRequest::looks_like_request(&colliding.to_le_bytes()));
     }
+
+    /// `MAX_NODES` counts the nodes of **every** sort, and each of the seven
+    /// decoders does its own counting. This pins that per sort, at the exact
+    /// boundary: `MAX_NODES` nodes decode, one more is refused.
+    ///
+    /// Nothing else can see a decoder that stops counting. The junction
+    /// pre-check (`a_lying_child_count_does_not_allocate`) runs before any child
+    /// is read, so it never reaches the per-node arms. The fuzz target cannot
+    /// reach them either at libFuzzer's default `-max_len` of 4096 bytes: a node
+    /// is at least one byte and the header six, so the 4097th node needs at
+    /// least 4103 bytes. A coverage report on 2026-10-25 had the int, big,
+    /// big-vector, bool and int-vector arms at zero even with `-max_len=16384`.
+    ///
+    /// Each shape below is built so that the sort under test supplies a large
+    /// share of the nodes. If that sort's decoder stopped counting, the
+    /// over-budget case would come in far under the cap and decode, and the
+    /// test would fail on it. The `MAX_NODES` case is what keeps the arithmetic
+    /// honest: an off-by-one in the counts below fails one side or the other.
+    #[test]
+    fn every_sort_counts_against_the_node_budget() {
+        // `elems` elements of `per` nodes each, plus fillers of one node,
+        // inside one list or junction node: `1 + elems * per + fillers`.
+        const ELEMS: usize = 600;
+        fn fillers(per: usize, total: usize) -> usize {
+            total - 1 - ELEMS * per
+        }
+        fn big_one() -> BigExpr {
+            BigExpr::Lit(BigLit::from_le_bytes(false, vec![1]).unwrap())
+        }
+
+        type Build = fn(usize) -> AnyExpr;
+        let cases: [(&str, usize, Build); 6] = [
+            // Int: `cardinality( empty )` is one int and one set.
+            ("int", 2, |f| {
+                let mut xs = vec![IntExpr::Cardinality(Box::new(SetExpr::Empty)); ELEMS];
+                xs.extend(std::iter::repeat_n(IntExpr::Lit(0), f));
+                AnyExpr::VecInt(VecIntExpr::List(xs))
+            }),
+            // Int vector: `at( [ 0 ], 0 )` is an int, an int vector and an int.
+            ("int vector", 3, |f| {
+                let at = IntExpr::At(Box::new(VecIntExpr::List(vec![IntExpr::Lit(0)])), 0);
+                let mut xs = vec![at; ELEMS];
+                xs.extend(std::iter::repeat_n(IntExpr::Lit(0), f));
+                AnyExpr::VecInt(VecIntExpr::List(xs))
+            }),
+            // Big: `read( empty, 1 )` is one big and one set.
+            ("big", 2, |f| {
+                let mut xs = vec![BigExpr::Read(Box::new(SetExpr::Empty), 1); ELEMS];
+                xs.extend(std::iter::repeat_n(big_one(), f));
+                AnyExpr::VecBig(VecBigExpr::List(xs))
+            }),
+            // Big vector: `fold( [ 1 ], add )` is a big, a big vector and a big.
+            ("big vector", 3, |f| {
+                let fold =
+                    BigExpr::Fold(Box::new(VecBigExpr::List(vec![big_one()])), BigFoldOp::Add);
+                let mut xs = vec![fold; ELEMS];
+                xs.extend(std::iter::repeat_n(big_one(), f));
+                AnyExpr::VecBig(VecBigExpr::List(xs))
+            }),
+            // Bool: `map_bool( [ empty ], contains( _, 0 ) )` is a set, a set
+            // vector, a set, a bool and a set.
+            ("bool", 5, |f| {
+                let m = SetExpr::MapBool(
+                    Box::new(VecSetExpr::List(vec![SetExpr::Empty])),
+                    Box::new(BoolExpr::Contains(Box::new(SetExpr::Hole), 0)),
+                );
+                let mut xs = vec![m; ELEMS];
+                xs.extend(std::iter::repeat_n(SetExpr::Empty, f));
+                AnyExpr::Set(SetExpr::Or(xs))
+            }),
+            // Set vector: `fold( [ empty ], or )` is a set, a set vector and a set.
+            ("set vector", 3, |f| {
+                let fold =
+                    SetExpr::Fold(Box::new(VecSetExpr::List(vec![SetExpr::Empty])), FoldOp::Or);
+                let mut xs = vec![fold; ELEMS];
+                xs.extend(std::iter::repeat_n(SetExpr::Empty, f));
+                AnyExpr::Set(SetExpr::Or(xs))
+            }),
+        ];
+
+        for (sort, per, build) in cases {
+            let at_cap = build(fillers(per, MAX_NODES)).encode();
+            assert!(
+                AnyExpr::decode(&at_cap).is_ok(),
+                "{sort}: exactly MAX_NODES nodes must decode, got {:?}",
+                AnyExpr::decode(&at_cap)
+            );
+            let over = build(fillers(per, MAX_NODES + 1)).encode();
+            assert_eq!(
+                AnyExpr::decode(&over),
+                Err(ExprError::TooManyNodes),
+                "{sort}: one node past MAX_NODES must be refused"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

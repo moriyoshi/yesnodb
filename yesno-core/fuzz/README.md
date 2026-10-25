@@ -30,17 +30,31 @@ does not replace the workspace test gate.
 
 ## Where the budget is worth spending
 
-Measured on 2026-10-24, 180 seconds per target against the corpora on that
-machine. **Two of the three found no new coverage at all**: `decode_container`
-executed 4 024 836 inputs and `roaring_import` 538 546, and both ended on
-exactly the edge count they started with ( 274 and 801 ). They are saturated at
-their corpora, so more time buys nothing until the corpora change or the
-decoders do.
+**None of the three is saturated, though for a while two looked it.** On
+2026-10-24, 180 seconds each, `decode_container` (4 024 836 inputs) and
+`roaring_import` (538 546) ended on exactly the edge counts they started with
+(274 and 801), and this section called them saturated. On 2026-10-25 that
+turned out to be two different blind spots:
 
-`decode_expr` is the one that is not saturated: 19 241 943 inputs, 1 727 edges
-to 1 749, corpus 1 317 entries to 1 413, and still climbing when the budget ran
-out. That is also the only one of the three whose input reaches the server from
-a client rather than out of a file the server wrote. Spend time here.
+- **`decode_container` was boxed in, not finished.** A bitmap payload is exactly
+  8192 bytes and libFuzzer's default `-max_len` is 4096, so every bitmap input
+  in every run stopped at the length check. The corpus had never held a file
+  over 93 bytes. The target now has a fitted mode, set by the selector byte's
+  high bit, which zero-pads or truncates a bitmap payload to size. The next 300
+  seconds on four workers went from 291 to 343 edges, and the popcount
+  cross-check, `validate` on a bitmap and bitmap re-encoding are now reached.
+- **`roaring_import` was undersampled.** It runs at about 2 000 inputs a second,
+  so 538 546 is a small sample. 300 seconds on four workers gained 29 edges at
+  the default length and 37 at `-max_len=16384`, one run each, so a bigger
+  length limit is not what helps. A bitmap container *read from the input* is
+  still unreached: no input grew past 1132 bytes even at 16384. The bitmap
+  decodes that do appear in its coverage come from the target re-reading its
+  own serialization. The bitmap decoder is now fuzzed directly by
+  `decode_container`, so what remains uncovered is the file framing around it.
+
+`decode_expr` still has the largest surface, and it is the only target whose
+input reaches the server from a client rather than from a file the server
+wrote.
 
 **Pass `-rss_limit_mb` deliberately** rather than taking libFuzzer's 2 048 MB
 default: `decode_expr` peaked at 1 040 MB in that run with nothing wrong, so the

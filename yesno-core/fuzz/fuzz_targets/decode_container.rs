@@ -42,7 +42,26 @@ fuzz_target!(|data: &[u8]| {
     // fuzzer disagree with the payload is the point, not a nuisance — that
     // disagreement is exactly the bitmap-popcount defect.
     let card = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-    let payload = &data[5..];
+    // The high bit of the selector asks for a bitmap payload fitted to
+    // `BITMAP_BYTES`, zero-padded or truncated. Without it no bitmap could ever
+    // decode: libFuzzer's default `-max_len` is 4096 and a bitmap payload is
+    // exactly 8192 bytes, so before this every bitmap input in every run stopped
+    // at the length check, and the popcount cross-check, `validate` on a bitmap
+    // and bitmap re-encoding were never reached (measured 2026-10-25 by
+    // `cargo fuzz coverage`). Fitting only bitmaps is deliberate: an array's
+    // or a run's length follows from a value inside the input, so padding them
+    // makes nothing reachable that a short input cannot already express. With
+    // the bit clear the payload is passed unchanged, so wrong lengths are still
+    // fuzzed.
+    let fitted;
+    let payload = if kind == ContainerKind::Bitmap && data[0] & 0x80 != 0 {
+        let mut p = data[5..].to_vec();
+        p.resize(yesno_core::BITMAP_BYTES, 0);
+        fitted = p;
+        &fitted[..]
+    } else {
+        &data[5..]
+    };
 
     if let Ok(c) = codec::decode(kind, payload, card) {
         assert!(
