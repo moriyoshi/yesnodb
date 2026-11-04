@@ -118,6 +118,15 @@ transport retransmission problem in the faster-sending arm. No production socket
 setting was changed. Raw phase samples and the controlled socket A/B are under
 `.agents-workspace/tmp/flight-bitvector-bench/`.
 
+**Superseded on 2026-10-27: the daemon now sets `TCP_NODELAY`, and the 200 ms mode
+did not reproduce.** The same experiment against `yesnod`'s own listener, 300
+sequential 8 MiB `do_get`s per setting: Nagle left 96 of 300 in the 40 ms mode,
+NODELAY 0 of 300, and neither had a request 150 ms over the median. Retransmits
+were 9 and 8, timeouts 0 and 0. Loopback and plaintext only; TLS, concurrency and
+a real network are untested. The fix landed in `tls::serve_router` because the
+same stall cost a standby 125 ms per shard to become ready. See JOURNAL
+2026-10-27, *Every connection `yesnod` accepted kept Nagle on*.
+
 **B is closed as of 2026-10-01, and the first attempt to close it used the wrong argument.**
 That attempt measured Arrow *batch size* -- finding 64 KiB to 2 MiB a plateau and one 128 MiB
 batch 30 to 50 times worse -- and concluded that B's larger regions were therefore useless.

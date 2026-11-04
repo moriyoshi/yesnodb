@@ -14,7 +14,7 @@ The shared Flight protocol is consumed by Rust, Python, Java, Go, C++, PostgreSQ
 - Remote materialization is bounded by advertised cardinality and then verified for type, nullability, ordering, and row count.
 - Ingest acknowledgements accept the legacy 8-byte row count or the 16-byte row-count-plus-version form; exact-version reads may wait briefly for that commit to enter the visible prefix.
 - The capability bitmask is checked across all four implementations rather than restated in them. `FEATURE_CONTAINER_PUT` reached the server ten days before any client could name it, so a checker compares Rust, Python, Go and Java rather than relying on someone remembering four copies.
-- Only the Rust client sends container batches. A Java client can produce the payloads through public `org.roaringbitmap` API with **no new encoder** -- measured, see below -- and Python and Go have no equivalent container access.
+- All four clients send container batches: Python since 2026-10-22, Go since 2026-10-23 and Java since 2026-10-27. Java *could* have used `org.roaringbitmap`'s own containers -- measured, see below -- and was given an encoder of its own instead, a port of the Go one, so the four traps below are not on its path at all.
 
 ## Details
 
@@ -156,6 +156,8 @@ the estimate, the estimate was genuinely wrong, and four hours of pricing an exa
 a path the optimizer never walked.
 
 ### A Java client can build yesno container payloads with no new encoder
+
+**What was done with this, 2026-10-27.** `ContainerChunk.encode` in the Java client is its own encoder, ported from Go, and does not go through `org.roaringbitmap` at all. The finding below stands -- the route works -- but using it would mean carrying all four traps, plus the coupling to a library's container choice, to save about 150 lines whose layouts fit in a three-row table. `ContainerChunk.ofBitmap` reads a `RoaringBitmap`'s *values* and encodes them, so a caller holding one loses nothing.
 
 Verified 2026-10-13, against the shipped decoder rather than by reading. Container payloads on the
 write wire cost **64.8x less** than one row per set bit, and at the time of measurement only the

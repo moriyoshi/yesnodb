@@ -5025,3 +5025,877 @@ implementations, and only a test that can fail for each of them keeps them
 all honest. The fuzz target's check on whatever it accepts reads as covering
 this, but it is vacuous unless the fuzzer can produce an input near the bound,
 and at the default length it cannot.
+
+## 2026-10-25 -- Six depth checks pinned at the boundary, and the seventh cannot fire
+
+The node budget entry above has a twin. `MAX_DEPTH` (32) is also enforced by
+each of the seven `yesno-wire` decoders separately, and `depth_is_bounded`
+tested only the set decoder, five levels past the limit, so neither the other
+six checks nor the boundary itself were pinned.
+
+**A whole over-deep payload cannot pin a check.** A node with children that
+is missing its own check is still refused, one level down, by its child's.
+So `every_sort_refuses_one_level_past_the_depth_limit` cuts each payload
+instead: it encodes the same tree twice with two variants of the target node
+whose first differing byte is inside that node, and keeps only the common
+prefix. The decoder then arrives at the target with nothing left to read. At
+depth `MAX_DEPTH` the check must pass and the read fail with `Truncated`, and
+at `MAX_DEPTH + 1` the check must fire first with `TooDeep`. Depth is raised by
+a chain of one-child `and`s for the set-rooted cases and of `neg`s for the
+big-rooted ones; set, set vector, big, big vector, int and int vector each have
+a case.
+
+**Sabotage, two mutations per decoder** (`depth > MAX_DEPTH + 1` to disable a
+check, `depth >= MAX_DEPTH` for an off-by-one), each on a scratch copy restored
+and `cmp`-confirmed after every run:
+
+```text
+  expr, int_expr, big_vector, big_expr,
+  vec_int_expr, vec_expr        off: fails   ge: fails
+  bool_expr                     off: passes  ge: passes
+```
+
+**The bool check is unreachable from any input, by construction.**
+`bool_expr` has one caller, the `map_bool` arm of `expr`, and that arm decodes
+`vec_expr(depth + 1)` before `body(depth + 1, bool_expr)`. So a bool is never
+entered at a depth its vector sibling was not already admitted at, and every
+vector node has a child one level deeper, so the deepest legal bool is at
+`MAX_DEPTH - 1`. Replacing the check with `if false` leaves all 50
+`yesno-wire` tests passing. The check stays, with a comment saying why, for the
+next position a bool is decoded from.
+
+**This corrects the previous entry**, which listed `bool_expr`'s depth check
+among the arms the fuzzer had not yet reached. It is not that the search did
+not aim there: there is nothing to reach. A zero in a coverage report can mean
+"never retained", "unreachable at this length", or, as here, "unreachable".
+
+## 2026-10-25 -- Padding a truncated file reaches input-read bitmaps, but only with the right fill
+
+`roaring_import` had never decoded a bitmap container read from its input.
+The format stores one as 8192 bytes, libFuzzer's default `-max_len` is 4096,
+and even at 16384 no corpus input grew past 1132 bytes. The bitmap decodes
+its coverage showed were the target re-reading its own serialization.
+
+**The fix uses two properties the parser already has.** `deserialize_u64`
+ignores trailing bytes, and every short read reports
+`Truncated { expected, found }`. So the target now checks the input as
+before, then, while the result is `Truncated`, pads by exactly
+`expected - found` and checks again: at most 8 rounds and 64 KiB
+(`FIT_ROUNDS`, `FIT_MAX_LEN`). An input that parses is never padded, and every
+padded input is just another input the property must hold for.
+
+**A/B, the minimized corpus (249 files), 300 s, `-fork=4`, two seeds an arm,
+0 crashes, OOMs and timeouts in all six runs.** Edges are first and last
+status line; "input bitmaps" is corpus files whose fitted form parses with at
+least one container that is not run-flagged and declares a cardinality over
+4096. That count comes from a scratch probe that walks the container headers
+itself, under `.agents-workspace/tmp/fit-roaring/probe/`.
+
+```text
+  arm            edges          executions        input bitmaps
+  base           812 -> 817     2.31 M, 2.07 M    0, 0
+  zero fill      851 -> 853/856 1.92 M, 1.91 M    0, 0
+  last-byte fill 853 -> 875/872 1.46 M, 1.87 M    31, 31
+```
+
+**The zero fill was not enough, and coverage said why.** In its corpus
+`decode_bitmap` ran 156 times and returned `Ok` 131 times, the same 131 as the
+bitmap re-encodings, so every input-read bitmap failed the popcount check. The
+portable format reads a bitmap only when the declared cardinality is over
+4096, so the payload needs over 4096 set bits matching the declaration
+exactly, which is at least 513 bytes the fuzzer must write itself. The fill
+is now the input's last byte. A `0xFF` fill under a declared 65536 is a full
+bitmap, and an input ending in `0x00` pads exactly as the zero-fill version
+did.
+
+**The first probe was wrong, and in a misleading direction.** It counted
+`Container::Bitmap` in the *decoded* set and reported 68 such files in the
+*unpadded* base corpus, where no input exceeds 1132 bytes and so none can
+carry an 8192-byte payload, so none of them came from the file. Counting
+what the file declared, rather than what came out, gave 0 there, as it must.
+
+The cost is speed, about a quarter fewer executions, because the inputs that
+matter are now 8 KiB. `decode_container` already fuzzes the bitmap codec
+directly; what this adds is that codec reached through the file framing,
+which is the subject of this target.
+
+## 2026-10-25 -- The wire format was canonical in bytes, and the fuzz target only checked it in values
+
+A coverage report of `decode_expr` showed `SetExpr::encode` at zero, which
+led to reading what the target asserts about re-encoding. It decodes, encodes
+and decodes again and compares the two *values*. Its header says the format
+is "canonical by construction", but the value fixed point cannot see the
+failure that phrase rules out: a decoder that accepts a second spelling and
+normalizes it. Both spellings decode to one value, that value re-encodes
+consistently, and the check passes.
+
+**Probed before asserting.** A scratch crate,
+`.agents-workspace/tmp/canon-probe/`, replayed every accepted input in the
+three `decode_expr` corpora (the 900 s run's, the minimized one and the
+in-tree one) and compared `encode( decode( b ) )` with `b`: **1 568 of 1 568
+expressions and 54 of 54 requests re-encode to their exact input.** The
+reserved header byte is checked, an unpinned request with a nonzero version
+field is refused, and literals and views refuse non-canonical forms. So the
+byte property is one the format already has, and the target now asserts it
+for both `AnyExpr::decode` and `QueryRequest::decode`.
+
+**Sabotage.** In a scratch copy of `yesno-wire`, the refusal of a nonzero
+version field on an unpinned request was deleted, and both the new target and
+the committed one were built against it. 120 s each, one process, seed 1, the
+minimized corpus and the dictionary (`Dictionary: 82 entries` in both logs):
+
+```text
+  committed target   13 499 321 executions, nothing found
+  new target         crashed within ~10 000 executions:
+                     "an accepted request is not the canonical spelling of its value"
+```
+
+The crashing input is `YSNQ 01`, flags `00`, then version bytes
+`00 00 00 00 00 01 59 53`, which is the sabotage exactly. Against the
+restored decoder it is refused in 0 ms. Both files were put back from scratch
+copies and confirmed identical with `cmp`.
+
+This is the dictionary lesson again from the other side: the target looked as
+if it checked canonicality, and the sentence that said so was true of the
+format and not of the target.
+
+**A clean run of the new target**, against the real decoder: 300 s,
+`-fork=8`, `-max_len=16384`, the dictionary, seeded from the 900 s run's
+corpus. **183 613 492 executions, 0 crashes, OOMs or timeouts**, edges
+1914 -> 1936. No legitimate second spelling turned up for the assertion to
+trip on.
+
+## 2026-10-25 -- The container target had the same gap, with two deliberate exceptions
+
+`decode_container` round-tripped *contents* only, so it had the gap just
+closed in `decode_expr`. A container payload is not canonical in bytes
+everywhere, though, and both exceptions are policy, documented at
+`codec::decode` and `decode_run`:
+
+- a **run** container's declared cardinality is ignored, because the `roaring`
+  crate ignores it too (pinned in `tests/differential.rs` since 2026-10-23);
+- **touching runs are coalesced**, because the Roaring spec forbids overlap
+  and not adjacency, so a conforming foreign file may carry `[0,3],[4,7]`.
+
+**Probed first**, with `.agents-workspace/tmp/canon-container/`, over the
+minimized, in-tree and fitted-bitmap corpora read the way the target reads
+them: **100 accepted payloads re-encode identically, 23 run payloads
+re-encode to exactly what an independent coalescing gives, and 0 are anything
+else.** The probe's first run printed several runs accepted under a declared
+cardinality of 3 211 274, which looked like a defect until the doc comment
+above `codec::decode` turned out to say why.
+
+So the target now asserts that decode keeps the kind, and that the
+re-encoding equals the payload, or for a run the payload with touching runs
+merged by a coalescing written in the target. The declared cardinality is not
+part of the payload and is not compared.
+
+**Sabotage**: `decode_array` was made to accept spare trailing bytes and
+ignore them, which preserves contents exactly. 120 s each, seed 1, the
+minimized corpus:
+
+```text
+  committed target   3 374 314 executions, nothing found
+  new target         crashed within ~360 executions:
+                     "an accepted Array payload is not the canonical spelling of its contents"
+```
+
+`codec.rs` and the target were restored from scratch copies and confirmed
+with `cmp`, and the crashing input executes cleanly against the real codec.
+
+**Clean run against the real codec**: 300 s, `-fork=4`, seeded from the
+fitted-bitmap corpus, **34 122 127 executions, 0 crashes, OOMs or timeouts**.
+Edges stayed at 395 the whole run, so this says the assertion has no false
+positive on what the search reaches, not that the search grew.
+
+## 2026-10-25 -- A byte check that `roaring_import` does not get, and why
+
+After the two byte checks above, the obvious third was in `roaring_import`:
+assert that re-serializing the re-read of our own output gives the same
+bytes, `serialize( deserialize( serialize( s ) ) ) == serialize( s )`. It was
+written, passed over 1 574 corpus inputs, and **taken out again**, because no
+plausible regression trips it.
+
+A foreign file cannot be held to its own bytes, since its writer chose each
+container's kind, so the check has to start from our serialization. Then any
+deterministic change the reader makes is applied twice: `s` already carries
+it from the first read, and the re-read applies it again to no effect. Decoding
+every small run as an array, re-optimizing each container on read, and
+dropping empty containers would all pass. Only a reader that changes a
+representation it itself produced would fail, and nothing suggests one. A
+writer and reader that disagree about a kind already change *contents*, which
+the target checks.
+
+The test that separates this from the two that stayed: each of those has a
+sabotage the old target misses and the new one catches within seconds. For
+this one I could not write one that was not contrived, so it does not earn a
+line in the hot loop.
+
+## 2026-10-25 -- The mmap decoder repeats the run checks, and nothing compared the copies
+
+`codec::decode_buffer` is the zero-copy path `db::store` reads segment pages
+through. Its module note is explicit that it does *not* share `decode`'s
+contract: pages arrive CRC-verified, so it skips an array's ordering and a
+bitmap's popcount on purpose. Its **run** arm is the exception. To keep the
+pairs shared it repeats every check `decode_run` makes -- a run past the
+chunk, overlap or descent, touching runs (by handing off to `decode`), the
+total -- in its own loop. That is a second implementation of a validation,
+and nothing compared the two: the `decode_container` fuzz target never
+called `decode_buffer`, and its unit tests cover alignment and bounds, not
+run content.
+
+**Measured, not argued.** With the overlap check deleted from the shared arm
+only, **all 1 283 `yesno-core` tests passed**, because every other caller hands
+`decode_buffer` runs this crate wrote.
+
+**Two guards, one per layer.**
+
+- `decode_container` now calls `decode_buffer` on every input at three
+  placements: an address that is 0 mod 8 (everything shared), 2 mod 8 (`u16`
+  data shared, a bitmap copied) and 1 mod 8 (nothing shared). Wherever
+  `decode` accepts, `decode_buffer` must give the same kind, cardinality,
+  contents and encoding. On runs the verdict must match on every input,
+  because both paths claim the same checks. Arrays and bitmaps that `decode`
+  refuses are not asserted, since that difference is the documented contract.
+- `codec::tests::decode_buffer_and_decode_agree_on_runs` is the copy the gate
+  runs: seven handcrafted run payloads (disjoint, touching, the final
+  ordinal, overlapping, descending, a repeated start, past the chunk) at 0
+  and 1 mod 8, plus an `is_shared` assertion so the aligned case is known to
+  reach the arm it is about.
+
+**Sabotage**, each on a scratch copy of `codec.rs` restored with `cmp` after:
+
+```text
+  shared arm without          unit test    fuzz target
+  the overlap check           fails        crashed on a corpus input, before mutating
+  the past-the-chunk check    fails        (not run)
+  the adjacency hand-off      fails        (not run)
+```
+
+The adjacency case is why both compare **encodings** and not only contents.
+Leaving touching runs unmerged keeps contents and cardinality identical, so
+the first draft of the test passed it. It is still a container every run
+kernel assumes cannot exist.
+
+Clean runs against the real codec: 300 s at `-fork=4`, 13 540 143 executions,
+then 180 s with the encoding check added, 9 757 167, with 0 crashes, OOMs or
+timeouts in either.
+
+**A check that cannot fire, noted rather than removed**: `total > CHUNK_CARD`
+in both run paths. Runs that ascend without overlap inside a 16-bit chunk
+total at most 65 536, which is `CHUNK_CARD`, so the refusal is unreachable
+once the overlap and past-the-chunk checks pass. It is cheap and protects
+the next edit to the loop, the same reasoning as the `bool_expr` depth check
+above.
+
+## 2026-10-26 -- A TLS test hung the gate for eleven hours, because nothing in it had a deadline
+
+Two gate runs on 2026-10-25 failed to finish, for different reasons.
+
+**The first was OOM-killed** while compiling the workspace test binaries.
+The `codec.rs` test change had invalidated `yesno-core`, so every crate
+rebuilt at once on 20 jobs, on a host that other sessions were also using.
+The kernel log was not readable from the session, so what the OOM killer chose
+is not known. The rerun was capped with `CARGO_BUILD_JOBS=8` and sampled
+`free -m` every 2 s: **system memory used peaked at 63 GB of 121 GB** during
+that compile phase, everything on the host included. That is a ceiling to
+know about: a full rebuild at the default job count is within reach of the
+host when anything else is running.
+
+**The second hung.** `yesno-server/tests/tls_reload.rs` stopped writing at
+21:49 and was found at 08:36 with all four tests "running for over 60
+seconds". The 13 threads of the test process were all asleep (`ep_poll`,
+`futex_do_wait`), so it was a future that never completed, not a spin. The
+four tests serialize on one `ROTATION` mutex, so one hung while holding it and
+three queued behind it. Every network step in the file -- the `connect` in
+`client()`, `get_flight_info` in `assert_served` and `assert_refused`, the
+`handshake` and its stream in `whoami`, the call on the connection held across
+the rotation -- was awaited with no bound. Only `sighup_rotates_the_certificate`
+had a deadline, and only around its polling loop.
+
+**It does not reproduce**: 5 runs through cargo, then the gate's own binary
+(`tls_reload-e3d0...`, the workspace feature set) 100 times in sequence and
+100 times as five rounds of 20 in parallel, under a 60 s or 120 s `timeout`.
+All passed, each run taking about a second. So the cause is not known. What is
+known is that the file could turn a stall into a gate that never ends.
+
+**The fix bounds every step** with `bounded( what, f )`, a 30 s
+`tokio::time::timeout` that panics naming the step. It loosens no assertion:
+before, a stalled step waited forever, and now it fails. `tokio::sync::Mutex`
+does not poison, so the queued tests still run after one fails. Shown to be
+wired by setting the bound to 1 ms on a scratch copy, which failed two tests
+with `before any bad rotation: no answer within 1ms` and
+`the handshake: no answer within 1ms`. Restored, 20 runs out of 20 pass.
+
+**Note** for whoever next waits on a gate in the background: the first rerun
+here lost its log, because `rm -f log && ( monitor loop ) & gate > log` puts
+the `rm` in the background job, where it ran after the shell had opened `log`
+for the gate and unlinked it. The output was still reachable as
+`/proc/<pid>/fd/1` and was recovered with
+`tail -c +1 -f --pid=<pid> /proc/<pid>/fd/1`.
+
+## 2026-10-26 -- A yesno scan could not be cancelled, timed out or terminated
+
+Surveying for unbounded waits after the `tls_reload` hang found two in
+production code with no timeout at all. The one with consequences was
+`yesno-pg`'s Flight transport. PostgreSQL's executor is synchronous, so each
+RPC was a `block_on` on a current-thread runtime, and nothing in `yesno-pg`
+called `check_for_interrupts!` anywhere.
+
+**Demonstrated before fixing**, in a container from the `yesno-e2e:local`
+image, built with the gate's own Bazel cache (`scripts/scratch.sh` must be
+sourced first or `pgrx-pg-sys`'s build script fails with a bare
+`No such file or directory`). A cluster was started by hand, and a Python
+listener accepted connections on 127.0.0.1 and never wrote a byte. Probe at
+`.agents-workspace/tmp/pg-cancel-probe/probe.sh`, `statement_timeout = '2s'`:
+
+```text
+                                   before                     after
+  pg_sleep( 10 ), the control      cancelled at 2.0 s         cancelled at 2.0 s
+  count(*) on the silent server    blocked at 40 s (killed)   cancelled at 2.0 s
+  a row scan on it                 blocked at 40 s (killed)   cancelled at 2.0-2.1 s
+  pg_cancel_backend                still blocked 20 s later   ended in ~2 s
+  pg_terminate_backend             still blocked 20 s later   ended in ~2 s, FATAL as usual
+  one session, two cancels, SELECT --                         served
+  server log, PANIC or crash       --                         0
+```
+
+`pg_stat_activity` showed the blocked backends as plain `active` with no wait
+event, so nothing would point an operator at the cause, and `SIGKILL`, the
+only remedy, makes the postmaster reinitialize every session.
+
+**The fix adds no timeout of its own.** All three mechanisms only set the flag
+`CHECK_FOR_INTERRUPTS` reads, so the fix is to reach that check while waiting.
+Every wait in `transport/flight.rs` goes through `wait`, which loops a
+50 ms `tokio::time::timeout` around the future and runs
+`pgrx::check_for_interrupts!` between polls. For a cancel or terminate, pgrx
+turns the `ERROR` into a panic that unwinds out of `block_on` and back into
+PostgreSQL's error. Any other pending interrupt is processed and the wait goes
+on. How long a statement may wait stays `statement_timeout`'s decision. Two
+details worth keeping:
+
+- the macro expands to `#[allow(unused_unsafe)] unsafe { ... }`, which is
+  only legal in statement position, so `|| pgrx::check_for_interrupts!()`
+  fails to build with E0658 and the closure needs a block body;
+- the tick is injectable (`wait_ticking`), so three unit tests run without a
+  backend, a panicking tick standing in for the cancel. One of them asserts the
+  runtime still works after the unwind, because the transport keeps it for the
+  next statement.
+
+**Regression**, in `e2e/postgresql/postgres.py` through a new fixture verb
+pair, `fx_silent_start` / `fx_silent_stop`. It creates a foreign table on the
+silent listener, sets `statement_timeout = '1s'`, runs a count and a scan, and
+asserts both report the timeout and that the session then answers a plain
+`SELECT`. With `flight.rs` reverted inside the container, the first version of
+that block **hung for 20 minutes**. The runner's `--timeout 300` does not
+interrupt a host call (filed as
+`the-e2e-runner-timeout-cannot-end-a-blocked-host-call`), so that `psql` now
+runs under `/usr/bin/timeout 60`, and the reverted build fails in 60.7 s with
+"a server that never answers held the backend for 60 s past a 1 s
+statement_timeout". Restored, it passes in 27 s.
+
+**The channel transport has the same defect and is not fixed.** Against a
+silent Unix socket, a 2 s `statement_timeout` was still blocked at 30 s and
+survived `pg_terminate_backend`. Its client is `yesno-plugin`'s synchronous
+one, so the remedy belongs in that client and is filed as
+`the-pg-channel-transport-ignores-cancel-and-terminate`.
+
+`apply`'s commit is interruptible along with everything else. A cancel inside
+`commit_write` leaves the server's outcome unknown, the ambiguity
+`fdw-two-phase-commit` already records for a dropped connection, and a commit
+that could not be cancelled at all was the worse of the two.
+
+## 2026-10-27 -- The channel client gets a wait hook, and a poisoned lock is the broken flag
+
+The second half of yesterday's cancellation defect: `yesno-pg`'s channel
+transport waits inside `yesno-channel`'s synchronous client, which is shared
+with the C ABI, so the remedy went into the client and is opt-in.
+
+**`Client::connect_waiting( path, name, Some( hook ) )`.** Before the greeting
+and before every read and write, the client `poll`s the socket for 50 ms at a
+time and runs `hook` whenever it is not ready. `EINTR` from `poll` counts as
+not ready, because the signal that interrupts it is usually the one the hook
+exists to notice. `Client::connect` is `connect_waiting( .., None )` and
+behaves exactly as before, so no other consumer changed. `read_frame` already
+kept a partial frame in the connection's buffer and only ever called `read`,
+so wrapping the socket in a reader that waits first was all the frame layer
+needed.
+
+**The hook ends a wait by unwinding, and the unwinding is also the record of
+it.** The connection sits behind a `Mutex` held for the whole exchange, so a
+hook that panics partway poisons it. Nothing else can, short of a bug, and a
+bug leaves the stream just as unpaired: the frames carry no request
+identifiers, so the next response read would belong to the abandoned request.
+So `Client::is_broken` is `is_poisoned`, and the four poisoned-lock branches
+now say "an earlier request on this plugin channel was abandoned partway" and
+not "the lock was poisoned". `ChannelTransport::client` drops a broken client,
+with the snapshot and scan it served, and connects afresh. The `PINS` that
+reference the old connection are cleared on `XACT_EVENT_ABORT`, which a
+cancel always reaches.
+
+**Tests that fail rather than hang.** Two unit tests drive a scripted server
+over `UnixStream::pair` (`Client::handshake` was split out of
+`connect_waiting` for them): one greets and then falls silent, and a hook
+panicking on its third tick must end `snapshot()`, leave the client broken,
+and have the next call refuse naming why; the other never greets, and the
+hook must end the handshake. With either wait removed, the first draft of the
+tests **hung** for the full 120 s `timeout`, which is the `tls_reload` failure
+mode all over again. So each runs its call on a thread with a 10 s
+`recv_timeout`, and the same two sabotages now fail in 10 s with "the wait did
+not end: the hook is not being run".
+
+**Regression**: `fx_silent_start( dir )` now also listens on a Unix socket in
+`dir` and returns both addresses, and `postgres.py` runs the same three
+statements against `silent_flight` and `silent_channel`. With `channel.rs`
+reverted to the plain `connect` it fails in 62.9 s naming `silent_channel`.
+Restored, `//yesno-pg:unit` and `//e2e/postgresql:regress` pass together in
+141 s. The hand probe gives a 2 s cancel on the channel too.
+
+## 2026-10-27: The runner's time limit never counted time spent in a verb
+
+**Found while closing `the-e2e-runner-timeout-cannot-end-a-blocked-host-call`.**
+That entry said monty's `max_duration` cannot interrupt a blocked host call.
+Reading `monty-types` 0.0.21 shows it is worse. `ResourceTracker` runs its
+clock only between `on_execution_start` and `on_execution_stop`, and the VM
+calls the stop at every suspension, external calls included. So the limit is
+on interpreter time alone. A scenario of many short verbs ran past `--timeout`
+exactly as freely as one blocked verb, and nearly every scenario's time is
+verb time. `DEFAULT_TIME_LIMIT`'s comment, "how long a single scenario may run
+before it is killed", had been describing a wall clock nothing enforced.
+
+**Before changing the meaning, checked that no gate depends on the old one.**
+Every limit in the tree already reads as a wall-clock budget with room left:
+- the cargo suite runs all of `e2e/scenarios/` in 44 s, with 120 s each;
+- `postgres.py` passes in 30 to 60 s against 300;
+- operator runs 214 to 272 s against 1200;
+- filesystems runs 39 to 47 s against 1200;
+- java runs 1.5 s against 600.
+
+**Two halves, because the runner is not the one blocked.**
+- **The runner.** `execute` takes a deadline at the start and checks it after
+  every verb. Past it, the scenario ends with the new `E2eError::TimedOut`,
+  naming the verb and call number, and the script is not resumed, so a late
+  answer cannot be caught and carried on from. The verb's own error goes on
+  the end of the message.
+- **The fixture.** `fx_run` and `fx_run_merged` now poll their child, backing
+  off from 1 ms to 25 ms, and kill it at the deadline, which
+  `FixtureState::set_deadline` hands them. Their error says what was still
+  running. `fx_wait_ready`, `fx_wait_output` and `fx_close` shorten their own
+  timeouts to the deadline. stdin is written from a thread, so a child that
+  stops reading cannot block the write.
+
+**Only the direct child is killed.** A process group would reach a wrapper's
+grandchildren, but a child in its own group no longer gets the Ctrl-C or the
+group kill a test runner sends the harness, and an orphan left by an
+interrupted run is the worse leak. Output now goes to files rather than
+pipes: the old `output()` waited for EOF, so a grandchild holding a pipe open
+could hold the wait as well.
+
+**Both tests fail with their half disabled, checked:**
+- `a_verb_blocked_on_a_child_is_ended_at_the_limit` runs `/bin/sleep 30`
+  under a 1 s limit. With the fixture deadline off, it runs the full 30 s and
+  fails on the message.
+- `a_scenario_spending_its_time_in_verbs_is_ended_at_the_limit` makes twenty
+  0.2 s calls under a 1 s limit. With the runner check off, both tests fail:
+  the fixture's `RuntimeError` reaches the script as an ordinary exception
+  instead of ending it. With both halves off, the second test passes after
+  4 s, which is the state before this change.
+
+**Still not covered:**
+- A verb blocked in-process, on a network call or a lock, is caught only when
+  it returns.
+- The aws, operator, cloud, search and filesystems modules spawn processes
+  outside `fixture.rs`, with waits of their own.
+
+`postgres.py` keeps its `/usr/bin/timeout 60` around the silent-server `psql`.
+It fails in 60 s and names the cause, where the runner would now fail it at
+300 s and name only the verb.
+
+`fx_wait_ready`'s probe command gets the readiness timeout as its own
+deadline. Before, a probe that hung held the wait past that timeout,
+indefinitely until today and up to the scenario's deadline after the first
+cut of this change.
+
+## 2026-10-27: The Java client sends container batches, and a valid wrong payload is what the read-back is for
+
+**Closes `three-clients-cannot-send-container-batches`.** Java was the last
+client that could ask whether the server accepts container batches but could
+not build one.
+
+**An encoder of its own, though the entry had measured that none was
+needed.** On 2026-10-13, Java's public `ContainerPointer` route was shown to
+produce payloads the shipped decoder accepts, and that still holds. The route
+was declined anyway. It brings four traps:
+- a protected container accessor;
+- a serialized size two bytes larger than an array payload;
+- big-endian `ByteBuffer`s by default;
+- a 32-bit bitmap that reaches only `prefix48 < 2^16`.
+
+It would also couple the wire to a library's container choice. Against that,
+the encoder is about 150 lines whose layouts fit a three-row table, and the Go
+port it copies has already been through two rounds of defects.
+`ContainerChunk.ofBitmap` reads a `RoaringBitmap`'s values and encodes those,
+so a caller holding one still has a one-call path.
+
+**The surface:**
+- `ContainerChunk` is a record: key, `prefix48`, kind, cardinality and payload.
+  The payload is copied in and out, and equality compares its content.
+- `ContainerChunk.encode` builds one chunk from its sorted 16-bit values.
+- `ofOrdinals` takes unsorted, repeating, raw unsigned ordinals.
+- `YesnoClient.applyContainers` sends them as one commit, in batches of 2048,
+  and compares the acknowledgement against the summed cardinality.
+- `insertContainers( key, bitmap )` is the one-call path for a bitmap.
+
+**The note that the gate cannot run here was wrong.** This host has a JRE but
+no `javac`, so `./gradlew build` fails on the toolchain. In an
+`eclipse-temurin:21-jdk-jammy` container, as the host user, with a scratch
+`GRADLE_USER_HOME`, the module gate runs in 32 s. `scripts/gate-java.sh`
+covers the live half, as it always has.
+
+**Unit layer:** an independent `PayloadDecoder`, written from the
+storage-format table, reads bitmaps as `u64` words where the encoder writes
+flat bytes. A seeded sweep of 3000 chunks checks four things:
+- every chunk round-trips;
+- the chosen size is the smallest viable one;
+- each kind appears more than 100 times;
+- there are more than 100 multi-interval runs.
+
+The fake Flight server now decodes container batches with that decoder and
+acknowledges what it decoded, not the cardinality column. Five encoder
+sabotages each fail the sweep, among other tests:
+- a big-endian array;
+- a run length off by one;
+- a reversed bitmap bit order;
+- a cardinality off by one;
+- a mid-loop run write wrong for multi-interval runs only.
+
+The last one at first failed only `ContainerChunkTest`, because the client
+test's run chunk had a single interval. It has two now, and the sabotage fails
+that test too.
+
+**Live layer:** `LiveDaemonCheck` writes key 7005 with an array, a bitmap, a
+two-interval run, and a chunk at prefix `2^20`, whose ordinals are above
+`2^32`. `client.py` asserts four things:
+- the kinds, `[0, 1, 2, 0]`, so the section cannot pass without each layout
+  on the wire;
+- the acknowledgement in ordinals;
+- the version advanced;
+- the whole set read back through the Rust client.
+
+A payload whose cardinality column says 3 for two values is refused as
+`INVALID_ARGUMENT`. That was a guess when written, and the run confirmed it.
+
+**The live sabotage is the finding.** With the bitmap's bit order reversed in
+the tree, the server accepted the batch. Each byte keeps its popcount, so the
+declared cardinality matched, the acknowledgement matched, and a different set
+was stored. Only `flight_get( f, E ) == sorted( epsilon )` failed. No count,
+acknowledgement or validation check can catch a valid payload of the wrong
+set: an independent read-back is the only check, and the scenario has one.
+The unit layer caught the same sabotage through the independent decoder,
+which reads bits in the documented order.
+
+The image `yesno-e2e:local` built for that sabotage run contained the broken
+encoder. The tree was restored from a scratch copy and compared byte for
+byte, and every gate rebuilds the image from the tree. Still open: no Java
+caller in the tree bulk-loads through this client, which was the entry's own
+question about whether the work was needed.
+
+## 2026-10-27: Two follow-ups to the wall-clock runner limit -- a gap it opened, and the same bound one level up
+
+**The deep gate depended on the old meaning, and the first survey missed
+it.** The 2026-10-27 change made `yesno-e2e`'s limit wall-clock. It was
+justified by checking every caller that passes `--timeout`. Three deep-gate
+steps, in both `scripts/gate.sh` and the weekly CI job, pass none and so take
+the 120 s default:
+- the two full-corpus `aged_state.py` runs;
+- `wal_size.py`.
+
+Under interpreter-only time those could never reach 120 s. Measured in
+release on the gate host:
+- 28.2 s and 42.4 s for the two `aged_state.py` runs;
+- 0.1 s for `wal_size.py`.
+
+So nothing failed, but under 3x headroom on one host is not the "cannot fail
+on a slow runner" that the CI step's own comment promises. Both `aged_state`
+lines now pass `--timeout 600`, in both files. `check-gate-parity.py` still
+agrees.
+
+**The same unboundedness one level up: libtest has no timeout.** The test
+harness reports a test "running for over 60 seconds" and goes on waiting,
+which is how `tls_reload` held a gate for 11 hours. CI was never exposed,
+because every job has a `timeout-minutes`. The local gate was. `gate.sh` now
+sets cargo's target runner for the host triple to `timeout --foreground
+--kill-after=60 1800`, so every test, bench and example binary it runs has a
+bound. Probed on a scratch crate with one test sleeping 600 s under a 65 s
+bound:
+- the run ended at 65 s;
+- cargo's error named the binary, with exit status 124;
+- libtest's "has been running for over 60 seconds" line named the test.
+
+**`--foreground` was chosen deliberately.** Without it, `timeout` moves the
+binary into a process group of its own. A Ctrl-C on the gate then no longer
+reaches the binary, which keeps running for up to the bound, holding memory on
+a host that has already been OOM-killed this week. With `--foreground`, a
+timeout kills the binary but not processes it started. That cost falls only on
+a run that has already failed.
+
+The limit is 1800 s against a slowest routine-gate binary of 87 s. The
+sanitizer steps run under it too, and how long ThreadSanitizer's
+`concurrency` suite takes there is not measured. `YESNO_GATE_BINARY_LIMIT`
+raises it, and a runner the caller already set is left alone.
+
+## 2026-10-27: `java_client` and the search verbs wait under the scenario deadline
+
+**The wall-clock limit reached only `fixture.rs`.** The earlier entry today made
+the fixture's process verbs kill their child at the scenario deadline, and
+named five families that spawn children of their own outside it. Two of them
+run in gates this host can drive, and both had a wait with no bound at all.
+- `java_client` ran the Java driver with a bare `Command::output()`.
+  `LiveDaemonCheck` passes no `CallOption` timeout, so a `yesnod` that stops
+  answering held the verb, and `gate-java`, forever.
+- In the search family, `wait_http` polls readiness with `curl -fsS` and no
+  `--max-time`. An engine that accepts the connection and never answers holds
+  that one `curl`, and the `START_TIMEOUT` loop around it is never checked
+  again. The plugin builds, the archive download, `tar`, the installer and every
+  index and query `curl` were unbounded too.
+
+**What changed.**
+- `fixture.rs` exposes the capture-to-tempfile wait it already had as
+  `output_by`, makes `run_to_exit` crate-visible, and adds a
+  `FixtureState::deadline` getter.
+- `java_client` runs the JVM through `output_by`.
+- The search `Config` carries the deadline. `prepare_artifacts`, the image
+  build, has none. `checked_status` uses `run_to_exit`, so build output still
+  reaches the console. `curl_output` uses `output_by`.
+- Each readiness probe is bounded by the earlier of `START_TIMEOUT` and the
+  scenario deadline, the same shape as `wait_ready`'s probe.
+- One behavioural change outside a hang: `checked_status` children now get a
+  null stdin where they used to inherit one. Gradle, `tar`, `curl` and the
+  installer, which runs with `--batch`, do not read it.
+
+**Tests, each sabotaged.**
+- `javaclient::a_driver_that_never_exits_is_killed_at_the_deadline` drives
+  `/bin/sleep 30` under a 300 ms deadline. With the deadline replaced by `None`
+  it ran 30.02 s and failed.
+- `search::a_silent_engine_fails_readiness_at_the_deadline` gives `wait_http` a
+  `TcpListener` that never accepts, so the kernel completes the handshake and
+  nothing replies, with a 1 s deadline. It passes in 1.1 s. With the probe's
+  deadline replaced by `None`, it was still running when an outer 60 s
+  `timeout` killed it, and no `curl` or `sleep` was left behind.
+- `a_driver_that_exits_is_parsed_as_before` covers the ordinary path through
+  `drive`.
+
+**Still outside.** The aws, cloud, operator and filesystem families do not see
+the deadline. Some of their waits have timeouts of their own, and some are bare
+`wait()` calls, for example `cloud.rs`'s streamed command runner. Those gates
+need AWS, kind or privileged Docker and were not run here. The gate-level
+binary bound from the previous entry does not reach them either, because they
+run under their own scripts.
+
+## 2026-10-27: Every connection `yesnod` accepted kept Nagle on, and the 2026-10-02 caution did not reproduce
+
+**Found by measuring standby readiness, the half of
+`where-follower-boot-time-actually-goes-is-unmeasured` that was still open.**
+A scratch scenario timed `srv_launch` of a standby to its first complete pass,
+which is exactly where `initial_sync_complete` and so `/readyz` flip. Release
+build, five reps per cell, 20 000 ordinals over 997 keys:
+- 1 shard 126-203 ms, 2 shards 176-329, 4 shards 478-557, 8 shards 914-1112,
+  16 shards 1836-2427: about 125 ms per shard.
+- The same whether the data was in the base image, all in WAL catch-up, or
+  absent, and whether the standby served reads.
+- CPU was 1.7 s of 15.6 s wall clock, so it was waiting, not working.
+
+**The cause was a socket option, not replication.** A standalone crate under
+`.agents-workspace/tmp/boot-probe/crate` served a real `LeaderService` and timed
+each call of `one_pass`'s sequence through the real `FollowerClient`. It
+reproduced about 120 ms per shard. `fetch_manifest` took 42-50 ms and each empty
+`catch_up_shard` 43-52 ms. Setting `TCP_NODELAY` on the accepted sockets alone
+took 4 shards from 447-494 ms to 72-81 ms and 16 shards from 1826-1992 ms to
+434-583 ms. tonic documents that `tcp_nodelay` is ignored under
+`serve_with_incoming`, and every listener the daemon owns goes through
+`tls::serve_router`, which hands tonic already-accepted streams on both its
+plaintext and TLS arms. The client side was never the problem:
+tonic's `Endpoint` defaults to nodelay on. That Nagle meeting the client's
+delayed ACK is the mechanism is inferred from the 40 ms and from the
+intervention working. The frame sequence was not traced.
+
+**It was on every Flight read, not only on replication.** Against the daemon's
+own listener, `flight_get` of a three-ordinal key took 42.0 ms p50, 40.9 to
+43.0, against 0.4 ms for the unary `flight_info`. With the fix it took 0.3 ms.
+
+**The fix.** `serve_router` applies `no_delay` to each accepted connection,
+through a new `incoming_plain` on the plaintext arm and before the handshake on
+the TLS arm. A refusal is logged at debug and the connection kept. Two unit tests
+in `tls.rs` accept one real connection per arm and assert `nodelay()` on the
+server's own socket. With `no_delay` made a no-op, both fail. With only the TLS
+arm's call removed, only the TLS test fails.
+
+**This contradicts a recorded caution, so it was re-tested first.**
+`LTM/contiguous-dense-span-extents-plan.md`, 2026-10-02, found the same cause on
+a scratch Flight server and changed no production socket. Its NODELAY arm showed
+a roughly 200 ms mode, with host-wide retransmits rising from 13 to 368. The same
+experiment shape against the daemon's listener: 8 MiB `do_get`s of 1 048 576
+ordinals, sequential, `nstat` deltas around each run:
+
+| Arm | Requests | +30 ms over p50 | +150 ms over p50 | p90 | Retransmits | Timeouts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nagle | 300 | 96 | 0 | 77.9 ms | 9 | 0 |
+| NODELAY | 300 | 0 | 0 | 37.2 ms | 8 | 0 |
+
+Two earlier 100-request rounds agreed: 44 and 36 slow with Nagle, 0 and 0 with
+NODELAY, at most 5 retransmits in any run. The Nagle arm's 96 of 300 matches the
+earlier 97 of 300, so the setup is comparable. The 200 ms mode did not appear.
+**What this does not cover:** TLS, concurrent clients, a non-loopback network,
+and that session's Arrow resolution. The earlier counters were system-wide, so
+whatever else that host was doing is not excluded either.
+
+**Standby readiness with the fix**, same scenario: 1 shard 25-50 ms, 4 shards
+100-151 ms, 16 shards 653-984 ms. What is left at 16 grows faster than linearly.
+`bootstrap_shard` opens with `check_leader`, which calls `Status`, and the
+leader's `Status` calls `log_end_lsn` for every shard. Traced, each of those
+reads the shard's superblock, lists the directory and reads its WAL header. So a
+bootstrap of S shards does S times S of that work. In the probe that
+was 115-160 ms of bare `Status` calls at 16 shards. The per-shard `fsync`s are
+about 20 ms: the image 13 ms, the directory 3.6, the WAL 3. Neither is changed
+here.
+
+**Not changed:** the harness's own in-process Flight and replication servers,
+in `yesno-e2e`'s `flight.rs`, `repl.rs` and `fixture.rs`, and the servers in
+tests. They use bare `TcpListenerStream` and still pay 40 ms per streamed
+response. That only costs gate time, and it is filed.
+
+## 2026-10-27: The follower's fence asked the leader to walk every shard, once per shard
+
+**The remainder after the Nagle fix, and it was not only a boot cost.** Filed an
+hour earlier as `status-runs-once-per-bootstrapped-shard-and-reads-every-shard`.
+`check_leader` opens `bootstrap_shard`, `catch_up_shard` and `apply_shard_into`,
+so a steady-state pass makes a `Status` call per shard, not only a bootstrap.
+Each of those made the leader compute `end_lsn` through `log_end_lsn` for every
+shard, which is a superblock read, a directory listing and a WAL header read,
+traced. The fence reads only `db_uuid` and `term`, and `one_pass`'s own
+`Status` reads only `shard_count`. Measured with the standalone probe: one
+`Status` costs about 0.6 ms per shard on the leader, 44 ms at 64 shards, so a
+64-shard bootstrap and catch-up spent about 2.8 s of the leader's time on log
+ends nobody read. An idle 64-shard follower would cost the same every pass.
+
+**The change: an additive request flag.** `StatusRequest` gains `bool
+omit_end_lsn = 1`, and `LeaderService::status` leaves `end_lsn` empty when it is
+set. The fence and `one_pass`'s shard-count probe set it. Every other caller
+sends `StatusRequest::default()` and gets the full response as before: the
+sidecar, the seed, base backup, the control plane, the harness and the tests.
+Prost makes `StatusRequest {}` stop compiling once the message has a field,
+which is the whole churn. Compatibility in both directions:
+- a leader that predates the field ignores it and fills `end_lsn`, which these
+  callers never read;
+- a follower that predates it never sets it.
+
+**The fence is unchanged.** Every call still fetches a fresh identity and term
+from the leader, so this does not settle, or need, the per-bootstrap-fence
+decision in `follower-bootstrap-from-the-leader-is-serial-across-shards`. What it
+loses is one incidental check: a leader whose WAL catalog cannot be read no
+longer fails `Status` for these callers. The next `subscribe` on that shard
+still fails.
+
+**Measured.** Probe totals, release, NODELAY on, three runs each:
+- 4 shards about 85 ms to 77-78 ms;
+- 16 shards 536-645 ms to 292-312 ms;
+- 64 shards 6981-7810 ms to 1268-1306 ms.
+
+At 64 shards catch-up went from about 45 ms per shard to 2 ms. Standby readiness
+through the real follower loop, the harness scenario, five reps:
+- 4 shards 75-101 ms, from 100-151 after the Nagle fix and 478-557 before both;
+- 16 shards 301-353 ms, from 653-984 and 1836-2427;
+- 64 shards 1187-1316 ms. That count was not run before.
+
+**Test.** `a_follower_never_asks_the_leader_for_log_ends_it_does_not_read`, in
+`replication_steady_state.rs`, serves a `LeaderService` behind a delegating
+wrapper that records every `StatusRequest`. A follower bootstraps and catches up
+four shards, and the test asserts at least eight `Status` calls were seen and
+none asked for `end_lsn`. It then asserts the leader honours both forms. Each
+half was sabotaged:
+- with the fence sending `omit_end_lsn: false`, it failed with "asked for
+  end_lsn in 9 of 9 Status calls";
+- with the leader ignoring the flag, it failed on `lean.end_lsn.is_empty()`.
+
+`one_pass`'s single per-pass call is not covered by that test, because the test
+drives `FollowerClient` directly. It is one call per pass rather than one per
+shard.
+
+## 2026-10-27: The harness's own Flight and replication servers set `TCP_NODELAY` too
+
+Follow-up to the daemon fix earlier today, filed as
+`the-harness-and-test-flight-servers-still-run-with-nagle`. The harness's
+in-process servers in `fixture.rs` (the Flight fixture the PostgreSQL and MySQL
+gates use), `flight.rs` (`flight_serve`) and `repl.rs` handed tonic a bare
+`TcpListenerStream`. A scratch scenario timing 40 `flight_get`s of a
+three-ordinal key against `flight_serve` measured 42.0 ms p50, 40.9 to 42.8,
+before the change, and 0.8 ms p50, 0.2 to 1.4, after it.
+
+**Repeated rather than shared, on purpose.** `fixture.rs` is compiled by Bazel
+into `fixture_host`, which links `yesno-core`, `yesno-flight` and
+`yesno-plugin` but not `yesno-server`, and its BUILD file says why. So the
+accept helper is `fixture::incoming_nodelay`, about ten lines, and `flight.rs`
+and `repl.rs` call it. The daemon's copy stays in `tls::serve_router`.
+
+**Test.** `fixture::accept::a_harness_server_connection_is_served_without_nagle`
+accepts one connection through the helper and asserts `nodelay()` on the
+server's end. With `set_nodelay(false)`, it fails.
+
+**Gates.** `gate.sh` passed with 3486 tests. `gate-pg.sh` passed, and its two
+`//e2e/postgresql:regress` invocations took 65.5 s and 58.5 s against 81.2 s and
+73.2 s in the previous run today. That is one run each on a host doing other
+work, so it is a direction, not a measurement.
+
+**Still on Nagle:** the servers built inside the `yesno-flight`, `yesno-server`,
+`yesno-tantivy` and `yesno-server-utils` integration tests. They cost test time
+only, and no measurement in this repository times through them.
+
+## 2026-10-27: `one_pass`'s per-pass `Status` is now covered by the same recorder
+
+The entry on the follower's fence left `one_pass`'s own call uncovered, because
+`a_follower_never_asks_the_leader_for_log_ends_it_does_not_read` drove
+`FollowerClient` directly. The daemon's loop sends one more `Status` per pass, to
+learn the shard count, and that call does not go through `check_leader`.
+
+The test now has a second phase. It starts `yesno_server::follower::start` against
+the same recording leader with a fresh directory, waits for two completed passes
+(the bootstrapping one and a steady-state one), stops the node, and asserts that
+none of the `Status` calls recorded during that phase asked for `end_lsn`. It also
+asserts at least `2 * SHARDS + 2` calls were recorded, so the assertion is not
+vacuous. The phase adds about one poll interval to the test, which runs in 2.2 s.
+
+Sabotage: with `one_pass` sending `omit_end_lsn: false`, it failed with "the daemon
+asked for end_lsn in 2 of 16 Status calls", one per pass. The source was restored
+by a cmp-verified copy. `gate.sh` passed, 3 486 tests, 0 failed. The test count is
+unchanged because an existing test was extended. `gate-pg.sh` was not run, since
+only a `yesno-server` integration test changed and Bazel does not build that crate.
+
+## 2026-10-29: The integration-test servers keep Nagle, measured
+
+This closes the remaining half of `the-harness-and-test-flight-servers-still-run-with-nagle`.
+The in-process servers built by the `yesno-flight`, `yesno-server`, `yesno-tantivy` and
+`yesno-server-utils` integration tests (13 files) still hand tonic a bare
+`TcpListenerStream`, so their accepted sockets keep Nagle on.
+
+**Construction.** I patched the two slowest affected binaries, `yesno-flight`'s
+`tests/client.rs` and `tests/roundtrip.rs`. Each accepted socket got
+`set_nodelay(true)`, by wrapping the stream in
+`tokio_stream::StreamExt::map(..., |accepted| accepted.inspect(|stream| drop(stream.set_nodelay(true))))`.
+I then ran `cargo test -q -p yesno-flight --test client --test roundtrip` five times
+per arm on a warm build and read libtest's `finished in`.
+
+| Arm | `client.rs` | `roundtrip.rs` |
+|---|---|---|
+| Nagle (as committed) | 2.04-2.14 s | 1.32-1.53 s |
+| `TCP_NODELAY` | 1.88-2.02 s | 1.23-1.32 s |
+
+**Reading.** These tests are dominated by their own work, not by the 40 ms stall on
+streamed responses. All 13 files together take about 10 s and run in parallel inside
+the gate, so the whole change would save well under a second. No measurement fixture
+times a call through any of these servers, so nothing reported is distorted by the
+stall either.
+
+**Decision.** Not applied, and the probe was reverted by a cmp-verified copy. Thirteen
+edited test files buy too little. The TODO entry is closed with the one-expression recipe,
+in case a timing fixture ever goes through one of these servers. No compiled code
+changed, so no gate was run.

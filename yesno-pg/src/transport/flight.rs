@@ -11,6 +11,24 @@
 //! hundred connections become hundreds of idle threads, and a scan has no
 //! concurrency to spend them on — it consumes one stream in order.
 //!
+//! # Every wait answers PostgreSQL's interrupts
+//!
+//! A `block_on` is a wait PostgreSQL cannot see into. Until 2026-10-26 every one
+//! here was a plain `block_on`, and a server that accepted the connection and
+//! then said nothing held the backend **forever**: `statement_timeout`,
+//! `pg_cancel_backend` and even `pg_terminate_backend` were all ignored, because
+//! each only sets a flag that the backend acts on at its next
+//! `CHECK_FOR_INTERRUPTS`, and a backend parked in tokio never reaches one. The
+//! only way out was `SIGKILL`, which makes the postmaster restart every session.
+//!
+//! So every wait goes through [`wait`], which wakes every [`INTERRUPT_POLL`] to
+//! run `check_for_interrupts!`. A cancel or a terminate raises PostgreSQL's own
+//! error from inside the wait -- pgrx turns it into a panic that unwinds out of
+//! the runtime and back into an ordinary `ERROR` -- and any other interrupt is
+//! processed and the wait carries on. This adds no timeout of its own: how long
+//! a statement may wait is `statement_timeout`'s business, and now it is
+//! honoured.
+//!
 //! # The ticket is opaque, on purpose
 //!
 //! `YesnoClient` validates the ticket returned by `get_flight_info`, but this
@@ -81,6 +99,40 @@ fn expr_of(cmd: &[u8]) -> Result<yesno_flight::SetExpr, TransportError> {
     Ok(yesno_flight::SetExpr::Key(u64::from_le_bytes(bytes)))
 }
 
+/// How often a wait on the server checks for a PostgreSQL interrupt.
+///
+/// Only the latency of a cancel. A wait that completes sooner never ticks, so
+/// this costs nothing on the normal path.
+const INTERRUPT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// `fut`, run on `rt`, answering PostgreSQL's interrupts while it waits.
+fn wait<T>(rt: &tokio::runtime::Runtime, fut: impl std::future::Future<Output = T>) -> T {
+    // A statement, not the closure's expression: the macro expands to an
+    // attribute on an `unsafe` block, which is only allowed in statement position.
+    wait_ticking(rt, fut, || {
+        pgrx::check_for_interrupts!();
+    })
+}
+
+/// `fut`, run on `rt`, with `on_tick` run every [`INTERRUPT_POLL`] until it
+/// completes. Split from [`wait`] so the waiting can be tested without a
+/// backend: a test's `on_tick` stands in for an interrupt by panicking.
+fn wait_ticking<T>(
+    rt: &tokio::runtime::Runtime,
+    fut: impl std::future::Future<Output = T>,
+    mut on_tick: impl FnMut(),
+) -> T {
+    rt.block_on(async move {
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match tokio::time::timeout(INTERRUPT_POLL, fut.as_mut()).await {
+                Ok(out) => return out,
+                Err(_) => on_tick(),
+            }
+        }
+    })
+}
+
 /// Rows per staging request inside one write transaction.
 ///
 /// The transaction bounds the *commit*; this bounds each *request*, so a flush
@@ -135,19 +187,17 @@ impl FlightTransport {
             // `YesnoClient::connect` here would connect while constructing the
             // adapter, including during an unexecuted EXPLAIN.
             let endpoint = self.endpoint.clone();
-            let channel = self
-                .runtime
-                .block_on(async move {
-                    Channel::from_shared(endpoint)
-                        .map_err(|e| e.to_string())?
-                        .connect()
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-                .map_err(|why| TransportError::Connect {
-                    endpoint: self.endpoint.clone(),
-                    why,
-                })?;
+            let channel = wait(&self.runtime, async move {
+                Channel::from_shared(endpoint)
+                    .map_err(|e| e.to_string())?
+                    .connect()
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|why| TransportError::Connect {
+                endpoint: self.endpoint.clone(),
+                why,
+            })?;
             self.client = Some(YesnoClient::new(channel));
         }
         Ok(self.client.as_mut().expect("just assigned"))
@@ -165,10 +215,7 @@ impl Transport for FlightTransport {
         let cmd = wrapped.as_deref().unwrap_or(cmd);
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
-        let info = self
-            .runtime
-            .block_on(client.prepare_command(cmd))
-            .map_err(client_error)?;
+        let info = wait(&self.runtime, client.prepare_command(cmd)).map_err(client_error)?;
         Ok(info.total_records())
     }
 
@@ -177,10 +224,7 @@ impl Transport for FlightTransport {
         let cmd = wrapped.as_deref().unwrap_or(cmd);
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
-        let info = self
-            .runtime
-            .block_on(client.prepare_command(cmd))
-            .map_err(client_error)?;
+        let info = wait(&self.runtime, client.prepare_command(cmd)).map_err(client_error)?;
 
         // The ticket is taken from the server response and handed back unread.
         // QueryInfo validates its shape but this adapter never constructs one.
@@ -218,10 +262,8 @@ impl Transport for FlightTransport {
         self.close_scan();
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
-        let batches = self
-            .runtime
-            .block_on(client.fetch_ticket(ticket.to_vec()))
-            .map_err(client_error)?;
+        let batches =
+            wait(&self.runtime, client.fetch_ticket(ticket.to_vec())).map_err(client_error)?;
         self.stream = Some(Box::pin(batches));
         Ok(())
     }
@@ -235,7 +277,7 @@ impl Transport for FlightTransport {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(None);
         };
-        let next = self.runtime.block_on(stream.next());
+        let next = wait(&self.runtime, stream.next());
         let batch = match next {
             None => return Ok(None),
             Some(Ok(b)) => b,
@@ -274,7 +316,7 @@ impl Transport for FlightTransport {
     fn keys(&mut self) -> Result<Vec<u64>, TransportError> {
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
-        self.runtime.block_on(client.keys()).map_err(client_error)
+        wait(&self.runtime, client.keys()).map_err(client_error)
     }
 
     fn apply(&mut self, ops: &[(u64, u64, bool)]) -> Result<u64, TransportError> {
@@ -283,7 +325,13 @@ impl Transport for FlightTransport {
         }
         self.client()?;
         let client = self.client.as_mut().expect("connected above");
-        self.runtime.block_on(async move {
+        // Interruptible like every other wait, including the commit, which runs
+        // from PostgreSQL's pre-commit callback with interrupts still live. A
+        // cancel landing inside `commit_write` leaves it unknown whether yesnod
+        // committed -- the same ambiguity a dropped connection there already has,
+        // recorded as `fdw-two-phase-commit` -- and a commit that cannot be
+        // cancelled at all, which is what this was, is the worse of the two.
+        wait(&self.runtime, async move {
             // A write transaction rather than the one-shot `apply`, because a
             // flush can be arbitrarily large -- `INSERT ... SELECT` buffers the
             // whole statement -- and staging in chunks keeps one request
@@ -323,21 +371,74 @@ impl Transport for FlightTransport {
         self.client()?;
         let pairs = ordinals.iter().copied().map(|ordinal| (key, ordinal));
         let client = self.client.as_mut().expect("connected above");
-        self.runtime
-            .block_on(async move {
-                if remove {
-                    client.remove_batch(pairs).await
-                } else {
-                    client.insert_batch(pairs).await
-                }
-            })
-            .map_err(client_error)
+        wait(&self.runtime, async move {
+            if remove {
+                client.remove_batch(pairs).await
+            } else {
+                client.insert_batch(pairs).await
+            }
+        })
+        .map_err(client_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// The normal path: a wait that finishes inside one poll never ticks.
+    #[test]
+    fn a_prompt_wait_never_looks_for_an_interrupt() {
+        let rt = runtime();
+        let mut ticks = 0;
+        assert_eq!(wait_ticking(&rt, async { 7 }, || ticks += 1), 7);
+        assert_eq!(ticks, 0);
+    }
+
+    /// A slow wait ticks while it waits and still returns its value: an
+    /// interrupt that turns out to be nothing must not cost the answer.
+    #[test]
+    fn a_slow_wait_ticks_and_still_answers() {
+        let rt = runtime();
+        let mut ticks = 0;
+        let slow = async {
+            tokio::time::sleep(INTERRUPT_POLL * 5 / 2).await;
+            9
+        };
+        assert_eq!(wait_ticking(&rt, slow, || ticks += 1), 9);
+        // At least one: a loaded host delays ticks, which can only lower it.
+        assert!(ticks >= 1, "a 125 ms wait never ticked");
+    }
+
+    /// The defect this exists for: a wait on a server that never answers. A
+    /// tick that raises -- as `check_for_interrupts!` does for a cancel --
+    /// must end it, and the runtime must still work afterwards, because the
+    /// transport keeps it for the next statement.
+    #[test]
+    fn a_wait_that_never_completes_is_ended_by_an_interrupt() {
+        let rt = runtime();
+        let mut ticks = 0;
+        let started = std::time::Instant::now();
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wait_ticking(&rt, std::future::pending::<()>(), || {
+                ticks += 1;
+                if ticks == 3 {
+                    panic!("canceling statement due to user request");
+                }
+            })
+        }));
+        assert!(ended.is_err(), "the interrupt did not end the wait");
+        assert_eq!(ticks, 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(wait_ticking(&rt, async { 1 }, || {}), 1);
+    }
 
     /// The bare-key payload retained by the adapter is little-endian.
     #[test]

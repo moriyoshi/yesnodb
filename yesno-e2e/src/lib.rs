@@ -189,6 +189,44 @@ mod tests {
         );
     }
 
+    /// A verb blocked on a child is ended at the limit, not when the child
+    /// exits. Before 2026-10-27 this ran the whole 30 seconds and passed.
+    #[test]
+    fn a_verb_blocked_on_a_child_is_ended_at_the_limit() {
+        let started = Instant::now();
+        let out = run_source(
+            "blocked.py",
+            "r = fx_run('/bin/sleep', ['30'], [], '')\nassert r['success']\n",
+            Duration::from_secs(1),
+        );
+        let waited = started.elapsed();
+        match out.error {
+            Some(E2eError::TimedOut(m)) => {
+                assert!(m.contains("during fx_run()"), "{m}");
+                assert!(m.contains("/bin/sleep was still running"), "{m}");
+            }
+            other => panic!("expected the time limit, got {other:?}"),
+        }
+        assert!(waited < Duration::from_secs(10), "took {waited:?}");
+    }
+
+    /// monty's own limit stops its clock at every host call, so a scenario
+    /// whose time all goes to verbs never reached it. Before 2026-10-27 this
+    /// ran its 4 seconds against a 1 second limit and passed.
+    #[test]
+    fn a_scenario_spending_its_time_in_verbs_is_ended_at_the_limit() {
+        let out = run_source(
+            "slow.py",
+            "for _ in range(20):\n    assert fx_run('/bin/sleep', ['0.2'], [], '')['success']\n",
+            Duration::from_secs(1),
+        );
+        match out.error {
+            Some(E2eError::TimedOut(m)) => assert!(m.contains("during fx_run()"), "{m}"),
+            other => panic!("expected the time limit, got {other:?}"),
+        }
+        assert!(out.calls < 20, "ran {} calls", out.calls);
+    }
+
     #[test]
     fn print_output_is_captured_not_leaked() {
         let out = run_source(

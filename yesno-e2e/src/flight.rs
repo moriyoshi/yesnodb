@@ -281,7 +281,7 @@ impl World {
                                     Arc::new(db),
                                 )))
                                 .serve_with_incoming_shutdown(
-                                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                                    crate::fixture::incoming_nodelay(listener),
                                     async {
                                         let _ = rx.await;
                                     },

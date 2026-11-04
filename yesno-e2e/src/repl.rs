@@ -202,7 +202,7 @@ impl World {
                             let _ = Server::builder()
                                 .add_service(ReplicationServer::new(svc))
                                 .serve_with_incoming_shutdown(
-                                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                                    crate::fixture::incoming_nodelay(listener),
                                     async {
                                         let _ = rx.await;
                                     },
@@ -251,7 +251,7 @@ impl World {
                 let rt = self.rt_handle(verb)?;
                 let client = &mut self.leader(a.handle(0)?, verb)?.client;
                 let st = rt
-                    .block_on(client.status(pb::StatusRequest {}))
+                    .block_on(client.status(pb::StatusRequest::default()))
                     .map_err(|e| db_err(verb, e))?
                     .into_inner();
                 Ok(dict(vec![

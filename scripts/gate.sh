@@ -54,6 +54,26 @@ cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 deep=0
 [[ "${1:-}" == "--deep" ]] && deep=1
 
+# **Every test, bench and example binary cargo runs here gets a wall-clock
+# bound**, through cargo's target runner. libtest has no timeout of its own: it
+# reports a test "running for over 60 seconds" and goes on waiting. On
+# 2026-10-26 `yesno-server/tests/tls_reload.rs` waited 11 hours like that, and
+# the gate never finished. With the bound, the run fails and cargo's error
+# names the binary (exit status 124), with libtest's 60-second line naming the
+# test above it.
+#
+# 1800 s against a slowest binary of 87 s in the routine gate on 2026-10-27.
+# `--foreground` keeps the binary in the gate's process group, so a Ctrl-C
+# still reaches it. The price is that on a timeout only the binary is killed,
+# not processes it started, which matters only on a run that has already
+# failed. A runner the caller set is left alone. `YESNO_GATE_BINARY_LIMIT`
+# changes the bound.
+gate_host=$(rustc -vV | sed -n 's/^host: //p')
+gate_runner_var="CARGO_TARGET_$(tr 'a-z-' 'A-Z_' <<<"$gate_host")_RUNNER"
+if [[ -n "$gate_host" && -z "${!gate_runner_var:-}" ]]; then
+    export "$gate_runner_var=timeout --foreground --kill-after=60 ${YESNO_GATE_BINARY_LIMIT:-1800}"
+fi
+
 fail=0
 steps_run=0
 # Client gates this host could not run, named in the verdict. A skip that is not
@@ -647,10 +667,14 @@ check env RUSTFLAGS="-Zsanitizer=thread" \
 # routine gate and is the only size the recorded figures can be compared to.
 # `--show-output` is what makes a passing fixture print its table at all.
 step "aged-state space measurement (numbers reported, the run asserted)"
-report 14 cargo run --release -p yesno-e2e -- --show-output \
+# `--timeout 600` because the runner's limit is wall-clock since 2026-10-27,
+# verbs included; before, it counted interpreter time only and these never
+# reached it. Measured that day in release: 28 s and 42 s, against a default
+# of 120 s that a slower host could cross.
+report 14 cargo run --release -p yesno-e2e -- --show-output --timeout 600 \
     --arg keys=200 --arg per_key=2000 --arg rounds=60 \
     e2e/scenarios/aged_state.py
-report 14 cargo run --release -p yesno-e2e -- --show-output \
+report 14 cargo run --release -p yesno-e2e -- --show-output --timeout 600 \
     --arg keys=400 --arg per_key=400 --arg rounds=40 --arg spread=100000 \
     e2e/scenarios/aged_state.py
 

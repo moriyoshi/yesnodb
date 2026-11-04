@@ -19,6 +19,8 @@ pub enum E2eError {
     Harness(String),
     /// The script never asserted anything, or never called a verb.
     Vacuous(String),
+    /// The scenario was still running when its time limit passed.
+    TimedOut(String),
 }
 
 impl std::fmt::Display for E2eError {
@@ -28,6 +30,7 @@ impl std::fmt::Display for E2eError {
             E2eError::Sandbox(m) => write!(f, "sandbox violation: {m}"),
             E2eError::Harness(m) => write!(f, "harness error: {m}"),
             E2eError::Vacuous(m) => write!(f, "scenario proves nothing: {m}"),
+            E2eError::TimedOut(m) => write!(f, "time limit: {m}"),
         }
     }
 }
@@ -58,6 +61,17 @@ impl Outcome {
 ///
 /// A scenario that hangs is a failure like any other; without a limit it would
 /// hang the whole suite instead of reporting which file did it.
+///
+/// **Wall-clock time, verbs included**, and enforced twice because monty
+/// enforces only half of it. Its `max_duration` counts interpreter time: the
+/// clock stops whenever the VM suspends at a host call, so a scenario whose
+/// time goes to verbs never reaches the limit at all, and one blocked inside a
+/// verb is never interrupted. Measured on 2026-10-26: a `postgres.py` run with
+/// `--timeout 300` sat in one `fx_run_merged` for 20 minutes. So the runner
+/// also checks the wall clock after every verb, and the fixture's process
+/// verbs stop waiting at the same deadline and kill what they are waiting on.
+/// A verb that blocks in something other than a child process, such as a
+/// network call, is still only caught when it returns.
 pub const DEFAULT_TIME_LIMIT: Duration = Duration::from_secs(120);
 
 /// Whole-number knobs a scenario reads with `yn_arg( name, default )`.
@@ -187,6 +201,8 @@ fn execute(
     )
     .map_err(|e| E2eError::Python(format_exception(&e)))?;
 
+    let deadline = Instant::now() + limit;
+    world.fixture.set_deadline(deadline);
     let tracker = ResourceTracker::new(ResourceLimits::default().max_duration(limit));
     let mut progress = run
         .start(Vec::new(), tracker, writer(output))
@@ -215,7 +231,11 @@ fn execute(
             RunProgress::FunctionCall(fc) => {
                 let result = if World::is_verb(&fc.function_name) {
                     *calls += 1;
-                    match world.call(&fc.function_name, &fc.args, &fc.kwargs) {
+                    let result = world.call(&fc.function_name, &fc.args, &fc.kwargs);
+                    if Instant::now() >= deadline {
+                        return Err(past_deadline(limit, &fc.function_name, *calls, result));
+                    }
+                    match result {
                         Ok(v) => ExtFunctionResult::Return(v),
                         Err(e) => ExtFunctionResult::Error(e),
                     }
@@ -256,6 +276,26 @@ fn execute(
     }
     debug_assert_eq!(*calls, world.calls(), "verb accounting disagrees");
     Ok(())
+}
+
+/// The error for a verb that returned after the scenario's deadline.
+///
+/// The scenario is not resumed, whatever the verb returned: resuming would
+/// hand a late answer to a script that may catch the error and carry on.
+/// The verb's own error is kept, because a fixture verb that gave up at the
+/// deadline says there what it was waiting on.
+fn past_deadline(
+    limit: Duration,
+    verb: &str,
+    call: u64,
+    result: Result<MontyObject, monty_types::MontyException>,
+) -> E2eError {
+    let mut m = format!("the {limit:?} limit passed during {verb}(), verb call {call}");
+    if let Err(e) = result {
+        m.push_str(": ");
+        m.push_str(&e.summary());
+    }
+    E2eError::TimedOut(m)
 }
 
 fn writer(output: &mut String) -> PrintWriter<'_> {

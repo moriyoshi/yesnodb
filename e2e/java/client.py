@@ -30,6 +30,8 @@ A = 7001
 B = 7002
 C = 7003
 D = 7004
+E = 7005
+F = 7006
 
 srv = srv_start("java-client", shards=2)
 f = srv_flight(srv)
@@ -81,6 +83,23 @@ assert obs["ordinals_c_committed"] == sorted(gamma), obs
 # ---- and one thrown away, which must leave nothing
 assert obs["ordinals_d_aborted"] == [], obs
 
+# ---- container payloads, which the encoder chose and the server decoded.
+# The kinds are the client's own choice and are asserted only so this section
+# cannot pass without each layout and a multi-interval run on the wire; the
+# set itself is Python's, read back below through the Rust client.
+epsilon = {1, 5, 9}
+epsilon |= {(3 << 16) | v for v in range(0, 30000, 2)}
+epsilon |= {(4 << 16) | v for v in range(100, 400)}
+epsilon |= {(4 << 16) | v for v in range(1000, 1200)}
+epsilon |= {((1 << 20) << 16) | 7, ((1 << 20) << 16) | 8}
+assert obs["supports_container_put"] is True, obs
+assert obs["container_kinds"] == [0, 1, 2, 0], obs
+# Ordinals, not chunks: four rows carried all of these.
+assert obs["container_rows"] == len(epsilon), obs
+assert obs["container_advanced_version"] is True, obs
+assert obs["cardinality_e"] == len(epsilon), obs
+assert obs["lying_container_status"] == "INVALID_ARGUMENT", obs
+
 # ---- the refusals. A status code is the half of the contract a wire vector
 # cannot express, and the half that changes without anyone noticing.
 assert obs["short_ticket_status"] == "INVALID_ARGUMENT", obs
@@ -113,6 +132,8 @@ assert flight_get(f, A) == sorted(alpha)
 assert flight_get(f, B) == sorted(beta)
 assert flight_get(f, C) == sorted(gamma)
 assert flight_get(f, D) == []
+assert flight_get(f, E) == sorted(epsilon)
+assert flight_get(f, F) == []
 assert flight_info(f, A)["total_records"] == len(alpha)
 
 # ---- and the daemon still gives the database back after all of that.

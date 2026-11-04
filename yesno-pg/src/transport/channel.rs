@@ -60,6 +60,18 @@
 //! client refuses it as well, before spending a round trip; this layer repeats
 //! the check because it is the one that knows the message is read from a SQL
 //! prompt and that the remedy is spelled `ALTER SERVER`.
+//!
+//! # Every wait answers PostgreSQL's interrupts
+//!
+//! The client is synchronous, so a socket read is a wait PostgreSQL cannot see
+//! into. Against a server that accepted and then fell silent, a 2 s
+//! `statement_timeout` was still blocked at 30 s and survived
+//! `pg_terminate_backend` (measured 2026-10-26), for the reason the Flight
+//! transport's header gives. So the client is connected with
+//! [`answer_interrupts`] as its wait hook, which runs `check_for_interrupts!`
+//! every 50 ms while it waits. A cancel unwinds out of the request partway,
+//! which leaves that client unable to pair a response with its request, so
+//! [`ChannelTransport::client`] drops a broken one and connects afresh.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -215,13 +227,19 @@ impl ChannelTransport {
     /// there should fail the query that needs it rather than the planning of
     /// every query that mentions the table.
     fn client(&mut self) -> Result<&mut Client, TransportError> {
+        // A cancel abandoned a request on it, so its next response would belong
+        // to that request. The snapshot and scan it served go with it.
+        if self.client.as_ref().is_some_and(Client::is_broken) {
+            self.scan = None;
+            self.pinned = None;
+            self.client = None;
+        }
         if self.client.is_none() {
-            let client = Client::connect(&self.socket, PEER_NAME).map_err(|why| {
-                TransportError::Connect {
+            let client = Client::connect_waiting(&self.socket, PEER_NAME, Some(answer_interrupts))
+                .map_err(|why| TransportError::Connect {
                     endpoint: self.socket.clone(),
                     why: why.to_string(),
-                }
-            })?;
+                })?;
             self.client = Some(client);
         }
         Ok(self.client.as_mut().expect("just assigned"))
@@ -310,6 +328,15 @@ impl ChannelTransport {
 /// finer than [`TransportError`] can express, so it travels in the message.
 /// Widening `TransportError` would be the way to act on it, exactly as widening
 /// MySQL's `Backend` was.
+/// The channel client's wait hook: let PostgreSQL act on a pending interrupt.
+///
+/// A cancel or terminate raises from inside the wait, and pgrx carries it back
+/// out as an ordinary `ERROR`. Any other interrupt is processed and the wait
+/// goes on.
+fn answer_interrupts() {
+    pgrx::check_for_interrupts!();
+}
+
 fn rpc(error: ClientError) -> TransportError {
     TransportError::Rpc(error.to_string())
 }

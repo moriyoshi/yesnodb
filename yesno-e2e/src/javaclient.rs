@@ -36,6 +36,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use monty_types::{ExcType, MontyException, MontyObject};
 
@@ -65,7 +66,7 @@ impl World {
                 a.exact(1)?;
                 a.no_kwargs()?;
                 let location = a.str_at(0)?;
-                run(location).map_err(|error| {
+                run(location, &self.root, self.fixture.deadline()).map_err(|error| {
                     MontyException::new(
                         ExcType::RuntimeError,
                         Some(format!("{verb}(): the Java client check failed: {error}")),
@@ -84,7 +85,7 @@ fn workspace() -> Result<PathBuf, String> {
         .map(Path::to_path_buf)
 }
 
-fn run(location: &str) -> Result<MontyObject, String> {
+fn run(location: &str, home: &Path, deadline: Option<Instant>) -> Result<MontyObject, String> {
     let workspace = workspace()?;
     let java_home = std::env::var_os("YESNO_E2E_JAVA_HOME")
         .or_else(|| std::env::var_os("JAVA_HOME"))
@@ -108,14 +109,28 @@ fn run(location: &str) -> Result<MontyObject, String> {
     // disagree with it.
     let classpath = format!("{}:{}/lib/*", classes.display(), staged.display());
 
-    let output = Command::new(&java)
+    let mut command = Command::new(&java);
+    command
         .arg("--add-opens=java.base/java.nio=ALL-UNNAMED")
         .arg("-cp")
         .arg(&classpath)
         .arg(MAIN_CLASS)
-        .arg(location)
-        .output()
-        .map_err(|error| format!("cannot run {}: {error}", java.display()))?;
+        .arg(location);
+    drive(command, &java, home, deadline)
+}
+
+/// Run the driver to exit, killing the JVM at `deadline`, and parse what it
+/// printed.
+///
+/// The driver's Flight calls carry no timeout of their own, so a daemon that
+/// stops answering would otherwise hold this verb, and the scenario, forever.
+fn drive(
+    command: Command,
+    java: &Path,
+    home: &Path,
+    deadline: Option<Instant>,
+) -> Result<MontyObject, String> {
+    let output = crate::fixture::output_by(command, java, "", home, deadline)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() {
@@ -184,6 +199,41 @@ fn missing(what: &str, line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_driver_that_never_exits_is_killed_at_the_deadline() {
+        let home = tempfile::tempdir().unwrap();
+        let sleep = Path::new("/bin/sleep");
+        let mut command = Command::new(sleep);
+        command.arg("30");
+        let started = Instant::now();
+        let error = drive(
+            command,
+            sleep,
+            home.path(),
+            Some(started + Duration::from_millis(300)),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("/bin/sleep was still running"),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_driver_that_exits_is_parsed_as_before() {
+        let home = tempfile::tempdir().unwrap();
+        let shell = Path::new("/bin/sh");
+        let mut command = Command::new(shell);
+        command.args(["-c", "echo noise; echo yesno-live int rows 3"]);
+        let parsed = drive(command, shell, home.path(), None).unwrap();
+        assert_eq!(
+            flatten(&parsed),
+            vec![("rows".to_owned(), MontyObject::Int(3))]
+        );
+    }
 
     /// The parsed dict, flattened so a test can index it. `DictPairs` keeps
     /// insertion order and exposes only `IntoIterator`, so this is also the

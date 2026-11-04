@@ -633,7 +633,9 @@ jobs:
       # this job run them, CI would have caught it. What is asserted is that
       # the measurement **ran** -- a non-zero exit or empty output fails the
       # step. The numbers are reported for a human to read, not compared, so
-      # this cannot fail on a slow runner.
+      # this cannot fail on a slow runner. `--timeout 600` keeps that true: the
+      # runner's limit is wall-clock since 2026-10-27, and these took 28 s and
+      # 42 s on the gate host against a 120 s default.
       - name: aged-state space measurement (numbers reported, the run asserted)
         run: |
           set -euo pipefail
@@ -642,10 +644,10 @@ jobs:
             [ -n "${out//[[:space:]]/}" ] || { echo "measurement produced no output"; exit 1; }
             echo "$out" | tail -n 14
           }
-          run_measurement cargo run --release -p yesno-e2e -- --show-output \
+          run_measurement cargo run --release -p yesno-e2e -- --show-output --timeout 600 \
             --arg keys=200 --arg per_key=2000 --arg rounds=60 \
             e2e/scenarios/aged_state.py
-          run_measurement cargo run --release -p yesno-e2e -- --show-output \
+          run_measurement cargo run --release -p yesno-e2e -- --show-output --timeout 600 \
             --arg keys=400 --arg per_key=400 --arg rounds=40 --arg spread=100000 \
             e2e/scenarios/aged_state.py
 

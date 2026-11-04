@@ -152,6 +152,76 @@ assert infos == 2, (
 )
 checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop counting extension")
 
+# A server that accepts the connection and then never answers must not hold a
+# backend past `statement_timeout`.
+#
+# Until 2026-10-26 it held it forever, and not only against the timeout:
+# `pg_cancel_backend` and `pg_terminate_backend` were ignored too, because every
+# wait in the Flight transport was a plain `block_on` and a backend parked in
+# tokio never reaches a `CHECK_FOR_INTERRUPTS`. All three only set the flag
+# that check reads, so this one assertion stands for them. The third statement
+# shows the session survives both cancels.
+#
+# **`psql` runs under `/usr/bin/timeout`**, so a regression fails here in 60 s
+# and says what it is. Measured on 2026-10-26 with the fix reverted, this
+# `fx_run_merged` sat for 20 minutes, because the runner's `--timeout` did not
+# count time spent in a verb. Since 2026-10-27 it does, so without the wrapper
+# the scenario would end at its 300 s limit naming this verb, not the cause.
+silent_dir = fx_join(work, "silent")
+fx_mkdir(silent_dir)
+silent = fx_silent_start(silent_dir)
+checked(psql_run(["-q", "-c", "CREATE EXTENSION yesno_pg"]), "create extension for silence")
+# Both transports, because they wait in different code: Flight in tokio, the
+# channel in its own synchronous client.
+for name, option in [
+    ("silent_flight", "endpoint '" + silent["endpoint"] + "'"),
+    ("silent_channel", "socket '" + silent["socket"] + "'"),
+]:
+    checked(
+        psql_run(
+            [
+                "-q",
+                "-c",
+                "CREATE SERVER " + name + " FOREIGN DATA WRAPPER yesno_fdw OPTIONS ( " + option + " )",
+                "-c",
+                "CREATE FOREIGN TABLE "
+                + name
+                + "42 ( ordinal bigint ) SERVER "
+                + name
+                + " OPTIONS ( key '42' )",
+            ]
+        ),
+        "create " + name,
+    )
+    timed_out = fx_run_merged(
+        "/usr/bin/timeout",
+        [
+            "60",
+            psql,
+            "-X",
+            "-q",
+            "-c",
+            "SET statement_timeout = '1s'",
+            "-c",
+            "SELECT count(*) FROM " + name + "42",
+            "-c",
+            "SELECT ordinal FROM " + name + "42 LIMIT 1",
+            "-c",
+            "SELECT 'the session is still usable'",
+        ],
+        env,
+        "",
+    )
+    said = timed_out["stdout"]
+    assert timed_out["code"] != 124, (
+        name + ": a server that never answers held the backend for 60 s past a 1 s "
+        "statement_timeout:\n" + said
+    )
+    assert said.count("canceling statement due to statement timeout") == 2, name + ":\n" + said
+    assert "the session is still usable" in said, name + ":\n" + said
+checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop silent extension")
+fx_silent_stop()
+
 sql_files = fx_list(sql_dir, ".sql")
 expected_files = fx_list(expected_dir, ".out")
 assert len(sql_files) > 0

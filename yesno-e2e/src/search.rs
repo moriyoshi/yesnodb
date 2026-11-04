@@ -35,7 +35,7 @@ pub fn prepare_artifacts() -> Result<()> {
 
     let mut application = gradle(&config, "yesno-search-java");
     application.arg("build");
-    checked_status(&mut application, "Java search application build")?;
+    checked_status(application, "Java search application build", None)?;
 
     for engine in [Engine::OpenSearch, Engine::Elasticsearch] {
         build_plugin(&config, engine)?;
@@ -82,7 +82,9 @@ impl World {
                 a.exact(1)?;
                 a.no_kwargs()?;
                 let location = a.str_at(0)?;
-                let config = Config::from_env().map_err(|error| search_err(verb, error))?;
+                let config = Config::from_env()
+                    .map_err(|error| search_err(verb, error))?
+                    .until(self.fixture.deadline());
                 run_application(&config, location).map_err(|error| search_err(verb, error))?;
                 Ok(MontyObject::Bool(true))
             }
@@ -96,7 +98,9 @@ impl World {
                 }
                 let location = a.str_at(0)?;
                 let engine = Engine::parse(a.str_at(1)?)?;
-                let config = Config::from_env().map_err(|error| search_err(verb, error))?;
+                let config = Config::from_env()
+                    .map_err(|error| search_err(verb, error))?
+                    .until(self.fixture.deadline());
                 let running = RunningEngine::start(&config, location, engine)
                     .map_err(|error| search_err(verb, error))?;
                 self.search.engine = Some(running);
@@ -153,6 +157,9 @@ struct Config {
     cache: PathBuf,
     opensearch_override: Option<PathBuf>,
     elasticsearch_override: Option<PathBuf>,
+    /// When every child this module waits on is killed. `None` outside a
+    /// scenario, where the image build calls [`prepare_artifacts`].
+    deadline: Option<Instant>,
 }
 
 impl Config {
@@ -185,7 +192,14 @@ impl Config {
                 .map(PathBuf::from),
             elasticsearch_override: std::env::var_os("YESNO_E2E_ELASTICSEARCH_ARCHIVE")
                 .map(PathBuf::from),
+            deadline: None,
         })
+    }
+
+    /// Bound every child this configuration starts by the running scenario's
+    /// deadline. See `FixtureState::set_deadline`.
+    fn until(self, deadline: Option<Instant>) -> Self {
+        Self { deadline, ..self }
     }
 
     fn archive(&self, engine: Engine) -> Result<PathBuf> {
@@ -202,7 +216,7 @@ impl Config {
                 verify_archive(path, &specification)?;
                 Ok(path.clone())
             }
-            None => download_archive(&self.cache, &specification),
+            None => download_archive(&self.cache, &specification, self.deadline),
         }
     }
 }
@@ -212,7 +226,7 @@ fn run_application(config: &Config, flight_location: &str) -> Result<()> {
     command
         .arg("e2eTest")
         .arg(format!("-PyesnoE2eFlightLocation={flight_location}"));
-    checked_status(&mut command, "Java search application E2E")
+    checked_status(command, "Java search application E2E", config.deadline)
 }
 
 #[derive(Clone, Copy)]
@@ -293,7 +307,8 @@ struct RunningEngine {
     child: ChildGuard,
     endpoint: String,
     log_path: PathBuf,
-    _work: TempDir,
+    work: TempDir,
+    deadline: Option<Instant>,
 }
 
 impl RunningEngine {
@@ -310,7 +325,7 @@ impl RunningEngine {
             .map_err(|error| format!("cannot create {}: {error}", distribution.display()))?;
         let mut tar = Command::new("tar");
         tar.arg("-xf").arg(&archive).arg("-C").arg(&distribution);
-        checked_status(&mut tar, &format!("unpack {}", engine.name()))?;
+        checked_status(tar, &format!("unpack {}", engine.name()), config.deadline)?;
         let home = one_directory(&distribution)?;
 
         let zip = engine.zip(&config.workspace);
@@ -320,7 +335,11 @@ impl RunningEngine {
             .arg("install")
             .arg("--batch")
             .arg(format!("file://{}", zip.display()));
-        checked_status(&mut installer, &format!("install {}", engine.name()))?;
+        checked_status(
+            installer,
+            &format!("install {}", engine.name()),
+            config.deadline,
+        )?;
 
         let port = free_port()?;
         let endpoint = format!("http://127.0.0.1:{port}");
@@ -369,30 +388,36 @@ impl RunningEngine {
             .spawn()
             .map_err(|error| format!("cannot start {}: {error}", engine.name()))?;
         let mut child = ChildGuard::new(child);
-        wait_http(&mut child, &endpoint, &log_path, engine.name())?;
+        wait_http(
+            &mut child,
+            &endpoint,
+            &log_path,
+            engine.name(),
+            work.path(),
+            config.deadline,
+        )?;
         Ok(Self {
             child,
             endpoint,
             log_path,
-            _work: work,
+            work,
+            deadline: config.deadline,
         })
     }
 
     fn index(&mut self, ordinals: &[u64]) -> Result<()> {
-        curl_json("PUT", &format!("{}/yesno-e2e", self.endpoint), MAPPING)
-            .map_err(|error| self.with_log(error))?;
+        self.curl_json("PUT", &format!("{}/yesno-e2e", self.endpoint), MAPPING)?;
         let mut bulk = String::new();
         for ordinal in ordinals {
             bulk.push_str(&format!(
                 "{{\"index\":{{\"_id\":\"{ordinal}\"}}}}\n{{\"ordinal\":{ordinal}}}\n"
             ));
         }
-        let output = curl_json(
+        let output = self.curl_json(
             "POST",
             &format!("{}/yesno-e2e/_bulk?refresh=true", self.endpoint),
             &bulk,
-        )
-        .map_err(|error| self.with_log(error))?;
+        )?;
         let response = String::from_utf8(output.stdout)
             .map_err(|error| self.with_log(format!("bulk response was not UTF-8: {error}")))?;
         if !response.contains("\"errors\":false") {
@@ -405,18 +430,22 @@ impl RunningEngine {
         let body = format!(
             "{{\"size\":10000,\"sort\":[{{\"ordinal\":\"asc\"}}],\"query\":{{\"yesno\":{{\"field\":\"ordinal\",\"width\":\"integer\",\"snapshot\":\"current\",\"expression\":{{\"key\":\"{key}\"}}}}}}}}"
         );
-        let output = curl_json(
+        let output = self.curl_json(
             "POST",
             &format!(
                 "{}/yesno-e2e/_search?filter_path=hits.hits._id",
                 self.endpoint
             ),
             &body,
-        )
-        .map_err(|error| self.with_log(error))?;
+        )?;
         let response = String::from_utf8(output.stdout)
             .map_err(|error| self.with_log(format!("search response was not UTF-8: {error}")))?;
         parse_search_ids(&response).map_err(|error| self.with_log(error))
+    }
+
+    fn curl_json(&self, method: &str, endpoint: &str, body: &str) -> Result<Output> {
+        curl_json(method, endpoint, body, self.work.path(), self.deadline)
+            .map_err(|error| self.with_log(error))
     }
 
     fn with_log(&self, error: impl std::fmt::Display) -> String {
@@ -465,7 +494,11 @@ fn gradle(config: &Config, project: &str) -> Command {
 fn build_plugin(config: &Config, engine: Engine) -> Result<()> {
     let mut build = gradle(config, engine.project());
     build.arg("build").arg("-PyesnoE2ePermissions=true");
-    checked_status(&mut build, &format!("{} plugin build", engine.name()))
+    checked_status(
+        build,
+        &format!("{} plugin build", engine.name()),
+        config.deadline,
+    )
 }
 
 /// The pinned engine distributions, and the only place they are listed.
@@ -518,7 +551,11 @@ fn pinned_archive(engine: &str, arch: &str) -> Result<Option<Archive>> {
 /// Publication is atomic and happens only after the complete temporary file
 /// matches the embedded SHA-512. A failed or interrupted transfer is never
 /// mistaken for a cached distribution on the next run.
-fn download_archive(cache: &Path, specification: &Archive) -> Result<PathBuf> {
+fn download_archive(
+    cache: &Path,
+    specification: &Archive,
+    deadline: Option<Instant>,
+) -> Result<PathBuf> {
     let destination = cache.join(specification.file);
     if destination.is_file() {
         verify_archive(&destination, specification)?;
@@ -541,7 +578,7 @@ fn download_archive(cache: &Path, specification: &Archive) -> Result<PathBuf> {
         .arg("--output")
         .arg(temporary.path())
         .arg(specification.url);
-    checked_status(&mut curl, &format!("download {}", specification.file))?;
+    checked_status(curl, &format!("download {}", specification.file), deadline)?;
     verify_archive(temporary.path(), specification)?;
     temporary
         .persist(&destination)
@@ -575,10 +612,12 @@ fn verify_archive(path: &Path, specification: &Archive) -> Result<()> {
     Ok(())
 }
 
-fn checked_status(command: &mut Command, label: &str) -> Result<()> {
-    let status = command
-        .status()
-        .map_err(|error| format!("cannot run {label}: {error}"))?;
+/// Run `command` with its output on the harness's own, killing it at
+/// `deadline`.
+fn checked_status(command: Command, label: &str, deadline: Option<Instant>) -> Result<()> {
+    let program = PathBuf::from(command.get_program());
+    let status = crate::fixture::run_to_exit(command, &program, "", deadline)
+        .map_err(|error| format!("{label}: {error}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -639,10 +678,25 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_http(child: &mut ChildGuard, endpoint: &str, log: &Path, engine: &str) -> Result<()> {
-    let deadline = Instant::now() + START_TIMEOUT;
+/// Poll `endpoint` until it answers, for at most [`START_TIMEOUT`] and never
+/// past `scenario`.
+///
+/// Each probe is bounded too: an engine that accepts the connection and never
+/// answers would otherwise hold one `curl`, and this loop, forever.
+fn wait_http(
+    child: &mut ChildGuard,
+    endpoint: &str,
+    log: &Path,
+    engine: &str,
+    home: &Path,
+    scenario: Option<Instant>,
+) -> Result<()> {
+    let started = Instant::now();
+    let deadline = scenario.map_or(started + START_TIMEOUT, |at| {
+        at.min(started + START_TIMEOUT)
+    });
     while Instant::now() < deadline {
-        if curl_output(["-fsS", &format!("{endpoint}/")]).is_ok() {
+        if curl_output(["-fsS", &format!("{endpoint}/")], home, Some(deadline)).is_ok() {
             return Ok(());
         }
         if let Some(status) = child
@@ -662,33 +716,42 @@ fn wait_http(child: &mut ChildGuard, endpoint: &str, log: &Path, engine: &str) -
     ))
 }
 
-fn curl_json(method: &str, endpoint: &str, body: &str) -> Result<Output> {
-    curl_output([
-        "--fail-with-body",
-        "-sS",
-        "-X",
-        method,
-        endpoint,
-        "-H",
-        if endpoint.contains("_bulk") {
-            "Content-Type: application/x-ndjson"
-        } else {
-            "Content-Type: application/json"
-        },
-        "--data-binary",
-        body,
-    ])
+fn curl_json(
+    method: &str,
+    endpoint: &str,
+    body: &str,
+    home: &Path,
+    deadline: Option<Instant>,
+) -> Result<Output> {
+    curl_output(
+        [
+            "--fail-with-body",
+            "-sS",
+            "-X",
+            method,
+            endpoint,
+            "-H",
+            if endpoint.contains("_bulk") {
+                "Content-Type: application/x-ndjson"
+            } else {
+                "Content-Type: application/json"
+            },
+            "--data-binary",
+            body,
+        ],
+        home,
+        deadline,
+    )
 }
 
-fn curl_output<I, S>(arguments: I) -> Result<Output>
+fn curl_output<I, S>(arguments: I, home: &Path, deadline: Option<Instant>) -> Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("curl")
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("cannot run curl: {error}"))?;
+    let mut command = Command::new("curl");
+    command.args(arguments);
+    let output = crate::fixture::output_by(command, Path::new("curl"), "", home, deadline)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -712,6 +775,34 @@ fn read_log(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine that accepts the connection and never answers: the readiness
+    /// probe must end at the scenario's deadline, not wait on `curl` forever.
+    #[test]
+    fn a_silent_engine_fails_readiness_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("engine.log");
+        fs::write(&log, "silent\n").unwrap();
+        let mut child = ChildGuard::new(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let started = Instant::now();
+        let error = wait_http(
+            &mut child,
+            &endpoint,
+            &log,
+            "silent engine",
+            home.path(),
+            Some(started + Duration::from_secs(1)),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("did not become ready"),
+            "unexpected error: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(listener);
+    }
 
     #[test]
     fn filtered_search_ids_are_strictly_parsed() {

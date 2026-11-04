@@ -166,7 +166,8 @@ OPTIONS:
     --show-output      print what a passing scenario printed. The measurement
                        fixtures report their table this way; a failing scenario
                        shows its output regardless.
-    --timeout SECS     per-scenario time limit (default 120)
+    --timeout SECS     per-scenario wall-clock limit, verbs included
+                       (default 120)
     --arg NAME=N       a whole-number knob, read by yn_arg(NAME, default).
                        Scenarios default to a gate-sized corpus; this is how
                        a measurement fixture is run at full scale, e.g.

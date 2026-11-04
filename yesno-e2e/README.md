@@ -15,7 +15,7 @@ cargo run -p yesno-e2e -- e2e/scenarios/lifecycle.py
 
 With no scenario paths, the runner executes every file under `e2e/scenarios/`.
 `--show-output` displays the output of passing measurement fixtures, `--timeout`
-sets a per-scenario limit, and `--arg name=value` selects a larger corpus or
+sets a per-scenario wall-clock limit, verb time included, and `--arg name=value` selects a larger corpus or
 iteration count when a fixture supports it.
 
 Each scenario must contain an assertion and invoke at least one host verb.

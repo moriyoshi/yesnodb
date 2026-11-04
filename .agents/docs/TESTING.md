@@ -506,8 +506,15 @@ against the tens of nanoseconds a planner measurement is about.
   which runs the loop in the host. Terminals: `plan`, `cardinality`, `collect`,
   `drain`. It returns `{ns, iters, truncated}` and bounds itself by wall clock
   as well as by count, reporting the iterations it **actually ran** — the
-  runner's time limit only bounds the VM, so a host call that loops is invisible
-  to it.
+  runner checks its wall-clock limit only between verbs, so a host call that
+  loops in-process is invisible to it until it returns. ( Since 2026-10-27 the
+  fixture's process verbs also stop at that limit, but only because they wait on
+  a child they can kill; monty's own `max_duration` counts interpreter time and
+  stops at every host call. `java_client` and the `search_*` verbs were brought
+  under the same deadline the same day, including each `curl` the search
+  readiness loop starts. The aws, cloud, operator and filesystem families do not
+  see the deadline yet; some of their waits have timeouts of their own and some
+  have none. )
 * Where the subject is a hand-written walk, it cannot be timed — and per §4 that
   walk should not be in `scenarios/` at all.
 * `clock_ns()` is fine for millisecond-scale columns ( ingest rates, checkpoint

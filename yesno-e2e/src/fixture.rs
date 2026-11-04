@@ -29,6 +29,8 @@ pub const OWNS: &[&str] = &[
     "fx_flight_requests",
     "fx_channel_start",
     "fx_channel_stop",
+    "fx_silent_start",
+    "fx_silent_stop",
     "fx_resource",
     "fx_temp",
     "fx_join",
@@ -54,7 +56,11 @@ pub const OWNS: &[&str] = &[
 pub struct FixtureState {
     flight: Option<FlightFixture>,
     channel: Option<ChannelFixture>,
+    silent: Option<SilentFixture>,
     processes: Vec<Option<ManagedProcess>>,
+    /// When the running scenario's time limit passes. See
+    /// [`FixtureState::set_deadline`].
+    deadline: Option<Instant>,
 }
 
 struct ManagedProcess {
@@ -67,8 +73,33 @@ struct ManagedProcess {
 }
 
 impl FixtureState {
+    /// Every wait on a child process in this module ends at `deadline`, and so
+    /// do the `java_client` and `search_*` verbs, through [`output_by`] and
+    /// [`run_to_exit`].
+    ///
+    /// The runner checks its limit only between verbs, so a verb waiting on a
+    /// child that never exits would otherwise hold the scenario forever. At
+    /// the deadline the wait kills the child and returns an error naming it,
+    /// and the runner then ends the scenario with that error.
+    ///
+    /// Only the direct child is killed, not a process group. A child moved
+    /// into its own group would no longer receive the Ctrl-C or the
+    /// group-wide kill a test runner sends the harness, which is the worse
+    /// leak. Output goes to files rather than pipes, so a grandchild that
+    /// keeps one open cannot hold the wait either.
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    /// When the running scenario's time limit passes, for a verb outside this
+    /// module that waits on a child of its own.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     pub(crate) fn stop_all(&mut self) {
         drop(self.flight.take());
+        drop(self.silent.take());
         for process in self.processes.iter_mut().flatten() {
             drop(process.stdin.take());
             let _ = process.child.kill();
@@ -140,6 +171,32 @@ impl World {
                     value_err(format!("{verb}(): fixture plugin channel is not running"))
                 })?;
                 drop(channel);
+                Ok(MontyObject::None)
+            }
+            "fx_silent_start" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                if self.fixture.silent.is_some() {
+                    return Err(value_err(format!(
+                        "{verb}(): the silent listener is already running"
+                    )));
+                }
+                let dir = std::path::PathBuf::from(a.str_at(0)?);
+                let (silent, endpoint, socket) =
+                    SilentFixture::start(&dir).map_err(|error| fixture_err(verb, error))?;
+                self.fixture.silent = Some(silent);
+                Ok(dict(vec![
+                    ("endpoint", MontyObject::String(endpoint)),
+                    ("socket", MontyObject::String(socket)),
+                ]))
+            }
+            "fx_silent_stop" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                let silent = self.fixture.silent.take().ok_or_else(|| {
+                    value_err(format!("{verb}(): the silent listener is not running"))
+                })?;
+                drop(silent);
                 Ok(MontyObject::None)
             }
             "fx_flight_requests" => {
@@ -294,6 +351,7 @@ impl World {
                         &a.string_list(2)?,
                         a.str_at(3)?,
                         &self.root,
+                        self.fixture.deadline,
                     )
                     .map_err(|error| fixture_err(verb, error))?;
                     return Ok(status_dict(
@@ -308,6 +366,7 @@ impl World {
                     &a.string_list(2)?,
                     a.str_at(3)?,
                     &self.root,
+                    self.fixture.deadline,
                 )
                 .map_err(|error| fixture_err(verb, error))?;
                 output_obj(output, verb)
@@ -374,11 +433,14 @@ impl World {
                 let args = a.string_list(2)?;
                 let env = a.string_list(3)?;
                 let timeout = Duration::from_millis(a.u64(4)?);
+                let deadline = self.fixture.deadline;
                 let process = self.fixture.processes[slot]
                     .as_mut()
                     .ok_or_else(|| value_err(format!("{verb}(): process is closed")))?;
-                wait_ready(process, &program, &args, &env, timeout, &self.root)
-                    .map_err(|error| fixture_err(verb, error))?;
+                wait_ready(
+                    process, &program, &args, &env, timeout, &self.root, deadline,
+                )
+                .map_err(|error| fixture_err(verb, error))?;
                 Ok(MontyObject::None)
             }
             "fx_send" => {
@@ -401,7 +463,7 @@ impl World {
                 a.exact(3)?;
                 a.no_kwargs()?;
                 let marker = a.str_at(1)?.to_owned();
-                let timeout = Duration::from_millis(a.u64(2)?);
+                let timeout = within(Duration::from_millis(a.u64(2)?), self.fixture.deadline);
                 let process = self.fixture_process_mut(a.handle(0)?, verb)?;
                 Ok(MontyObject::String(
                     wait_output(process, &marker, timeout)
@@ -416,7 +478,8 @@ impl World {
                     .take()
                     .ok_or_else(|| value_err(format!("{verb}(): process is already closed")))?;
                 drop(process.stdin.take());
-                let status = wait_child(&mut process.child, Duration::from_millis(a.u64(1)?))
+                let timeout = within(Duration::from_millis(a.u64(1)?), self.fixture.deadline);
+                let status = wait_child(&mut process.child, timeout)
                     .map_err(|error| fixture_err(verb, error))?;
                 join_reader(&mut process);
                 process_output_obj(status, &process.stdout, &process.stderr)
@@ -514,29 +577,128 @@ fn run_command(
     env: &[String],
     stdin: &str,
     home: &Path,
+    deadline: Option<Instant>,
 ) -> Result<Output, String> {
-    let mut command =
-        prepared_command(program, args, env, home).map_err(|error| error.to_string())?;
-    if stdin.is_empty() {
-        return command
-            .output()
-            .map_err(|error| format!("cannot execute {}: {error}", program.display()));
-    }
+    let command = prepared_command(program, args, env, home).map_err(|error| error.to_string())?;
+    output_by(command, program, stdin, home, deadline)
+}
+
+/// Run `command` to exit with its output captured in files under `home`,
+/// killing it at `deadline`. See [`FixtureState::set_deadline`].
+pub(crate) fn output_by(
+    mut command: Command,
+    program: &Path,
+    stdin: &str,
+    home: &Path,
+    deadline: Option<Instant>,
+) -> Result<Output, String> {
+    let file = |what: &str| {
+        tempfile::tempfile_in(home)
+            .map_err(|error| format!("cannot create command {what}: {error}"))
+    };
+    let (mut stdout, mut stderr) = (file("stdout")?, file("stderr")?);
+    command
+        .stdout(Stdio::from(stdout.try_clone().map_err(|error| {
+            format!("cannot duplicate command stdout: {error}")
+        })?))
+        .stderr(Stdio::from(stderr.try_clone().map_err(|error| {
+            format!("cannot duplicate command stderr: {error}")
+        })?));
+    let status = run_to_exit(command, program, stdin, deadline)?;
+    Ok(Output {
+        status,
+        stdout: read_back(&mut stdout, "stdout")?,
+        stderr: read_back(&mut stderr, "stderr")?,
+    })
+}
+
+/// Start `command`, feed it `stdin`, and wait for it to exit, killing it at
+/// `deadline`. See [`FixtureState::set_deadline`].
+pub(crate) fn run_to_exit(
+    mut command: Command,
+    program: &Path,
+    stdin: &str,
+    deadline: Option<Instant>,
+) -> Result<std::process::ExitStatus, String> {
+    command.stdin(if stdin.is_empty() {
+        Stdio::null()
+    } else {
+        Stdio::piped()
+    });
     let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("cannot execute {}: {error}", program.display()))?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(stdin.as_bytes())
-        .map_err(|error| format!("cannot write {} stdin: {error}", program.display()))?;
-    child
-        .wait_with_output()
-        .map_err(|error| format!("cannot wait for {}: {error}", program.display()))
+    // Written from a thread: a child that stops reading would otherwise block
+    // this one in `write_all` with no deadline. Killing the child ends the
+    // write with a broken pipe.
+    let feeder = child.stdin.take().map(|mut pipe| {
+        let input = stdin.as_bytes().to_vec();
+        thread::spawn(move || pipe.write_all(&input))
+    });
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot wait for {}: {error}", program.display()))?
+        {
+            break status;
+        }
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(feeder) = feeder {
+                let _ = feeder.join();
+            }
+            return Err(format!(
+                "the scenario's time limit passed while {} was still running, so it was killed",
+                program.display()
+            ));
+        }
+        thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(25));
+    };
+    if let Some(feeder) = feeder {
+        feeder
+            .join()
+            .map_err(|_| format!("the {} stdin writer panicked", program.display()))?
+            .map_err(|error| format!("cannot write {} stdin: {error}", program.display()))?;
+    }
+    Ok(status)
+}
+
+fn read_back(file: &mut File, what: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    file.rewind()
+        .and_then(|()| file.read_to_end(&mut bytes))
+        .map_err(|error| format!("cannot read back command {what}: {error}"))?;
+    Ok(bytes)
+}
+
+/// A harness server's connections, each with `TCP_NODELAY` set.
+///
+/// tonic ignores its own `tcp_nodelay` under `serve_with_incoming`, so a
+/// harness server fed a bare `TcpListenerStream` kept Nagle on, and every
+/// streamed response waited out the client's 40 ms delayed ACK: 42 ms for a
+/// three-ordinal `flight_get`, measured 2026-10-27. The daemon's listeners do
+/// the same in `yesno-server`'s `tls::serve_router`; this crate's Bazel target
+/// does not link that crate, so the few lines are repeated here.
+pub(crate) fn incoming_nodelay(
+    listener: tokio::net::TcpListener,
+) -> impl tokio_stream::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    use tokio_stream::StreamExt as _;
+    tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| {
+        let stream = accepted?;
+        // A refusal leaves a slower connection, not a broken one.
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
+    })
+}
+
+/// `timeout`, shortened so it ends no later than `deadline`.
+fn within(timeout: Duration, deadline: Option<Instant>) -> Duration {
+    deadline.map_or(timeout, |at| {
+        timeout.min(at.saturating_duration_since(Instant::now()))
+    })
 }
 
 fn wait_ready(
@@ -546,8 +708,13 @@ fn wait_ready(
     env: &[String],
     timeout: Duration,
     home: &Path,
+    deadline: Option<Instant>,
 ) -> Result<(), String> {
+    let timeout = within(timeout, deadline);
     let started = Instant::now();
+    // A probe that hangs is killed when the readiness wait ends, not only at
+    // the scenario's deadline, so it cannot outlast the timeout it serves.
+    let probe_deadline = Some(started + timeout);
     loop {
         if process
             .child
@@ -560,7 +727,9 @@ fn wait_ready(
                 read_pair(process)
             ));
         }
-        if run_command(program, args, env, "", home).is_ok_and(|output| output.status.success()) {
+        if run_command(program, args, env, "", home, probe_deadline)
+            .is_ok_and(|output| output.status.success())
+        {
             return Ok(());
         }
         if started.elapsed() >= timeout {
@@ -860,6 +1029,77 @@ impl ChannelFixture {
     }
 }
 
+/// Listeners that accept every connection and never say anything: one on TCP
+/// for Flight, one on a Unix socket for the plugin channel.
+///
+/// The server a client must not wait on forever. The connect succeeds, so a
+/// client goes on to wait for the protocol's first bytes, which never come --
+/// the case a refused or unrouted address cannot produce, because both fail
+/// promptly. Accepted sockets are held, not read, until the fixture stops.
+struct SilentFixture {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SilentFixture {
+    fn start(dir: &Path) -> Result<(Self, String, String), String> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("cannot bind a silent listener: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("cannot read the silent listener's address: {e}"))?;
+        let path = dir.join("silent.sock");
+        let unix = std::os::unix::net::UnixListener::bind(&path)
+            .map_err(|e| format!("cannot bind a silent socket at {}: {e}", path.display()))?;
+        // Non-blocking so the loop can notice `stop`, as `ChannelFixture` does.
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("cannot make the silent listener non-blocking: {e}"))?;
+        unix.set_nonblocking(true)
+            .map_err(|e| format!("cannot make the silent socket non-blocking: {e}"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("fixture-silent".into())
+            .spawn(move || {
+                let (mut tcp, mut uds) = (Vec::new(), Vec::new());
+                while !stop_loop.load(Ordering::Relaxed) {
+                    let mut idle = true;
+                    if let Ok((stream, _)) = listener.accept() {
+                        tcp.push(stream);
+                        idle = false;
+                    }
+                    if let Ok((stream, _)) = unix.accept() {
+                        uds.push(stream);
+                        idle = false;
+                    }
+                    if idle {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            })
+            .map_err(|e| format!("cannot start the silent listener: {e}"))?;
+        Ok((
+            SilentFixture {
+                stop,
+                thread: Some(thread),
+            },
+            format!("http://{addr}"),
+            path.display().to_string(),
+        ))
+    }
+}
+
+impl Drop for SilentFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl Drop for ChannelFixture {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -897,12 +1137,9 @@ impl FlightFixture {
                         .map_err(|_| "scenario stopped before Flight startup".to_owned())?;
                     tonic::transport::Server::builder()
                         .add_service(FlightServiceServer::new(service))
-                        .serve_with_incoming_shutdown(
-                            tokio_stream::wrappers::TcpListenerStream::new(listener),
-                            async {
-                                let _ = shutdown_rx.await;
-                            },
-                        )
+                        .serve_with_incoming_shutdown(incoming_nodelay(listener), async {
+                            let _ = shutdown_rx.await;
+                        })
                         .await
                         .map_err(|error| format!("Flight fixture failed: {error}"))
                 })
@@ -949,41 +1186,22 @@ fn run_command_merged(
     env: &[String],
     stdin: &str,
     home: &Path,
+    deadline: Option<Instant>,
 ) -> Result<(std::process::ExitStatus, String), String> {
     let mut transcript = tempfile::tempfile_in(home)
         .map_err(|error| format!("cannot create command transcript: {error}"))?;
-    let errors = transcript
-        .try_clone()
-        .map_err(|error| format!("cannot duplicate command transcript: {error}"))?;
+    let duplicate = || {
+        transcript
+            .try_clone()
+            .map_err(|error| format!("cannot duplicate command transcript: {error}"))
+    };
     let mut command =
         prepared_command(program, args, env, home).map_err(|error| error.to_string())?;
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(transcript.try_clone().map_err(|error| {
-            format!("cannot duplicate command transcript: {error}")
-        })?))
-        .stderr(Stdio::from(errors))
-        .spawn()
-        .map_err(|error| format!("cannot execute {}: {error}", program.display()))?;
-    if !stdin.is_empty() {
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(stdin.as_bytes())
-            .map_err(|error| format!("cannot write {} stdin: {error}", program.display()))?;
-    } else {
-        drop(child.stdin.take());
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("cannot wait for {}: {error}", program.display()))?;
-    transcript
-        .rewind()
-        .map_err(|error| format!("cannot rewind command transcript: {error}"))?;
-    let mut output = String::new();
-    transcript
-        .read_to_string(&mut output)
+    command
+        .stdout(Stdio::from(duplicate()?))
+        .stderr(Stdio::from(duplicate()?));
+    let status = run_to_exit(command, program, stdin, deadline)?;
+    let output = String::from_utf8(read_back(&mut transcript, "transcript")?)
         .map_err(|error| format!("command transcript is not UTF-8: {error}"))?;
     Ok((status, output))
 }
@@ -1056,5 +1274,29 @@ mod pty_properties {
             expected.extend_from_slice(b"\r\n");
             prop_assert_eq!(received, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod accept {
+    use tokio_stream::StreamExt as _;
+
+    /// The server's own end, which is the end whose Nagle delay stalls a
+    /// streamed response; the client's setting says nothing about it.
+    #[test]
+    fn a_harness_server_connection_is_served_without_nagle() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let incoming = super::incoming_nodelay(listener);
+            tokio::pin!(incoming);
+            let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let served = incoming.next().await.unwrap().unwrap();
+            assert!(served.nodelay().unwrap());
+        });
     }
 }

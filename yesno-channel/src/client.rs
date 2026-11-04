@@ -208,6 +208,9 @@ pub enum Notice {
 
 struct Connection {
     socket: UnixStream,
+    /// Run every [`WAIT_TICK_MS`] while the socket is not ready, if set. See
+    /// [`Client::connect_waiting`].
+    wait: Option<fn()>,
     buf: Vec<u8>,
     /// The generation from `ServerHello`. An `Available` naming a different one means
     /// the database was replaced while we were away, so it is not good news.
@@ -226,14 +229,18 @@ impl Connection {
             return Err(Error::Stale);
         }
         let bytes = frame.encode().map_err(Error::Codec)?;
-        if let Err(e) = self.socket.write_all(&bytes) {
+        let mut io = Waiting {
+            socket: &self.socket,
+            wait: self.wait,
+        };
+        if let Err(e) = io.write_all(&bytes) {
             if is_disconnect(&e) {
                 self.stale = true;
             }
             return Err(Error::Io(e));
         }
         loop {
-            let frame = match read_frame(&mut self.socket, &mut self.buf) {
+            let frame = match read_frame(&mut io, &mut self.buf) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     self.stale = true;
@@ -305,6 +312,90 @@ impl Connection {
         }
         Error::Fault { status, message }
     }
+}
+
+/// How often a waiting connection runs its hook while the socket is not ready.
+///
+/// Only the latency of an interrupt. A socket that is ready at once is read or
+/// written without ticking, so the normal path pays one `poll`.
+const WAIT_TICK_MS: libc::c_int = 50;
+
+/// Block until `socket` is ready for `events`, running `wait` every
+/// [`WAIT_TICK_MS`] until it is.
+///
+/// A signal ends the `poll` early with `EINTR`, which is a reason to run the
+/// hook, not an error: an interrupt the hook exists to notice usually arrives
+/// as exactly that signal.
+fn wait_until(socket: &UnixStream, events: libc::c_short, wait: fn()) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let mut fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: one `pollfd`, live and writable for the duration of the call,
+        // naming a descriptor `socket` keeps open.
+        let n = unsafe { libc::poll(&mut fd, 1, WAIT_TICK_MS) };
+        if n > 0 {
+            // Readable, writable, hung up or in error: the read or write that
+            // follows reports which.
+            return Ok(());
+        }
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        wait();
+    }
+}
+
+/// The connection's socket, waiting through [`wait_until`] before each read or
+/// write when the connection has a hook, and exactly the socket when it has none.
+struct Waiting<'a> {
+    socket: &'a UnixStream,
+    wait: Option<fn()>,
+}
+
+impl io::Read for Waiting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(wait) = self.wait {
+            wait_until(self.socket, libc::POLLIN, wait)?;
+        }
+        let mut socket = self.socket;
+        socket.read(buf)
+    }
+}
+
+impl io::Write for Waiting<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(wait) = self.wait {
+            wait_until(self.socket, libc::POLLOUT, wait)?;
+        }
+        let mut socket = self.socket;
+        socket.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut socket = self.socket;
+        socket.flush()
+    }
+}
+
+/// What a poisoned connection lock means, and the only way it gets poisoned.
+///
+/// A panic while a request holds the lock, which is a wait hook raising -- see
+/// [`Client::connect_waiting`] -- or a bug. Either way the exchange was
+/// abandoned partway, and the frames carry no request identifiers, so the
+/// next response read would belong to the abandoned request.
+fn abandoned() -> Error {
+    Error::Protocol(
+        "an earlier request on this plugin channel was abandoned partway, so the \
+         stream is no longer paired; reconnect"
+            .into(),
+    )
 }
 
 /// Map a connection error to expiry when a version is pinned.
@@ -415,7 +506,31 @@ impl Client {
     ///
     /// `name` is what the server logs this peer as.
     pub fn connect(path: impl AsRef<Path>, name: &str) -> Result<Self> {
-        let socket = UnixStream::connect(path.as_ref())?;
+        Self::connect_waiting(path, name, None)
+    }
+
+    /// [`Client::connect`], with `wait` run every 50 ms whenever the client is
+    /// waiting on the server, from the greeting on.
+    ///
+    /// For a caller that must stay responsive while it blocks. A PostgreSQL
+    /// backend passes a hook that runs `CHECK_FOR_INTERRUPTS`: without one, a
+    /// server that accepted and then fell silent held the backend through
+    /// `statement_timeout`, `pg_cancel_backend` and `pg_terminate_backend`
+    /// alike (measured 2026-10-26).
+    ///
+    /// **The hook may unwind**, and that is how it ends a wait. A request it
+    /// abandons leaves this client [`broken`](Client::is_broken): every later
+    /// call fails promptly naming why, and the caller must reconnect.
+    pub fn connect_waiting(path: impl AsRef<Path>, name: &str, wait: Option<fn()>) -> Result<Self> {
+        Self::handshake(UnixStream::connect(path.as_ref())?, name, wait)
+    }
+
+    /// Everything after the socket connects, split out so the tests can hand it
+    /// one end of a `UnixStream::pair` with a scripted server on the other.
+    fn handshake(socket: UnixStream, name: &str, wait: Option<fn()>) -> Result<Self> {
+        if let Some(wait) = wait {
+            wait_until(&socket, libc::POLLIN, wait)?;
+        }
         let (fd, byte) = greet(&socket)?;
 
         // In arena mode the byte is the protocol version and the frame follows it.
@@ -436,13 +551,18 @@ impl Client {
 
         let mut conn = Connection {
             socket,
+            wait,
             buf,
             generation: 0,
             stale: false,
             notices: Vec::new(),
         };
 
-        let greeting = match read_frame(&mut conn.socket, &mut conn.buf)? {
+        let mut io = Waiting {
+            socket: &conn.socket,
+            wait,
+        };
+        let greeting = match read_frame(&mut io, &mut conn.buf)? {
             Some(frame) => frame,
             None => {
                 return protocol("yesnod closed before sending ServerHello");
@@ -545,6 +665,13 @@ impl Client {
         &self.limits
     }
 
+    /// Whether a request on this connection was abandoned partway, so that the
+    /// stream can no longer pair a response with its request. Every call on a
+    /// broken client fails; reconnect.
+    pub fn is_broken(&self) -> bool {
+        self.conn.is_poisoned()
+    }
+
     /// Is this connection serving blocks through the shared arena, or inline?
     pub fn is_arena(&self) -> bool {
         self.arena.is_some()
@@ -557,9 +684,7 @@ impl Client {
     }
 
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn
-            .lock()
-            .map_err(|_| Error::Protocol("the plugin channel lock was poisoned".into()))
+        self.conn.lock().map_err(|_| abandoned())
     }
 
     /// Apply writes, in one commit. Returns the committed version and the number of
@@ -630,7 +755,7 @@ impl Snapshot {
         let result = self
             .conn
             .lock()
-            .map_err(|_| Error::Protocol("the plugin channel lock was poisoned".into()))
+            .map_err(|_| abandoned())
             .and_then(|mut conn| conn.request(frame));
         under_version(self.version, result)
     }
@@ -897,7 +1022,7 @@ impl LaneCursor {
         let result = self
             .conn
             .lock()
-            .map_err(|_| Error::Protocol("the plugin channel lock was poisoned".into()))
+            .map_err(|_| abandoned())
             .and_then(|mut conn| {
                 conn.request(Frame::BlockAdvanceMany {
                     lanes: self.handle,
@@ -987,7 +1112,7 @@ impl LaneCursor {
         let result = self
             .conn
             .lock()
-            .map_err(|_| Error::Protocol("the plugin channel lock was poisoned".into()))
+            .map_err(|_| abandoned())
             .and_then(|mut conn| {
                 conn.request(Frame::BlockSeekMany {
                     lanes: self.handle,
@@ -1134,5 +1259,113 @@ impl Drop for LaneCursor {
         if let Ok(mut conn) = self.conn.lock() {
             let _ = conn.request(Frame::LanesRelease { lanes: self.handle });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The server half of a handshake, in inline mode: the greeting frame with
+    /// no descriptor, then `Done` for the client's hello, then silence until the
+    /// client goes away.
+    fn greet_then_fall_silent(mut server: UnixStream) {
+        let hello = Frame::ServerHello {
+            protocol: u32::from(ipc::VERSION),
+            generation: 1,
+            role: Role::Leader,
+            shards: 1,
+            arena_bytes: 0,
+            max_lanes: 1,
+            max_handles: 1,
+            max_blocks: 1,
+            max_writes: 1,
+            max_expr_bytes: 0,
+        };
+        server.write_all(&hello.encode().unwrap()).unwrap();
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_frame(&mut server, &mut buf).unwrap(),
+            Some(Frame::ClientHello { .. })
+        ));
+        server.write_all(&Frame::Done.encode().unwrap()).unwrap();
+        // Hold the socket open and answer nothing, swallowing whatever the
+        // client sends, until it closes.
+        let mut sink = [0u8; 256];
+        while matches!(io::Read::read(&mut server, &mut sink), Ok(n) if n > 0) {}
+    }
+
+    /// `f` on its own thread, or a failure if it has not returned in 10 s.
+    ///
+    /// A regression here is a wait nothing ends, so without this the test would
+    /// hang the suite rather than fail it -- which is how `tls_reload` held the
+    /// gate for eleven hours on 2026-10-25.
+    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(f());
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the wait did not end: the hook is not being run")
+    }
+
+    /// The whole point: a server that answers the handshake and then nothing.
+    /// The hook stands in for `CHECK_FOR_INTERRUPTS` by unwinding on its third
+    /// tick, which must end the request, and the client must then refuse every
+    /// call rather than read the abandoned request's response as the next one's.
+    #[test]
+    fn a_hook_ends_a_wait_on_a_silent_server_and_breaks_the_client() {
+        static TICKS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            if TICKS.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                panic!("canceling statement due to user request");
+            }
+        }
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || greet_then_fall_silent(server_end));
+        let client = Client::handshake(client_end, "test", Some(hook)).unwrap();
+        assert_eq!(
+            TICKS.load(Ordering::SeqCst),
+            0,
+            "a prompt handshake must not tick"
+        );
+        assert!(!client.is_broken());
+
+        let (client, ended) = within(move || {
+            let ended =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.snapshot()));
+            (client, ended.is_err())
+        });
+        assert!(ended, "the hook did not end the wait");
+        assert_eq!(TICKS.load(Ordering::SeqCst), 3);
+
+        assert!(client.is_broken());
+        let refused = client
+            .snapshot()
+            .err()
+            .expect("a broken client must refuse");
+        assert!(refused.to_string().contains("abandoned"), "{refused}");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    /// A server that accepts and never greets: the wait before the greeting is
+    /// the first one a hook must be able to end.
+    #[test]
+    fn a_hook_ends_a_wait_for_the_greeting() {
+        static TICKS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            if TICKS.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                panic!("canceling statement due to statement timeout");
+            }
+        }
+        let (client_end, _silent) = UnixStream::pair().unwrap();
+        let ended = within(move || {
+            std::panic::catch_unwind(|| Client::handshake(client_end, "test", Some(hook))).is_err()
+        });
+        assert!(ended, "the hook did not end the wait");
+        assert_eq!(TICKS.load(Ordering::SeqCst), 2);
     }
 }
