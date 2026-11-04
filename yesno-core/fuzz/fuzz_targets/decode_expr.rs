@@ -23,6 +23,14 @@
 //!     canonical by construction -- `NonCanonicalLiteral`, `NonCanonicalView`
 //!     and `NonCanonicalBigLit` are refusals, not normalizations -- so this is a
 //!     second, independent statement of what the first decode decided;
+//!   - **an accepted payload is the only spelling of its value**. Re-encoding
+//!     must give back the input bytes exactly, not merely bytes that decode to
+//!     the same value. The fixed point above cannot see a decoder that accepts
+//!     a second spelling and normalizes it -- an ignored flag, a field read but
+//!     not checked -- because both spellings decode to one value and that
+//!     value re-encodes consistently. On 2026-10-25 all 1 568 accepted
+//!     expressions and 54 accepted requests in the corpora already met this,
+//!     so it is a property the format has, now asserted;
 //!   - **the two entry points agree on a set**. `SetExpr::decode` is the legacy
 //!     single-sort reader and `AnyExpr::decode` the multi-sorted one; they share
 //!     a header and a tag table, and a payload the first accepts must read as
@@ -125,6 +133,10 @@ fuzz_target!(|data: &[u8]| {
     match AnyExpr::decode(data) {
         Ok(any) => {
             check(&any);
+            assert!(
+                any.encode() == data,
+                "an accepted expression is not the canonical spelling of its value"
+            );
             if let Some(s) = set {
                 assert_eq!(
                     any,
@@ -145,6 +157,10 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(q) = QueryRequest::decode(data) {
         check(&q.expression);
         let bytes = q.encode();
+        assert!(
+            bytes == data,
+            "an accepted request is not the canonical spelling of its value"
+        );
         assert!(
             QueryRequest::looks_like_request(&bytes),
             "an accepted request re-encodes to bytes the dispatch would not read as one"

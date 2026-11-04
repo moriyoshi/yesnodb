@@ -2302,6 +2302,9 @@ impl Cursor<'_> {
     }
 
     fn bool_expr(&mut self, depth: usize) -> Result<BoolExpr, ExprError> {
+        // Unreachable today: the one caller, a `map_bool` body, first decodes
+        // its vector operand at this same depth, and that refuses first. Kept
+        // for the next position a bool is decoded from, which may not.
         if depth > MAX_DEPTH {
             return Err(ExprError::TooDeep);
         }
@@ -3343,6 +3346,114 @@ mod tests {
                 Err(ExprError::TooManyNodes),
                 "{sort}: one node past MAX_NODES must be refused"
             );
+        }
+    }
+
+    /// Each decoder refuses a node of its own sort one level past
+    /// [`MAX_DEPTH`], and accepts one at it.
+    ///
+    /// `depth_is_bounded` nests sets only, and five levels past the limit,
+    /// so it says nothing about the other checks or about the boundary. A
+    /// whole over-deep payload cannot pin them either, because a node with
+    /// children is refused by its child's check when its own is missing. So
+    /// each payload is cut at the first byte where two variants of the target
+    /// node differ. The decoder reaches the target with nothing left to read:
+    /// at `MAX_DEPTH` its check passes and the read fails with `Truncated`,
+    /// and one level deeper the check must fire first.
+    ///
+    /// Six of the seven checks are here. The bool check cannot be reached
+    /// from any input: a bool is decoded only as a `map_bool` body, after the
+    /// vector operand at the same depth, which refuses first. The comment at
+    /// that check says so.
+    #[test]
+    fn every_sort_refuses_one_level_past_the_depth_limit() {
+        fn ands(k: usize, inner: SetExpr) -> AnyExpr {
+            let mut e = inner;
+            for _ in 0..k {
+                e = SetExpr::And(vec![e]);
+            }
+            AnyExpr::Set(e)
+        }
+        fn negs(k: usize, inner: BigExpr) -> AnyExpr {
+            let mut e = inner;
+            for _ in 0..k {
+                e = BigExpr::Neg(Box::new(e));
+            }
+            AnyExpr::Big(e)
+        }
+        fn big_one() -> BigExpr {
+            BigExpr::Lit(BigLit::from_le_bytes(false, vec![1]).unwrap())
+        }
+        fn empties() -> Box<VecSetExpr> {
+            Box::new(VecSetExpr::List(vec![SetExpr::Empty]))
+        }
+
+        // `( sort, levels above the target node beyond the k wrappers,
+        // build( k, variant ) )`. The two variants differ first inside the
+        // target node, which is the only node of its sort at that depth.
+        type Build = fn(usize, bool) -> AnyExpr;
+        let cases: [(&str, usize, Build); 6] = [
+            ("set", 0, |k, v| {
+                ands(k, if v { SetExpr::Key(1) } else { SetExpr::Empty })
+            }),
+            ("set vector", 1, |k, v| {
+                let t = if v {
+                    VecSetExpr::Map(empties(), Box::new(SetExpr::Empty))
+                } else {
+                    *empties()
+                };
+                ands(k, SetExpr::Fold(Box::new(t), FoldOp::Or))
+            }),
+            ("big", 0, |k, v| {
+                negs(
+                    k,
+                    if v {
+                        BigExpr::Widen(Box::new(IntExpr::Lit(0)))
+                    } else {
+                        big_one()
+                    },
+                )
+            }),
+            ("big vector", 1, |k, v| {
+                let t = if v {
+                    VecBigExpr::Map(empties(), Box::new(big_one()))
+                } else {
+                    VecBigExpr::List(vec![big_one()])
+                };
+                negs(k, BigExpr::Fold(Box::new(t), BigFoldOp::Add))
+            }),
+            ("int", 1, |k, v| {
+                let t = if v {
+                    IntExpr::Cardinality(Box::new(SetExpr::Empty))
+                } else {
+                    IntExpr::Lit(0)
+                };
+                negs(k, BigExpr::Widen(Box::new(t)))
+            }),
+            ("int vector", 2, |k, v| {
+                let t = if v {
+                    VecIntExpr::Map(empties(), Box::new(IntExpr::Lit(0)))
+                } else {
+                    VecIntExpr::List(vec![IntExpr::Lit(0)])
+                };
+                negs(k, BigExpr::Widen(Box::new(IntExpr::At(Box::new(t), 0))))
+            }),
+        ];
+
+        for (sort, above, build) in cases {
+            for (depth, want) in [
+                (MAX_DEPTH, ExprError::Truncated),
+                (MAX_DEPTH + 1, ExprError::TooDeep),
+            ] {
+                let a = build(depth - above, false).encode();
+                let b = build(depth - above, true).encode();
+                let cut = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+                assert_eq!(
+                    AnyExpr::decode(&a[..cut]),
+                    Err(want),
+                    "{sort}: a node at depth {depth} with nothing left to read"
+                );
+            }
         }
     }
 }

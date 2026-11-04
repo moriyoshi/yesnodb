@@ -46,11 +46,15 @@ turned out to be two different blind spots:
 - **`roaring_import` was undersampled.** It runs at about 2 000 inputs a second,
   so 538 546 is a small sample. 300 seconds on four workers gained 29 edges at
   the default length and 37 at `-max_len=16384`, one run each, so a bigger
-  length limit is not what helps. A bitmap container *read from the input* is
-  still unreached: no input grew past 1132 bytes even at 16384. The bitmap
-  decodes that do appear in its coverage come from the target re-reading its
-  own serialization. The bitmap decoder is now fuzzed directly by
-  `decode_container`, so what remains uncovered is the file framing around it.
+  length limit is not what helps. A bitmap container *read from the input*
+  was unreached: no input grew past 1132 bytes even at 16384, and the bitmap
+  decodes in its coverage came from the target re-reading its own
+  serialization. The target now retries a truncated input padded by exactly
+  the shortfall the parser reports, filled with the input's last byte. Two
+  seeds of 300 seconds on four workers each went from 853 to 872 and 875 edges,
+  and each corpus ended with 31 inputs holding a valid input-read bitmap,
+  against none before. It runs about a quarter slower, because those inputs
+  are 8 KiB each.
 
 `decode_expr` still has the largest surface, and it is the only target whose
 input reaches the server from a client rather than from a file the server

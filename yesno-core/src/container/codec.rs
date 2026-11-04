@@ -593,6 +593,68 @@ mod tests {
         assert!(decode_buffer(ContainerKind::Bitmap, &buf, 60, BITMAP_BYTES, 1).is_err());
     }
 
+    /// The shared run arm of `decode_buffer` repeats `decode_run`'s checks in
+    /// its own loop, so the two must agree on every run payload: the same
+    /// verdict and the same contents, shared or copied.
+    ///
+    /// Deleting the overlap check from the shared arm alone left all 1 283
+    /// `yesno-core` tests passing on 2026-10-25, because every other caller
+    /// of `decode_buffer` hands it runs this crate wrote. The decode_container
+    /// fuzz target caught it on its first corpus input; this is the copy of
+    /// that check the gate runs.
+    #[test]
+    fn decode_buffer_and_decode_agree_on_runs() {
+        use arrow_buffer::Buffer;
+
+        // `( name, runs, whether decode accepts it )`.
+        type Case = (&'static str, &'static [(u16, u16)], bool);
+        let cases: &[Case] = &[
+            ("disjoint", &[(0, 3), (10, 2)], true),
+            ("touching, coalesced", &[(0, 3), (4, 3)], true),
+            ("the final ordinal", &[(65535, 0)], true),
+            ("overlapping", &[(0, 5), (3, 2)], false),
+            ("descending", &[(10, 2), (0, 1)], false),
+            ("a repeated start", &[(5, 0), (5, 0)], false),
+            ("past the chunk", &[(65535, 1)], false),
+        ];
+        for &(name, runs, ok) in cases {
+            let payload = run_bytes(runs);
+            let copied = decode(ContainerKind::Run, &payload, 0);
+            assert_eq!(copied.is_ok(), ok, "{name}: decode");
+            // 0 mod 8 takes the shared arm, 1 mod 8 the copying fallback.
+            for residue in [0usize, 1] {
+                let mut raw = vec![0u8; payload.len() + 8];
+                let off = (residue + 8 - raw.as_ptr() as usize % 8) % 8;
+                raw[off..off + payload.len()].copy_from_slice(&payload);
+                let buf = Buffer::from_vec(raw);
+                let shared = decode_buffer(ContainerKind::Run, &buf, off, payload.len(), 0);
+                match (&copied, &shared) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.len(), b.len(), "{name} at {residue} mod 8");
+                        assert!(a.iter().eq(b.iter()), "{name} at {residue} mod 8");
+                        // Contents alone would pass touching runs left
+                        // unmerged, which every run kernel assumes away.
+                        assert_eq!(encode(a), encode(b), "{name} at {residue} mod 8");
+                    }
+                    (Err(_), Err(_)) => {}
+                    _ => panic!(
+                        "{name} at {residue} mod 8: decode gave {copied:?}, \
+                         decode_buffer gave {shared:?}"
+                    ),
+                }
+            }
+        }
+        // Non-vacuous: an aligned, uncoalesced payload really is shared, so the
+        // loop above did reach the arm it is about.
+        let payload = run_bytes(&[(0, 3), (10, 2)]);
+        let mut raw = vec![0u8; payload.len() + 8];
+        let off = (8 - raw.as_ptr() as usize % 8) % 8;
+        raw[off..off + payload.len()].copy_from_slice(&payload);
+        let buf = Buffer::from_vec(raw);
+        let c = decode_buffer(ContainerKind::Run, &buf, off, payload.len(), 0).unwrap();
+        assert!(c.is_shared(), "the aligned case must take the shared arm");
+    }
+
     #[test]
     fn validate_catches_structural_violations() {
         // Unsorted array.

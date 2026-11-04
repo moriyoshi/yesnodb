@@ -19,8 +19,49 @@
 
 use libfuzzer_sys::fuzz_target;
 use yesno_core::roaring_format::{deserialize_u64, serialize_u64};
+use yesno_core::CodecError;
+
+/// How many times a truncated input is padded and retried.
+const FIT_ROUNDS: usize = 8;
+/// The most bytes a fitted input may reach: eight bitmap payloads.
+const FIT_MAX_LEN: usize = 8 * yesno_core::BITMAP_BYTES;
 
 fuzz_target!(|data: &[u8]| {
+    check(data);
+
+    // A bitmap container is 8192 bytes and libFuzzer's default `-max_len` is
+    // 4096, so a bitmap *read from the input* was never reached: on
+    // 2026-10-25 no corpus input grew past 1132 bytes even at
+    // `-max_len=16384`. The parser ignores trailing bytes and reports a short
+    // read as `Truncated { expected, found }`, so a truncated input is
+    // retried padded by exactly the shortfall, a few rounds, up to
+    // `FIT_MAX_LEN`. The unpadded input is always checked first, so
+    // truncation itself is still fuzzed, and an input that parses is never
+    // padded.
+    //
+    // The fill is the input's last byte, not zero. This format reads a bitmap
+    // only when the declared cardinality is over 4096, so its payload needs
+    // over 4096 set bits matching the declaration exactly. With a zero fill
+    // the fuzzer would have to write at least 513 bytes of them, and 300 s of
+    // it produced 0 valid input bitmaps. A `0xFF` fill under a declared 65536
+    // is a valid full bitmap, and an input ending in `0x00` is zero-padded.
+    let fill = data.last().copied().unwrap_or(0);
+    let mut fitted = data.to_vec();
+    for _ in 0..FIT_ROUNDS {
+        let Err(CodecError::Truncated { expected, found }) = deserialize_u64(&fitted) else {
+            return;
+        };
+        let grow = expected.saturating_sub(found).max(1);
+        if fitted.len().saturating_add(grow) > FIT_MAX_LEN {
+            return;
+        }
+        fitted.resize(fitted.len() + grow, fill);
+        check(&fitted);
+    }
+});
+
+/// `Err` or a valid set, never a panic.
+fn check(data: &[u8]) {
     let Ok(s) = deserialize_u64(data) else {
         return;
     };
@@ -59,4 +100,4 @@ fuzz_target!(|data: &[u8]| {
         round.iter().eq(s.iter()),
         "contents changed across a serialize/deserialize round trip"
     );
-});
+}
