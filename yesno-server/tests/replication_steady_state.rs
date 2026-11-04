@@ -881,3 +881,188 @@ fn a_promotion_must_raise_the_term() {
         "a promotion succeeded while the database was open"
     );
 }
+
+/// The fence a follower runs before every shard must not cost the leader a
+/// probe of every shard.
+///
+/// `check_leader` opens `bootstrap_shard`, `catch_up_shard` and
+/// `apply_shard_into`, and reads only the identity and the term. When it sent
+/// a bare `StatusRequest`, the leader computed `end_lsn` by walking every
+/// shard's log, so one pass over S shards cost S x S of those walks: 2.8 s of
+/// bare `Status` calls in a 64-shard bootstrap, measured 2026-10-27. This
+/// records every `Status` the leader receives while a follower bootstraps and
+/// catches up, then while the daemon's loop runs two passes, and asserts none
+/// of them asked for the log ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_never_asks_the_leader_for_log_ends_it_does_not_read() {
+    use std::sync::{Arc, Mutex};
+    use tonic::{Request, Response, Status};
+    use yesno_server::replication::pb::replication_server::{Replication, ReplicationServer};
+    use yesno_server::replication::LeaderService;
+
+    struct Recording {
+        inner: LeaderService,
+        asked: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[tonic::async_trait]
+    impl Replication for Recording {
+        type SubscribeStream = <LeaderService as Replication>::SubscribeStream;
+        type FetchBaseSnapshotStream = <LeaderService as Replication>::FetchBaseSnapshotStream;
+
+        async fn status(
+            &self,
+            request: Request<pb::StatusRequest>,
+        ) -> Result<Response<pb::StatusResponse>, Status> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push(!request.get_ref().omit_end_lsn);
+            self.inner.status(request).await
+        }
+        async fn subscribe(
+            &self,
+            request: Request<pb::SubscribeRequest>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            self.inner.subscribe(request).await
+        }
+        async fn ack(
+            &self,
+            request: Request<tonic::Streaming<pb::AckRequest>>,
+        ) -> Result<Response<pb::AckResponse>, Status> {
+            self.inner.ack(request).await
+        }
+        async fn fetch_base_snapshot(
+            &self,
+            request: Request<pb::SnapshotRequest>,
+        ) -> Result<Response<Self::FetchBaseSnapshotStream>, Status> {
+            self.inner.fetch_base_snapshot(request).await
+        }
+        async fn fetch_manifest(
+            &self,
+            request: Request<pb::ManifestRequest>,
+        ) -> Result<Response<pb::ManifestResponse>, Status> {
+            self.inner.fetch_manifest(request).await
+        }
+    }
+
+    const SHARDS: usize = 4;
+    let leader_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(leader_dir.path(), opts(SHARDS)).unwrap();
+    let mut b = db.batch();
+    for k in 0..64u64 {
+        b.insert(k, k * 7);
+    }
+    b.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = Recording {
+        inner: LeaderService::new(leader_dir.path(), SHARDS),
+        asked: recorded.clone(),
+    };
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ReplicationServer::new(service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let mut client = pb::replication_client::ReplicationClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    let mut follower = FollowerClient::new(follower_dir.path(), 0, []);
+    follower.fetch_manifest(&mut client).await.unwrap();
+    for shard in 0..SHARDS as u32 {
+        let off = follower.bootstrap_shard(&mut client, shard).await.unwrap();
+        follower
+            .catch_up_shard(&mut client, shard, off, 64 * 1024)
+            .await
+            .unwrap();
+    }
+
+    let asked = recorded.lock().unwrap().clone();
+    // At least one fence per shard per call, or the recorder saw nothing and
+    // the assertion below is vacuous.
+    assert!(
+        asked.len() >= 2 * SHARDS,
+        "only {} Status calls were recorded",
+        asked.len()
+    );
+    assert_eq!(
+        asked.iter().filter(|full| **full).count(),
+        0,
+        "the follower asked for end_lsn in {} of {} Status calls",
+        asked.iter().filter(|full| **full).count(),
+        asked.len()
+    );
+
+    // The daemon's own loop sends one more `Status` per pass, to learn the
+    // shard count, and that one bypasses the fence. Two passes, so the
+    // steady-state pass is in the record as well as the bootstrapping one.
+    let daemon_dir = tempfile::tempdir().unwrap();
+    let mut cfg = yesno_server::config::Config::default();
+    cfg.server.role = yesno_server::config::Role::Follower;
+    cfg.server.data_dir = Some(daemon_dir.path().to_path_buf());
+    cfg.server.metrics.listen = "127.0.0.1:0".into();
+    cfg.follower.leader = format!("http://{addr}");
+    cfg.follower.poll_interval_secs = 1;
+    cfg.follower.max_backoff_secs = 1;
+    cfg.validate_with(false, true)
+        .expect("config must validate");
+    let recorded_before = asked.len();
+    let node = yesno_server::follower::start(&cfg).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while node
+        .status
+        .passes
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 2
+        && std::time::Instant::now() < end
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let passes = node
+        .status
+        .passes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(!node.is_halted(), "the daemon follower halted");
+    node.stop().await;
+    assert!(
+        passes >= 2,
+        "the daemon follower completed {passes} passes in 20 s"
+    );
+    let daemon: Vec<bool> = recorded.lock().unwrap()[recorded_before..].to_vec();
+    assert!(
+        daemon.len() >= 2 * SHARDS + 2,
+        "only {} Status calls were recorded from the daemon",
+        daemon.len()
+    );
+    assert_eq!(
+        daemon.iter().filter(|full| **full).count(),
+        0,
+        "the daemon asked for end_lsn in {} of {} Status calls",
+        daemon.iter().filter(|full| **full).count(),
+        daemon.len()
+    );
+
+    // And the leader honours both forms: the log ends only when asked for.
+    let full = client
+        .status(pb::StatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let lean = client
+        .status(pb::StatusRequest { omit_end_lsn: true })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(full.end_lsn.len(), SHARDS);
+    assert!(lean.end_lsn.is_empty());
+    assert_eq!(
+        (lean.shard_count, lean.db_uuid, lean.term),
+        (full.shard_count, full.db_uuid, full.term)
+    );
+}

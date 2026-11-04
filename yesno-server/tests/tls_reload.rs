@@ -29,6 +29,23 @@ use yesno_server::config::{Anonymous, Config, PrincipalConfig, PrincipalRole};
 /// One reload at a time. See the module header.
 static ROTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// How long one network step may take before the test fails rather than waits.
+///
+/// Every step here completes in milliseconds. On 2026-10-25 one of them did not
+/// complete at all inside the gate, and because nothing bounded it the gate
+/// sat for eleven hours with all four tests reported as "running for over 60
+/// seconds" (three of them only queued on `ROTATION`). It did not recur in 100
+/// sequential and 100 twenty-way parallel runs. A bound turns the next one into
+/// a failure that names the step.
+const STEP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `f`, or a panic naming `what` if it has not finished within [`STEP`].
+async fn bounded<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(STEP, f)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: no answer within {STEP:?}"))
+}
+
 /// A self-contained authority: its CA, a `localhost` server identity, and a
 /// client identity it signed.
 struct Pki {
@@ -132,11 +149,10 @@ async fn client(
     addr: std::net::SocketAddr,
     tls: ClientTlsConfig,
 ) -> Result<FlightServiceClient<Channel>, tonic::transport::Error> {
-    let ch = Channel::from_shared(format!("https://{addr}"))
+    let endpoint = Channel::from_shared(format!("https://{addr}"))
         .unwrap()
-        .tls_config(tls)?
-        .connect()
-        .await?;
+        .tls_config(tls)?;
+    let ch = bounded(&format!("connecting to {addr}"), endpoint.connect()).await?;
     Ok(FlightServiceClient::new(ch))
 }
 
@@ -155,8 +171,7 @@ async fn assert_served(addr: std::net::SocketAddr, ca_pem: &str, why: &str) {
     let mut c = client(addr, trusting(ca_pem))
         .await
         .unwrap_or_else(|e| panic!("{why}: connect failed: {e}"));
-    let info = c
-        .get_flight_info(descriptor(1))
+    let info = bounded(why, c.get_flight_info(descriptor(1)))
         .await
         .unwrap_or_else(|e| panic!("{why}: call failed: {e}"))
         .into_inner();
@@ -172,14 +187,15 @@ async fn assert_served(addr: std::net::SocketAddr, ca_pem: &str, why: &str) {
 /// precisely the regression this file exists to catch.
 async fn whoami(c: &mut FlightServiceClient<Channel>) -> Result<String, tonic::Status> {
     use futures::StreamExt as _;
-    let mut hs = c
-        .handshake(futures::stream::iter(
+    let mut hs = bounded(
+        "the handshake",
+        c.handshake(futures::stream::iter(
             Vec::<arrow_flight::HandshakeRequest>::new(),
-        ))
-        .await?
-        .into_inner();
-    let first = hs
-        .next()
+        )),
+    )
+    .await?
+    .into_inner();
+    let first = bounded("the handshake response", hs.next())
         .await
         .ok_or_else(|| tonic::Status::internal("the handshake produced no response"))??;
     Ok(String::from_utf8_lossy(&first.payload).into_owned())
@@ -192,7 +208,9 @@ async fn whoami(c: &mut FlightServiceClient<Channel>) -> Result<String, tonic::S
 async fn assert_refused(addr: std::net::SocketAddr, ca_pem: &str, why: &str) {
     if let Ok(mut c) = client(addr, trusting(ca_pem)).await {
         assert!(
-            c.get_flight_info(descriptor(1)).await.is_err(),
+            bounded(why, c.get_flight_info(descriptor(1)))
+                .await
+                .is_err(),
             "{why}: the server was still reachable"
         );
     }
@@ -238,11 +256,13 @@ async fn a_valid_rotation_is_picked_up_and_the_old_certificate_stops_being_serve
 
     // The already-negotiated connection still works. A rotation is not a
     // disconnect, and an operator rotating at noon must not drop live traffic.
-    let info = established
-        .get_flight_info(descriptor(1))
-        .await
-        .expect("an established connection was broken by a rotation")
-        .into_inner();
+    let info = bounded(
+        "the connection held across the rotation",
+        established.get_flight_info(descriptor(1)),
+    )
+    .await
+    .expect("an established connection was broken by a rotation")
+    .into_inner();
     assert_eq!(info.total_records, 0);
 
     drop(established);

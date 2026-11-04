@@ -2210,7 +2210,7 @@ mod tests {
         let mut replica =
             crate::replication::pb::replication_client::ReplicationClient::new(channel);
         let status = replica
-            .status(crate::replication::pb::StatusRequest {})
+            .status(crate::replication::pb::StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -2219,7 +2219,7 @@ mod tests {
 
         replication.clear();
         let error = replica
-            .status(crate::replication::pb::StatusRequest {})
+            .status(crate::replication::pb::StatusRequest::default())
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable);
@@ -2268,7 +2268,7 @@ mod tests {
         let mut replica =
             crate::replication::pb::replication_client::ReplicationClient::new(channel);
         let error = replica
-            .status(crate::replication::pb::StatusRequest {})
+            .status(crate::replication::pb::StatusRequest::default())
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);

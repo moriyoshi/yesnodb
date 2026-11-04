@@ -1182,7 +1182,7 @@ async fn term_loop(runtime: Runtime) -> Result<(), ArchiveError> {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut client = ReplicationClient::new(runtime.channel.clone());
-        match client.status(StatusRequest {}).await {
+        match client.status(StatusRequest::default()).await {
             Ok(response) => {
                 let status = response.into_inner();
                 if status.db_uuid != runtime.state.lock().await.database_uuid {
@@ -1537,7 +1537,10 @@ where
     let store = ArchiveStore::connect(&cli.store)?;
     let writer_lease = Arc::new(store.acquire_writer(new_writer_id()?, lease_ttl).await?);
     let mut replication = ReplicationClient::new(channel.clone());
-    let status = replication.status(StatusRequest {}).await?.into_inner();
+    let status = replication
+        .status(StatusRequest::default())
+        .await?
+        .into_inner();
     if status.db_uuid.len() != 16 || status.shard_count == 0 {
         return Err("replication status has no valid database identity/topology".into());
     }

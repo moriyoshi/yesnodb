@@ -372,7 +372,10 @@ async fn one_pass(
     // The shard count comes from the leader, not from the config: it is a
     // property of the database, and a standby that guessed would bootstrap
     // shards that do not exist.
-    let status = match client.status(pb::StatusRequest {}).await {
+    let status = match client
+        .status(pb::StatusRequest { omit_end_lsn: true })
+        .await
+    {
         Ok(r) => r.into_inner(),
         Err(e) => {
             tracing::warn!(error = %e, "status failed");

@@ -413,11 +413,14 @@ pub fn from_wire(b: pb::WalBatch) -> WalBatch {
 impl Replication for LeaderService {
     async fn status(
         &self,
-        _req: Request<pb::StatusRequest>,
+        req: Request<pb::StatusRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
-        let mut end_lsn = Vec::with_capacity(self.shards);
-        for s in 0..self.shards as u32 {
-            end_lsn.push(self.log_end_lsn(s).await?);
+        let mut end_lsn = Vec::new();
+        if !req.get_ref().omit_end_lsn {
+            end_lsn.reserve(self.shards);
+            for s in 0..self.shards as u32 {
+                end_lsn.push(self.log_end_lsn(s).await?);
+            }
         }
         // Was `fs::read(dir/UUID).unwrap_or_default()`, which reached past
         // the crate's API *and* turned a missing identity into sixteen zero

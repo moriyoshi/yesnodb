@@ -356,7 +356,13 @@ impl FollowerClient {
     /// check into `bootstrap_shard` look impossible; adopting resolves it without
     /// leaving the check optional.
     async fn check_leader(&mut self, client: &mut ReplicationClient<Channel>) -> Result<()> {
-        let st = client.status(pb::StatusRequest {}).await?.into_inner();
+        // Identity and term only: this runs before every shard's call, and
+        // the per-shard log ends would cost the leader a probe of every shard
+        // each time.
+        let st = client
+            .status(pb::StatusRequest { omit_end_lsn: true })
+            .await?
+            .into_inner();
         let offered_term = st.term;
         let found: [u8; 16] = st.db_uuid.try_into().map_err(|_| {
             FollowerError::Topology("the leader reported no usable database identity".to_owned())

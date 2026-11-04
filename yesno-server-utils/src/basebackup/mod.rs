@@ -333,7 +333,7 @@ async fn one_attempt(
     let mut follower = FollowerClient::new(dir, 0, []);
     let db_uuid = follower.fetch_manifest(client).await?;
     let status = client
-        .status(pb::StatusRequest {})
+        .status(pb::StatusRequest::default())
         .await
         .map_err(FollowerError::from)?
         .into_inner();

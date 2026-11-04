@@ -201,7 +201,7 @@ async fn leader_status(
     )
     .await?;
     let mut client = ReplicationClient::new(channel);
-    Ok(client.status(StatusRequest {}).await?.into_inner())
+    Ok(client.status(StatusRequest::default()).await?.into_inner())
 }
 
 /// Seed an empty follower from the archive's durable tip. The ordinary daemon

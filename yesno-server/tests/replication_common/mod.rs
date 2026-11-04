@@ -128,7 +128,7 @@ async fn serve_svc(svc: LeaderService) -> Leader {
 /// ever reclaimed. Ask the leader, which knows its own base.
 pub async fn end_lsn(client: &mut ReplicationClient<Channel>, shard: usize) -> u64 {
     client
-        .status(yesno_server::replication::pb::StatusRequest {})
+        .status(yesno_server::replication::pb::StatusRequest::default())
         .await
         .unwrap()
         .into_inner()

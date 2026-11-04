@@ -67,7 +67,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -401,6 +401,7 @@ fn incoming_tls(
                 };
                 match step {
                     Step::Accepted(Ok(stream)) => {
+                        let stream = no_delay(stream);
                         // **The snapshot point.** One `Arc` clone, taken
                         // before the handshake starts and used for all of it. A
                         // reload after this line changes what the *next*
@@ -427,6 +428,27 @@ fn incoming_tls(
     )
 }
 
+/// Turn Nagle's algorithm off on an accepted connection.
+///
+/// tonic sets `TCP_NODELAY` only on sockets it accepts itself, and every
+/// listener here hands it streams already accepted, so without this each
+/// connection the daemon serves kept the kernel default. A server-streaming
+/// response is written as a headers frame and then a data frame; with Nagle on,
+/// the second waits for the client to acknowledge the first, and Linux delays
+/// that acknowledgement by up to 40 ms. Measured on 2026-10-27: every
+/// `do_get` of a three-ordinal key took 42 ms against 0.4 ms for a unary
+/// `get_flight_info`, and a standby paid the same stall on every replication
+/// stream, 125 ms per shard to reach readiness whatever the shard held.
+///
+/// A refusal is logged and the connection kept: a socket that cannot take the
+/// option still works, only more slowly.
+fn no_delay(stream: TcpStream) -> TcpStream {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(error = %error, "cannot set TCP_NODELAY on an accepted connection");
+    }
+    stream
+}
+
 /// Serve `router` on `listener`, over TLS when there is any, until `shutdown`.
 ///
 /// The two arms are separate on purpose: the TLS one yields
@@ -450,11 +472,83 @@ where
         }
         None => {
             router
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    shutdown,
-                )
+                .serve_with_incoming_shutdown(incoming_plain(listener), shutdown)
                 .await
         }
+    }
+}
+
+/// A plaintext listener's connections, each with [`no_delay`] applied.
+fn incoming_plain(listener: TcpListener) -> impl Stream<Item = io::Result<TcpStream>> {
+    tokio_stream::wrappers::TcpListenerStream::new(listener).map(|accepted| accepted.map(no_delay))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn listener() -> (TcpListener, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    /// The server's own end of the socket, which is the end whose Nagle delay
+    /// stalls a streamed response. The client's setting says nothing about it.
+    #[tokio::test]
+    async fn a_plaintext_connection_is_served_without_nagle() {
+        let (listener, addr) = listener().await;
+        let incoming = incoming_plain(listener);
+        futures::pin_mut!(incoming);
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let served = incoming.next().await.unwrap().unwrap();
+        assert!(served.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_tls_connection_is_served_without_nagle() {
+        install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(dir.path().join("server.pem"), cert.pem()).unwrap();
+        std::fs::write(dir.path().join("server.key"), key.serialize_pem()).unwrap();
+        let tls = ReloadableTls::new(
+            &TlsConfig {
+                cert: Some(dir.path().join("server.pem")),
+                key: Some(dir.path().join("server.key")),
+                client_ca: None,
+                require_client_auth: false,
+            },
+            "test",
+        )
+        .unwrap()
+        .unwrap();
+
+        let (listener, addr) = listener().await;
+        let incoming = incoming_tls(listener, tls);
+        futures::pin_mut!(incoming);
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        // Driven together: the stream yields only once the handshake is done,
+        // and the handshake needs the client half to make progress.
+        let (client, served) = tokio::join!(
+            async {
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                connector.connect(name, tcp).await.unwrap()
+            },
+            async { incoming.next().await.unwrap().unwrap() },
+        );
+        assert!(served.get_ref().0.nodelay().unwrap());
+        drop(client);
     }
 }

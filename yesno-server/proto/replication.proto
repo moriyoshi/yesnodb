@@ -28,7 +28,14 @@ service Replication {
   rpc FetchManifest(ManifestRequest) returns (ManifestResponse);
 }
 
-message StatusRequest {}
+message StatusRequest {
+  // Leave `end_lsn` empty. Computing it probes every shard's log, so a
+  // follower that asks for the identity and the term before each shard -- the
+  // fence -- made a pass over S shards cost S x S probes. Only the follower's
+  // fence and shard-count checks set it. A leader that predates the field
+  // ignores it and fills `end_lsn` anyway, which those callers do not read.
+  bool omit_end_lsn = 1;
+}
 
 message StatusResponse {
   uint64 visible_version = 1;

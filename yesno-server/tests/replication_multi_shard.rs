@@ -199,7 +199,7 @@ async fn ack_reports_a_follower_the_leader_has_run_ahead_of() {
     }
     let end = leader
         .client
-        .status(yesno_server::replication::pb::StatusRequest {})
+        .status(yesno_server::replication::pb::StatusRequest::default())
         .await
         .unwrap()
         .into_inner()

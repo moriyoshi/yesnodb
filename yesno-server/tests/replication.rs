@@ -184,7 +184,7 @@ async fn a_follower_is_built_from_a_running_leader_over_mutual_tls() {
         .expect("the leader must hand over its MANIFEST");
 
     let st = client
-        .status(pb::StatusRequest {})
+        .status(pb::StatusRequest::default())
         .await
         .unwrap()
         .into_inner();
@@ -239,7 +239,10 @@ async fn an_explicit_deny_blocks_replication() {
     let ch = follower_channel(addr, &pki, true).await.unwrap();
     let mut client = ReplicationClient::new(ch);
 
-    let e = client.status(pb::StatusRequest {}).await.unwrap_err();
+    let e = client
+        .status(pb::StatusRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}");
     assert!(e.message().contains("denies"), "{}", e.message());
 

@@ -92,7 +92,7 @@ async fn a_follower_bootstraps_physically_then_catches_up_to_set_equality() {
 
     // ---- status
     let st = client
-        .status(pb::StatusRequest {})
+        .status(pb::StatusRequest::default())
         .await
         .unwrap()
         .into_inner();
@@ -298,7 +298,7 @@ async fn a_follower_bootstraps_over_the_wire_with_no_shared_filesystem() {
     );
 
     let st = client
-        .status(pb::StatusRequest {})
+        .status(pb::StatusRequest::default())
         .await
         .unwrap()
         .into_inner();
