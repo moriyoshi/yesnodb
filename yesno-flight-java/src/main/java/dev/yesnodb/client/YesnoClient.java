@@ -25,7 +25,9 @@ import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.UInt1Vector;
+import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -56,6 +58,19 @@ public final class YesnoClient implements AutoCloseable {
       new Field("hi", FieldType.notNullable(new ArrowType.Int(64, false)), null);
   private static final Field OP_FIELD =
       new Field("op", FieldType.notNullable(new ArrowType.Int(8, false)), null);
+  // The container wire is chosen by the server comparing schemas exactly, so
+  // a field that misses by name, width or nullability is read as the mutation
+  // wire instead, and refused as that.
+  private static final Field PREFIX48_FIELD =
+      new Field("prefix48", FieldType.notNullable(new ArrowType.Int(64, false)), null);
+  private static final Field KIND_FIELD =
+      new Field("kind", FieldType.notNullable(new ArrowType.Int(8, false)), null);
+  private static final Field CARDINALITY_FIELD =
+      new Field("cardinality", FieldType.notNullable(new ArrowType.Int(32, false)), null);
+  private static final Field PAYLOAD_FIELD =
+      new Field("payload", FieldType.notNullable(new ArrowType.Binary()), null);
+  /** Chunks per container batch: a bitmap chunk is 8 KiB, so at most ~16 MiB of payload. */
+  private static final int CONTAINER_BATCH_CHUNKS = 2048;
 
   private final BufferAllocator allocator;
   private final FlightClient flight;
@@ -277,6 +292,87 @@ public final class YesnoClient implements AutoCloseable {
    */
   public IngestAck apply(Iterable<Mutation> mutations, CallOption... options) {
     return putMutations(mutations, PUT_APPLY, options);
+  }
+
+  /**
+   * Unions whole chunks into the database as container payloads, as <b>one</b> commit.
+   *
+   * <p>One row per 65,536-ordinal chunk instead of one per set bit: the server measured 64.8x less
+   * wire on a half-dense page, and a dense chunk is 8 KiB here against 512 KiB of pairs. Build the
+   * chunks with {@link ContainerChunk#ofOrdinals}, {@link ContainerChunk#ofBitmap} or {@link
+   * ContainerChunk#encode}. Like {@link #apply}, every chunk becomes visible at the single version
+   * the acknowledgement reports, however many batches the call was split across.
+   *
+   * <p>There is no removal form; use {@link Mutation#removeRange}. Check {@link
+   * ServerStats#FEATURE_CONTAINER_PUT} first: a server predating the wire refuses the batch, because
+   * {@code apply} accepts only schemas it knows.
+   *
+   * <p>The acknowledgement's {@code rows} counts <b>ordinals</b>, not chunks, because that is what
+   * the server reports applying. It is compared against the sum of the chunks' cardinalities, which
+   * makes the comparison a check of the decode as well: the cardinality this client encoded against
+   * the one the server read out of the payloads.
+   */
+  public IngestAck applyContainers(Iterable<ContainerChunk> chunks, CallOption... options) {
+    ensureOpen();
+    Objects.requireNonNull(chunks, "chunks");
+    Iterator<ContainerChunk> iterator = chunks.iterator();
+    AckListener acknowledgements = new AckListener();
+    long sent = 0;
+
+    try (VectorSchemaRoot root =
+        VectorSchemaRoot.of(
+            new UInt8Vector(KEY_FIELD, allocator),
+            new UInt8Vector(PREFIX48_FIELD, allocator),
+            new UInt1Vector(KIND_FIELD, allocator),
+            new UInt4Vector(CARDINALITY_FIELD, allocator),
+            new VarBinaryVector(PAYLOAD_FIELD, allocator))) {
+      UInt8Vector keys = (UInt8Vector) root.getVector("key");
+      UInt8Vector prefixes = (UInt8Vector) root.getVector("prefix48");
+      UInt1Vector kinds = (UInt1Vector) root.getVector("kind");
+      UInt4Vector cardinalities = (UInt4Vector) root.getVector("cardinality");
+      VarBinaryVector payloads = (VarBinaryVector) root.getVector("payload");
+      FlightClient.ClientStreamListener writer =
+          flight.startPut(FlightDescriptor.command(PUT_APPLY), root, acknowledgements, options);
+      try {
+        while (iterator.hasNext()) {
+          root.allocateNew();
+          int row = 0;
+          while (row < CONTAINER_BATCH_CHUNKS && iterator.hasNext()) {
+            ContainerChunk chunk = Objects.requireNonNull(iterator.next(), "chunk");
+            keys.setSafe(row, chunk.key());
+            prefixes.setSafe(row, chunk.prefix48());
+            kinds.setSafe(row, chunk.kind());
+            cardinalities.setSafe(row, chunk.cardinality());
+            chunk.writePayload(payloads, row);
+            sent = Math.addExact(sent, chunk.cardinality());
+            row++;
+          }
+          root.setRowCount(row);
+          writer.putNext();
+        }
+      } catch (RuntimeException | Error exception) {
+        writer.error(exception);
+        throw exception;
+      }
+      writer.completed();
+      writer.getResult();
+    }
+
+    IngestAck acknowledged = acknowledgements.ack();
+    if (acknowledged.rows() != sent) {
+      throw new IllegalStateException(
+          "yesnodb acknowledged " + acknowledged.rows() + " of " + sent + " container ordinals");
+    }
+    return acknowledged;
+  }
+
+  /**
+   * Unions a {@link RoaringBitmap} into {@code key} as container payloads, as one commit.
+   *
+   * <p>{@link #applyContainers} over {@link ContainerChunk#ofBitmap}; see both.
+   */
+  public IngestAck insertContainers(long key, RoaringBitmap bitmap, CallOption... options) {
+    return applyContainers(ContainerChunk.ofBitmap(key, bitmap), options);
   }
 
   /** Opens a write transaction spanning several calls. */

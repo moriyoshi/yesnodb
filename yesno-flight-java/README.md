@@ -81,6 +81,45 @@ try (YesnoClient client = YesnoClient.connect(location)) {
 materializing the result. A query ticket is not a lease: if the server has
 reclaimed its version, plan the query again before retrying the fetch.
 
+## Writing whole sets
+
+The pair wire costs one row per ordinal. `applyContainers` costs one row per
+65,536-ordinal chunk, carrying the Roaring-spec payload the page store itself
+holds, which the server measured at 64.8x less wire on a half-dense page:
+
+```java
+import dev.yesnodb.client.ContainerChunk;
+import dev.yesnodb.client.ServerStats;
+
+long[] ordinals = new long[333_334];
+for (int index = 0; index < ordinals.length; index++) {
+  ordinals[index] = 3L * index;
+}
+if (client.supports(ServerStats.FEATURE_CONTAINER_PUT)) {
+  client.applyContainers(ContainerChunk.ofOrdinals(42, ordinals));
+} else {
+  List<OrdinalPair> pairs = new ArrayList<>();
+  for (long ordinal : ordinals) {
+    pairs.add(new OrdinalPair(42, ordinal));
+  }
+  client.insertBatch(pairs);
+}
+```
+
+One commit for the whole call, like `apply`: every chunk becomes visible at the
+single version the acknowledgement reports, however many batches the chunks
+were split across. The acknowledgement counts ordinals, not chunks. Container
+rows union into what is already under the key; there is no removal form,
+because the write wire reuses the read side's schema unchanged and that schema
+has no operation column. Remove with `Mutation.removeRange` instead.
+
+`ContainerChunk.ofBitmap` and `insertContainers( key, bitmap )` take a 32-bit
+`RoaringBitmap`. The payloads come from this client's own encoder, not from
+the bitmap's internal containers, and `ContainerChunk.encode` builds one chunk
+from its sorted 16-bit values. Each chunk takes the smallest of the three
+layouts, which is not always the one the server would pick, and the server
+normalizes what it receives.
+
 ## RoaringBitmap interoperability
 
 Queries whose ordinals fit the unsigned 32-bit domain can be materialized

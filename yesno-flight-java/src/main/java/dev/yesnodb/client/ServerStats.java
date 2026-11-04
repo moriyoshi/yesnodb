@@ -23,8 +23,7 @@ public record ServerStats(
   /**
    * Container payloads on the write wire, which cost 64.8x less than one row per set bit.
    *
-   * <p>This names what the <b>server</b> accepts. This client cannot build such a batch yet, so
-   * the bit is here to answer {@link #supports} honestly rather than to unlock a path.
+   * <p>Ask before {@link YesnoClient#applyContainers}: a server without it refuses the batch.
    */
   public static final long FEATURE_CONTAINER_PUT = 1L << 2;
 

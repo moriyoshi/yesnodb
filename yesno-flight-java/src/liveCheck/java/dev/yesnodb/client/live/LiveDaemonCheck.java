@@ -1,5 +1,6 @@
 package dev.yesnodb.client.live;
 
+import dev.yesnodb.client.ContainerChunk;
 import dev.yesnodb.client.Mutation;
 import dev.yesnodb.client.OrdinalPair;
 import dev.yesnodb.client.QueryInfo;
@@ -36,6 +37,8 @@ public final class LiveDaemonCheck {
   private static final long KEY_B = 7002;
   private static final long KEY_C = 7003;
   private static final long KEY_D = 7004;
+  private static final long KEY_E = 7005;
+  private static final long KEY_F = 7006;
 
   private LiveDaemonCheck() {}
 
@@ -139,6 +142,54 @@ public final class LiveDaemonCheck {
     client.stage(aborted, List.of(Mutation.insert(KEY_D, 21)));
     client.abortWrite(aborted);
     emitInts(out, "ordinals_d_aborted", client.getRoaringBitmap(KEY_D));
+
+    // ---- container payloads: every kind the encoder has, a run of more than
+    // one interval, and a chunk whose ordinals do not fit 32 bits. The set is
+    // spelled again in the scenario, which reads it back through the Rust
+    // client; this side reports only what it sent and what was acknowledged.
+    emitBool(
+        out, "supports_container_put", initial.supports(ServerStats.FEATURE_CONTAINER_PUT));
+    List<Long> epsilon = new ArrayList<>();
+    for (long ordinal : new long[] {1, 5, 9}) {
+      epsilon.add(ordinal);
+    }
+    for (long value = 0; value < 30000; value += 2) {
+      epsilon.add(3L << 16 | value);
+    }
+    for (long value = 100; value < 400; value++) {
+      epsilon.add(4L << 16 | value);
+    }
+    for (long value = 1000; value < 1200; value++) {
+      epsilon.add(4L << 16 | value);
+    }
+    epsilon.add((1L << 20) << 16 | 7);
+    epsilon.add((1L << 20) << 16 | 8);
+    List<ContainerChunk> chunks =
+        ContainerChunk.ofOrdinals(KEY_E, epsilon.stream().mapToLong(Long::longValue).toArray());
+    StringJoiner kinds = new StringJoiner(",");
+    for (ContainerChunk chunk : chunks) {
+      kinds.add(Byte.toString(chunk.kind()));
+    }
+    out.println("yesno-live list container_kinds " + kinds);
+    YesnoClient.IngestAck containers = client.applyContainers(chunks);
+    emitInt(out, "container_rows", containers.rows());
+    emitBool(
+        out,
+        "container_advanced_version",
+        Long.compareUnsigned(containers.version(), commitVersion) > 0);
+    emitInt(out, "cardinality_e", client.cardinality(KEY_E));
+    // A payload of two values under a cardinality of three. The server's
+    // decoder checks the declared cardinality, so this is its refusal and not
+    // the client's acknowledgement check.
+    emitString(
+        out,
+        "lying_container_status",
+        statusOf(
+            () ->
+                client.applyContainers(
+                    List.of(
+                        new ContainerChunk(
+                            KEY_F, 0, ContainerChunk.KIND_ARRAY, 3, new byte[] {1, 0, 2, 0})))));
 
     // ---- the refusals. A status code is the half of the contract that a
     // literal wire vector cannot express, and the half that changes silently.

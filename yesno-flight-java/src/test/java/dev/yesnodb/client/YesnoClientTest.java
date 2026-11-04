@@ -31,7 +31,10 @@ import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.UInt1Vector;
+import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -219,6 +222,10 @@ class YesnoClientTest {
                 stream.getDescriptor().getCommand(), "remove".getBytes(StandardCharsets.US_ASCII));
         while (stream.next()) {
           VectorSchemaRoot root = stream.getRoot();
+          if (root.getVector("payload") != null) {
+            rows += acceptContainers(root);
+            continue;
+          }
           UInt8Vector keys = (UInt8Vector) root.getVector("key");
           UInt8Vector ordinals = (UInt8Vector) root.getVector("ordinal");
           for (int row = 0; row < root.getRowCount(); row++) {
@@ -257,6 +264,48 @@ class YesnoClientTest {
         acknowledgements.onCompleted();
       };
     }
+
+    /**
+     * Applies a container batch, and acknowledges what the payloads held.
+     *
+     * <p>Decoded rather than trusted: the acknowledgement counts the values {@link PayloadDecoder}
+     * read out of each payload, not the cardinality column, so a client whose column disagrees with
+     * its payload sees the same mismatch a real server would refuse it for.
+     */
+    private long acceptContainers(VectorSchemaRoot root) {
+      containerBatches++;
+      UInt8Vector keys = (UInt8Vector) root.getVector("key");
+      UInt8Vector prefixes = (UInt8Vector) root.getVector("prefix48");
+      UInt1Vector kinds = (UInt1Vector) root.getVector("kind");
+      UInt4Vector cardinalities = (UInt4Vector) root.getVector("cardinality");
+      VarBinaryVector payloads = (VarBinaryVector) root.getVector("payload");
+      assertEquals(
+          List.of(
+              new Field("key", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+              new Field("prefix48", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+              new Field("kind", FieldType.notNullable(new ArrowType.Int(8, false)), null),
+              new Field("cardinality", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+              new Field("payload", FieldType.notNullable(new ArrowType.Binary()), null)),
+          root.getSchema().getFields(),
+          "the server picks the container wire by comparing schemas exactly");
+      long rows = 0;
+      for (int row = 0; row < root.getRowCount(); row++) {
+        NavigableSet<Long> set = values.computeIfAbsent(keys.get(row), ignored -> newSet());
+        long prefix = prefixes.get(row);
+        List<Integer> decoded = PayloadDecoder.decode(kinds.get(row), payloads.get(row));
+        if (decoded.size() != Integer.toUnsignedLong(cardinalities.get(row))) {
+          containerCardinalityMismatches++;
+        }
+        for (int value : decoded) {
+          set.add(prefix << 16 | value);
+        }
+        rows += decoded.size();
+      }
+      return rows;
+    }
+
+    int containerBatches;
+    int containerCardinalityMismatches;
 
     @Override
     public void doAction(
@@ -313,6 +362,62 @@ class YesnoClientTest {
 
   private static long littleEndianLong(byte[] value) {
     return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getLong();
+  }
+
+  @Test
+  // FlightServer.close exposes InterruptedException; the test deliberately owns it here.
+  @SuppressWarnings("try")
+  void containerChunksReachTheServerAsOneStreamAndAreCountedInOrdinals() throws Exception {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestProducer producer = new TestProducer(allocator);
+      Location listen = Location.forGrpcInsecure("127.0.0.1", 0);
+      try (FlightServer server = FlightServer.builder(allocator, listen, producer).build().start();
+          YesnoClient client = YesnoClient.connect(allocator, server.getLocation())) {
+        // 2049 chunks, so the stream needs a second batch, and all three kinds.
+        List<Long> ordinals = new ArrayList<>();
+        for (long chunk = 0; chunk < 2049; chunk++) {
+          ordinals.add(chunk << 16 | 7);
+        }
+        for (long value = 0; value < 30000; value += 2) {
+          ordinals.add(5000L << 16 | value); // a bitmap
+        }
+        for (long value = 100; value < 400; value++) {
+          ordinals.add(6000L << 16 | value); // a run, of two intervals
+          ordinals.add(6000L << 16 | (value + 1000));
+        }
+        long[] raw = ordinals.stream().mapToLong(Long::longValue).toArray();
+        List<ContainerChunk> chunks = ContainerChunk.ofOrdinals(21, raw);
+        assertEquals(2051, chunks.size());
+        assertEquals(
+            List.of(ContainerChunk.KIND_ARRAY, ContainerChunk.KIND_BITMAP, ContainerChunk.KIND_RUN),
+            chunks.stream().map(ContainerChunk::kind).distinct().sorted().toList());
+
+        YesnoClient.IngestAck ack = client.applyContainers(chunks);
+        assertEquals(raw.length, ack.rows(), "acknowledged in ordinals, not chunks");
+        assertTrue(ack.version() > 0);
+        assertEquals(2, producer.containerBatches);
+        assertEquals(0, producer.containerCardinalityMismatches);
+        NavigableSet<Long> want = newSet();
+        for (long ordinal : raw) {
+          want.add(ordinal);
+        }
+        assertEquals(want, producer.values.get(21L));
+
+        RoaringBitmap bitmap = RoaringBitmap.bitmapOf(1, 2, 3, -1);
+        assertEquals(4, client.insertContainers(22, bitmap).rows());
+        assertEquals(bitmap, client.getRoaringBitmap(22));
+
+        // A chunk whose cardinality column claims more than its payload holds:
+        // the comparison against the acknowledgement is what notices.
+        ContainerChunk lying =
+            new ContainerChunk(23, 0, ContainerChunk.KIND_ARRAY, 3, new byte[] {1, 0, 2, 0});
+        IllegalStateException refused =
+            assertThrows(IllegalStateException.class, () -> client.applyContainers(List.of(lying)));
+        assertTrue(refused.getMessage().contains("acknowledged 2 of 3 container ordinals"), refused.getMessage());
+
+        assertEquals(0, client.applyContainers(List.of()).rows());
+      }
+    }
   }
 
   @org.junit.jupiter.api.Test
