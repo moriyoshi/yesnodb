@@ -5899,3 +5899,66 @@ stall either.
 edited test files buy too little. The TODO entry is closed with the one-expression recipe,
 in case a timing fixture ever goes through one of these servers. No compiled code
 changed, so no gate was run.
+
+## 2026-11-05: A channel snapshot released during an abort could wait on a silent server for ever
+
+Found by reviewing `de5d42a` ("Honor cancellation and deadlines across clients and
+scenarios"). That change runs `CHECK_FOR_INTERRUPTS` every 50 ms while the channel
+client waits, so a cancel or a terminate can end a wait on a server that has
+fallen silent. One wait it cannot end is a release.
+
+**The path.** `fdw::modify::xact_callback` calls
+`transport::channel::release_transaction_pins` on `XACT_EVENT_ABORT`, and that
+drops every pinned `Snapshot`. `Snapshot::drop` sent `SnapshotClose` through
+`Connection::request` and waited for the answer with no limit. PostgreSQL's
+`AbortTransaction` holds interrupts off around its callbacks, so the hook's
+`check_for_interrupts!` does nothing there. Against a hung `yesnod`, a backend
+whose transaction aborts while it holds a pin on a connection the cancelled
+request did not use would therefore wait in its abort with nothing able to end
+it, `pg_terminate_backend` included. A cancelled request poisons its own
+connection, and the drops already skip a poisoned one, so this needs a pin on a
+second connection, for example a REPEATABLE READ pin from an earlier statement
+followed by a request on a fresh connection that times out. The same wait was
+unbounded before `de5d42a` too. **This is by reading PostgreSQL's abort path, not
+demonstrated in a backend.** The client-level hang is demonstrated.
+
+**A second hazard on the same path.** A hook that did raise inside a `Drop` would
+be unwinding out of a drop, and if that drop is itself part of an unwind, Rust
+aborts the process, which makes the postmaster restart every session.
+
+**The fix, in `yesno-channel`.** `Snapshot::drop` and `LaneCursor::drop` go
+through a new `Connection::release`. It waits at most `RELEASE_WAIT` (2 s), runs
+no hook, and when it gives up it marks the connection `abandoned`. The answer
+may still arrive and would pair with the next request, so every later request
+on that connection fails with the existing "abandoned partway" error, and
+`Client::is_broken` reports it. `ChannelTransport::client` in `yesno-pg` already
+reconnects a broken client. The server frees what the release named when the
+connection closes. `wait_until` gained an optional deadline and an optional hook
+to support this, and `Waiting` polls when it has either.
+
+**Test.** `releasing_a_snapshot_on_a_silent_server_gives_up_and_breaks_the_client`
+uses a scripted server that answers one `SnapshotOpen` and then swallows
+everything. The client's hook counts ticks and never raises, as in an abort.
+- On the unchanged code, the drop hung until the test's 10 s `within` limit.
+- Fixed, the drop returns after 2 s with zero ticks, and the client is broken
+  and refuses the next request naming "abandoned".
+- Sabotaged by not setting `abandoned`, it fails on `client.is_broken()`.
+- Sabotaged by passing the hook to the release, it fails on "a release must not
+  run the hook".
+
+Both sabotages were restored from a cmp-verified copy. `gate.sh` passed, 3 487
+tests, 0 failed. The first run failed in `cargo doc`, because two public doc
+comments linked the private `RELEASE_WAIT`; they now say "two seconds".
+`gate-pg.sh` passed.
+
+**Noted, not changed.** A blocking write after `POLLOUT` can still block for the
+rest of a frame larger than the socket's free buffer, without the 50 ms tick, if
+the server has stopped reading. Inside PostgreSQL this is ended anyway, because
+every interrupt arrives as a signal and a Unix stream `write` that has made
+progress returns its partial count on a signal, after which `write_all` polls
+again and the hook runs. So the comment's "every 50 ms" is true of every read and
+of every wait for write space, but not of a write already in progress. A
+non-blocking socket would make it literally true. It was left as is, because it
+needs a frame larger than the free send buffer and a server that has stopped
+reading, and even then a signal ends it. How large a frame `max_writes` allows
+was not checked.

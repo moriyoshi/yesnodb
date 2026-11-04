@@ -72,6 +72,13 @@
 //! every 50 ms while it waits. A cancel unwinds out of the request partway,
 //! which leaves that client unable to pair a response with its request, so
 //! [`ChannelTransport::client`] drops a broken one and connects afresh.
+//!
+//! The one wait the hook cannot end is a release. [`release_transaction_pins`]
+//! runs from the abort callback, where PostgreSQL holds interrupts off, so a
+//! `SnapshotClose` that waited for a silent server would hold the backend in its
+//! abort past `pg_terminate_backend` (by reading PostgreSQL's abort path; the
+//! client's own test demonstrates the wait). The client bounds every release instead,
+//! runs no hook for it, and breaks the connection when it gives up.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -227,8 +234,9 @@ impl ChannelTransport {
     /// there should fail the query that needs it rather than the planning of
     /// every query that mentions the table.
     fn client(&mut self) -> Result<&mut Client, TransportError> {
-        // A cancel abandoned a request on it, so its next response would belong
-        // to that request. The snapshot and scan it served go with it.
+        // A cancel abandoned a request on it, or a release gave up waiting on a
+        // silent server, so its next response would belong to that request. The
+        // snapshot and scan it served go with it.
         if self.client.as_ref().is_some_and(Client::is_broken) {
             self.scan = None;
             self.pinned = None;

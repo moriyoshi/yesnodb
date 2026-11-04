@@ -216,6 +216,9 @@ struct Connection {
     /// the database was replaced while we were away, so it is not good news.
     generation: u64,
     stale: bool,
+    /// Set when a release gave up waiting for its answer, which may still
+    /// arrive and would be read as the next request's. See [`RELEASE_WAIT`].
+    abandoned: bool,
     notices: Vec<Notice>,
 }
 
@@ -225,13 +228,43 @@ impl Connection {
     /// Steps over server-initiated notices, recording them. A [`Frame::Fault`]
     /// becomes [`Error::Fault`] here so that no call site has to remember to check.
     fn request(&mut self, frame: Frame) -> Result<Frame> {
+        self.exchange(frame, self.wait, None)
+    }
+
+    /// Send a release from a [`Drop`] and wait for its answer, but never run the
+    /// hook and never past [`RELEASE_WAIT`].
+    ///
+    /// A hook may unwind, and unwinding out of a drop that is itself part of an
+    /// unwind aborts the process. A PostgreSQL backend also releases from its
+    /// transaction abort callback, where interrupts are held off and the hook
+    /// could not end the wait anyway.
+    fn release(&mut self, frame: Frame) -> Result<Frame> {
+        let until = std::time::Instant::now() + RELEASE_WAIT;
+        let result = self.exchange(frame, None, Some(until));
+        if matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut) {
+            self.abandoned = true;
+        }
+        result
+    }
+
+    /// [`Connection::request`], waiting through `wait` and giving up at `until`.
+    fn exchange(
+        &mut self,
+        frame: Frame,
+        wait: Option<fn()>,
+        until: Option<std::time::Instant>,
+    ) -> Result<Frame> {
+        if self.abandoned {
+            return Err(abandoned());
+        }
         if self.stale {
             return Err(Error::Stale);
         }
         let bytes = frame.encode().map_err(Error::Codec)?;
         let mut io = Waiting {
             socket: &self.socket,
-            wait: self.wait,
+            wait,
+            until,
         };
         if let Err(e) = io.write_all(&bytes) {
             if is_disconnect(&e) {
@@ -320,15 +353,41 @@ impl Connection {
 /// written without ticking, so the normal path pays one `poll`.
 const WAIT_TICK_MS: libc::c_int = 50;
 
+/// The longest a [`Drop`] waits for the server to answer a release.
+///
+/// A healthy server answers in microseconds, so this is reached only against a
+/// server that has stopped answering, and the release then gives up rather
+/// than hold its caller. The server frees what the release named when the
+/// connection closes, so giving up loses nothing but this connection.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Block until `socket` is ready for `events`, running `wait` every
-/// [`WAIT_TICK_MS`] until it is.
+/// [`WAIT_TICK_MS`] until it is, and failing with `TimedOut` at `until`.
 ///
 /// A signal ends the `poll` early with `EINTR`, which is a reason to run the
 /// hook, not an error: an interrupt the hook exists to notice usually arrives
 /// as exactly that signal.
-fn wait_until(socket: &UnixStream, events: libc::c_short, wait: fn()) -> io::Result<()> {
+fn wait_until(
+    socket: &UnixStream,
+    events: libc::c_short,
+    wait: Option<fn()>,
+    until: Option<std::time::Instant>,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     loop {
+        let mut tick = WAIT_TICK_MS;
+        if let Some(until) = until {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "yesnod did not answer in time",
+                ));
+            }
+            // Rounded up, so the last poll does not wake just short of `until`.
+            let left_ms = left.as_micros().div_ceil(1000);
+            tick = tick.min(libc::c_int::try_from(left_ms).unwrap_or(libc::c_int::MAX));
+        }
         let mut fd = libc::pollfd {
             fd: socket.as_raw_fd(),
             events,
@@ -336,7 +395,7 @@ fn wait_until(socket: &UnixStream, events: libc::c_short, wait: fn()) -> io::Res
         };
         // SAFETY: one `pollfd`, live and writable for the duration of the call,
         // naming a descriptor `socket` keeps open.
-        let n = unsafe { libc::poll(&mut fd, 1, WAIT_TICK_MS) };
+        let n = unsafe { libc::poll(&mut fd, 1, tick) };
         if n > 0 {
             // Readable, writable, hung up or in error: the read or write that
             // follows reports which.
@@ -348,22 +407,33 @@ fn wait_until(socket: &UnixStream, events: libc::c_short, wait: fn()) -> io::Res
                 return Err(e);
             }
         }
-        wait();
+        if let Some(wait) = wait {
+            wait();
+        }
     }
 }
 
 /// The connection's socket, waiting through [`wait_until`] before each read or
-/// write when the connection has a hook, and exactly the socket when it has none.
+/// write when the exchange has a hook or a deadline, and exactly the socket when
+/// it has neither.
 struct Waiting<'a> {
     socket: &'a UnixStream,
     wait: Option<fn()>,
+    until: Option<std::time::Instant>,
+}
+
+impl Waiting<'_> {
+    fn ready(&self, events: libc::c_short) -> io::Result<()> {
+        if self.wait.is_some() || self.until.is_some() {
+            wait_until(self.socket, events, self.wait, self.until)?;
+        }
+        Ok(())
+    }
 }
 
 impl io::Read for Waiting<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(wait) = self.wait {
-            wait_until(self.socket, libc::POLLIN, wait)?;
-        }
+        self.ready(libc::POLLIN)?;
         let mut socket = self.socket;
         socket.read(buf)
     }
@@ -371,9 +441,7 @@ impl io::Read for Waiting<'_> {
 
 impl io::Write for Waiting<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(wait) = self.wait {
-            wait_until(self.socket, libc::POLLOUT, wait)?;
-        }
+        self.ready(libc::POLLOUT)?;
         let mut socket = self.socket;
         socket.write(buf)
     }
@@ -528,8 +596,8 @@ impl Client {
     /// Everything after the socket connects, split out so the tests can hand it
     /// one end of a `UnixStream::pair` with a scripted server on the other.
     fn handshake(socket: UnixStream, name: &str, wait: Option<fn()>) -> Result<Self> {
-        if let Some(wait) = wait {
-            wait_until(&socket, libc::POLLIN, wait)?;
+        if wait.is_some() {
+            wait_until(&socket, libc::POLLIN, wait, None)?;
         }
         let (fd, byte) = greet(&socket)?;
 
@@ -555,12 +623,14 @@ impl Client {
             buf,
             generation: 0,
             stale: false,
+            abandoned: false,
             notices: Vec::new(),
         };
 
         let mut io = Waiting {
             socket: &conn.socket,
             wait,
+            until: None,
         };
         let greeting = match read_frame(&mut io, &mut conn.buf)? {
             Some(frame) => frame,
@@ -668,8 +738,11 @@ impl Client {
     /// Whether a request on this connection was abandoned partway, so that the
     /// stream can no longer pair a response with its request. Every call on a
     /// broken client fails; reconnect.
+    ///
+    /// Two things abandon one: a hook unwinding out of a wait, and a release
+    /// that gave up after two seconds without an answer.
     pub fn is_broken(&self) -> bool {
-        self.conn.is_poisoned()
+        self.conn.lock().map_or(true, |conn| conn.abandoned)
     }
 
     /// Is this connection serving blocks through the shared arena, or inline?
@@ -969,10 +1042,12 @@ impl Snapshot {
 impl Drop for Snapshot {
     /// Release the pinned version. Errors are dropped on purpose: this runs on every
     /// path including an early return, and there is nothing a caller could do with a
-    /// failure to close something it is finished with.
+    /// failure to close something it is finished with. The wait for the answer
+    /// gives up after two seconds and runs no wait hook, because a hook that
+    /// unwound out of a drop could abort the process.
     fn drop(&mut self) {
         if let Ok(mut conn) = self.conn.lock() {
-            let _ = conn.request(Frame::SnapshotClose { snapshot: self.id });
+            let _ = conn.release(Frame::SnapshotClose { snapshot: self.id });
         }
     }
 }
@@ -1257,7 +1332,7 @@ impl Drop for LaneCursor {
     /// Release the handle. Errors dropped, for the reason [`Snapshot::drop`] gives.
     fn drop(&mut self) {
         if let Ok(mut conn) = self.conn.lock() {
-            let _ = conn.request(Frame::LanesRelease { lanes: self.handle });
+            let _ = conn.release(Frame::LanesRelease { lanes: self.handle });
         }
     }
 }
@@ -1270,7 +1345,13 @@ mod tests {
     /// The server half of a handshake, in inline mode: the greeting frame with
     /// no descriptor, then `Done` for the client's hello, then silence until the
     /// client goes away.
-    fn greet_then_fall_silent(mut server: UnixStream) {
+    fn greet_then_fall_silent(server: UnixStream) {
+        greet_open_then_fall_silent(server, 0);
+    }
+
+    /// As [`greet_then_fall_silent`], answering the first `opens` requests,
+    /// each of which must be `SnapshotOpen`, before it falls silent.
+    fn greet_open_then_fall_silent(mut server: UnixStream, opens: u64) {
         let hello = Frame::ServerHello {
             protocol: u32::from(ipc::VERSION),
             generation: 1,
@@ -1290,6 +1371,17 @@ mod tests {
             Some(Frame::ClientHello { .. })
         ));
         server.write_all(&Frame::Done.encode().unwrap()).unwrap();
+        for snapshot in 1..=opens {
+            assert!(matches!(
+                read_frame(&mut server, &mut buf).unwrap(),
+                Some(Frame::SnapshotOpen)
+            ));
+            let opened = Frame::SnapshotOpened {
+                snapshot,
+                version: 7,
+            };
+            server.write_all(&opened.encode().unwrap()).unwrap();
+        }
         // Hold the socket open and answer nothing, swallowing whatever the
         // client sends, until it closes.
         let mut sink = [0u8; 256];
@@ -1367,5 +1459,55 @@ mod tests {
         });
         assert!(ended, "the hook did not end the wait");
         assert_eq!(TICKS.load(Ordering::SeqCst), 2);
+    }
+
+    /// Releasing a snapshot must not wait on the server for ever, and must not
+    /// run the hook.
+    ///
+    /// A PostgreSQL backend drops its pinned snapshots from the transaction
+    /// abort callback, and PostgreSQL holds interrupts off for the whole abort,
+    /// so `CHECK_FOR_INTERRUPTS` does nothing there: the hook below never
+    /// raises, which is what it does in that callback. Against a server that
+    /// has fallen silent, a release that waited for its answer would hold the
+    /// backend in the abort past `pg_terminate_backend`. And a hook that did raise
+    /// would be unwinding out of a `Drop`, which aborts the process when the
+    /// drop is itself part of an unwind.
+    #[test]
+    fn releasing_a_snapshot_on_a_silent_server_gives_up_and_breaks_the_client() {
+        static TICKS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            TICKS.fetch_add(1, Ordering::SeqCst);
+        }
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || greet_open_then_fall_silent(server_end, 1));
+        let client = Client::handshake(client_end, "test", Some(hook)).unwrap();
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.version(), 7);
+
+        let started = std::time::Instant::now();
+        let client = within(move || {
+            drop(snapshot);
+            client
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited >= RELEASE_WAIT && waited < RELEASE_WAIT * 3,
+            "the release gave up after {waited:?}, not after about {RELEASE_WAIT:?}"
+        );
+        assert_eq!(
+            TICKS.load(Ordering::SeqCst),
+            0,
+            "a release must not run the hook"
+        );
+
+        // Its answer may still arrive, and would be read as the next request's.
+        assert!(client.is_broken());
+        let refused = client
+            .snapshot()
+            .err()
+            .expect("a client whose release was abandoned must refuse");
+        assert!(refused.to_string().contains("abandoned"), "{refused}");
+        drop(client);
+        server.join().unwrap();
     }
 }
