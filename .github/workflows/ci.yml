@@ -576,12 +576,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly with the sanitizer prerequisites
+      # Only sanitizers require nightly. Keep ordinary builds on stable, as in
+      # the local gate: a nightly async-drop query cycle prevented DataFusion
+      # from compiling for the aged-state measurement on 2026-11-01.
+      - name: Install stable and nightly with the sanitizer prerequisites
         # `rust-src` is for ThreadSanitizer's `-Zbuild-std`, not for MIRI.
         run: |
           rustup toolchain install nightly --profile minimal \
             --component rust-src
-          rustup default nightly
+          rustup toolchain install stable --profile minimal
+          rustup default stable
           rustc --version
 
       - name: Install valgrind
@@ -608,7 +612,7 @@ jobs:
         # memory-safety bug lives. Do not "fix" this by deleting the doctests.
         run: |
           RUSTFLAGS="-Zsanitizer=address" \
-            cargo test -p yesno-core --lib --tests \
+            cargo +nightly test -p yesno-core --lib --tests \
             --target x86_64-unknown-linux-gnu
 
       - name: ThreadSanitizer
@@ -616,7 +620,7 @@ jobs:
         # away and ASan does not check races.
         run: |
           RUSTFLAGS="-Zsanitizer=thread" \
-            cargo test -p yesno-core -Zbuild-std \
+            cargo +nightly test -p yesno-core -Zbuild-std \
             --target x86_64-unknown-linux-gnu --test concurrency
 
       - name: Valgrind
