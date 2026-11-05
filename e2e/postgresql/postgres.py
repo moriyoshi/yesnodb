@@ -38,7 +38,7 @@ env = [
 
 
 def checked(out, label):
-    assert out["success"], f"{label} failed:\n{actual}\n{out['stderr']}"
+    assert out["success"], f"{label} failed:\n{out['stdout']}\n{out['stderr']}"
     return out
 
 
@@ -221,6 +221,83 @@ for name, option in [
     assert "the session is still usable" in said, name + ":\n" + said
 checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop silent extension")
 fx_silent_stop()
+
+# A release must not wait on a server that has stopped answering either.
+#
+# A REPEATABLE READ read pins a channel snapshot for the transaction, and
+# ROLLBACK releases it from PostgreSQL's abort callback, where interrupts are
+# held off: no `statement_timeout`, cancel or terminate can end that wait, so the
+# silent server above cannot stand in for it. The channel fixture holds its
+# replies while `mute` exists in its directory, and psql creates the file between
+# the read and the ROLLBACK, since no verb can run while the session does, by
+# absolute path because the sandbox's shell has no `PATH` to find it on. Until
+# 2026-11-05 the release waited for ever. It now gives up after two seconds, which
+# is what the ROLLBACK's timing asserts, so a pin that was never taken fails here
+# rather than passing quickly.
+mute = fx_join(fx_join(work, "chan"), "mute")
+checked(
+    psql_run(
+        [
+            "-q",
+            "-c",
+            "CREATE EXTENSION yesno_pg",
+            "-c",
+            "CREATE SERVER muted_channel FOREIGN DATA WRAPPER yesno_fdw OPTIONS ( socket '"
+            + channel_socket
+            + "' )",
+            "-c",
+            "CREATE FOREIGN TABLE muted42 ( ordinal bigint ) SERVER muted_channel "
+            + "OPTIONS ( key '42' )",
+        ]
+    ),
+    "create muted_channel",
+)
+released = fx_run_merged(
+    "/usr/bin/timeout",
+    [
+        "60",
+        psql,
+        "-X",
+        "-q",
+        "-At",
+        "-c",
+        "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        "-c",
+        "SELECT count(*) FROM muted42",
+        "-c",
+        "\\! /usr/bin/touch " + mute,
+        "-c",
+        "\\timing on",
+        "-c",
+        "ROLLBACK",
+        "-c",
+        "\\timing off",
+        "-c",
+        "\\! /bin/rm -f " + mute,
+        "-c",
+        "SELECT count(*) FROM muted42",
+    ],
+    env,
+    "",
+)
+# Unmuted whatever happened: a backend still waiting would otherwise stay stuck.
+checked(fx_run("/bin/rm", ["-f", mute], env, ""), "unmute the channel fixture")
+said = released["stdout"]
+assert released["code"] != 124, (
+    "a ROLLBACK releasing a channel pin waited 60 s on a server that stopped answering:\n"
+    + said
+)
+assert released["success"], "the muted-release session failed:\n" + said
+timings = [line for line in said.split("\n") if line.startswith("Time: ")]
+assert len(timings) == 1, "expected the ROLLBACK's timing alone:\n" + said
+rollback_ms = int(timings[0].split(" ")[1].split(".")[0])
+assert rollback_ms >= 1900 and rollback_ms < 10000, (
+    f"the ROLLBACK took {rollback_ms} ms, not the two-second release limit:\n" + said
+)
+# Both reads answer, the second on a fresh connection, since the release that
+# gave up left the first one unable to pair a reply with its request.
+assert [line for line in said.split("\n") if line == "10"] == ["10", "10"], said
+checked(psql_run(["-q", "-c", "DROP EXTENSION yesno_pg CASCADE"]), "drop muted extension")
 
 sql_files = fx_list(sql_dir, ".sql")
 expected_files = fx_list(expected_dir, ".out")

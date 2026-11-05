@@ -75,10 +75,12 @@
 //!
 //! The one wait the hook cannot end is a release. [`release_transaction_pins`]
 //! runs from the abort callback, where PostgreSQL holds interrupts off, so a
-//! `SnapshotClose` that waited for a silent server would hold the backend in its
-//! abort past `pg_terminate_backend` (by reading PostgreSQL's abort path; the
-//! client's own test demonstrates the wait). The client bounds every release instead,
-//! runs no hook for it, and breaks the connection when it gives up.
+//! `SnapshotClose` that waited for a silent server held the backend in its abort:
+//! `e2e/postgresql/postgres.py` mutes the channel between a REPEATABLE READ read
+//! and its ROLLBACK, and before 2026-11-05 that ROLLBACK did not return in 60 s.
+//! With interrupts held off, `pg_terminate_backend` could not have ended it
+//! either. The client bounds every release instead, runs no hook for it, and
+//! breaks the connection when it gives up.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

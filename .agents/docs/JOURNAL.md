@@ -5962,3 +5962,45 @@ non-blocking socket would make it literally true. It was left as is, because it
 needs a frame larger than the free send buffer and a server that has stopped
 reading, and even then a signal ends it. How large a frame `max_writes` allows
 was not checked.
+
+## 2026-11-05: The release hang is now demonstrated in a PostgreSQL backend, and gated
+
+Follow-up to *A channel snapshot released during an abort could wait on a silent
+server for ever*, which said the backend half was known only by reading
+PostgreSQL's abort path. It is now a `gate-pg` assertion.
+
+**The construction.** The harness's in-process `ChannelFixture` holds every reply
+while a file named `mute` exists in its directory. Requests are still read and
+handled; only the answers wait, until the file goes or the fixture stops. The new
+`postgres.py` step creates a `muted_channel` server and a foreign table on key 42,
+then runs one psql session under `/usr/bin/timeout 60`:
+1. `BEGIN ISOLATION LEVEL REPEATABLE READ`, then `SELECT count(*)`, which
+   publishes a pin to `PINS`;
+2. `\! /usr/bin/touch <mute>`, between statements, because no verb can run while
+   psql does;
+3. `\timing on`, then `ROLLBACK`;
+4. `\! /bin/rm -f <mute>`, then the same `SELECT count(*)` again.
+After the session the scenario removes the file itself, so a backend still waiting
+is freed whatever happened.
+
+It asserts that the session was not killed at 60 s, that the `ROLLBACK`'s timing is
+1 900-10 000 ms, and that both reads answered 10. The timing bound is what keeps it
+from passing vacuously. A pin that was never taken, or a mute that never took, gives
+a fast `ROLLBACK`, and the first run proved that: the sandbox's `\!` shell has no
+`PATH`, `touch: not found` muted nothing, and the step failed on "the ROLLBACK took
+0 ms" rather than passing. Both commands now use absolute paths.
+
+**Results.**
+- With `yesno-channel/src/client.rs` put back to its pre-fix version, the session
+  was killed at 60 s, failing with "a ROLLBACK releasing a channel pin waited 60 s
+  on a server that stopped answering". `postgres.py` took 64 950 ms against 4 976
+  ms otherwise.
+- With the fix, `gate-pg.sh` passed. The client was restored from a copy and
+  checked equal to HEAD with `git diff --quiet`.
+- `gate.sh` passed, 3 487 tests, 0 failed.
+
+**A drive-by fix in the same file.** `checked()` interpolated `{actual}` into its
+failure message. `actual` is a global the regression loop assigns later, so a
+`checked` failing before that loop raised a `NameError` that hid the label and the
+output, and one failing inside it printed the previous fixture's output. It now
+prints `out['stdout']`.

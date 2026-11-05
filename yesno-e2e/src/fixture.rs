@@ -923,6 +923,9 @@ struct FlightFixture {
 /// greeting. Inline mode is the fallback if the arena cannot be created, which
 /// is the same decision the server makes, so a scenario exercises the zero-copy
 /// path rather than a simpler one that would hide its arithmetic.
+///
+/// **It falls silent while a file named `mute` exists in its directory.** See
+/// [`Muted`].
 struct ChannelFixture {
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -970,6 +973,7 @@ impl ChannelFixture {
             .set_nonblocking(true)
             .map_err(|error| format!("cannot set the channel socket non-blocking: {error}"))?;
 
+        let mute = dir.join("mute");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_loop = Arc::clone(&stop);
         let thread = thread::Builder::new()
@@ -980,13 +984,17 @@ impl ChannelFixture {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let host = host.clone();
+                            let muted = Muted {
+                                mute: mute.clone(),
+                                stop: Arc::clone(&stop_loop),
+                            };
                             workers.push(thread::spawn(move || {
                                 // The listener is non-blocking; the accepted
                                 // stream must not be, or `serve_blocking` spins.
                                 if stream.set_nonblocking(false).is_err() {
                                     return;
                                 }
-                                Self::serve_one(stream, host);
+                                Self::serve_one(stream, host, muted);
                             }));
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1010,7 +1018,7 @@ impl ChannelFixture {
         ))
     }
 
-    fn serve_one(stream: std::os::unix::net::UnixStream, host: yesno_plugin::Host) {
+    fn serve_one(stream: std::os::unix::net::UnixStream, host: yesno_plugin::Host, muted: Muted) {
         use yesno_plugin::channel::{send_fd, serve_blocking, Arena, Session};
         let limits = Self::limits();
         match Arena::new(limits.arena_bytes()) {
@@ -1019,13 +1027,62 @@ impl ChannelFixture {
                     return;
                 }
                 let mut session = Session::new(host, arena, limits);
-                let _ = serve_blocking(&mut session, stream);
+                let _ = serve_blocking(&mut session, muted.over(stream));
             }
             Err(_) => {
                 let mut session = Session::new_inline(host, limits);
-                let _ = serve_blocking(&mut session, stream);
+                let _ = serve_blocking(&mut session, muted.over(stream));
             }
         }
+    }
+}
+
+/// Holds every reply of a [`ChannelFixture`] connection while the file `mute`
+/// exists, until it is removed or the fixture stops.
+///
+/// The server a *release* must not wait on for ever. [`SilentFixture`] never
+/// greets, so no client gets far enough to hold a snapshot on it; this one
+/// answers until told not to. A scenario tells it from inside a `psql` session,
+/// with `\! touch`, because no verb can run while that session does. Requests
+/// are still read and handled while muted, so the session's state moves on
+/// exactly as it would on a server whose answers were lost.
+struct Muted {
+    mute: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Muted {
+    fn over(self, stream: std::os::unix::net::UnixStream) -> MutedStream {
+        MutedStream {
+            stream,
+            muted: self,
+        }
+    }
+}
+
+struct MutedStream {
+    stream: std::os::unix::net::UnixStream,
+    muted: Muted,
+}
+
+impl Read for MutedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for MutedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        while self.muted.mute.exists()
+            && !self.muted.stop.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
     }
 }
 
