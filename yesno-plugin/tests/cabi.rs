@@ -375,3 +375,140 @@ fn a_snapshot_outlives_a_closed_channel_handle() {
 
     server.join().unwrap();
 }
+
+/// A stop check ends a request the server never answers, and leaves the channel
+/// broken.
+///
+/// The server greets and accepts the hello, then holds every later reply until
+/// the test lets it go. A host such as a MySQL storage engine passes a check of
+/// its session's kill flag; here the check reads a flag through its argument,
+/// which is also what proves the argument arrives intact.
+#[test]
+fn a_stop_check_ends_a_request_the_server_never_answers() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Writes the greeting and the hello's `Done`, then holds every write.
+    struct Falls {
+        stream: std::os::unix::net::UnixStream,
+        written: usize,
+        release: Arc<AtomicBool>,
+    }
+    impl Read for Falls {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.stream.read(buf)
+        }
+    }
+    impl Write for Falls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written += 1;
+            if self.written > 2 {
+                while !self.release.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            self.stream.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    unsafe extern "C" fn flagged(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+        // SAFETY: the test passes a pointer to an `AtomicBool` that outlives the
+        // channel.
+        let stop = unsafe { &*(arg as *const AtomicBool) };
+        std::ffi::c_int::from(stop.load(Ordering::Relaxed))
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("yesno-chanc-stop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _clean = Clean(dir.clone());
+    let db = Db::open_with(
+        dir.join("db"),
+        DbOptions {
+            shards: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let slot = Arc::new(RwLock::new(Some(Arc::new(db))));
+    let host = Host::new(slot, 1, Role::Leader);
+    let sock = dir.join("sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let release = Arc::new(AtomicBool::new(false));
+    let server_release = Arc::clone(&release);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut session = Session::new_inline(host, limits());
+        let falls = Falls {
+            stream,
+            written: 0,
+            release: server_release,
+        };
+        let _ = serve_blocking(&mut session, falls);
+    });
+
+    let stop = AtomicBool::new(false);
+    let path = cstr(&sock);
+    let name = std::ffi::CString::new("stop").unwrap();
+    let mut err = [0 as std::ffi::c_char; 256];
+    // SAFETY: valid strings and buffers; `stop` outlives the channel.
+    unsafe {
+        let mut channel: *mut yesno_channel = std::ptr::null_mut();
+        assert_eq!(
+            yesno_channel_open_waiting(
+                path.as_ptr(),
+                name.as_ptr(),
+                5000,
+                Some(flagged),
+                &stop as *const AtomicBool as *mut std::ffi::c_void,
+                &mut channel,
+                err.as_mut_ptr(),
+                err.len()
+            ),
+            0,
+            "a server that greets must open"
+        );
+        let mut broken = 7u8;
+        assert_eq!(
+            yesno_channel_is_broken(channel, &mut broken, err.as_mut_ptr(), err.len()),
+            0
+        );
+        assert_eq!(broken, 0);
+
+        stop.store(true, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let mut snap: *mut yesno_channel_snapshot = std::ptr::null_mut();
+        let status = yesno_channel_snapshot_open(channel, &mut snap, err.as_mut_ptr(), err.len());
+        let message = std::ffi::CStr::from_ptr(err.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(status, 6, "expected INTERRUPTED: {message}");
+        assert!(message.contains("interrupted"), "{message}");
+        assert!(snap.is_null());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop check took {:?} to end the wait",
+            started.elapsed()
+        );
+
+        assert_eq!(
+            yesno_channel_is_broken(channel, &mut broken, err.as_mut_ptr(), err.len()),
+            0
+        );
+        assert_eq!(broken, 1, "an interrupted channel must say it is broken");
+        stop.store(false, Ordering::Relaxed);
+        let refused = yesno_channel_snapshot_open(channel, &mut snap, err.as_mut_ptr(), err.len());
+        let message = std::ffi::CStr::from_ptr(err.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(refused, 1, "a broken channel must refuse: {message}");
+        assert!(message.contains("abandoned"), "{message}");
+        yesno_channel_close(channel);
+    }
+    release.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+}

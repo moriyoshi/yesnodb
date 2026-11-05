@@ -44,11 +44,25 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  /* The interruptible open fails the same way, with or without a stop check. */
+  status = yesno_channel_open_waiting(absent, "smoke", 1000, NULL, NULL, &channel,
+                                      error, sizeof error);
+  if (status == YESNO_CHANNEL_OK || channel != NULL) {
+    fprintf(stderr, "an interruptible open of %s should have failed\n", absent);
+    return 1;
+  }
+
   /* Null handles are reported, not dereferenced. */
   uint8_t flag = 7;
   status = yesno_channel_is_arena(NULL, &flag, error, sizeof error);
   if (status != YESNO_CHANNEL_ERROR) {
     fprintf(stderr, "a null channel must be an error, got %d\n", (int)status);
+    return 1;
+  }
+
+  status = yesno_channel_is_broken(NULL, &flag, error, sizeof error);
+  if (status != YESNO_CHANNEL_ERROR) {
+    fprintf(stderr, "a null channel must be an error to is_broken, got %d\n", (int)status);
     return 1;
   }
 
@@ -86,6 +100,7 @@ int main(int argc, char **argv) {
   assert(YESNO_CHANNEL_STALE == 3);
   assert(YESNO_CHANNEL_EXPIRED == 4);
   assert(YESNO_CHANNEL_WRONG_ROLE == 5);
+  assert(YESNO_CHANNEL_INTERRUPTED == 6);
   assert(YESNO_CHANNEL_LANE_ARRAY == 0);
   assert(YESNO_CHANNEL_LANE_BITMAP == 1);
   assert(YESNO_CHANNEL_LANE_RUN == 2);

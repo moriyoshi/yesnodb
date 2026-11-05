@@ -206,11 +206,15 @@ pub enum Notice {
     RoleChanged { from: Role, to: Role },
 }
 
+/// What a waiting client runs every 50 ms while the server has not answered.
+/// See [`Client::connect_waiting`] and [`Client::connect_with`].
+pub type WaitHook = Arc<dyn Fn() + Send + Sync>;
+
 struct Connection {
     socket: UnixStream,
     /// Run every [`WAIT_TICK_MS`] while the socket is not ready, if set. See
     /// [`Client::connect_waiting`].
-    wait: Option<fn()>,
+    wait: Option<WaitHook>,
     buf: Vec<u8>,
     /// The generation from `ServerHello`. An `Available` naming a different one means
     /// the database was replaced while we were away, so it is not good news.
@@ -228,7 +232,8 @@ impl Connection {
     /// Steps over server-initiated notices, recording them. A [`Frame::Fault`]
     /// becomes [`Error::Fault`] here so that no call site has to remember to check.
     fn request(&mut self, frame: Frame) -> Result<Frame> {
-        self.exchange(frame, self.wait, None)
+        let hook = self.wait.clone();
+        self.exchange(frame, hook.as_deref(), None)
     }
 
     /// Send a release from a [`Drop`] and wait for its answer, but never run the
@@ -251,7 +256,7 @@ impl Connection {
     fn exchange(
         &mut self,
         frame: Frame,
-        wait: Option<fn()>,
+        wait: Option<&(dyn Fn() + Send + Sync)>,
         until: Option<std::time::Instant>,
     ) -> Result<Frame> {
         if self.abandoned {
@@ -370,7 +375,7 @@ const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 fn wait_until(
     socket: &UnixStream,
     events: libc::c_short,
-    wait: Option<fn()>,
+    wait: Option<&(dyn Fn() + Send + Sync)>,
     until: Option<std::time::Instant>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -418,7 +423,7 @@ fn wait_until(
 /// it has neither.
 struct Waiting<'a> {
     socket: &'a UnixStream,
-    wait: Option<fn()>,
+    wait: Option<&'a (dyn Fn() + Send + Sync)>,
     until: Option<std::time::Instant>,
 }
 
@@ -590,14 +595,41 @@ impl Client {
     /// abandons leaves this client [`broken`](Client::is_broken): every later
     /// call fails promptly naming why, and the caller must reconnect.
     pub fn connect_waiting(path: impl AsRef<Path>, name: &str, wait: Option<fn()>) -> Result<Self> {
-        Self::handshake(UnixStream::connect(path.as_ref())?, name, wait)
+        let hook = wait.map(|wait| Arc::new(wait) as WaitHook);
+        Self::handshake(UnixStream::connect(path.as_ref())?, name, hook, None)
+    }
+
+    /// [`Client::connect_waiting`] for a hook that carries state, and with the
+    /// handshake given up after `handshake_within` when that is set.
+    ///
+    /// For a host that cannot unwind through this client on its own: the C ABI
+    /// wraps a foreign stop check in a hook that unwinds to its own boundary. The
+    /// time limit is for a caller with nothing to stop it while it connects, such
+    /// as a storage engine initializing inside its server's startup, where a
+    /// server that never greets would otherwise hold that startup for ever. A
+    /// handshake that runs out of time fails with an `io::ErrorKind::TimedOut`
+    /// error, and no connection results.
+    pub fn connect_with(
+        path: impl AsRef<Path>,
+        name: &str,
+        wait: Option<WaitHook>,
+        handshake_within: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        let socket = UnixStream::connect(path.as_ref())?;
+        let until = handshake_within.map(|within| std::time::Instant::now() + within);
+        Self::handshake(socket, name, wait, until)
     }
 
     /// Everything after the socket connects, split out so the tests can hand it
     /// one end of a `UnixStream::pair` with a scripted server on the other.
-    fn handshake(socket: UnixStream, name: &str, wait: Option<fn()>) -> Result<Self> {
-        if wait.is_some() {
-            wait_until(&socket, libc::POLLIN, wait, None)?;
+    fn handshake(
+        socket: UnixStream,
+        name: &str,
+        wait: Option<WaitHook>,
+        until: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        if wait.is_some() || until.is_some() {
+            wait_until(&socket, libc::POLLIN, wait.as_deref(), until)?;
         }
         let (fd, byte) = greet(&socket)?;
 
@@ -619,7 +651,7 @@ impl Client {
 
         let mut conn = Connection {
             socket,
-            wait,
+            wait: wait.clone(),
             buf,
             generation: 0,
             stale: false,
@@ -629,8 +661,8 @@ impl Client {
 
         let mut io = Waiting {
             socket: &conn.socket,
-            wait,
-            until: None,
+            wait: wait.as_deref(),
+            until,
         };
         let greeting = match read_frame(&mut io, &mut conn.buf)? {
             Some(frame) => frame,
@@ -705,10 +737,12 @@ impl Client {
         conn.generation = generation;
 
         // Only now may the client speak, and `ClientHello` is answered with `Done`.
-        match conn.request(Frame::ClientHello {
+        // Inside the handshake's time limit, like the greeting before it.
+        let hello = Frame::ClientHello {
             protocol: version,
             name: name.to_owned(),
-        })? {
+        };
+        match conn.exchange(hello, wait.as_deref(), until)? {
             Frame::Done => {}
             _ => return protocol("yesnod did not accept the channel hello"),
         }
@@ -1417,7 +1451,8 @@ mod tests {
         }
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || greet_then_fall_silent(server_end));
-        let client = Client::handshake(client_end, "test", Some(hook)).unwrap();
+        let client =
+            Client::handshake(client_end, "test", Some(Arc::new(hook) as WaitHook), None).unwrap();
         assert_eq!(
             TICKS.load(Ordering::SeqCst),
             0,
@@ -1455,10 +1490,38 @@ mod tests {
         }
         let (client_end, _silent) = UnixStream::pair().unwrap();
         let ended = within(move || {
-            std::panic::catch_unwind(|| Client::handshake(client_end, "test", Some(hook))).is_err()
+            std::panic::catch_unwind(|| {
+                Client::handshake(client_end, "test", Some(Arc::new(hook) as WaitHook), None)
+            })
+            .is_err()
         });
         assert!(ended, "the hook did not end the wait");
         assert_eq!(TICKS.load(Ordering::SeqCst), 2);
+    }
+
+    /// A greeting that never comes ends at the handshake's time limit, as a
+    /// `TimedOut` I/O error, with no hook needed to end it.
+    ///
+    /// The case a storage engine meets when it connects from its server's
+    /// startup, where nothing would ever run a hook.
+    #[test]
+    fn a_greeting_that_never_comes_ends_at_the_handshake_limit() {
+        let (client_end, _silent) = UnixStream::pair().unwrap();
+        let limit = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = within(move || {
+            let until = std::time::Instant::now() + limit;
+            Client::handshake(client_end, "test", None, Some(until)).err()
+        });
+        let waited = started.elapsed();
+        let Some(Error::Io(e)) = result else {
+            panic!("expected a timed-out handshake, got {result:?}");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(
+            waited >= limit && waited < limit * 10,
+            "the handshake gave up after {waited:?}, not after about {limit:?}"
+        );
     }
 
     /// Releasing a snapshot must not wait on the server for ever, and must not
@@ -1480,7 +1543,8 @@ mod tests {
         }
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || greet_open_then_fall_silent(server_end, 1));
-        let client = Client::handshake(client_end, "test", Some(hook)).unwrap();
+        let client =
+            Client::handshake(client_end, "test", Some(Arc::new(hook) as WaitHook), None).unwrap();
         let snapshot = client.snapshot().unwrap();
         assert_eq!(snapshot.version(), 7);
 

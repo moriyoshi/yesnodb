@@ -54,11 +54,12 @@
 )]
 
 use std::any::Any;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::sync::Arc;
 
-use crate::client::{Client, Error, LaneCursor, Snapshot};
+use crate::client::{Client, Error, LaneCursor, Snapshot, WaitHook};
 use crate::ipc::{Write, WriteOp};
 
 const YESNO_CHANNEL_OK: c_int = 0;
@@ -67,7 +68,17 @@ const YESNO_CHANNEL_RETRY: c_int = 2;
 const YESNO_CHANNEL_STALE: c_int = 3;
 const YESNO_CHANNEL_EXPIRED: c_int = 4;
 const YESNO_CHANNEL_WRONG_ROLE: c_int = 5;
+const YESNO_CHANNEL_INTERRUPTED: c_int = 6;
 
+/// The unwind payload of a wait the caller's stop check ended.
+///
+/// Carried by `resume_unwind` rather than `panic!`, which would run the panic
+/// hook and print a backtrace into the host's log every time a query is
+/// killed. [`ffi_call`] recognises it and reports `INTERRUPTED`.
+struct Interrupted;
+
+/// The caller's stop check, as `yesno_channel_open_waiting` received it.
+type StopCheck = unsafe extern "C" fn(*mut c_void) -> c_int;
 pub struct yesno_channel {
     inner: Client,
 }
@@ -184,6 +195,14 @@ fn ffi_call(
             write_error(error, error_capacity, &e.message());
             e.status()
         }
+        Err(payload) if payload.is::<Interrupted>() => {
+            write_error(
+                error,
+                error_capacity,
+                "interrupted: the caller's stop check ended the wait",
+            );
+            YESNO_CHANNEL_INTERRUPTED
+        }
         Err(payload) => {
             write_error(error, error_capacity, &panic_message(payload));
             YESNO_CHANNEL_ERROR
@@ -272,6 +291,61 @@ pub unsafe extern "C" fn yesno_channel_open(
         let boxed = Box::new(yesno_channel { inner: client });
         // SAFETY: `out` is non-null, checked above.
         unsafe { *out = Box::into_raw(boxed) };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn yesno_channel_open_waiting(
+    socket_path: *const c_char,
+    name: *const c_char,
+    handshake_timeout_ms: u32,
+    should_stop: Option<StopCheck>,
+    should_stop_arg: *mut c_void,
+    out: *mut *mut yesno_channel,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> c_int {
+    ffi_call(error, error_capacity, || {
+        out_ptr(out, "channel")?;
+        let path = unsafe { str_arg(socket_path, "socket_path") }?;
+        let name = unsafe { str_arg(name, "name") }?;
+        // An address, not a pointer, so the hook is `Send + Sync`. The header
+        // makes the caller responsible for what it points to.
+        let arg = should_stop_arg as usize;
+        let hook = should_stop.map(|check| {
+            Arc::new(move || {
+                // SAFETY: the header requires `should_stop` to be callable with
+                // `should_stop_arg` from any thread waiting in a call on this
+                // channel, for as long as the channel or anything opened from it
+                // is live.
+                if unsafe { check(arg as *mut c_void) } != 0 {
+                    std::panic::resume_unwind(Box::new(Interrupted));
+                }
+            }) as WaitHook
+        });
+        let within = (handshake_timeout_ms != 0)
+            .then(|| std::time::Duration::from_millis(u64::from(handshake_timeout_ms)));
+        let client = Client::connect_with(path, name, hook, within)?;
+        let boxed = Box::new(yesno_channel { inner: client });
+        // SAFETY: `out` is non-null, checked above.
+        unsafe { *out = Box::into_raw(boxed) };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn yesno_channel_is_broken(
+    channel: *const yesno_channel,
+    out: *mut u8,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> c_int {
+    ffi_call(error, error_capacity, || {
+        out_ptr(out, "is_broken")?;
+        let c = unsafe { handle(channel, "channel") }?;
+        // SAFETY: `out` is non-null, checked above.
+        unsafe { *out = u8::from(c.inner.is_broken()) };
         Ok(())
     })
 }

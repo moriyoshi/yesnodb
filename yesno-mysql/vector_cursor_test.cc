@@ -10,9 +10,16 @@
 // subtlety: a cursor must be able to sit *outside* the set at either end and
 // come back, which is what `ORDER BY ... DESC` needs after a failed seek.
 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -168,12 +175,48 @@ void one_element() {
 void absent_socket() {
   std::string error;
   auto backend = yesno_mysql::OpenChannelBackend("/nonexistent/yesno.sock",
-                                                 &error);
+                                                 nullptr, &error);
   expect(backend == nullptr, "an absent socket yields no backend");
   expect(!error.empty(), "and leaves a message");
   expect(error.find("yesno channel") != std::string::npos,
          "the message names the transport");
   std::printf("absent socket reported: %s\n", error.c_str());
+}
+
+int always_stop(void *) { return 1; }
+
+/// A server that accepts and never greets cannot hold the open once the stop
+/// check says stop: it fails promptly, as interrupted, with no backend.
+///
+/// The listener never calls `accept`; the kernel completes the connection from
+/// its backlog, which is all a silent yesnod looks like from this side.
+void a_stop_check_ends_an_open_that_is_never_greeted() {
+  char dir[] = "/tmp/yesno-mysql-silent-XXXXXX";
+  expect(mkdtemp(dir) != nullptr, "make a directory for the silent socket");
+  const std::string path = std::string(dir) + "/s";
+  const int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+  expect(listener >= 0, "create the silent listener");
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::strncpy(address.sun_path, path.c_str(), sizeof address.sun_path - 1);
+  expect(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof address) == 0,
+         "bind the silent listener");
+  expect(listen(listener, 4) == 0, "listen on the silent socket");
+
+  std::string error;
+  const auto started = std::chrono::steady_clock::now();
+  auto backend = yesno_mysql::OpenChannelBackend(path, always_stop, &error);
+  const auto waited = std::chrono::steady_clock::now() - started;
+  close(listener);
+  unlink(path.c_str());
+  rmdir(dir);
+
+  expect(backend == nullptr, "an interrupted open yields no backend");
+  expect(error.find("interrupted") != std::string::npos,
+         "an interrupted open says so");
+  expect(waited < std::chrono::seconds(2),
+         "the stop check ended the open, not the handshake's time limit");
+  std::printf("silent socket reported: %s\n", error.c_str());
 }
 
 }  // namespace
@@ -184,6 +227,7 @@ int main() {
   empty_set();
   one_element();
   absent_socket();
+  a_stop_check_ends_an_open_that_is_never_greeted();
   std::printf("yesno-mysql shared cursor and channel backend tests passed\n");
   return 0;
 }

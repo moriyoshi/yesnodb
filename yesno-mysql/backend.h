@@ -36,6 +36,9 @@ enum class BackendStatus {
   kExpired = 4,
   /// The request needed a leader and reached a read-only replica.
   kWrongRole = 5,
+  /// The query was killed while the backend waited for its server. Only the
+  /// channel backend reports it; the statement is over, so nothing retries.
+  kInterrupted = 6,
 };
 
 enum class SeekMode {
@@ -122,7 +125,13 @@ std::unique_ptr<Backend> OpenFlightBackend(const std::string& endpoint,
 /// Unlike `OpenFlightBackend`, its `Apply` is **one commit** across every key,
 /// because a single channel `Apply` frame carries them all -- so its atomicity
 /// matches the embedded backend's rather than Flight's.
+///
+/// `should_stop` is called with a null argument on whichever thread is waiting,
+/// about every 50 ms, and nonzero ends the wait with `kInterrupted`. The engine
+/// passes a check of the waiting session's kill flag, which is what lets `KILL
+/// QUERY` and `max_execution_time` end a query whose yesnod stopped answering.
 std::unique_ptr<Backend> OpenChannelBackend(const std::string &socket_path,
+                                            int (*should_stop)(void *),
                                             std::string *error);
 
 }  // namespace yesno_mysql

@@ -64,6 +64,10 @@ int bridge_status(yesno_mysql::BackendStatus status, const std::string &error) {
   switch (status) {
     case yesno_mysql::BackendStatus::kOk:
       return 0;
+    // No message of ours: MySQL reports the kill itself, as "Query execution
+    // was interrupted", which is what the client of a killed query expects.
+    case yesno_mysql::BackendStatus::kInterrupted:
+      return HA_ERR_QUERY_INTERRUPTED;
     case yesno_mysql::BackendStatus::kRetry:
       classification = "backend temporarily unavailable, retrying may succeed";
       break;
@@ -86,6 +90,16 @@ int bridge_status(yesno_mysql::BackendStatus status, const std::string &error) {
                     classification);
   }
   return HA_ERR_INTERNAL_ERROR;
+}
+
+/// The channel backend's stop check: has the session waiting been killed?
+///
+/// Called on the waiting thread, so `current_thd` is the session whose request
+/// is in flight. Null during plugin initialization, where nothing can be
+/// killed and the handshake's own time limit applies instead.
+int waiting_session_killed(void *) {
+  THD *thd = current_thd;
+  return thd != nullptr && thd_killed(thd) != 0 ? 1 : 0;
 }
 
 int command_error(const char *message) {
@@ -686,7 +700,8 @@ int yesno_init_func(void *plugin) {
       return 1;
     }
     yesno_backend =
-        yesno_mysql::OpenChannelBackend(yesno_channel_socket, &error);
+        yesno_mysql::OpenChannelBackend(yesno_channel_socket,
+                                        waiting_session_killed, &error);
   } else {
     my_printf_error(
         ER_UNKNOWN_ERROR,

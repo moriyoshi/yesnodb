@@ -6004,3 +6004,87 @@ failure message. `actual` is a global the regression loop assigns later, so a
 `checked` failing before that loop raised a `NameError` that hid the label and the
 output, and one failing inside it printed the previous fixture's output. It now
 prints `out['stdout']`.
+
+## 2026-11-06: The MySQL channel backend answers KILL QUERY, and a silent yesnod no longer holds mysqld's startup
+
+Filed the same day as `the-mysql-engine-cannot-be-interrupted-while-it-waits-on-yesnod`,
+after the PostgreSQL interrupt work, by reading. Reproduced first, then fixed. The
+Flight backend is not covered and is what remains of that entry.
+
+**Reproduction, in `e2e/mysql/mysql.py`.** `run_backend`'s mysqld setup became
+`boot( label, backend_args )` so the new steps could start their own servers.
+- **KILL QUERY.** A mysqld on the channel fixture creates a table and fills it, then
+  the fixture's `mute` file is created (see the 2026-11-05 entry). A background
+  client runs `SELECT COUNT(*)`. Another finds its session in
+  `information_schema.PROCESSLIST` and runs `KILL QUERY`, and the scenario gives
+  the first client 10 s to end. Pre-fix, it was still running at 10 s. `fx_close`
+  killed it, and it had printed nothing.
+- **Startup.** A mysqld with `--yesno-backend=channel` pointed at
+  `fx_silent_start`'s socket. Pre-fix, its log stopped at "InnoDB initialization
+  has ended", with no plugin error and no "ready for connections", because the
+  plugin's init was waiting for a greeting.
+- The two results are collected and asserted together, so one run reports both.
+  The first run asserted at once and stopped at the first.
+- **A probe bug, found by the fixed run.** The readiness loop used `mysql_run`,
+  which adds `--database=test`, and a fresh server has no such database, so the
+  probe could never succeed. The pre-fix startup result rests on the log above,
+  not on that probe. The fixed run's log showed "ready for connections" about
+  10.3 s after start while the probe still failed. The probe is now a plain
+  `SELECT 1`. The corrected probe was not re-run against the pre-fix code.
+
+**The fix.**
+- `yesno-channel`: the wait hook is now `WaitHook = Arc<dyn Fn() + Send + Sync>`,
+  so it can carry state. `connect_waiting` keeps its `fn()` signature. The new
+  `Client::connect_with( path, name, hook, handshake_within )` bounds all three
+  handshake waits (the first byte with its descriptor, `ServerHello`, and the
+  hello's `Done`) and fails with `io::ErrorKind::TimedOut`.
+- C ABI, in `yesno-plugin`:
+  - `yesno_channel_open_waiting( path, name, handshake_timeout_ms, should_stop,
+    arg, ... )` wraps the C check in a hook. A nonzero result
+    `resume_unwind`s an `Interrupted` payload (not `panic!`, which would print a
+    backtrace into mysqld's log on every kill). `ffi_call`'s existing
+    `catch_unwind` turns it into the new `YESNO_CHANNEL_INTERRUPTED = 6`.
+    Unwinding with the connection locked poisons it, which is the existing
+    "broken" state.
+  - `yesno_channel_is_broken` reports that state.
+- `yesno-mysql`:
+  - `waiting_session_killed` returns `thd_killed( current_thd )`, null-safe for
+    plugin init.
+  - `kInterrupted` maps to `HA_ERR_QUERY_INTERRUPTED`, with no message of the
+    engine's, so the client sees MySQL's own "Query execution was interrupted".
+    `handler::print_error` maps that code to `ER_QUERY_INTERRUPTED` in 8.4,
+    checked in the pinned source.
+  - The backend's mutex became a `timed_mutex` taken in 50 ms slices that check
+    the same flag. A session queued behind a stuck one can therefore be killed
+    too.
+  - `Enter` reopens the channel when `yesno_channel_is_broken` says so. Before
+    this, the channel backend never reconnected at all: a broken or stale channel
+    failed every query until mysqld restarted.
+  - The handshake limit is 10 s (`kHandshakeTimeoutMs`). On expiry the plugin
+    fails to initialize and mysqld starts without the engine.
+
+**Tests.**
+- `a_greeting_that_never_comes_ends_at_the_handshake_limit` (`yesno-channel`).
+- `a_stop_check_ends_a_request_the_server_never_answers` (`yesno-plugin/tests/cabi.rs`).
+  Its scripted server greets, then holds every reply, and the check reads a flag
+  through its `arg`. It asserts `INTERRUPTED` within 2 s, `is_broken` reporting 1,
+  and the next call refused naming "abandoned". Two sabotages, both restored from a
+  cmp-verified copy:
+  - Ignoring the check made it hang until `timeout 120` ended it.
+  - Mapping the payload to `ERROR` failed it on "expected INTERRUPTED".
+- `a_stop_check_ends_an_open_that_is_never_greeted` in `vector_cursor_test.cc`,
+  run by `scripts/check-channel-cabi.sh`. It uses a listener that never accepts,
+  and expects a prompt "interrupted" from `OpenChannelBackend`.
+- The C fixture covers `yesno_channel_open_waiting` on an absent socket,
+  `yesno_channel_is_broken` on a null channel, and `INTERRUPTED == 6`.
+
+**Gates.** `gate.sh` passed, 3 489 tests, 0 failed, on a cold `target/` after the
+2026-11-05 disk cleanup. `gate-mysql.sh` passed with both new steps green.
+`gate-pg.sh`: see the end of this entry.
+
+**Not done.** The Flight backend has no timeout or stop token in
+`yesno-flight-c++` and is still unkillable against a silent server. And one shared
+connection still queues every session behind a slow one; a kill now ends the
+queueing, but a connection per session or a pool would remove it.
+
+`gate-pg.sh` passed after the entry above was written, completing the three gates.

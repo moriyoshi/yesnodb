@@ -9,10 +9,12 @@
 // than a second hand-written client.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backend.h"
@@ -28,6 +30,18 @@ namespace {
 /// would size the stack buffer below by the protocol's limit rather than by
 /// anything this backend needs.
 constexpr std::size_t kPage = 1024;
+
+/// How long opening the channel may wait for yesnod's greeting.
+///
+/// The first open runs inside mysqld's startup, where no kill can reach it, so
+/// without a limit a yesnod that accepts and never greets holds the whole
+/// server's startup for ever. Measured 2026-11-06: mysqld never accepted a
+/// connection. On expiry the open fails, the plugin does not initialize, and
+/// mysqld starts without the engine.
+constexpr std::uint32_t kHandshakeTimeoutMs = 10000;
+
+/// How often a thread waiting for the connection checks whether it was killed.
+constexpr std::chrono::milliseconds kLockPoll{50};
 
 /// Fold a channel status and its message into a `Backend` error string.
 ///
@@ -58,6 +72,10 @@ BackendStatus Fail(yesno_channel_status status, const char *buffer,
     case YESNO_CHANNEL_WRONG_ROLE:
       name = "read-only replica";
       mapped = BackendStatus::kWrongRole;
+      break;
+    case YESNO_CHANNEL_INTERRUPTED:
+      name = "interrupted";
+      mapped = BackendStatus::kInterrupted;
       break;
     case YESNO_CHANNEL_OK:
     case YESNO_CHANNEL_ERROR:
@@ -97,9 +115,21 @@ class ScopedSnapshot {
   yesno_channel_snapshot *handle_{nullptr};
 };
 
+/// One connection, shared by every session and taken in turn.
+///
+/// **Every wait here answers a kill.** A request waits in the channel, which
+/// runs `should_stop_` while yesnod is silent, and a session queued behind it
+/// waits in [`ChannelBackend::Enter`], which checks the same flag. A killed
+/// request leaves the channel broken, because its answer may still arrive and
+/// would be read as the next request's, so `Enter` opens a fresh one for the
+/// next session.
 class ChannelBackend final : public Backend {
  public:
-  explicit ChannelBackend(yesno_channel *channel) : channel_(channel) {}
+  ChannelBackend(std::string socket_path, int (*should_stop)(void *),
+                 yesno_channel *channel)
+      : socket_path_(std::move(socket_path)),
+        should_stop_(should_stop),
+        channel_(channel) {}
   ~ChannelBackend() override { yesno_channel_close(channel_); }
 
   BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
@@ -124,7 +154,11 @@ class ChannelBackend final : public Backend {
   /// applied would be worse than one refused.
   BackendStatus Apply(const std::vector<KeyWrites> &writes,
              std::string *error) override {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     std::vector<yesno_channel_write> flat;
     for (const KeyWrites &per_key : writes) {
       // A `TRUNCATE` inside the transaction empties the key before the
@@ -169,7 +203,11 @@ class ChannelBackend final : public Backend {
 
   BackendStatus Contains(std::uint64_t key, std::uint64_t ordinal, bool *present,
                 std::string *error) override {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
     const BackendStatus opened =
@@ -189,7 +227,11 @@ class ChannelBackend final : public Backend {
 
   BackendStatus Cardinality(std::uint64_t key, std::uint64_t *cardinality,
                    std::string *error) override {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
     const BackendStatus opened =
@@ -206,7 +248,11 @@ class ChannelBackend final : public Backend {
   }
 
   BackendStatus Clear(std::uint64_t key, std::string *error) override {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     const yesno_channel_write write{key, 0, 0, YESNO_CHANNEL_DELETE_KEY};
     char buffer[512] = {0};
     std::uint64_t version = 0;
@@ -243,7 +289,11 @@ class ChannelBackend final : public Backend {
   /// protocol has no backward continuation at all -- see `vector_cursor.h`.
   BackendStatus OpenCursor(std::uint64_t key, std::unique_ptr<Cursor> *cursor,
                   std::string *error) override {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     char buffer[512] = {0};
     ScopedSnapshot snapshot;
     const BackendStatus opened =
@@ -281,9 +331,45 @@ class ChannelBackend final : public Backend {
   }
 
  private:
+  /// Take the connection, giving up if this session is killed while another
+  /// holds it, and reopen the channel if the last request on it was abandoned.
+  BackendStatus Enter(std::unique_lock<std::timed_mutex> *guard,
+                      std::string *error) {
+    *guard = std::unique_lock<std::timed_mutex>(mutex_, std::defer_lock);
+    while (!guard->try_lock_for(kLockPoll)) {
+      if (should_stop_ != nullptr && should_stop_(nullptr) != 0) {
+        *error = "yesno channel: interrupted while another query held the connection";
+        return BackendStatus::kInterrupted;
+      }
+    }
+    char buffer[512] = {0};
+    if (channel_ != nullptr) {
+      std::uint8_t broken = 1;
+      if (yesno_channel_is_broken(channel_, &broken, buffer, sizeof buffer) ==
+              YESNO_CHANNEL_OK &&
+          broken == 0) {
+        return BackendStatus::kOk;
+      }
+      yesno_channel_close(channel_);
+      channel_ = nullptr;
+    }
+    const yesno_channel_status status = yesno_channel_open_waiting(
+        socket_path_.c_str(), "mysql", kHandshakeTimeoutMs, should_stop_, nullptr,
+        &channel_, buffer, sizeof buffer);
+    if (status != YESNO_CHANNEL_OK) {
+      channel_ = nullptr;
+      return Fail(status, buffer, error);
+    }
+    return BackendStatus::kOk;
+  }
+
   BackendStatus One(std::uint64_t key, std::uint64_t ordinal,
            yesno_channel_write_op op, bool *changed, std::string *error) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::unique_lock<std::timed_mutex> guard;
+    if (const BackendStatus entered = Enter(&guard, error);
+        entered != BackendStatus::kOk) {
+      return entered;
+    }
     const yesno_channel_write write{key, ordinal, ordinal,
                                     static_cast<std::uint8_t>(op)};
     char buffer[512] = {0};
@@ -297,24 +383,30 @@ class ChannelBackend final : public Backend {
     return BackendStatus::kOk;
   }
 
+  const std::string socket_path_;
+  int (*const should_stop_)(void *);
+  /// Null only between a broken channel being closed and its replacement
+  /// opening, which `Enter` completes or reports before anything reads it.
   yesno_channel *channel_;
-  std::mutex mutex_;
+  std::timed_mutex mutex_;
 };
 
 }  // namespace
 
 std::unique_ptr<Backend> OpenChannelBackend(const std::string &socket_path,
+                                            int (*should_stop)(void *),
                                             std::string *error) {
   char buffer[512] = {0};
   yesno_channel *channel = nullptr;
-  const yesno_channel_status status = yesno_channel_open(
-      socket_path.c_str(), "mysql", &channel, buffer, sizeof buffer);
+  const yesno_channel_status status = yesno_channel_open_waiting(
+      socket_path.c_str(), "mysql", kHandshakeTimeoutMs, should_stop, nullptr,
+      &channel, buffer, sizeof buffer);
   if (status != YESNO_CHANNEL_OK) {
     Fail(status, buffer, error);
     return nullptr;
   }
   error->clear();
-  return std::make_unique<ChannelBackend>(channel);
+  return std::make_unique<ChannelBackend>(socket_path, should_stop, channel);
 }
 
 }  // namespace yesno_mysql

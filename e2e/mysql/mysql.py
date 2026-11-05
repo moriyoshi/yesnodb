@@ -423,7 +423,8 @@ def exercise_schema_errors(mysql, client_base, env):
     )
 
 
-def run_backend(label, backend_args, plugin_preloaded, run_fixture):
+# A fresh mysqld with `backend_args`, started but not yet waited for.
+def boot(label, backend_args):
     work = fx_temp("mysql-" + label)
     mysql_home = fx_join(work, "prefix")
     datadir = fx_join(work, "data")
@@ -477,6 +478,23 @@ def run_backend(label, backend_args, plugin_preloaded, run_fixture):
         "--socket=" + socket,
         "--user=root",
     ]
+    return {
+        "server": server,
+        "mysql": mysql,
+        "mysqltest": mysqltest,
+        "client_base": client_base,
+        "env": env,
+        "log": fx_join(work, "mysqld.log"),
+    }
+
+
+def run_backend(label, backend_args, plugin_preloaded, run_fixture):
+    booted = boot(label, backend_args)
+    server = booted["server"]
+    mysql = booted["mysql"]
+    mysqltest = booted["mysqltest"]
+    client_base = booted["client_base"]
+    env = booted["env"]
     fx_wait_ready(server, mysql, client_base + ["--execute=SELECT 1"], env, 60000)
     assert fx_alive(server)
     checked(fx_run(mysql, client_base + ["--execute=CREATE DATABASE test"], env, ""), label + " create database")
@@ -556,4 +574,141 @@ run_backend(
     True,
     True,
 )
+
+
+def channel_args(socket):
+    return [
+        "--plugin-load-add=ha_yesno.so",
+        "--yesno-backend=channel",
+        "--yesno-channel-socket=" + socket,
+    ]
+
+
+def pause():
+    checked(fx_run("/bin/sleep", ["0.2"], [], ""), "sleep")
+
+
+# The id of the session running exactly `sql`, waiting up to about 10 s for it.
+def session_running(mysql, client_base, env, sql):
+    find = "SELECT ID FROM information_schema.PROCESSLIST WHERE INFO = '" + sql + "'"
+    for _ in range(50):
+        out = checked(mysql_run(mysql, client_base, env, find, True), "find " + sql)
+        if out["stdout"] != "":
+            return out["stdout"].strip()
+        pause()
+    assert False, "no session ran " + sql
+
+
+# A query waiting on a yesnod that has stopped answering must end at KILL QUERY.
+#
+# `KILL QUERY` only sets a flag the killed thread has to notice, and until
+# 2026-11-06 a thread parked in the channel's socket read never did: the query
+# was still running 10 s after the kill. The engine now passes the channel a
+# check of the waiting session's kill flag, so the wait ends, the query reports
+# "Query execution was interrupted", and the abandoned connection is replaced on
+# the next use, which the count after unmuting proves. The channel fixture holds
+# its replies while `mute` exists, which gives a server that greeted, answered,
+# and then fell silent.
+mute = fx_join(channel_dir, "mute")
+booted = boot("channel-mute", channel_args(channel_socket))
+server = booted["server"]
+mysql = booted["mysql"]
+client_base = booted["client_base"]
+env = booted["env"]
+fx_wait_ready(server, mysql, client_base + ["--execute=SELECT 1"], env, 60000)
+checked(fx_run(mysql, client_base + ["--execute=CREATE DATABASE test"], env, ""), "mute database")
+checked(
+    mysql_run(
+        mysql,
+        client_base,
+        env,
+        "CREATE TABLE muted (ordinal BIGINT UNSIGNED NOT NULL PRIMARY KEY) "
+        + "ENGINE=YESNO CONNECTION='key=2000'",
+        False,
+    ),
+    "create muted",
+)
+checked(mysql_run(mysql, client_base, env, "INSERT INTO muted VALUES (1), (2), (3)", False), "fill muted")
+stuck_sql = "SELECT COUNT(*) FROM muted"
+fx_write(mute, "")
+stuck = fx_start(mysql, client_base + ["--database=test", "--execute=" + stuck_sql], env)
+killed = mysql_run(
+    mysql, client_base, env, "KILL QUERY " + session_running(mysql, client_base, env, stuck_sql), False
+)
+ended = fx_close(stuck, 10000)
+# Unmuted before any assertion, so a thread still waiting is let go and the
+# server can shut down whatever happened.
+checked(fx_run("/bin/rm", ["-f", mute], [], ""), "unmute")
+after = mysql_run(mysql, client_base, env, stuck_sql, True)
+checked(fx_run(mysql, client_base + ["--execute=SHUTDOWN"], env, ""), "mute shutdown")
+checked(fx_close(server, 30000), "mute mysqld exit")
+checked(killed, "KILL QUERY")
+# Collected rather than asserted at once, so one run reports both hangs.
+hangs = []
+if "interrupted" not in ended["stderr"]:
+    hangs.append(
+        "KILL QUERY did not end a query waiting on a yesnod that stopped answering; "
+        + f"it was still running after 10 s: {ended}"
+    )
+assert checked(after, "count after unmute")["stdout"] == "3\n", after
+
+# Nor may a yesnod that never answers hang mysqld's startup.
+#
+# The channel backend connects in the plugin's init function, which mysqld runs
+# before it accepts a connection, and a greeting that never comes is a wait no
+# kill can reach. Until 2026-11-06 mysqld never accepted a connection here. The
+# handshake now gives up after 10 s, the plugin fails to initialize, and mysqld
+# starts without the engine.
+silent_dir = fx_join(fx_temp("silent"), "s")
+fx_mkdir(silent_dir)
+silent = fx_silent_start(silent_dir)
+booted = boot("channel-silent", channel_args(silent["socket"]))
+server = booted["server"]
+mysql = booted["mysql"]
+client_base = booted["client_base"]
+env = booted["env"]
+up = False
+for _ in range(150):
+    # Not `mysql_run`, which names a database this fresh server does not have.
+    if fx_run(mysql, client_base + ["--execute=SELECT 1"], env, "")["success"]:
+        up = True
+        break
+    pause()
+engine = ""
+if up:
+    engine = checked(
+        fx_run(
+            mysql,
+            client_base
+            + [
+                "--batch",
+                "--skip-column-names",
+                "--execute=SELECT PLUGIN_STATUS FROM information_schema.PLUGINS "
+                + "WHERE PLUGIN_NAME='YESNO'",
+            ],
+            env,
+            "",
+        ),
+        "silent plugin status",
+    )["stdout"]
+    checked(fx_run(mysql, client_base + ["--execute=SHUTDOWN"], env, ""), "silent shutdown")
+    checked(fx_close(server, 30000), "silent mysqld exit")
+else:
+    fx_stop(server)
+fx_silent_stop()
+silent_log = fx_read(booted["log"])
+if not up:
+    hangs.append(
+        "mysqld did not accept a connection within about 30 s of starting against a "
+        + "channel socket that never answers:\n"
+        + silent_log
+    )
+elif engine == "ACTIVE\n" or "did not answer in time" not in silent_log:
+    hangs.append(
+        "mysqld started against a silent channel socket, but the engine was "
+        + "'" + engine.strip() + "' rather than absent, or the log does not say the handshake "
+        + "timed out:\n"
+        + silent_log
+    )
+assert hangs == [], "\n\n".join(hangs)
 fx_channel_stop()

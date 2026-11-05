@@ -36,6 +36,9 @@ typedef struct yesno_channel_lanes yesno_channel_lanes;
  *               retry the call.
  *   WRONG_ROLE  this connection is to a read-only replica and the request
  *               needed a leader.
+ *   INTERRUPTED the stop check given to `yesno_channel_open_waiting` asked to
+ *               end a wait. The request was abandoned partway, so the channel
+ *               is broken: close it and open another.
  *   ERROR       everything else: I/O, a malformed frame, a protocol violation,
  *               or a server fault with no special handling.
  */
@@ -46,6 +49,7 @@ typedef enum yesno_channel_status {
   YESNO_CHANNEL_STALE = 3,
   YESNO_CHANNEL_EXPIRED = 4,
   YESNO_CHANNEL_WRONG_ROLE = 5,
+  YESNO_CHANNEL_INTERRUPTED = 6,
 } yesno_channel_status;
 
 /* Lane payload encodings. The payload's length is implied by the kind and the
@@ -108,6 +112,39 @@ typedef struct yesno_channel_write {
 yesno_channel_status yesno_channel_open(const char *socket_path, const char *name,
                                         yesno_channel **out, char *error,
                                         size_t error_capacity);
+
+/* A stop check: nonzero ends the wait it was called from. */
+typedef int (*yesno_channel_should_stop)(void *arg);
+
+/* `yesno_channel_open`, for a host that must stay interruptible while it waits.
+ *
+ * Every call on a channel otherwise blocks until yesnod answers, however long
+ * that is. Here `should_stop`, when not NULL, is called with `should_stop_arg`
+ * about every 50 ms while any call on this channel, or on a snapshot or lane
+ * cursor opened from it, is waiting for the server, on the thread that is
+ * waiting. When it returns nonzero the call returns YESNO_CHANNEL_INTERRUPTED
+ * and the channel is broken. A storage engine passes a check of its own kill
+ * flag. It must not call into this library, and `should_stop_arg` must stay
+ * valid until the channel and everything opened from it are closed.
+ *
+ * `handshake_timeout_ms`, when not 0, bounds the handshake: a server that
+ * accepts and never greets fails the open with YESNO_CHANNEL_ERROR after that
+ * long, rather than holding the caller for ever. It does not bound later calls,
+ * which is what the stop check is for. Releases, the snapshot and lane close
+ * functions, never run the stop check and give up after two seconds of
+ * silence, breaking the channel. */
+yesno_channel_status yesno_channel_open_waiting(const char *socket_path, const char *name,
+                                                uint32_t handshake_timeout_ms,
+                                                yesno_channel_should_stop should_stop,
+                                                void *should_stop_arg,
+                                                yesno_channel **out, char *error,
+                                                size_t error_capacity);
+
+/* Whether a request on this channel was abandoned partway, by a stop check or a
+ * release that gave up. Every later call on a broken channel fails; close it
+ * and open another. */
+yesno_channel_status yesno_channel_is_broken(const yesno_channel *channel, uint8_t *out,
+                                             char *error, size_t error_capacity);
 void yesno_channel_close(yesno_channel *channel);
 
 yesno_channel_status yesno_channel_get_limits(const yesno_channel *channel,
