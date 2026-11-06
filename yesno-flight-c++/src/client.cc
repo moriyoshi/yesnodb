@@ -5,6 +5,7 @@
 #include "protocol_internal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -29,6 +30,8 @@ struct Client::Impl {
       : flight(std::move(value)) {}
 
   std::unique_ptr<arrow::flight::FlightClient> flight;
+  // Passed to every call. Arrow's default timeout is negative, meaning none.
+  arrow::flight::FlightCallOptions options;
 };
 
 arrow::Result<std::unique_ptr<Client>> Client::Connect(std::string_view uri) {
@@ -46,10 +49,18 @@ Client::~Client() = default;
 Client::Client(Client&&) noexcept = default;
 Client& Client::operator=(Client&&) noexcept = default;
 
+void Client::SetCallTimeout(std::chrono::milliseconds limit) {
+  impl_->options.timeout =
+      limit > std::chrono::milliseconds::zero()
+          ? std::chrono::duration_cast<arrow::flight::TimeoutDuration>(limit)
+          : arrow::flight::TimeoutDuration(-1);
+}
+
 arrow::Result<QueryInfo> Client::PrepareKey(std::uint64_t key) {
   ARROW_ASSIGN_OR_RAISE(
       auto info,
       impl_->flight->GetFlightInfo(
+          impl_->options,
           arrow::flight::FlightDescriptor::Command(internal::EncodeU64(key))));
   if (info->total_records() < 0) {
     return arrow::Status::Invalid(
@@ -69,7 +80,8 @@ arrow::Result<std::vector<std::uint64_t>> Client::Fetch(
     const QueryInfo& query) {
   ARROW_ASSIGN_OR_RAISE(
       auto stream,
-      impl_->flight->DoGet(arrow::flight::Ticket(query.ticket)));
+      impl_->flight->DoGet(impl_->options,
+                           arrow::flight::Ticket(query.ticket)));
 
   if (query.total_records >
       static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
@@ -106,7 +118,7 @@ arrow::Result<std::uint64_t> Client::U64Action(std::string_view name,
                                                std::string body) {
   ARROW_ASSIGN_OR_RAISE(
       auto results,
-      impl_->flight->DoAction(arrow::flight::Action(
+      impl_->flight->DoAction(impl_->options, arrow::flight::Action(
           std::string(name), arrow::Buffer::FromString(std::move(body)))));
   std::string response;
   while (true) {
@@ -188,6 +200,7 @@ arrow::Result<std::uint64_t> Client::PutMutations(
   ARROW_ASSIGN_OR_RAISE(
       auto put,
       impl_->flight->DoPut(
+          impl_->options,
           arrow::flight::FlightDescriptor::Command(std::string(command)),
           schema));
 
@@ -257,6 +270,7 @@ arrow::Result<std::uint64_t> Client::Put(
   ARROW_ASSIGN_OR_RAISE(
       auto put,
       impl_->flight->DoPut(
+          impl_->options,
           arrow::flight::FlightDescriptor::Command(std::string(command)),
           schema));
 

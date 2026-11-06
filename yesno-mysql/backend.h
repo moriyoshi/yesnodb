@@ -17,10 +17,10 @@ namespace yesno_mysql {
 /// five, and this is where they stop being a string an operator reads and start
 /// being something `ha_yesno.cc` can branch on.
 ///
-/// The embedded and Flight backends only ever report `kOk` and `kError`. That
-/// is not a gap: an embedded database has no peer to be stale against, and the
-/// Flight surface exposes no equivalent classification. A backend returning
-/// only the two is conforming.
+/// The embedded backend only ever reports `kOk` and `kError`, and the Flight
+/// backend those and `kInterrupted`. That is not a gap: an embedded database
+/// has no peer to be stale against, and the Flight surface exposes no
+/// equivalent classification. A backend returning only the two is conforming.
 enum class BackendStatus {
   kOk = 0,
   /// An unclassified failure. The message is all there is.
@@ -37,7 +37,7 @@ enum class BackendStatus {
   /// The request needed a leader and reached a read-only replica.
   kWrongRole = 5,
   /// The query was killed while the backend waited for its server. Only the
-  /// channel backend reports it; the statement is over, so nothing retries.
+  /// remote backends report it; the statement is over, so nothing retries.
   kInterrupted = 6,
 };
 
@@ -92,12 +92,9 @@ class Backend {
 
   /// Apply a whole transaction's writes.
   ///
-  /// **The embedded backend applies these atomically across every key**, by
-  /// putting them in one `yesno_batch`. The Flight backend sends one
-  /// `RemoveMany` and one `InsertMany` covering every key, so each call is a
-  /// batch but the pair is not one transaction -- a failure between them leaves
-  /// the removals applied. Removals go first, so that partial state is a
-  /// smaller set rather than a larger one.
+  /// **Every backend applies these atomically across every key**: the
+  /// embedded one in one `yesno_batch`, the Flight one in one write
+  /// transaction, and the channel one in one `Apply` frame.
   virtual BackendStatus Apply(const std::vector<KeyWrites> &writes,
                      std::string *error) = 0;
   virtual BackendStatus Insert(std::uint64_t key, std::uint64_t ordinal, bool *changed,
@@ -116,15 +113,22 @@ class Backend {
 
 std::unique_ptr<Backend> OpenEmbeddedBackend(const std::string& path,
                                              std::string *error);
-std::unique_ptr<Backend> OpenFlightBackend(const std::string& endpoint,
+
+/// The Flight backend: a yesnod's Flight endpoint.
+///
+/// Its first call has 10 s to be answered, so an endpoint that accepts and
+/// never answers fails the open rather than holding mysqld's startup. Later
+/// calls have no time limit and answer `should_stop` instead, exactly as
+/// `OpenChannelBackend` describes. A Flight call cannot be cancelled from
+/// another thread, so each runs on a thread of the backend's and a stopped
+/// session stops *waiting* for it; the call goes on until its server answers,
+/// and the backend connects afresh for the next one.
+std::unique_ptr<Backend> OpenFlightBackend(const std::string &endpoint,
+                                           int (*should_stop)(void *),
                                            std::string *error);
 
 /// The plugin-channel backend: a Unix socket to a yesnod that already holds the
 /// database's exclusive lock.
-///
-/// Unlike `OpenFlightBackend`, its `Apply` is **one commit** across every key,
-/// because a single channel `Apply` frame carries them all -- so its atomicity
-/// matches the embedded backend's rather than Flight's.
 ///
 /// `should_stop` is called with a null argument on whichever thread is waiting,
 /// about every 50 ms, and nonzero ends the wait with `kInterrupted`. The engine

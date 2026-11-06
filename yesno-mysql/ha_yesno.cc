@@ -92,11 +92,11 @@ int bridge_status(yesno_mysql::BackendStatus status, const std::string &error) {
   return HA_ERR_INTERNAL_ERROR;
 }
 
-/// The channel backend's stop check: has the session waiting been killed?
+/// The remote backends' stop check: has the session waiting been killed?
 ///
 /// Called on the waiting thread, so `current_thd` is the session whose request
 /// is in flight. Null during plugin initialization, where nothing can be
-/// killed and the handshake's own time limit applies instead.
+/// killed and the open's own time limit applies instead.
 int waiting_session_killed(void *) {
   THD *thd = current_thd;
   return thd != nullptr && thd_killed(thd) != 0 ? 1 : 0;
@@ -689,8 +689,8 @@ int yesno_init_func(void *plugin) {
           MYF(0));
       return 1;
     }
-    yesno_backend =
-        yesno_mysql::OpenFlightBackend(yesno_flight_endpoint, &error);
+    yesno_backend = yesno_mysql::OpenFlightBackend(
+        yesno_flight_endpoint, waiting_session_killed, &error);
   } else if (mode == "channel") {
     if (yesno_channel_socket == nullptr || yesno_channel_socket[0] == '\0') {
       my_printf_error(

@@ -53,7 +53,12 @@ elsewhere. Back it up separately from MySQL's transactional engines.
 
 For a remote server, start MySQL with `--yesno-backend=flight` and
 `--yesno-flight-endpoint=grpc://host:port`. Plugin initialization probes the
-endpoint and fails if it is unavailable. Each scan materializes one remote
+endpoint and fails if it is unavailable or has not answered within 10 s, and
+mysqld then starts without the engine rather than waiting. After that, a query
+waiting on the endpoint ends at `KILL QUERY` with "Query execution was
+interrupted", and the next query connects afresh; the
+abandoned Flight call itself runs on until the server answers, because Flight
+gives no way to cancel it from another thread. Each scan materializes one remote
 snapshot into a C++ cursor, while point writes use atomic Flight actions so
 duplicate and missing-row results are not implemented as racy read-then-write
 sequences. A committed transaction is staged through one Flight write

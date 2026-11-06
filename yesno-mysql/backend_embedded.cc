@@ -227,7 +227,8 @@ std::unique_ptr<Backend> OpenEmbeddedBackend(const std::string& path,
 }
 
 #ifndef YESNO_WITH_FLIGHT
-std::unique_ptr<Backend> OpenFlightBackend(const std::string&,
+std::unique_ptr<Backend> OpenFlightBackend(const std::string &,
+                                           int (*)(void *),
                                            std::string *error) {
   *error =
       "this yesno-mysql module was built without the Arrow Flight C++ backend";
@@ -237,6 +238,7 @@ std::unique_ptr<Backend> OpenFlightBackend(const std::string&,
 
 #ifndef YESNO_WITH_CHANNEL
 std::unique_ptr<Backend> OpenChannelBackend(const std::string &,
+                                            int (*)(void *),
                                             std::string *error) {
   *error =
       "this yesno-mysql module was built without the plugin-channel backend";

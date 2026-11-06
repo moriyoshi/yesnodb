@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "protocol_internal.h"
+#include "yesno/flight/client.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -12,6 +19,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/flight/types.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 
@@ -230,6 +238,51 @@ void PromisedCardinalityIsExact() {
                "4 ordinals after promising 3", "long result");
 }
 
+// An endpoint that accepts and never answers is what a call limit is for.
+//
+// The listener never calls `accept`; the kernel completes the connection from
+// its backlog, so the client gets as far as waiting for the server's first
+// HTTP/2 frame, which never comes. Without the limit this call waits for ever,
+// which is what held mysqld's startup against such an endpoint.
+void ACallLimitEndsAWaitOnAnEndpointThatNeverAnswers() {
+  const int listener = socket(AF_INET, SOCK_STREAM, 0);
+  Check(listener >= 0, "could not create the silent listener");
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  Check(bind(listener, reinterpret_cast<sockaddr*>(&address),
+             sizeof address) == 0,
+        "could not bind the silent listener");
+  Check(listen(listener, 4) == 0, "could not listen on the silent socket");
+  socklen_t length = sizeof address;
+  Check(getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                    &length) == 0,
+        "could not read the silent listener's port");
+  const std::string endpoint =
+      "grpc://127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+
+  auto connected = yesno::flight::Client::Connect(endpoint);
+  Check(connected.ok(), "connecting is lazy and cannot fail here");
+  if (connected.ok()) {
+    auto client = std::move(connected).ValueOrDie();
+    client->SetCallTimeout(std::chrono::milliseconds(300));
+    const auto started = std::chrono::steady_clock::now();
+    auto probe = client->Cardinality(0);
+    const auto waited = std::chrono::steady_clock::now() - started;
+    Check(!probe.ok(), "a call to a silent endpoint succeeded");
+    const auto detail =
+        arrow::flight::FlightStatusDetail::UnwrapStatus(probe.status());
+    Check(detail != nullptr &&
+              detail->code() == arrow::flight::FlightStatusCode::TimedOut,
+          "a call to a silent endpoint did not end as timed out: " +
+              probe.status().ToString());
+    Check(waited < std::chrono::seconds(5),
+          "the call limit did not end the wait promptly");
+  }
+  close(listener);
+}
+
 }  // namespace
 
 int main() {
@@ -240,6 +293,7 @@ int main() {
   OrdinalBatchesAreValidatedAtomically();
   MalformedOrdinalSchemasAreRejected();
   PromisedCardinalityIsExact();
+  ACallLimitEndsAWaitOnAnEndpointThatNeverAnswers();
   if (failures != 0) {
     std::cerr << failures << " unit assertion(s) failed\n";
     return 1;

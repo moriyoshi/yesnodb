@@ -2,6 +2,7 @@
 #ifndef YESNO_FLIGHT_CLIENT_H
 #define YESNO_FLIGHT_CLIENT_H
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -32,6 +33,15 @@ class Client {
   Client& operator=(const Client&) = delete;
   Client(Client&&) noexcept;
   Client& operator=(Client&&) noexcept;
+
+  // Give every later call at most `limit`, after which it fails with an
+  // `arrow::flight::FlightStatusDetail` of `TimedOut`. Zero, the default, waits
+  // for ever.
+  //
+  // The limit covers the whole call, streaming included, so it suits a call
+  // whose answer is small, such as a first probe of an endpoint that may
+  // accept and never answer, and not a fetch whose size it cannot know.
+  void SetCallTimeout(std::chrono::milliseconds limit);
 
   arrow::Result<QueryInfo> PrepareKey(std::uint64_t key);
   arrow::Result<std::vector<std::uint64_t>> Fetch(const QueryInfo& query);

@@ -6088,3 +6088,96 @@ connection still queues every session behind a slow one; a kill now ends the
 queueing, but a connection per session or a pool would remove it.
 
 `gate-pg.sh` passed after the entry above was written, completing the three gates.
+
+## 2026-11-06 -- The MySQL Flight backend answers KILL QUERY and cannot hang startup
+
+The Flight half of `the-mysql-engine-cannot-be-interrupted-while-it-waits-on-yesnod`,
+demonstrated first and then fixed. The channel half is the entry above.
+
+**What the reproduction showed, and one thing it refuted.** `e2e/mysql/mysql.py`
+now runs the channel's two legs as functions, `kill_while_muted` and
+`start_against_silence`, and runs them against Flight too. Against the unchanged
+engine:
+- **`flight-held`.** A `SELECT COUNT(*)` waiting on a Flight server that holds
+  every request was still running 10 s after `KILL QUERY`.
+- **`flight-held-startup`.** mysqld never accepted a connection within about
+  30 s. Its log stops after InnoDB init, so the plugin's startup probe was
+  waiting.
+- **`flight-silent`.** This one did **not** hang, contrary to the TODO's reading.
+  Against `SilentFixture`'s endpoint, which accepts TCP and never sends a byte,
+  gRPC itself gave up at about 20 s: "connection attempt timed out before
+  receiving SETTINGS frame". mysqld then started without the engine. gRPC's
+  connect timeout covers silence below HTTP/2, and nothing covers a server whose
+  HTTP/2 layer is alive while its handlers are stuck.
+
+**The fixture holds requests, not bytes, for that reason.** The first attempt
+muted the Flight fixture below HTTP/2, the way the channel fixture's `Muted` does.
+That reproduced the kill hang. But a whole-connection mute at startup is the same
+as `SilentFixture`, which gRPC times out. `Held` now wraps the fixture's tonic
+service and parks each request while `fx_flight_hold(1)` is in force. The
+handshake completes and pings are answered, and only the answers never come.
+That is the stuck-yesnod case and the one no gRPC timer ends.
+
+**A Flight call cannot be cancelled from another thread, checked in the Arrow
+25.0.1 source.**
+- `FlightCallOptions::stop_token` is read only between stream messages, never
+  during a blocked read.
+- `DoAction`'s `ResultStream` and `DoPut`'s writer expose no cancel.
+- `FlightClient::Close` cancels nothing. Its own comment says gRPC offers no real
+  close.
+- Only `DoGet`'s reader and the async `GetFlightInfo` have one.
+
+So the fix ends the *waiting*, not the call:
+- **A worker thread per backend.** Each backend call runs on it. The session
+  waits in 50 ms slices that check `waiting_session_killed`, the same check the
+  channel uses.
+- **Walking away.** A killed session abandons the worker and its client, and the
+  next call connects afresh. The abandoned call keeps its client alive through a
+  `shared_ptr` and finishes when the server answers. Its result lands in a heap
+  slot, never the dead caller's frame.
+- **Pinning the library.** On the first abandonment the plugin pins its own
+  library, with `dlopen( RTLD_NOLOAD | RTLD_NODELETE )`. A thread still inside
+  an abandoned call therefore cannot have its code unmapped by
+  `UNINSTALL PLUGIN`.
+- **`Apply` aborts rather than commits** if the session stopped waiting before
+  the commit was sent. A session already told "interrupted" must not have its
+  work published afterwards. A stop during the commit itself is as ambiguous as
+  a lost connection.
+- **The startup probe has a 10 s limit.** That comes from a new
+  `yesno::flight::Client::SetCallTimeout`, applied to that one call only.
+  Arrow's deadline covers the whole call, streaming included, so a general limit
+  would also cut off legitimate large fetches. A timed-out probe says "did not
+  answer in time", matching the channel.
+- **The connection mutex is a `timed_mutex`**, polled against the same flag, as
+  in the channel backend.
+
+**Also fixed.** `backend_embedded.cc`'s fallback stubs, compiled only when a
+remote backend is configured out, still had the two-argument
+`OpenChannelBackend` signature that `f380761` replaced. A build without the
+channel backend would have failed to link. No gate builds that configuration, so
+nothing caught it. A `-fsyntax-only` compile of the file now passes; that is the
+only check it had. Also corrected: `backend.h`'s comments, which still said the
+Flight `Apply` was a `RemoveMany` and an `InsertMany` rather than one write
+transaction.
+
+**Tests.**
+- `ACallLimitEndsAWaitOnAnEndpointThatNeverAnswers` in
+  `yesno-flight-c++/tests/unit.cc`: a listener that never accepts, a 300 ms
+  limit, and an expected `TimedOut` in under 5 s. It was not sabotaged. Without
+  the limit, gRPC's own 20 s connect timeout would fail it, on both the
+  status-code check and the elapsed-time check. That is reasoned from the
+  `flight-silent` measurement, not run.
+- The three Flight legs in `mysql.py`, which failed as described above before
+  the fix and pass after it.
+- **Not covered:** `Apply`'s abort-before-commit path. Reaching it needs a hold
+  that starts between `Stage` and `CommitWrite`.
+
+**Gates.** `gate-mysql.sh` passed, four of four steps.
+
+`gate.sh` then passed, 3 489 tests, 0 failed, and `gate-pg.sh` passed, completing
+the three gates. The first `gate.sh` run failed one test that this change does not
+touch: `a_gap_is_taken_between_shards_and_not_by_the_default_path` in `yesno-core`,
+whose plain checkpoint took 1.77 s against the staggered one's 1.43 s. Run alone it
+passed three times in about 0.35 s, and the full rerun passed. That reads as fsync
+stalling under the suite's own parallel load, minutes after a MySQL image build on
+the same disk. The test's bound was not changed.

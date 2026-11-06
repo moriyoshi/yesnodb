@@ -27,6 +27,7 @@ pub const OWNS: &[&str] = &[
     "fx_flight_start",
     "fx_flight_stop",
     "fx_flight_requests",
+    "fx_flight_hold",
     "fx_channel_start",
     "fx_channel_stop",
     "fx_silent_start",
@@ -211,6 +212,16 @@ impl World {
                     ("do_gets", crate::convert::int_obj(gets)),
                     ("do_puts", crate::convert::int_obj(puts)),
                 ]))
+            }
+            "fx_flight_hold" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let on = a.u64(0)? != 0;
+                let flight = self.fixture.flight.as_ref().ok_or_else(|| {
+                    value_err(format!("{verb}(): fixture Flight server is not running"))
+                })?;
+                flight.held.store(on, std::sync::atomic::Ordering::Relaxed);
+                Ok(MontyObject::None)
             }
             "fx_flight_stop" => {
                 a.exact(0)?;
@@ -907,6 +918,8 @@ struct FlightFixture {
     /// query made rather than only what it returned. Taken before the service
     /// moves into the server task, which is the only moment it can be.
     requests: Arc<yesno_flight::RequestCounts>,
+    /// Set by `fx_flight_hold`; see [`Held`].
+    held: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A real plugin channel over a real socket, for a scenario that drives a peer.
@@ -1086,6 +1099,58 @@ impl Write for MutedStream {
     }
 }
 
+/// Holds every request a [`FlightFixture`] receives while `fx_flight_hold(1)`
+/// is in force, until `fx_flight_hold(0)` or the fixture stops.
+///
+/// The Flight server a client must not wait on for ever. It is held above
+/// HTTP/2 rather than below, so the connection stays alive -- the handshake
+/// completes and pings are answered -- and only the answers never come, as when
+/// yesnod's handlers are stuck. A server silent below HTTP/2 is
+/// [`SilentFixture`]'s, and gRPC's own connect timeout ends a client's wait on
+/// that one; nothing ends a wait on this one but the client. A verb rather than
+/// [`Muted`]'s file, because the MySQL scenario that drives it runs its client
+/// in the background and is free to call one.
+#[derive(Clone)]
+struct Held<S> {
+    inner: S,
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<S, B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for Held<S>
+where
+    S: tonic::codegen::Service<tonic::codegen::http::Request<B>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        // The clone that was made ready serves this request, as tower expects.
+        let ready = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, ready);
+        let held = Arc::clone(&self.held);
+        Box::pin(async move {
+            while held.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            inner.call(request).await
+        })
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for Held<S> {
+    const NAME: &'static str = S::NAME;
+}
+
 /// Listeners that accept every connection and never say anything: one on TCP
 /// for Flight, one on a Unix socket for the plugin channel.
 ///
@@ -1170,6 +1235,8 @@ impl FlightFixture {
     fn start(keys: Vec<u64>, ordinals: Vec<u64>) -> Result<(Self, String), String> {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready, ready_rx) = mpsc::sync_channel(1);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held_serve = Arc::clone(&held);
         let thread = thread::Builder::new()
             .name("yesno-e2e-flight-fixture".to_owned())
             .spawn(move || {
@@ -1193,7 +1260,10 @@ impl FlightFixture {
                         .send(Ok((address, requests)))
                         .map_err(|_| "scenario stopped before Flight startup".to_owned())?;
                     tonic::transport::Server::builder()
-                        .add_service(FlightServiceServer::new(service))
+                        .add_service(Held {
+                            inner: FlightServiceServer::new(service),
+                            held: held_serve,
+                        })
                         .serve_with_incoming_shutdown(incoming_nodelay(listener), async {
                             let _ = shutdown_rx.await;
                         })
@@ -1206,6 +1276,7 @@ impl FlightFixture {
             shutdown: Some(shutdown),
             thread: Some(thread),
             requests: Arc::new(yesno_flight::RequestCounts::default()),
+            held,
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok((address, requests))) => {
@@ -1230,6 +1301,9 @@ impl FlightFixture {
 
 impl Drop for FlightFixture {
     fn drop(&mut self) {
+        // Released first: a graceful shutdown waits for its requests, and a
+        // held one would hold it for ever.
+        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
         drop(self.shutdown.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
