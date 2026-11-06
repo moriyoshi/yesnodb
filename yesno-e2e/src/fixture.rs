@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +29,8 @@ pub const OWNS: &[&str] = &[
     "fx_flight_stop",
     "fx_flight_requests",
     "fx_flight_hold",
+    "fx_flight_hold_method",
+    "fx_flight_hold_counts",
     "fx_channel_start",
     "fx_channel_stop",
     "fx_silent_start",
@@ -216,12 +219,44 @@ impl World {
             "fx_flight_hold" => {
                 a.exact(1)?;
                 a.no_kwargs()?;
-                let on = a.u64(0)? != 0;
+                let which = if a.u64(0)? != 0 { "*" } else { "" };
                 let flight = self.fixture.flight.as_ref().ok_or_else(|| {
                     value_err(format!("{verb}(): fixture Flight server is not running"))
                 })?;
-                flight.held.store(on, std::sync::atomic::Ordering::Relaxed);
+                flight.hold.set(which);
                 Ok(MontyObject::None)
+            }
+            "fx_flight_hold_method" => {
+                a.exact(1)?;
+                a.no_kwargs()?;
+                let method = a.str_at(0)?;
+                if method.is_empty() || method == "*" {
+                    return Err(value_err(format!(
+                        "{verb}(): name one Flight method, such as \"DoPut\""
+                    )));
+                }
+                let flight = self.fixture.flight.as_ref().ok_or_else(|| {
+                    value_err(format!("{verb}(): fixture Flight server is not running"))
+                })?;
+                flight.hold.set(method);
+                Ok(MontyObject::None)
+            }
+            "fx_flight_hold_counts" => {
+                a.exact(0)?;
+                a.no_kwargs()?;
+                let flight = self.fixture.flight.as_ref().ok_or_else(|| {
+                    value_err(format!("{verb}(): fixture Flight server is not running"))
+                })?;
+                Ok(dict(vec![
+                    (
+                        "parked",
+                        crate::convert::int_obj(flight.hold.parked.load(Ordering::SeqCst)),
+                    ),
+                    (
+                        "answered",
+                        crate::convert::int_obj(flight.hold.answered.load(Ordering::SeqCst)),
+                    ),
+                ]))
             }
             "fx_flight_stop" => {
                 a.exact(0)?;
@@ -918,8 +953,8 @@ struct FlightFixture {
     /// query made rather than only what it returned. Taken before the service
     /// moves into the server task, which is the only moment it can be.
     requests: Arc<yesno_flight::RequestCounts>,
-    /// Set by `fx_flight_hold`; see [`Held`].
-    held: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `fx_flight_hold` and `fx_flight_hold_method`; see [`Held`].
+    hold: Arc<Hold>,
 }
 
 /// A real plugin channel over a real socket, for a scenario that drives a peer.
@@ -1100,7 +1135,8 @@ impl Write for MutedStream {
 }
 
 /// Holds every request a [`FlightFixture`] receives while `fx_flight_hold(1)`
-/// is in force, until `fx_flight_hold(0)` or the fixture stops.
+/// is in force, or only one method's while `fx_flight_hold_method(name)` is,
+/// until `fx_flight_hold(0)` or the fixture stops.
 ///
 /// The Flight server a client must not wait on for ever. It is held above
 /// HTTP/2 rather than below, so the connection stays alive -- the handshake
@@ -1110,10 +1146,62 @@ impl Write for MutedStream {
 /// that one; nothing ends a wait on this one but the client. A verb rather than
 /// [`Muted`]'s file, because the MySQL scenario that drives it runs its client
 /// in the background and is free to call one.
+///
+/// One method's hold reaches into the middle of a sequence of calls: holding
+/// `DoPut` alone parks a write transaction's staging after its `DoAction` begin
+/// was answered and before its commit is sent. `fx_flight_hold_counts()` says
+/// when a request is parked, so a scenario acts on the wait rather than on a
+/// guess at its timing, and how many requests were answered, so it can wait
+/// for a call it let go to finish.
 #[derive(Clone)]
 struct Held<S> {
     inner: S,
-    held: Arc<std::sync::atomic::AtomicBool>,
+    hold: Arc<Hold>,
+}
+
+/// What [`Held`] parks, and what it has seen.
+#[derive(Default)]
+struct Hold {
+    /// Empty for nothing, `*` for every request, otherwise one method's name,
+    /// the last segment of a gRPC path such as `DoPut`.
+    which: std::sync::Mutex<String>,
+    /// Requests parked right now.
+    parked: AtomicU64,
+    /// Requests the service has answered, held or not, since the fixture
+    /// started.
+    answered: AtomicU64,
+}
+
+impl Hold {
+    fn set(&self, which: &str) {
+        let mut held = self
+            .which
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        which.clone_into(&mut held);
+    }
+
+    fn holds(&self, path: &str) -> bool {
+        let held = self
+            .which
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match held.as_str() {
+            "" => false,
+            "*" => true,
+            method => path.rsplit('/').next() == Some(method),
+        }
+    }
+}
+
+/// Counts a request out of [`Hold::parked`] however its wait ends, including
+/// a client that gives up and drops it.
+struct Parked<'a>(&'a AtomicU64);
+
+impl Drop for Parked<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl<S, B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for Held<S>
@@ -1137,12 +1225,19 @@ where
         // The clone that was made ready serves this request, as tower expects.
         let ready = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, ready);
-        let held = Arc::clone(&self.held);
+        let hold = Arc::clone(&self.hold);
+        let path = request.uri().path().to_owned();
         Box::pin(async move {
-            while held.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            if hold.holds(&path) {
+                hold.parked.fetch_add(1, Ordering::SeqCst);
+                let _parked = Parked(&hold.parked);
+                while hold.holds(&path) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
-            inner.call(request).await
+            let answer = inner.call(request).await;
+            hold.answered.fetch_add(1, Ordering::SeqCst);
+            answer
         })
     }
 }
@@ -1235,8 +1330,8 @@ impl FlightFixture {
     fn start(keys: Vec<u64>, ordinals: Vec<u64>) -> Result<(Self, String), String> {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready, ready_rx) = mpsc::sync_channel(1);
-        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let held_serve = Arc::clone(&held);
+        let hold = Arc::new(Hold::default());
+        let hold_serve = Arc::clone(&hold);
         let thread = thread::Builder::new()
             .name("yesno-e2e-flight-fixture".to_owned())
             .spawn(move || {
@@ -1262,7 +1357,7 @@ impl FlightFixture {
                     tonic::transport::Server::builder()
                         .add_service(Held {
                             inner: FlightServiceServer::new(service),
-                            held: held_serve,
+                            hold: hold_serve,
                         })
                         .serve_with_incoming_shutdown(incoming_nodelay(listener), async {
                             let _ = shutdown_rx.await;
@@ -1276,7 +1371,7 @@ impl FlightFixture {
             shutdown: Some(shutdown),
             thread: Some(thread),
             requests: Arc::new(yesno_flight::RequestCounts::default()),
-            held,
+            hold,
         };
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok((address, requests))) => {
@@ -1303,7 +1398,7 @@ impl Drop for FlightFixture {
     fn drop(&mut self) {
         // Released first: a graceful shutdown waits for its requests, and a
         // held one would hold it for ever.
-        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.hold.set("");
         drop(self.shutdown.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

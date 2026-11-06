@@ -6181,3 +6181,47 @@ whose plain checkpoint took 1.77 s against the staggered one's 1.43 s. Run alone
 passed three times in about 0.35 s, and the full rerun passed. That reads as fsync
 stalling under the suite's own parallel load, minutes after a MySQL image build on
 the same disk. The test's bound was not changed.
+
+## 2026-11-06 -- A MySQL write killed before its commit is gated not to land
+
+The entry above left `Apply`'s abort-before-commit path untested. It also said
+the test needed a hold that starts between `Stage` and `CommitWrite`. **That was
+the wrong place.** A hold there parks the commit after it was sent, and a kill
+then leaves the outcome unknown, which is the case the code documents rather
+than the one it guards. The guard runs when `Stage` returns. So the test holds
+`Stage` itself, kills the session while it waits, and then lets it go.
+
+**The fixture.** `Held` now parks one method's requests as well as every
+request.
+- `fx_flight_hold_method("DoPut")` holds only staging. `BeginWrite`,
+  `CommitWrite` and `AbortWrite` are `DoAction`s, and they pass.
+- `fx_flight_hold_counts()` returns `parked`, the number of requests waiting
+  right now, and `answered`, the number the service has answered since the
+  fixture started.
+- `fx_flight_hold(0)` releases both kinds of hold.
+- A guard decrements `parked` however a wait ends, including when a client
+  drops the request.
+
+**The leg.** `flight-held-stage` in `e2e/mysql/mysql.py`:
+1. Fills key 2001 with three ordinals.
+2. Holds `DoPut` and starts an autocommit `INSERT ... VALUES (4)` in the
+   background.
+3. Waits until `parked` is 1, so the kill lands on the wait rather than on a
+   guess about timing.
+4. Runs `KILL QUERY` and expects "interrupted".
+5. Releases the hold.
+6. Waits until `answered` has grown by 2. Those two answers are the stage and
+   whatever came after it: the abort, or the commit this leg exists to catch.
+   A count taken any earlier could see 3 before a late commit lands, and pass
+   for the wrong reason.
+7. Expects the count to be 3.
+
+**Demonstrated before trusting it.** With the `abandoned` check in
+`backend_flight.cc` disabled (`false &&`), `gate-mysql.sh` failed on this leg
+alone: "a write killed before its commit was sent took effect after the server
+let it go; the count is 4 rather than 3". Every other interrupt leg passed in
+the same run. With the check restored, `gate-mysql.sh` passed.
+
+**Still unknown by design.** A kill that lands while the commit itself is in
+flight leaves the outcome open, as a dropped connection would. Nothing tests
+that case, because no single answer would be the right one.

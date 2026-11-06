@@ -756,8 +756,76 @@ def release_flight():
     fx_flight_hold(0)
 
 
+# Waits up to about 10 s for `done(fx_flight_hold_counts())`.
+def await_flight(done, what):
+    for _ in range(50):
+        if done(fx_flight_hold_counts()):
+            return
+        pause()
+    assert False, "the Flight fixture never " + what + ": " + str(fx_flight_hold_counts())
+
+
+# A write killed before its commit was sent must not take effect: its client
+# was told it was interrupted. The engine applies a statement's writes as
+# begin, stage, commit, and holding `DoPut` alone parks the stage with the
+# begin answered and the commit not yet sent. The kill abandons the call; once
+# the stage is let go, the abandoned call must abort rather than commit, which
+# the count proves after waiting for both of its last two requests to be
+# answered. Returns what went wrong.
+def kill_before_commit(label, backend_args):
+    booted = boot(label, backend_args)
+    server = booted["server"]
+    mysql = booted["mysql"]
+    client_base = booted["client_base"]
+    env = booted["env"]
+    fx_wait_ready(server, mysql, client_base + ["--execute=SELECT 1"], env, 60000)
+    checked(fx_run(mysql, client_base + ["--execute=CREATE DATABASE test"], env, ""), label + " database")
+    checked(
+        mysql_run(
+            mysql,
+            client_base,
+            env,
+            "CREATE TABLE staged (ordinal BIGINT UNSIGNED NOT NULL PRIMARY KEY) "
+            + "ENGINE=YESNO CONNECTION='key=2001'",
+            False,
+        ),
+        label + " create staged",
+    )
+    checked(mysql_run(mysql, client_base, env, "INSERT INTO staged VALUES (1), (2), (3)", False), label + " fill")
+    stuck_sql = "INSERT INTO staged VALUES (4)"
+    fx_flight_hold_method("DoPut")
+    stuck = fx_start(mysql, client_base + ["--database=test", "--execute=" + stuck_sql], env)
+    await_flight(lambda counts: counts["parked"] == 1, "parked the stage")
+    answered = fx_flight_hold_counts()["answered"]
+    killed = mysql_run(
+        mysql, client_base, env, "KILL QUERY " + session_running(mysql, client_base, env, stuck_sql), False
+    )
+    ended = fx_close(stuck, 10000)
+    release_flight()
+    # The stage, then the abort, or the commit this leg exists to catch.
+    await_flight(lambda counts: counts["answered"] >= answered + 2, "answered the abandoned call")
+    after = mysql_run(mysql, client_base, env, "SELECT COUNT(*) FROM staged", True)
+    checked(fx_run(mysql, client_base + ["--execute=SHUTDOWN"], env, ""), label + " shutdown")
+    checked(fx_close(server, 30000), label + " mysqld exit")
+    checked(killed, label + " KILL QUERY")
+    wrong = []
+    if "interrupted" not in ended["stderr"]:
+        wrong.append(label + ": KILL QUERY did not end a write parked in its stage: " + str(ended))
+    count = checked(after, label + " count after release")["stdout"]
+    if count != "3\n":
+        wrong.append(
+            label
+            + ": a write killed before its commit was sent took effect after the server let it go; "
+            + "the count is "
+            + count.strip()
+            + " rather than 3"
+        )
+    return wrong
+
+
 flight_http = fx_flight_start([], [])
 hangs = hangs + kill_while_muted("flight-held", flight_args(flight_http), hold_flight, release_flight)
+hangs = hangs + kill_before_commit("flight-held-stage", flight_args(flight_http))
 hold_flight()
 hangs = hangs + start_against_silence(
     "flight-held-startup", flight_args(flight_http), "did not answer in time"
