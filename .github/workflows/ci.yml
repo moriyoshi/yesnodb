@@ -21,6 +21,10 @@
 # `cargo semver-checks` ( policy R7, the mechanical enforcement of R1 ). It
 # needs a published baseline to compare against and nothing is published yet.
 #
+# The known-vulnerability scan is `osv-scanner.yml`. It is not here because
+# this file is `release.yml`'s gate, and the scan's backlog would block every
+# release; that file explains how it gates pull requests instead.
+#
 # The Bazel PostgreSQL gate is separate. It builds a pinned PostgreSQL server and
 # is not hidden inside the routine Cargo job; a green badge therefore covers the
 # Cargo workspace, not the experimental extension.
@@ -34,9 +38,11 @@
 # Treat the first execution as the test of this file, and do not read a green
 # local gate as evidence that the workflow itself works.
 #
-# Only first-party actions are used, so the toolchain steps are plain `rustup`.
-# That is a few more lines than `dtolnay/rust-toolchain` in exchange for no
-# third-party code in the supply chain of the thing that guards the supply chain.
+# Only first-party actions are used here, so the toolchain steps are plain
+# `rustup`. That is a few more lines than `dtolnay/rust-toolchain` in exchange
+# for no third-party code in the supply chain of the thing that guards the
+# supply chain. `osv-scanner.yml` is the one exception in the repository,
+# pinned by commit, and its header says why.
 
 name: ci
 

@@ -1,0 +1,101 @@
+# Known-vulnerability scan of every lockfile in the tree, against the OSV
+# database.
+#
+# ---------------------------------------------------------------------------
+# What it scans, and what it cannot see
+# ---------------------------------------------------------------------------
+#
+# A recursive scan from the root finds the four Cargo lockfiles ( the workspace,
+# `yesno-c`, `yesno-pg` and `yesno-core/fuzz` ), `yesno-flight-python/uv.lock`
+# and `yesno-flight-go/go.mod`. It cannot see two things, and neither is
+# covered anywhere else:
+#
+# * What Bazel pins in `MODULE.bazel.lock`: the PostgreSQL, MySQL, Arrow and
+#   LLVM sources under `third_party/`. osv-scanner reads no Bazel lockfile, and
+#   reports those directories as holding no packages.
+# * The Gradle builds. `build.gradle.kts` is not a lockfile, and the Java
+#   modules do not write one.
+#
+# ---------------------------------------------------------------------------
+# Why it is its own workflow and not a job in `ci.yml`
+# ---------------------------------------------------------------------------
+#
+# The first scan, on 2026-11-07, found 61 known vulnerabilities in 33 packages.
+# Every one was already in the lockfiles, and no change on a branch caused it.
+# `release.yml` calls `ci.yml` as its gate, so a failing job there would have
+# blocked every release until all 61 were fixed. Uploading results to the
+# Security tab also needs `security-events: write`. A reusable workflow cannot
+# hold more permission than its caller grants, so asking for it in `ci.yml`
+# would have meant changing what `release.yml` grants its gate.
+#
+# So the gate here is narrow on purpose:
+#
+# * **A pull request fails only for a vulnerability it introduces.** The PR
+#   workflow scans the base and the head and reports the difference.
+# * **A push to `main`, the weekly timer and a manual run do a full scan and do
+#   not fail.** Their findings go to Security > Code scanning, which is where the
+#   existing list lives. A scan that fails on every run until the backlog is
+#   gone is a check people learn to ignore. Once the backlog is gone,
+#   `fail-on-vuln: true` on `scan-full` turns this into a gate as well.
+#
+# ---------------------------------------------------------------------------
+# Supply chain
+# ---------------------------------------------------------------------------
+#
+# This is the one third-party action in the repository. `ci.yml` uses only
+# first-party actions, and its header explains why. There is no first-party
+# equivalent, so this one is pinned to a full commit SHA, the commit tagged
+# v2.7.0, checked against the tag on 2026-11-07. The reusable workflows pin
+# every action they call by SHA as well. The scan jobs get no secrets, and their
+# write permission is `security-events` alone. To upgrade, resolve the new
+# tag's commit with `gh api repos/google/osv-scanner-action/git/ref/tags/<tag>`
+# and follow the annotated tag object to its commit. Do not pin a tag name,
+# which can be moved.
+
+name: osv-scanner
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Monday 04:00 UTC. A new advisory against an unchanged lockfile only
+    # reaches the Security tab through this timer or the next push.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: osv-scanner-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  scan-pr:
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
+      # A pull request from a fork gets a read-only token, so the upload would
+      # fail the job for a reason unrelated to the scan.
+      upload-sarif: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+
+  scan-full:
+    if: github.event_name != 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
+      fail-on-vuln: false

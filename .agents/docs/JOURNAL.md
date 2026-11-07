@@ -6225,3 +6225,55 @@ the same run. With the check restored, `gate-mysql.sh` passed.
 **Still unknown by design.** A kill that lands while the commit itself is in
 flight leaves the outcome open, as a dropped connection would. Nothing tests
 that case, because no single answer would be the right one.
+
+## 2026-11-07 -- osv-scanner joins CI, as its own workflow
+
+`.github/workflows/osv-scanner.yml` runs Google's `osv-scanner-action`
+reusable workflows, pinned to `b1d267aea5211fa648d9d442fa64b90dbdcbdd36`. That
+is the commit the annotated tag v2.7.0 points to, resolved through the GitHub
+API. It is the first third-party action in the repository. `ci.yml`'s header
+had said why it uses none, and now points at this file as the exception.
+
+**The scan ran before the workflow was written.** I ran the action's own image,
+`ghcr.io/google/osv-scanner-action:v2.7.0 --recursive ./`, over a
+`git archive HEAD` export, so that untracked scratch under `.agents-workspace/`
+could not count.
+- **It read six lockfiles:** the workspace `Cargo.lock` (708 packages),
+  `yesno-pg` (233), `yesno-c` (56), the fuzz crate (36), `uv.lock` (19) and
+  `go.mod` (15).
+- **It found 61 known vulnerabilities in 33 packages,** 12 of them High, and
+  exited 1.
+- **It cannot see two sources:** `MODULE.bazel.lock` and the Gradle builds.
+  It reported the `third_party/` directories as holding 0 packages.
+
+The breakdown is in TODO `the-lockfiles-carry-61-known-vulnerabilities`.
+
+**That number decided the shape.** A failing job in `ci.yml` would have blocked
+every release, because `release.yml` calls `ci.yml` as its gate. The SARIF
+upload needs `security-events: write`. A called workflow cannot hold more
+permission than its caller grants, so putting the upload there would also have
+meant changing what `release.yml` grants. So the scan got its own workflow:
+- **Pull requests:** `osv-scanner-reusable-pr.yml` fails only on what the PR
+  introduces. Uploads are skipped for fork PRs, whose token is read-only.
+- **`main`, the Monday timer and dispatch:** the full scan runs with
+  `fail-on-vuln: false` and fills Security > Code scanning.
+
+The top-level `permissions: {}` gives each job only `actions: read`,
+`contents: read` and `security-events: write`, which the reusable workflows
+require. No secrets are passed.
+
+**One finding about the scanner itself.** `rustls` 0.21.12, `rustls-webpki`
+0.101.7 and `h2` 0.3.27 are in `Cargo.lock` only through
+`aws-smithy-http-client` 1.0.6's legacy hyper 0.14 path. `cargo tree -i`
+cannot find `rustls` 0.21.12 under any feature set or target. osv-scanner reads
+the lockfile, not the build graph, so a locked-but-unbuilt package counts the
+same as a built one. Some of the 61 may never be compiled into anything.
+
+**Verified locally:**
+- actionlint 1.7.7 passes on `osv-scanner.yml` and on the edited `ci.yml`.
+- `check-gate-parity.py` and `check-msrv-consistency.py`, the two scripts that
+  read workflow files, still pass.
+
+**Not verified:** the workflow has not run on GitHub. As with `ci.yml`, its
+first run is the test of the file. No compiled code changed, so the gates were
+not run.
